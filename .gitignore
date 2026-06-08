@@ -1,0 +1,24 @@
+# Dependencies & build output
+node_modules/
+dist/
+**/target/
+build/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Generated per-case working data (kept on disk, not tracked)
+cases/
+output/*
+!output/synthetic_oct.nrrd
+
+# Local tooling / agent scratch
+.agents/
+
+# OS
+.DS_Store

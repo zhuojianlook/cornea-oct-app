@@ -1,0 +1,19 @@
+{
+  "segments": [
+    {
+      "name": "background",
+      "color": [0.05, 0.05, 0.05],
+      "seeds": [
+        { "ijk": [20, 20, 20], "radius_voxels": [6, 6, 3] },
+        { "ijk": [220, 220, 80], "radius_voxels": [6, 6, 3] }
+      ]
+    },
+    {
+      "name": "cornea",
+      "color": [0.1, 0.7, 1.0],
+      "seeds": [
+        { "ijk": [120, 120, 60], "radius_voxels": [8, 8, 3] }
+      ]
+    }
+  ]
+}
