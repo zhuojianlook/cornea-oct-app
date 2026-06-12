@@ -2,6 +2,7 @@ import { TextField, Button, Divider, Typography } from "@mui/material";
 import { useCaseStore } from "../../store/caseStore";
 import { ScanLoader } from "../panels/ScanLoader";
 import { OctLoader } from "../panels/OctLoader";
+import { CohortPanel } from "../panels/CohortPanel";
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -26,6 +27,12 @@ export function Sidebar() {
     <div className="flex flex-col">
       <Section title="OCT preprocessing">
         <OctLoader />
+      </Section>
+
+      <Divider sx={{ borderColor: "var(--c-border)" }} />
+
+      <Section title="Cohort batch">
+        <CohortPanel />
       </Section>
 
       <Divider sx={{ borderColor: "var(--c-border)" }} />

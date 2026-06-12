@@ -17,6 +17,8 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import List
 
@@ -40,6 +42,7 @@ import postprocess
 import metrics_export
 import consensus as consensus_mod
 import oct_preprocess as oct_mod
+import cohort as cohort_mod
 
 app = FastAPI(title="Cornea OCT Segmentation Sidecar")
 
@@ -242,8 +245,9 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
     orch.ensure_case_dirs(case_id)
     base = _ensure_volume_nifti(case_id)            # SAM2 likes natural raw contrast
     work = orch.case_root(case_id) / "sam2_work"
-    label, meta = sam2_segment.segment_volume(
-        base, work, planes=tuple(req.planes), vote=req.vote)
+    with _GPU_LOCK:                                  # one SAM2/CUDA inference at a time
+        label, meta = sam2_segment.segment_volume(
+            base, work, planes=tuple(req.planes), vote=req.vote)
     if label.sum() == 0:
         raise HTTPException(500, f"SAM2 produced an empty mask: {meta}")
     # Persist as the canonical labelmap so the overlay and nnU-Net export use it.
@@ -424,7 +428,8 @@ def scar_sam2_hint(case_id: str, req: ScarHintRequest) -> dict:
     vol = np.asarray(nib.load(str(work_vol)).dataobj).astype(np.float32)
     raw = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
     work = orch.case_root(case_id) / "sam2_work"
-    scar_sam, meta = sam2_segment.segment_scar_from_clicks(base, arr, points, work)
+    with _GPU_LOCK:                                  # one SAM2/CUDA inference at a time
+        scar_sam, meta = sam2_segment.segment_scar_from_clicks(base, arr, points, work)
     # SAM2 localizes *where* you clicked; constrain it to the hyper-reflective tissue
     # so it keeps only the scar within that region (a raw point grabs the whole band).
     from scipy import ndimage
@@ -527,44 +532,39 @@ def _read_label_ijk(path: Path) -> np.ndarray:
     return np.rint(np.asarray(nib.load(str(path)).dataobj)).astype(np.uint8)
 
 
-@app.post("/api/consensus/build")
-def consensus_build(req: ConsensusBuildRequest) -> dict:
-    """Segment each scan (if needed), scar-anchor-register the repeats, build a
-    probabilistic partial-overlap consensus, and render per-tab previews (each scan's
-    own image with its mask, and with the consensus mask, all in the reference frame)."""
-    if len(req.cases) < 2:
-        raise HTTPException(400, "Upload at least 2 scans of the same eye for consensus.")
+def _build_consensus_case(cases: List[str], group: str | None = None,
+                          reference: str | None = None, ensure: bool = True) -> tuple[str, dict]:
+    """Segment each scan (if needed), register + vote a partial-overlap consensus, render
+    the per-tab previews, and persist. Shared by the /consensus/build endpoint and the
+    cohort batch. Returns (consensus_case_id, report)."""
+    import nibabel as nib
+    if len(cases) < 2:
+        raise ValueError("Need at least 2 scans of the same eye for consensus.")
     seg_errors: dict = {}
-    for cid in req.cases:
-        try:
-            _ensure_segmented(cid)
-        except HTTPException as exc:
-            seg_errors[cid] = str(exc.detail)
-        except Exception as exc:  # noqa: BLE001
-            seg_errors[cid] = str(exc)
+    if ensure:
+        for cid in cases:
+            try:
+                _ensure_segmented(cid)
+            except HTTPException as exc:
+                seg_errors[cid] = str(exc.detail)
+            except Exception as exc:  # noqa: BLE001
+                seg_errors[cid] = str(exc)
 
-    ccid = orch.safe_case_id(req.group or f"{req.cases[0]}_consensus")
+    ccid = orch.safe_case_id(group or f"{cases[0]}_consensus")
     orch.ensure_case_dirs(ccid)
-    try:
-        report = consensus_mod.build_consensus(req.cases, ccid, req.reference)
-    except ValueError as exc:
-        detail = str(exc) + (f" — failed scans: {seg_errors}" if seg_errors else "")
-        raise HTTPException(400, detail)
+    report = consensus_mod.build_consensus(cases, ccid, reference)
     report["segmentation_errors"] = seg_errors
 
-    import nibabel as nib
     cons_vol = orch.case_root(ccid) / "previews" / "volume.nii.gz"
     cons_lab = _read_label_ijk(labels.corrected_path(ccid))
-    # Consensus tab: reference image + consensus scar
     postprocess.render_seg_previews(cons_vol, cons_lab, _preview_group_dir(ccid, "segmentation"))
-    # Per-scan tabs: each scan's warped image with (a) its own scar, (b) the consensus scar.
-    # For (b) the consensus mask is clipped to where THIS scan actually has data (its FOV),
-    # so the comparison stays on the scan's image instead of painting over empty background.
+    # Per-scan tabs: each scan's warped image with its own scar, and with the consensus
+    # scar clipped to that scan's FOV (so it isn't painted over empty background).
     scans_dir = orch.case_root(ccid) / "scans"
     for cid in report["scans"]:
         svol = scans_dir / cid / "volume.nii.gz"
         slab = _read_label_ijk(scans_dir / cid / "label.nii.gz")
-        data_mask = np.asarray(nib.load(str(svol)).dataobj) > 0  # warped FOV (fill is exact 0)
+        data_mask = np.asarray(nib.load(str(svol)).dataobj) > 0
         cons_clipped = np.where(data_mask, cons_lab, 0).astype(np.uint8)
         postprocess.render_seg_previews(svol, slab, _preview_group_dir(ccid, f"scan_{cid}_self"))
         postprocess.render_seg_previews(svol, cons_clipped, _preview_group_dir(ccid, f"scan_{cid}_cons"))
@@ -573,6 +573,19 @@ def consensus_build(req: ConsensusBuildRequest) -> dict:
         "input_volume": str(cons_vol), "corrected_volume": str(cons_vol),
         "consensus_report": report, "consensus_cases": report["scans"], "reference": report["reference"],
     })
+    return ccid, report
+
+
+@app.post("/api/consensus/build")
+def consensus_build(req: ConsensusBuildRequest) -> dict:
+    """Segment each scan (if needed), scar-anchor-register the repeats, build a
+    probabilistic partial-overlap consensus, and render per-tab previews."""
+    if len(req.cases) < 2:
+        raise HTTPException(400, "Upload at least 2 scans of the same eye for consensus.")
+    try:
+        ccid, report = _build_consensus_case(req.cases, req.group, req.reference)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"consensus_case": ccid, "report": report,
             "images": orch.preview_images_from_dir("Segmentation", _preview_group_dir(ccid, "segmentation"))}
 
@@ -736,6 +749,153 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     out["preprocessed"] = True
     out["n_frames"] = _nifti_frames(work)
     return out
+
+
+# ── Cohort batch: mass-produce the labeled training set ─────────────────────
+# Point at a directory of .OCT scans → group repeat scans by (patient, eye) → per
+# scan preprocess + SAM2 + scar → per group build the consensus label. Runs in a
+# background thread; resumable (skips already-corrected/segmented scans).
+_COHORT: dict = {"running": False, "done": False, "error": None, "groups": []}
+_COHORT_LOCK = threading.Lock()
+# Serialises all SAM2/CUDA inference (cohort worker thread + user-triggered endpoints
+# run on separate threads and share one predictor + CUDA context).
+_GPU_LOCK = threading.Lock()
+
+
+def _cohort_case_conflict(cid: str, full_path: str) -> bool:
+    """True if a case with this id already references a DIFFERENT .OCT (by full path, so
+    same-basename scans in different patient folders don't collide / get overwritten)."""
+    src = orch.read_manifest(cid).get("oct_source")
+    return bool(src) and str(Path(src)) != str(Path(full_path))
+
+
+def _cohort_make_case(scan: dict, used: set) -> str:
+    """Create/reuse a case for a disk .OCT scan (references it in place; no copy)."""
+    fm = oct_mod.parse_oct_filename(scan["filename"])
+    if fm.get("patient_id"):
+        base = orch.safe_case_id(f"case_{fm['patient_name'].lower()}_{fm['laterality'].lower()}_v{fm.get('series_number', 1)}")
+    else:
+        base = orch.safe_case_id(f"oct_{Path(scan['path']).stem}")
+    cid, k = base, 2
+    while cid in used or _cohort_case_conflict(cid, scan["path"]):
+        cid = f"{base}_{k}"
+        k += 1
+    used.add(cid)
+    orch.ensure_case_dirs(cid)
+    if not orch.read_manifest(cid).get("oct_source"):
+        orch.write_manifest_value(cid, {"oct_source": scan["path"], "companion_txt": scan.get("companion"),
+                                        "oct_volume_index": 0, "oct_preprocessed": False})
+    return cid
+
+
+def _cohort_worker(params: dict, do_preprocess: bool) -> None:
+    try:
+        import nibabel as nib
+        used: set = set()
+        for g in _COHORT["groups"]:
+            g["status"] = "running"
+            cids = []
+            for sc in g["scans"]:
+                try:
+                    cid = _cohort_make_case(sc["_scan"], used)
+                    sc["case_id"] = cid
+                    work = _oct_working_path(cid, sc["_scan"]["path"])
+                    m = orch.read_manifest(cid)
+                    if do_preprocess and not m.get("oct_preprocessed"):
+                        sc["status"] = "preprocessing"
+                        _run_oct_worker("preprocess", sc["_scan"]["path"], work, params, 0)
+                        orch.write_manifest_value(cid, {"input_volume": str(work), "corrected_volume": str(work),
+                                                        "oct_preprocessed": True, "oct_params": params})
+                    elif not work.exists():
+                        _run_oct_worker("raw" if not do_preprocess else "preprocess", sc["_scan"]["path"], work, params, 0)
+                        orch.write_manifest_value(cid, {"input_volume": str(work), "corrected_volume": str(work),
+                                                        "oct_preprocessed": do_preprocess})
+                    sc["status"] = "segmenting"
+                    _ensure_segmented(cid)
+                    arr, _ = labels.best_labelmap_nnunet(cid)
+                    mm = scar_mod.quantify(arr, nib.load(str(_ensure_volume_nifti(cid))).header.get_zooms())
+                    sc["scar_mm3"] = mm["scar_volume_mm3"]
+                    sc["status"] = "done"
+                    cids.append(cid)
+                except Exception as exc:  # noqa: BLE001
+                    sc["status"] = "error"
+                    sc["error"] = str(exc)[:300]
+            ok = [c for c in cids if labels.corrected_path(c).exists()]
+            if len(ok) > 1:
+                g["status"] = "consensus"
+                try:
+                    ccid, report = _build_consensus_case(
+                        ok, orch.safe_case_id(f"case_{(g['patient'] or 'x').lower()}_{(g['eye'] or 'x').lower()}_consensus"),
+                        ensure=False)
+                    g["consensus_case"] = ccid
+                    g["scar_volume_mm3"] = report["scar_volume_mm3"]["mean"]
+                    g["cv_percent"] = report["scar_volume_mm3"]["cv_percent"]
+                except Exception as exc:  # noqa: BLE001
+                    g["error"] = str(exc)[:300]
+            elif len(ok) == 1:
+                g["single_case"] = ok[0]
+            g["status"] = "done"
+        _COHORT["done"] = True
+    except Exception as exc:  # noqa: BLE001
+        _COHORT["error"] = str(exc)[:500]
+    finally:
+        _COHORT["running"] = False
+
+
+class CohortScanRequest(BaseModel):
+    directory: str
+
+
+class CohortRunRequest(BaseModel):
+    directory: str
+    params: dict | None = None
+    preprocess: bool = True
+
+
+@app.post("/api/cohort/scan")
+def cohort_scan(req: CohortScanRequest) -> dict:
+    """Discover + group the .OCT scans under a directory (the run plan). Fast, no decode."""
+    if not Path(req.directory).expanduser().is_dir():
+        raise HTTPException(400, f"Not a directory: {req.directory}")
+    groups = cohort_mod.group_by_eye(cohort_mod.discover(req.directory))
+    return {"n_groups": len(groups), "n_scans": sum(len(g["scans"]) for g in groups),
+            "groups": [{"patient": g["patient"], "eye": g["eye"],
+                        "scans": [s["filename"] for s in g["scans"]]} for g in groups]}
+
+
+@app.post("/api/cohort/run")
+def cohort_run(req: CohortRunRequest) -> dict:
+    """Start the batch: preprocess → SAM2 → scar per scan, consensus per (patient, eye).
+    Runs in the background; poll /api/cohort/status."""
+    with _COHORT_LOCK:
+        if _COHORT["running"]:
+            raise HTTPException(409, "A cohort run is already in progress.")
+        groups = cohort_mod.group_by_eye(cohort_mod.discover(req.directory))
+        if not groups:
+            raise HTTPException(400, "No 3D Cornea .OCT scans found under that directory.")
+        _COHORT.update({
+            "running": True, "done": False, "error": None,
+            "groups": [{"patient": g["patient"], "eye": g["eye"], "status": "queued",
+                        "scans": [{"filename": s["filename"], "status": "queued", "_scan": s} for s in g["scans"]]}
+                       for g in groups],
+        })
+        threading.Thread(target=_cohort_worker, args=(req.params or {}, req.preprocess), daemon=True).start()
+    return {"started": True, "n_groups": len(groups),
+            "n_scans": sum(len(g["scans"]) for g in groups)}
+
+
+@app.get("/api/cohort/status")
+def cohort_status() -> dict:
+    """Live progress of the running/last cohort batch. Snapshots keys (not live .items())
+    so it can't crash with 'dict changed size' while the worker thread inserts keys."""
+    def view(d: dict, skip: str) -> dict:
+        return {k: d[k] for k in list(d.keys()) if k != skip}
+    groups = []
+    for g in list(_COHORT["groups"]):
+        gv = view(g, "scans")
+        gv["scans"] = [view(s, "_scan") for s in list(g["scans"])]
+        groups.append(gv)
+    return {"running": _COHORT["running"], "done": _COHORT["done"], "error": _COHORT["error"], "groups": groups}
 
 
 # ── nnU-Net export (the corrected labels become the training set) ──────────
