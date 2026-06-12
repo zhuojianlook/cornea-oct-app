@@ -753,6 +753,32 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     return out
 
 
+class OctLoadDirRequest(BaseModel):
+    directory: str
+
+
+@app.post("/api/oct/load-dir")
+def oct_load_dir(req: OctLoadDirRequest) -> dict:
+    """Load every .OCT in a SERVER-SIDE directory as cases (referenced in place, with their
+    .txt companions auto-paired). For local data this beats the browser folder picker:
+    no re-upload, and the companion .txt is always found next to the .OCT."""
+    d = Path(req.directory).expanduser()
+    if not d.is_dir():
+        raise HTTPException(400, f"Not a directory: {req.directory}")
+    items = cohort_mod.discover(req.directory)
+    cornea = [it for it in items if it["is_3d_cornea"]]
+    items = cornea if cornea else items
+    if not items:
+        raise HTTPException(400, "No .OCT scans found under that directory.")
+    used: set = set()
+    cases = []
+    for it in items:
+        cid = _cohort_make_case(it, used)   # references in place + pairs companion
+        cases.append({"case_id": cid, "filename": it["filename"], "patient": it["patient"],
+                      "eye": it["eye"], "has_companion": bool(it["companion"]), "preprocessed": False})
+    return {"cases": cases}
+
+
 # ── Cohort batch: mass-produce the labeled training set ─────────────────────
 # Point at a directory of .OCT scans → group repeat scans by (patient, eye) → per
 # scan preprocess + SAM2 + scar → per group build the consensus label. Runs in a

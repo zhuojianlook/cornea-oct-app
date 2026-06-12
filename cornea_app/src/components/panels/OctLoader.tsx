@@ -3,8 +3,8 @@
    mark Scar / Control (and a scar frame range) → tune correction params → select scans →
    Run preprocessing (OCT→correct, correct Avanti geometry) → Run SAM2 + consensus. */
 
-import { useEffect, useRef, useState } from "react";
-import { Button, Typography, LinearProgress, Slider, Checkbox, ToggleButton, ToggleButtonGroup, Collapse } from "@mui/material";
+import { useRef, useState } from "react";
+import { Button, Typography, TextField, LinearProgress, Slider, Checkbox, ToggleButton, ToggleButtonGroup, Collapse } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
@@ -52,17 +52,9 @@ const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function OctLoader() {
   const fileRef = useRef<HTMLInputElement | null>(null);
-  const dirRef = useRef<HTMLInputElement | null>(null);
   const filesRef = useRef<File[]>([]);
   const [scans, setScans] = useState<OctScan[]>([]);
-
-  // webkitdirectory isn't in the React input typings — set it imperatively.
-  useEffect(() => {
-    if (dirRef.current) {
-      dirRef.current.setAttribute("webkitdirectory", "");
-      dirRef.current.setAttribute("directory", "");
-    }
-  }, []);
+  const [dirPath, setDirPath] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [step, setStep] = useState<string | null>(null);
@@ -120,6 +112,35 @@ export function OctLoader() {
       if (first) await preview(first.case_id);
     } catch (e) {
       setStep(`Load failed: ${msg(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Load every .OCT from a SERVER-SIDE folder path (no browser picker, no re-upload,
+  // companions auto-paired). Best for local data — the .OCT stay in place on disk.
+  const loadDir = async () => {
+    if (!dirPath.trim()) return;
+    setBusy(true);
+    setReport(null);
+    try {
+      setStep("Scanning folder…");
+      const up = await api.json<{ cases: { case_id: string; filename: string; patient: string; eye: string; has_companion: boolean }[] }>(
+        "/api/oct/load-dir",
+        "POST",
+        JSON.stringify({ directory: dirPath.trim() }),
+      );
+      setScans(up.cases.map((c) => ({
+        filename: c.filename, caseId: c.case_id, patient: c.patient, eye: c.eye,
+        nFrames: 101, status: "ready", scarRange: [1, 101], selected: true,
+      })));
+      setLoaded(true);
+      setStage(1);
+      const noTxt = up.cases.filter((c) => !c.has_companion).length;
+      setStep(`Loaded ${up.cases.length} scan(s) from folder${noTxt ? ` (⚠ ${noTxt} missing a .txt companion)` : ""}. Click one to scrub.`);
+      if (up.cases[0]) await preview(up.cases[0].case_id);
+    } catch (e) {
+      setStep(`Load folder failed: ${msg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -242,21 +263,22 @@ export function OctLoader() {
       </Typography>
       <input ref={fileRef} type="file" accept=".oct,.txt" multiple hidden
         onChange={(e) => onPicked(Array.from(e.target.files ?? []))} />
-      {/* webkitdirectory (set imperatively above): load a whole folder at once */}
-      <input ref={dirRef} type="file" multiple hidden
-        onChange={(e) => onPicked(Array.from(e.target.files ?? []))} />
+
+      {/* Server-side folder (reliable for local data — no browser picker, no re-upload). */}
+      <TextField size="small" label="Folder path (on this machine)" value={dirPath}
+        onChange={(e) => setDirPath(e.target.value)} placeholder="/home/…/OCT scans" disabled={busy} fullWidth />
       <div className="flex gap-2">
-        <Button variant="outlined" size="small" fullWidth onClick={() => fileRef.current?.click()} disabled={busy}>
-          Files…
+        <Button variant="contained" size="small" fullWidth onClick={loadDir} disabled={busy || !dirPath.trim()}>
+          Load folder
         </Button>
-        <Button variant="outlined" size="small" fullWidth onClick={() => dirRef.current?.click()} disabled={busy}>
-          Folder…
+        <Button variant="outlined" size="small" fullWidth onClick={() => fileRef.current?.click()} disabled={busy}>
+          Pick files…
         </Button>
       </div>
 
       {scans.length > 0 && !loaded && (
         <Button variant="contained" size="small" onClick={load} disabled={busy || scans.length < 1}>
-          Load {scans.length} scan{scans.length === 1 ? "" : "s"}
+          Upload {scans.length} file{scans.length === 1 ? "" : "s"}
         </Button>
       )}
 
