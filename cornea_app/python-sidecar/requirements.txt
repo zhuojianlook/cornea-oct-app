@@ -1,11 +1,15 @@
 fastapi>=0.110
 uvicorn>=0.29
 python-multipart>=0.0.9
-numpy>=1.24
+numpy>=1.24,<2          # SimpleITK/opencv stack tested on 1.26; numpy 2 breaks the env
 nibabel>=5.2
 pynrrd>=1.0
 Pillow>=10.0
 requests>=2.31
 scipy>=1.10
-anthropic>=0.69
 SimpleITK
+# OCT preprocessing pipeline (Optovue .OCT -> corrected volume)
+oct-converter>=0.5        # POCT reader for .OCT files
+pydicom>=2.4              # OCT->DICOM (and DICOM I/O)
+opencv-python>=4.8,<4.12  # bilateral/histeq in the smoother; 4.12+ requires numpy>=2
+scikit-learn>=1.3         # RANSAC quadratic edge fit

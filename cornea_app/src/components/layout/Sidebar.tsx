@@ -1,6 +1,7 @@
 import { TextField, Button, Divider, Typography } from "@mui/material";
 import { useCaseStore } from "../../store/caseStore";
 import { ScanLoader } from "../panels/ScanLoader";
+import { OctLoader } from "../panels/OctLoader";
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -23,7 +24,13 @@ export function Sidebar() {
 
   return (
     <div className="flex flex-col">
-      <Section title="Load scan(s)">
+      <Section title="OCT preprocessing">
+        <OctLoader />
+      </Section>
+
+      <Divider sx={{ borderColor: "var(--c-border)" }} />
+
+      <Section title="Load volume(s) directly">
         <ScanLoader />
       </Section>
 

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import List
 
@@ -37,6 +39,7 @@ import preprocess
 import postprocess
 import metrics_export
 import consensus as consensus_mod
+import oct_preprocess as oct_mod
 
 app = FastAPI(title="Cornea OCT Segmentation Sidecar")
 
@@ -531,6 +534,167 @@ def consensus_build(req: ConsensusBuildRequest) -> dict:
     })
     return {"consensus_case": ccid, "report": report,
             "images": orch.preview_images_from_dir("Segmentation", _preview_group_dir(ccid, "segmentation"))}
+
+
+# ── .OCT preprocessing (Optovue Avanti): inspect → correct → register case ──
+# Pipeline (oct_preprocess.py, ported from the user's OCT_Extraction scripts):
+#   upload .OCT (+ companion .txt) → raw z-stack NIfTI for scrubbing → on Run, the
+#   corneal-edge + column + 3D-active correction → corrected NIfTI (correct Avanti
+#   geometry) which becomes the case's working volume for SAM2/consensus.
+class OctPreprocessRequest(BaseModel):
+    params: dict | None = None
+    volume_index: int | None = None
+    classification: str | None = None   # "scar" | "control" (no scar) | None
+    scar_range: List[int] | None = None  # [start_frame, end_frame], 1-based
+
+
+def _oct_working_path(case_id: str, src: str) -> Path:
+    return orch.case_root(case_id) / "input" / f"{orch.safe_case_id(Path(src).stem)}.nii.gz"
+
+
+def _oct_case_taken(cid: str, name: str) -> bool:
+    """True if a case with this id already holds a DIFFERENT .OCT (don't reuse/overwrite it)."""
+    src = orch.read_manifest(cid).get("oct_source")
+    return bool(src) and Path(src).name != name
+
+
+def _nifti_frames(path: Path) -> int:
+    """Frame count (z dim) of a working NIfTI — drives the scar frame-range slider."""
+    import nibabel as nib
+    try:
+        return int(nib.load(str(path)).shape[2])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int) -> None:
+    """Run the oct_preprocess CLI in an isolated subprocess (keeps its fork-based
+    parallelism away from the sidecar's CUDA/torch state). New session so a timeout can
+    reap the whole fork-pool process group."""
+    import os
+    import signal
+    cmd = [sys.executable, str(Path(oct_mod.__file__)), mode, str(src), str(out),
+           "--params", json.dumps(params or {}), "--volume-index", str(vi)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        _, err = proc.communicate(timeout=1200)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise HTTPException(504, f"OCT {mode} timed out (>1200s).")
+    if proc.returncode != 0 or not Path(out).exists():
+        raise HTTPException(500, f"OCT {mode} failed: {(err or '')[-800:]}")
+
+
+def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict) -> dict:
+    """Point the case at `work` as its volume, drop stale segmentation, render grayscale."""
+    orch.write_manifest_value(case_id, {
+        "input_volume": str(work), "corrected_volume": str(work),
+        "oct_preprocessed": preprocessed, **extra,
+    })
+    seg_dir = orch.segmentation_preview_dir(case_id)
+    if not preprocessed and seg_dir.exists():
+        import shutil
+        shutil.rmtree(seg_dir, ignore_errors=True)
+    base = _ensure_volume_nifti(case_id)
+    postprocess.render_context_previews(base, orch.context_preview_dir(case_id))
+    return {"case_info": orch.current_case_info(case_id),
+            "images": orch.preview_images_from_dir("Context", orch.context_preview_dir(case_id))}
+
+
+@app.post("/api/oct/upload")
+async def oct_upload(files: List[UploadFile] = File(...)) -> dict:
+    """Upload .OCT files (+ optional companion .txt). One case per .OCT; metadata is
+    parsed from the filename + companion. No conversion yet — fast for whole directories."""
+    if not files:
+        raise HTTPException(400, "No files uploaded.")
+    blobs = [(up.filename or "", await up.read()) for up in files]
+    octs = [(n, b) for n, b in blobs if n.lower().endswith(".oct")]
+    txts = {Path(n).stem.lower(): (n, b) for n, b in blobs if n.lower().endswith(".txt")}
+    if not octs:
+        raise HTTPException(400, "No .OCT files found (also drop the companion .txt files).")
+    used: set = set()
+    cases = []
+    for name, data in octs:
+        fm = oct_mod.parse_oct_filename(name)
+        if fm.get("patient_id"):
+            base = orch.safe_case_id(f"case_{fm['patient_name'].lower()}_{fm['laterality'].lower()}_v{fm.get('series_number', 1)}")
+        else:
+            base = orch.safe_case_id(f"oct_{Path(name).stem}")
+        # Unique per distinct .OCT: reuse iff the same file is already there, else suffix —
+        # otherwise repeat scans of one eye (the consensus case!) would overwrite each other.
+        cid, k = base, 2
+        while cid in used or _oct_case_taken(cid, name):
+            cid = f"{base}_{k}"
+            k += 1
+        used.add(cid)
+        orch.ensure_case_dirs(cid)
+        oct_dst = orch.case_root(cid) / "input" / Path(name).name
+        oct_dst.write_bytes(data)
+        comp = txts.get(Path(name).stem.lower())
+        txt_dst = None
+        if comp:
+            txt_dst = orch.case_root(cid) / "input" / Path(comp[0]).name
+            txt_dst.write_bytes(comp[1])
+        meta = oct_mod.metadata_for(name, str(txt_dst) if txt_dst else None)
+        orch.write_manifest_value(cid, {
+            "oct_source": str(oct_dst), "companion_txt": str(txt_dst) if txt_dst else None,
+            "oct_volume_index": 0, "oct_preprocessed": False,
+        })
+        cases.append({"case_id": cid, "filename": name, "patient": meta["patient_name"],
+                      "eye": fm.get("laterality", ""), "preprocessed": False})
+    return {"cases": cases}
+
+
+@app.post("/api/case/{case_id}/oct-volume")
+def oct_volume(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Materialise the RAW .OCT z-stack as the working NIfTI + grayscale previews so the
+    user can scrub/inspect before correcting. Lazy — only the previewed scan is read."""
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not src or not Path(src).exists():
+        raise HTTPException(400, f"Case {case_id} has no .OCT source.")
+    vi = req.volume_index if req.volume_index is not None else int(m.get("oct_volume_index", 0))
+    work = _oct_working_path(case_id, src)
+    changed_index = req.volume_index is not None and req.volume_index != int(m.get("oct_volume_index", 0))
+    # If the case is already corrected (and we're not switching capture), RE-SHOW the
+    # corrected volume rather than reverting it to raw — re-inspecting must not clobber it.
+    show_corrected = bool(m.get("oct_preprocessed")) and work.exists() and not changed_index
+    if not show_corrected:
+        try:
+            oct_mod.raw_oct_to_nifti(src, work, volume_index=vi)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"Reading .OCT failed: {exc}")
+    out = _oct_render_volume(case_id, work, preprocessed=show_corrected, extra={"oct_volume_index": vi})
+    out["n_frames"] = _nifti_frames(work)
+    out["preprocessed"] = show_corrected
+    return out
+
+
+@app.post("/api/case/{case_id}/oct-preprocess")
+def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Run the corneal-edge + column + 3D-active correction on the case's .OCT and make
+    the corrected volume (correct Avanti geometry) the working volume for SAM2/consensus.
+    Persists the scar/control classification + scar frame range for the later Scar stage."""
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not src or not Path(src).exists():
+        raise HTTPException(400, f"Case {case_id} has no .OCT source.")
+    vi = req.volume_index if req.volume_index is not None else int(m.get("oct_volume_index", 0))
+    work = _oct_working_path(case_id, src)
+    _run_oct_worker("preprocess", src, work, req.params or {}, vi)
+    extra = {"oct_volume_index": vi, "oct_params": req.params or {}}
+    if req.classification:
+        extra["scar_classification"] = req.classification
+    if req.scar_range:
+        extra["scar_range"] = req.scar_range
+    out = _oct_render_volume(case_id, work, preprocessed=True, extra=extra)
+    out["preprocessed"] = True
+    out["n_frames"] = _nifti_frames(work)
+    return out
 
 
 # ── nnU-Net export (the corrected labels become the training set) ──────────
