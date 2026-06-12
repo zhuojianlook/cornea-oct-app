@@ -3,12 +3,12 @@
    segmentation overlay) as plain <img>, so the OCT is viewable in browsers
    without WebGL2 (e.g. the VS Code Simple Browser). */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ToggleButton, ToggleButtonGroup, Slider, CircularProgress } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { pxToIjk } from "../../api/coords";
+import { pxToIjk, brushVoxels } from "../../api/coords";
 import type { PreviewImage } from "../../api/types";
 
 type Group = "segmentation" | "context";
@@ -30,6 +30,18 @@ export function SliceGallery() {
   // When a consensus tab is active the store pins the preview group (the voted
   // map, or a scan warped into the common frame); otherwise we auto-select below.
   const previewGroup = useWorkflowStore((s) => s.previewGroup);
+
+  // manual 2D scar editing
+  const scarEditMode = useWorkflowStore((s) => s.scarEditMode);
+  const scarErase = useWorkflowStore((s) => s.scarErase);
+  const scarBrush = useWorkflowStore((s) => s.scarBrush);
+  const scarBusy = useWorkflowStore((s) => s.scarBusy);
+  const runScarEdit = useWorkflowStore((s) => s.runScarEdit);
+  const wfSet = useWorkflowStore((s) => s.set);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const paintingRef = useRef(false);
+  const voxelsRef = useRef<Map<string, [number, number, number]>>(new Map());
 
   const [group, setGroup] = useState<Group>("context");
   const [orient, setOrient] = useState<(typeof ORIENTS)[number]>("axial");
@@ -133,6 +145,63 @@ export function SliceGallery() {
     ? (scarHints ?? []).filter((h) => h.orientation === cur.orientation && h.slice_index === cur.slice_index)
     : [];
 
+  // ── 2D scar brush (paint cornea→scar / erase scar→cornea on the current slice) ──
+  const editing = scarEditMode && !!cur && !scarBusy;
+
+  useEffect(() => {
+    const img = imgRef.current, cv = canvasRef.current;
+    if (!img || !cv) return;
+    const sync = () => {
+      cv.width = img.clientWidth;
+      cv.height = img.clientHeight;
+    };
+    if (img.complete) sync();
+    img.addEventListener("load", sync);
+    window.addEventListener("resize", sync);
+    return () => {
+      img.removeEventListener("load", sync);
+      window.removeEventListener("resize", sync);
+    };
+  }, [cur, scarEditMode]);
+
+  const paintAt = (e: React.PointerEvent) => {
+    const img = imgRef.current, cv = canvasRef.current;
+    if (!img || !cur) return;
+    const rect = img.getBoundingClientRect();
+    const fx = (e.clientX - rect.left) / rect.width;
+    const fy = (e.clientY - rect.top) / rect.height;
+    if (fx < 0 || fy < 0 || fx > 1 || fy > 1) return;
+    for (const v of brushVoxels(cur, fx, fy, scarBrush)) voxelsRef.current.set(v.join(","), v);
+    const ctx = cv?.getContext("2d");
+    if (cv && ctx) {
+      const rpx = Math.max(2, scarBrush * (rect.width / (cur.source_width ?? 1)));
+      ctx.fillStyle = scarErase ? "rgba(57,208,255,0.45)" : "rgba(255,46,85,0.45)";
+      ctx.beginPath();
+      ctx.arc(fx * cv.width, fy * cv.height, rpx, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  };
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (!editing) return;
+    e.preventDefault();
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    paintingRef.current = true;
+    voxelsRef.current.clear();
+    paintAt(e);
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (editing && paintingRef.current) paintAt(e);
+  };
+  const onPointerUp = async () => {
+    if (!editing || !paintingRef.current) return;
+    paintingRef.current = false;
+    const voxels = Array.from(voxelsRef.current.values());
+    voxelsRef.current.clear();
+    const cv = canvasRef.current;
+    cv?.getContext("2d")?.clearRect(0, 0, cv.width, cv.height);
+    if (voxels.length) await runScarEdit(voxels, scarErase ? "erase" : "paint");
+  };
+
   return (
     <div className="flex flex-col h-full min-h-0" style={{ backgroundColor: "var(--c-bg)" }}>
       <div
@@ -163,10 +232,43 @@ export function SliceGallery() {
             </ToggleButton>
           ))}
         </ToggleButtonGroup>
+
+        {cur && (
+          <ToggleButton
+            size="small"
+            value="edit"
+            selected={scarEditMode}
+            onChange={() => {
+              const on = !scarEditMode;
+              wfSet("scarEditMode", on);
+              if (on && !previewGroup) setGroup("segmentation"); // show the scar to edit it
+            }}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Paint / erase scar on this slice"
+          >
+            ✎ Scar
+          </ToggleButton>
+        )}
+        {scarEditMode && (
+          <>
+            <ToggleButtonGroup
+              size="small"
+              exclusive
+              value={scarErase ? "erase" : "paint"}
+              onChange={(_, v) => v && wfSet("scarErase", v === "erase")}
+            >
+              <ToggleButton value="paint" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}>Paint</ToggleButton>
+              <ToggleButton value="erase" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}>Erase</ToggleButton>
+            </ToggleButtonGroup>
+            <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>brush</span>
+            <Slider size="small" min={1} max={20} value={scarBrush} sx={{ width: 64 }}
+              onChange={(_, v) => wfSet("scarBrush", v as number)} />
+          </>
+        )}
         <div className="flex-1" />
-        {loading && <CircularProgress size={16} />}
+        {(loading || scarBusy) && <CircularProgress size={16} />}
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
-          2D view (no WebGL)
+          {scarEditMode ? "drag to edit scar" : "2D view (no WebGL)"}
         </span>
       </div>
 
@@ -196,16 +298,27 @@ export function SliceGallery() {
         ) : (
           <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
             <img
+              ref={imgRef}
               src={cur.data_url}
               alt={cur.file_name}
+              draggable={false}
               onClick={onImgClick}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerLeave={onPointerUp}
               style={{
                 display: "block",
                 maxHeight: "100%",
                 maxWidth: "100%",
                 imageRendering: "pixelated",
-                cursor: hintMode ? "crosshair" : "default",
+                touchAction: editing ? "none" : undefined,
+                cursor: editing || hintMode ? "crosshair" : "default",
               }}
+            />
+            <canvas
+              ref={canvasRef}
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
             />
             {hintsHere.map((h, i) => (
               <span

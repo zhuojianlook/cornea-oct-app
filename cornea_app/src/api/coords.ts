@@ -21,3 +21,26 @@ export function pxToIjk(meta: PreviewImage, x: number, y: number): [number, numb
   if (meta.orientation === "sagittal") return [slice, col, row];
   return null;
 }
+
+/* Voxels under a circular brush centred at image-fraction (fx, fy) with `radius` in
+   SOURCE voxels — enumerated densely in source space so a downscaled preview doesn't
+   leave gaps in the painted scar. */
+export function brushVoxels(meta: PreviewImage, fx: number, fy: number, radius: number): [number, number, number][] {
+  const sw = meta.source_width, sh = meta.source_height, slice = meta.slice_index, o = meta.orientation;
+  if (sw == null || sh == null || slice == null || !o) return [];
+  const cCol = fx * (sw - 1);
+  const cRow = (1 - fy) * (sh - 1); // previews are saved vertically flipped (match pxToIjk)
+  const r = Math.max(0, Math.round(radius));
+  const out: [number, number, number][] = [];
+  for (let dr = -r; dr <= r; dr++) {
+    for (let dc = -r; dc <= r; dc++) {
+      if (dc * dc + dr * dr > r * r) continue;
+      const col = Math.round(cCol + dc), row = Math.round(cRow + dr);
+      if (col < 0 || col >= sw || row < 0 || row >= sh) continue;
+      if (o === "axial") out.push([col, row, slice]);
+      else if (o === "coronal") out.push([col, slice, row]);
+      else if (o === "sagittal") out.push([slice, col, row]);
+    }
+  }
+  return out;
+}

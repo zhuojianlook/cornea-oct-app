@@ -58,6 +58,12 @@ interface WorkflowState {
   hintPositive: boolean; // current click polarity (scar vs not-scar)
   scarHints: ScarHint[];
 
+  // manual 2D scar editing (brush on the slice gallery)
+  scarEditMode: boolean;
+  scarErase: boolean; // brush erases (scar→cornea) instead of painting (cornea→scar)
+  scarBrush: number; // brush radius in source voxels
+  runScarEdit: (voxels: [number, number, number][], mode: "paint" | "erase") => Promise<void>;
+
   // consensus tabs (multi-scan): each repeat scan + the consensus are tabs.
   previewGroup: string | null; // when set, the gallery shows this preview group
   activeTab: string; // "consensus" or a scan caseId
@@ -109,6 +115,10 @@ export const useWorkflowStore = create<WorkflowState>()(
     hintMode: false,
     hintPositive: true,
     scarHints: [],
+
+    scarEditMode: false,
+    scarErase: false,
+    scarBrush: 6,
 
     previewGroup: null,
     activeTab: "consensus",
@@ -311,6 +321,45 @@ export const useWorkflowStore = create<WorkflowState>()(
       } catch (e) {
         set((s) => {
           s.status = { kind: "error", title: "Scar hint failed", detail: e instanceof Error ? e.message : String(e) };
+        });
+      } finally {
+        set((s) => {
+          s.scarBusy = false;
+        });
+      }
+    },
+
+    runScarEdit: async (voxels, mode) => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId || voxels.length === 0) return;
+      set((s) => {
+        s.scarBusy = true;
+      });
+      try {
+        const res = await api.json<{ metrics: ScarMetrics }>(
+          `/api/case/${caseId}/scar/edit`,
+          "POST",
+          JSON.stringify({ voxels, mode }),
+        );
+        // niivue refresh is best-effort (no-op without WebGL); the 2D gallery refetches via segVersion.
+        try {
+          await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        } catch {
+          /* no WebGL — gallery updates from segVersion below */
+        }
+        set((s) => {
+          s.scarMetrics = res.metrics;
+          s.segLoaded = true;
+          s.segVersion += 1;
+          s.status = {
+            kind: "done",
+            title: mode === "erase" ? "Scar erased" : "Scar painted",
+            detail: `${res.metrics.scar_volume_mm3 ?? 0} mm³ · ${res.metrics.scar_area_mm2 ?? 0} mm² en-face after edit.`,
+          };
+        });
+      } catch (e) {
+        set((s) => {
+          s.status = { kind: "error", title: "Scar edit failed", detail: e instanceof Error ? e.message : String(e) };
         });
       } finally {
         set((s) => {

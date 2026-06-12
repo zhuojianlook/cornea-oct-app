@@ -352,6 +352,47 @@ def scar_auto(case_id: str, req: ScarAutoRequest) -> dict:
             "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
 
+class ScarEditRequest(BaseModel):
+    voxels: List[List[int]]          # [[i,j,k], …] brush footprint on one slice
+    mode: str = "paint"              # "paint" (cornea→scar) | "erase" (scar→cornea)
+
+
+@app.post("/api/case/{case_id}/scar/edit")
+def scar_edit(case_id: str, req: ScarEditRequest) -> dict:
+    """Manual 2D scar edit: paint (cornea→scar) or erase (scar→cornea) the listed voxels
+    in the canonical labelmap, then re-render the overlay + re-quantify (correct geometry).
+    Hand-fixes the voted consensus scar (or any case's scar) before it becomes ground truth.
+    Paint only promotes cornea→scar and erase only demotes scar→cornea, so scar ⊆ cornea
+    is preserved and the cornea boundary is never touched."""
+    import nibabel as nib
+    arr, _ = labels.best_labelmap_nnunet(case_id)
+    if arr is None:
+        raise HTTPException(400, "No segmentation to edit — segment the cornea first.")
+    v = np.asarray(req.voxels or [], dtype=np.int64)
+    if v.ndim != 2 or v.shape[1] != 3 or len(v) == 0:
+        raise HTTPException(400, "voxels must be a non-empty list of [i, j, k].")
+    s = arr.shape
+    inb = (v[:, 0] >= 0) & (v[:, 0] < s[0]) & (v[:, 1] >= 0) & (v[:, 1] < s[1]) & (v[:, 2] >= 0) & (v[:, 2] < s[2])
+    v = v[inb]
+    if len(v) == 0:
+        raise HTTPException(400, "All edit voxels were out of bounds.")
+    ii, jj, kk = v[:, 0], v[:, 1], v[:, 2]
+    cur = arr[ii, jj, kk]
+    cur = np.where(cur == 2, 1, cur) if req.mode == "erase" else np.where(cur == 1, 2, cur)
+    arr[ii, jj, kk] = cur
+
+    base = _ensure_volume_nifti(case_id)
+    work = _working_volume(case_id)
+    vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)
+    raw = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
+    labels.write_label_nifti(arr, base, labels.corrected_path(case_id))
+    postprocess.render_seg_previews(work, arr, orch.segmentation_preview_dir(case_id), density_vol=vol)
+    metrics = scar_mod.quantify(arr, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
+    orch.write_manifest_value(case_id, {"scar_metrics": metrics})
+    return {"metrics": metrics,
+            "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
+
+
 class ScarClick(BaseModel):
     ijk: List[int]
     orientation: str                 # axial | coronal | sagittal
