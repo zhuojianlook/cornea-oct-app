@@ -14,6 +14,9 @@ import numpy as np
 SEGMENT_COLORS = {
     "background": (255, 145, 0),
     "cornea": (0, 190, 255),
+    "scar_diffuse": (255, 180, 120),   # low-density scar (diffuse haze)
+    "scar_mod": (255, 110, 80),        # moderate density
+    "scar": (255, 30, 70),             # dense scar core
 }
 
 
@@ -314,11 +317,13 @@ def save_previews(volume_array, masks_by_name, output_dir, prefix, spacing_ijk=N
         for stack_position, index in enumerate(indices):
             rgb = gray_to_rgb(slice_volume(volume_array, orientation, index))
             source_height, source_width = rgb.shape[:2]
-            for segment_name in ("cornea", "background"):
+            for segment_name in ("background", "cornea", "scar_diffuse", "scar_mod", "scar"):
                 mask = masks_by_name.get(segment_name)
                 if mask is None:
                     continue
-                if segment_name == "cornea":
+                if segment_name.startswith("scar"):
+                    alpha = 0.62          # paint scar tiers last (diffuse→dense), on top
+                elif segment_name == "cornea":
                     alpha = 0.56
                 elif prefix == "seeds":
                     alpha = 0.58

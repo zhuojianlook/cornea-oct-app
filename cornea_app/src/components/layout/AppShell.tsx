@@ -11,7 +11,7 @@ import { Sidebar } from "./Sidebar";
 import { Toolbar } from "./Toolbar";
 import { StageStepper } from "../stepper/StageStepper";
 import { VolumeCanvas } from "../viewer/VolumeCanvas";
-import { AiPaintPanel } from "../panels/AiPaintPanel";
+import { InspectorPanel } from "../panels/InspectorPanel";
 
 export function AppShell() {
   const config = useCaseStore((s) => s.config);
@@ -89,7 +89,7 @@ export function AppShell() {
               className="flex-none border-l overflow-hidden"
               style={{ width: 340, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}
             >
-              <AiPaintPanel />
+              <InspectorPanel />
             </aside>
           </div>
         </main>

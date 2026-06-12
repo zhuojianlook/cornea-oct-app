@@ -20,6 +20,8 @@ interface CaseState {
   uploadVolume: (file: File) => Promise<void>;
   exportNnunet: () => Promise<void>;
   exportInfo: string | null;
+  preprocessed: boolean;
+  setPreprocess: (enabled: boolean) => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -42,6 +44,31 @@ export const useCaseStore = create<CaseState>()(
     volumeUrl: null,
     busy: false,
     exportInfo: null,
+    preprocessed: false,
+
+    setPreprocess: async (enabled: boolean) => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => {
+        s.busy = true;
+        s.apiError = null;
+      });
+      try {
+        await api.json(`/api/case/${id}/preprocess`, "POST", JSON.stringify({ enabled }));
+        set((s) => {
+          s.preprocessed = enabled;
+          if (s.caseInfo) s.volumeUrl = volumeUrlFor(id); // cache-bust so the viewer reloads
+        });
+      } catch (e) {
+        set((s) => {
+          s.apiError = e instanceof Error ? e.message : String(e);
+        });
+      } finally {
+        set((s) => {
+          s.busy = false;
+        });
+      }
+    },
 
     fetchConfig: async () => {
       const ok = await checkHealth();
@@ -93,6 +120,8 @@ export const useCaseStore = create<CaseState>()(
           s.caseId = info.case_id;
           s.volumeUrl = hasVolume(info) ? volumeUrlFor(info.case_id) : null;
         });
+        // Remember this case so the app reopens to it across restarts.
+        api.putConfig({ default_case_id: info.case_id }).catch(() => {});
       } catch (e) {
         set((s) => {
           s.apiError = e instanceof Error ? e.message : String(e);

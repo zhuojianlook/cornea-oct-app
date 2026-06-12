@@ -102,7 +102,7 @@ export async function checkHealth(): Promise<boolean> {
 
 export const api = {
   getConfig: () => apiJson<AppConfig>("/api/config"),
-  putConfig: (patch: Partial<AppConfig> & { openai_api_key?: string }) =>
+  putConfig: (patch: Partial<AppConfig>) =>
     apiJson<AppConfig>("/api/config", "PUT", JSON.stringify(patch)),
 
   request: apiRequest,

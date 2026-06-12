@@ -22,17 +22,41 @@ export function getNv(): Niivue | null {
   return nv;
 }
 
-export function attach(canvas: HTMLCanvasElement): Niivue {
+let webglError: string | null = null;
+export function webglFailure(): string | null {
+  return webglError;
+}
+
+/** Attach Niivue to the canvas. Returns null (and records webglFailure) if the
+ *  browser can't provide a WebGL2 context, so the rest of the app still works. */
+export function attach(canvas: HTMLCanvasElement): Niivue | null {
   if (nv) return nv;
-  nv = new Niivue({
-    backColor: [0.11, 0.11, 0.12, 1],
-    show3Dcrosshair: true,
-    isColorbar: false,
-    dragAndDropEnabled: false,
-  });
-  nv.attachToCanvas(canvas);
-  nv.setSliceType(SLICE.multi);
-  return nv;
+  // Probe for WebGL2 first — niivue throws hard without it, which would
+  // otherwise blank the whole React tree.
+  const probe = canvas.getContext("webgl2");
+  if (!probe) {
+    webglError =
+      "This browser/window can't provide a WebGL2 context, so the 3D viewer is disabled. " +
+      "Open the app in Chrome or Firefox (not the VS Code Simple Browser). " +
+      "Seed/segmentation thumbnails on the right still work.";
+    return null;
+  }
+  try {
+    nv = new Niivue({
+      backColor: [0.11, 0.11, 0.12, 1],
+      show3Dcrosshair: true,
+      isColorbar: false,
+      dragAndDropEnabled: false,
+    });
+    nv.attachToCanvas(canvas);
+    nv.setSliceType(SLICE.multi);
+    webglError = null;
+    return nv;
+  } catch (e) {
+    webglError = `Niivue failed to initialise WebGL: ${e instanceof Error ? e.message : String(e)}`;
+    nv = null;
+    return null;
+  }
 }
 
 /** Load (or replace) the grayscale base volume. */
@@ -95,8 +119,8 @@ export async function loadSegmentation(url: string, opacity: number): Promise<vo
   if (!nv) throw new Error("Niivue not attached");
   // Remove a prior segmentation overlay (any volume past the base).
   while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
-  // cal range 0.5..3.5 so labels 1/2/3 (bg/cornea/scar) get distinct colours.
-  await nv.addVolumeFromUrl({ url, colormap: "warm", opacity, cal_min: 0.5, cal_max: 3.5 });
+  // Labels are 0=bg (transparent, below cal_min), 1=cornea, 2=scar.
+  await nv.addVolumeFromUrl({ url, colormap: "warm", opacity, cal_min: 0.9, cal_max: 2.1 });
   segUrl = url;
   nv.updateGLVolume();
 }

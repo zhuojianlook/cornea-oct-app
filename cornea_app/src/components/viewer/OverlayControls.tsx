@@ -1,7 +1,7 @@
-/* Segmentation overlay controls + Grow QA summary (Stage 2). */
+/* Segmentation overlay controls + per-class voxel/volume summary. */
 
 import { Slider, Switch, FormControlLabel } from "@mui/material";
-import { usePaintStore } from "../../store/paintStore";
+import { useWorkflowStore } from "../../store/workflowStore";
 
 interface SegStat {
   voxel_count?: number;
@@ -9,10 +9,10 @@ interface SegStat {
 }
 
 export function OverlayControls() {
-  const { segLoaded, segOpacity, showSegmentation, growQa, setSegOpacity, toggleSegmentation } = usePaintStore();
+  const { segLoaded, segOpacity, showSegmentation, segQa, setSegOpacity, toggleSegmentation } = useWorkflowStore();
   if (!segLoaded) return null;
 
-  const segs = (growQa?.segments as Record<string, SegStat> | undefined) || undefined;
+  const segs = (segQa?.segments as Record<string, SegStat> | undefined) || undefined;
 
   return (
     <div className="rounded p-2 flex flex-col gap-2" style={{ backgroundColor: "var(--c-surface2)" }}>

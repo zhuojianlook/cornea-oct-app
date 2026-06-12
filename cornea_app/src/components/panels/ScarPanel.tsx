@@ -1,38 +1,52 @@
 /* Scar metrics (Stage 4). */
 
-import { usePaintStore } from "../../store/paintStore";
+import type { ReactNode } from "react";
+import { useWorkflowStore } from "../../store/workflowStore";
 
 export function ScarPanel() {
-  const scar = usePaintStore((s) => s.scarMetrics);
-  if (!scar) return null;
+  const scar = useWorkflowStore((s) => s.scarMetrics);
+  const summaryInfo = useWorkflowStore((s) => s.scarSummaryInfo);
+  if (!scar && !summaryInfo) return null;
+
+  const row = (label: string, value: ReactNode) => (
+    <div className="flex justify-between">
+      <span style={{ color: "var(--c-text-dim)" }}>{label}</span>
+      <span>{value}</span>
+    </div>
+  );
 
   return (
     <div className="rounded p-2 flex flex-col gap-1" style={{ backgroundColor: "var(--c-surface2)", borderLeft: "3px solid #ff453a" }}>
       <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--c-text-dim)" }}>
-        Scar
+        Scar quantification
       </div>
-      {!scar.scar_present ? (
+      {scar && (!scar.scar_present ? (
         <div className="text-xs" style={{ color: "var(--c-text-dim)" }}>
-          {scar.note || "No scar detected in this sample."}
+          {scar.note || "No scar above the presence gate — paint manually if present."}
         </div>
       ) : (
         <div className="flex flex-col gap-1 text-xs">
-          <div className="flex justify-between">
-            <span style={{ color: "var(--c-text-dim)" }}>Scar voxels</span>
-            <span>{scar.scar_voxels?.toLocaleString()}</span>
-          </div>
-          <div className="flex justify-between">
-            <span style={{ color: "var(--c-text-dim)" }}>% of cornea</span>
-            <span>{Math.round((scar.scar_fraction_of_cornea ?? 0) * 100)}%</span>
-          </div>
-          {scar.scar_bounds_ijk && (
+          {row("Volume", <b>{scar.scar_volume_mm3?.toLocaleString()} mm³</b>)}
+          {row("En-face area", <b>{scar.scar_area_mm2?.toLocaleString()} mm²</b>)}
+          {row("% of cornea", `${Math.round((scar.scar_fraction_of_cornea ?? 0) * 100)}%`)}
+          {scar.cornea_volume_mm3 != null && row("Cornea volume", `${scar.cornea_volume_mm3.toLocaleString()} mm³`)}
+          {scar.scar_density?.mean != null &&
+            row("Mean density", `${scar.scar_density.mean} (p10–90 ${scar.scar_density.p10}–${scar.scar_density.p90})`)}
+          {scar.scar_density?.tier_volume_mm3 && (
             <div className="flex justify-between">
-              <span style={{ color: "var(--c-text-dim)" }}>Bounds IJK</span>
-              <span>
-                {scar.scar_bounds_ijk.min.join(",")} → {scar.scar_bounds_ijk.max.join(",")}
+              <span style={{ color: "var(--c-text-dim)" }}>Density tiers</span>
+              <span title="diffuse / moderate / dense (mm³)">
+                {scar.scar_density.tier_volume_mm3.map((v) => v.toFixed(2)).join(" / ")}
               </span>
             </div>
           )}
+          {scar.largest_component_fraction != null &&
+            row("Continuity", `${Math.round(scar.largest_component_fraction * 100)}% in 1 region`)}
+        </div>
+      ))}
+      {summaryInfo && (
+        <div className="text-[11px] mt-1 break-all" style={{ color: "var(--c-text-dim)" }}>
+          {summaryInfo}
         </div>
       )}
     </div>

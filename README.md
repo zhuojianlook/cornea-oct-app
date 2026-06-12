@@ -1,28 +1,34 @@
-# Cornea OCT Segmentation
+# Cornea OCT Scar Quantification
 
-A desktop app for producing **background / cornea / scar** voxel labels from 3D
-OCT volumes, to train a UNet (e.g. nnU-Net) for the same segmentation.
+A desktop app that turns a 3D corneal OCT volume into **objective scar metrics**
+(volume, en-face area, density) and a **3-class voxel labelmap** (`0=background,
+1=cornea, 2=scar`) — the research deliverable, and the eventual training set for an
+automatic model (nnU-Net).
 
-The app lives in [`cornea_app/`](cornea_app/) and mirrors the architecture of the
-multipanelfigure app: **React + TypeScript + Vite + Tailwind + MUI** frontend with
-the **niivue** medical volume viewer, a thin **Tauri v2** Rust shell, and a
-**FastAPI Python sidecar** that drives 3D Slicer and the vision models.
+The app lives in [`cornea_app/`](cornea_app/): a **React + TypeScript + Vite +
+Tailwind + MUI** frontend with the **niivue** medical viewer (2D slice-gallery
+fallback when WebGL2 is unavailable), a thin **Tauri v2** Rust shell, and a
+**FastAPI Python sidecar**. Segmentation is **SAM2** (in-process, GPU); the only
+3D Slicer dependency is DICOM → NIfTI conversion.
 
-## Workflow
+## Workflow (3 stages)
 
-1. **Load** a 3D OCT volume (NRRD / NIfTI; DICOM via Slicer).
-2. **Seed paint** — an AI (OpenAI / local OpenAI-compatible / MedGemma) or a
-   deterministic heuristic paints cornea + background seeds. Edit them
-   interactively in niivue with a **cornea / background / scar** pen.
-3. **Verdict** — Accept, or Reject with notes → the model **repaints using your
-   feedback** (active-learning loop).
-4. **Grow from Seeds** — 3D Slicer grows the full segmentation; it overlays the
-   volume with voxel/volume QA.
-5. **Scar detection** (optional) — an AI or heuristic marks scar *inside* the
-   cornea, re-grows into a 3-class labelmap, and reports metrics.
-6. **Export → nnU-Net** — writes `output/nnunet/Dataset501_CorneaOCT/` with
-   `imagesTr/`, `labelsTr/`, and `dataset.json`. Labels: `0=background,
-   1=cornea, 2=scar` (scar optional per case).
+1. **Segment** — load a 3D OCT volume (NIfTI/NRRD; DICOM via Slicer), then
+   **SAM2** segments the cornea by treating each of the axial / coronal / sagittal
+   planes as a movie and fusing the three passes into one 3D cornea mask.
+2. **Correct** — load the segmentation as an editable niivue drawing and fix the
+   cornea boundary with the pen (`cornea=1`, `background=2` erases). Saved as the
+   canonical corrected labelmap.
+3. **Scar** — **Detect scar (auto)** flags the hyper-reflective stroma inside the
+   cornea as scar *candidates* (a sensitivity slider controls how much), shown in
+   density tiers; correct them with the scar pen (`3`). The corrected scar is
+   quantified — **volume (mm³), en-face area (mm²), densitometry** — and
+   **Export scar metrics** writes `output/scar_summary.csv` across all cases for
+   outcome correlation.
+
+**Export → nnU-Net** (sidebar) writes `output/nnunet/Dataset501_CorneaOCT/`
+(`imagesTr/`, `labelsTr/`, `dataset.json`) from the corrected labelmaps — the
+training set for automating this pipeline once enough patients are labelled.
 
 ## Running (browser-dev-first)
 
@@ -33,13 +39,15 @@ npm install                                       # first time
 ./dev-launch.sh                                   # sidecar :8765 + Vite :1420
 ```
 
-Then open <http://localhost:1420>. The app talks to the sidecar via the browser
-fetch fallback — no native window required.
+Then open <http://localhost:1420>. SAM2 needs the checkpoint at
+`cornea_app/sam2_ckpt/sam2.1_hiera_small.pt` and a CUDA GPU.
+
+Batch a cohort from the CLI: `python python-sidecar/process_cohort.py`
+(ingest → SAM2 → scar/auto → summary; then correct each case in the app).
 
 ### Native window (optional, deferred)
 
-The native Tauri v2 window needs WebKitGTK 4.1, which isn't installed here (only
-4.0). Install it once, then `./dev-launch.sh --native`:
+The native Tauri v2 window needs WebKitGTK 4.1:
 
 ```bash
 sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
@@ -47,12 +55,11 @@ sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
 
 ## Layout
 
-- `cornea_app/src/` — React frontend (niivue viewer, Zustand stores, API client)
-- `cornea_app/python-sidecar/` — FastAPI sidecar (orchestration, Slicer runner,
-  vision providers, volume/seed/scar/export modules)
-- `cornea_app/src-tauri/` — thin Tauri v2 Rust shell (scaffolded; build deferred)
-- `slicer_bridge/` — 3D Slicer scripts (rendering, Grow from Seeds, live bridge)
-- `local_vision/` — local MedGemma vision bridge + 2D helpers
+- `cornea_app/src/` — React frontend (niivue viewer, Zustand `workflowStore`, API client)
+- `cornea_app/python-sidecar/` — FastAPI sidecar: `sam2_segment` (cornea), `scar`
+  (detection + quantification), `masks` (correction round-trip), `metrics_export`
+  (scar_summary), `export` (nnU-Net), `postprocess` (in-process preview rendering)
+- `slicer_bridge/` — `convert_to_nifti.py` (DICOM→NIfTI) + pure-numpy `preview_io.py`
+- `cornea_app/sam2_ckpt/` — SAM2 checkpoint (downloaded, gitignored)
 
-The 3D Slicer executable path and vision-provider settings are configurable in
-the app's Settings panel.
+Label convention everywhere: `0=background, 1=cornea, 2=scar` (scar optional per case).

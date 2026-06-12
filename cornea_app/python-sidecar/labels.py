@@ -1,0 +1,52 @@
+"""Canonical segmentation labelmap — single source of truth for display + export.
+
+Final label convention (nnU-Net target): 0=background, 1=cornea, 2=scar.
+
+A case's labelmap is the corrected labelmap (<case>_corrected.nii.gz, already
+0/1/2) written by SAM2 and refined by the expert correction round-trip. The
+niivue overlay, the nnU-Net export, and the correction drawing all go through
+best_labelmap_nnunet so they can never disagree.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import nibabel as nib
+
+import orchestration as orch
+
+NNUNET_LABELS = {"background": 0, "cornea": 1, "scar": 2}
+
+
+def corrected_path(case_id: str) -> Path:
+    cid = orch.safe_case_id(case_id)
+    return orch.case_root(cid) / "segmentation" / f"{cid}_corrected.nii.gz"
+
+
+def best_labelmap_nnunet(case_id: str) -> tuple[np.ndarray | None, str | None]:
+    """Return (labelmap_ijk in {0,1,2}, source) — the corrected labelmap, or None."""
+    cp = corrected_path(case_id)
+    if cp.exists():
+        arr = np.rint(np.asarray(nib.load(str(cp)).dataobj)).astype(np.uint8)
+        return arr, "corrected"
+    return None, None
+
+
+def write_label_nifti(arr_ijk: np.ndarray, base_nifti: Path, dst: Path) -> Path:
+    base = nib.load(str(base_nifti))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(np.ascontiguousarray(arr_ijk.astype(np.uint8)), base.affine), str(dst))
+    return dst
+
+
+def labelmap_counts(arr_ijk: np.ndarray, spacing_mm3: float | None = None) -> dict:
+    """Per-class voxel counts (and optional volume) for QA, keyed by class name."""
+    out: dict[str, dict] = {}
+    for name, value in NNUNET_LABELS.items():
+        n = int((arr_ijk == value).sum())
+        entry: dict = {"voxel_count": n}
+        if spacing_mm3 is not None:
+            entry["volume_mm3"] = round(n * spacing_mm3, 4)
+        out[name] = entry
+    return out

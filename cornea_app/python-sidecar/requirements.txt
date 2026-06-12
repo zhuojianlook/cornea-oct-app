@@ -6,3 +6,6 @@ nibabel>=5.2
 pynrrd>=1.0
 Pillow>=10.0
 requests>=2.31
+scipy>=1.10
+anthropic>=0.69
+SimpleITK

@@ -14,11 +14,18 @@ __pycache__/
 
 # Generated per-case working data (kept on disk, not tracked)
 cases/
-output/*
-!output/synthetic_oct.nrrd
+output/
+
+# SAM2 model checkpoint (downloaded, not tracked)
+cornea_app/sam2_ckpt/
 
 # Local tooling / agent scratch
 .agents/
+.claude/
+*.local.json
 
 # OS
 .DS_Store
+
+# sidecar persisted state (no secrets)
+cornea_app/python-sidecar/.sidecar_state.json

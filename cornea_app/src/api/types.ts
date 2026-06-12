@@ -5,10 +5,6 @@ export interface AppConfig {
   cases_root: string;
   slicer_executable: string;
   default_case_id: string;
-  vision_provider: "local" | "openai" | "medgemma" | string;
-  openai_model: string;
-  local_vision_base_url: string;
-  has_openai_api_key: boolean;
 }
 
 export interface CaseInfo {
@@ -16,37 +12,8 @@ export interface CaseInfo {
   root: string;
   input_dir: string;
   segmentation_dir: string;
-  review_dir: string;
-  seed_json: string;
-  output_seg: string;
   qa_json: string;
   manifest: Record<string, unknown>;
-}
-
-export interface SeedStroke {
-  points_ijk: number[][];
-  radius_voxels: number[];
-}
-
-export interface SeedSeedPoint {
-  ijk: number[];
-  radius_voxels: number[];
-}
-
-export interface SeedSegment {
-  name: string;
-  color: number[];
-  seeds: SeedSeedPoint[];
-  strokes?: SeedStroke[];
-}
-
-export interface SeedSpec {
-  segments: SeedSegment[];
-}
-
-export interface GrowQa {
-  segments?: Record<string, { voxel_count?: number; volume_mm3?: number }>;
-  [key: string]: unknown;
 }
 
 export interface PreviewImage {
@@ -63,26 +30,45 @@ export interface PreviewImage {
   image_height: number | null;
 }
 
-export interface AiPaintResult {
-  case_info: CaseInfo;
-  seed_spec: SeedSpec;
-  qa: {
-    agent_marking?: { cornea_stroke_count?: number; background_stroke_count?: number };
-    confidence?: number | null;
-    issues?: string[];
-    paint_agent?: { provider?: string; model?: string; summary?: string };
-    [k: string]: unknown;
-  } | null;
-  mode?: string;
+export type Stage = 1 | 2 | 3;
+
+export interface ConsensusScan {
+  case: string;
+  role: string; // "reference" | "scar" | "cornea" (alignment anchor used)
+  scar_volume_mm3: number;
+  scar_dice_to_ref: number;
+  matched_fraction: number; // fraction of this scan's scar that falls in the consensus
+  low_correspondence: boolean; // likely a different FOV patch — only partly comparable
 }
 
-export type Stage = 1 | 2 | 3 | 4;
+export interface ConsensusReport {
+  n_scans: number;
+  reference: string;
+  agreement_threshold: number;
+  scar_volume_mm3: { mean: number; std: number; cv_percent: number; per_scan: number[] };
+  consensus_scar_mm3: number;
+  core_full_agreement_mm3: number;
+  union_mm3: number;
+  mean_pairwise_scar_dice: number | null;
+  per_scan: ConsensusScan[];
+  scans: string[];
+  segmentation_errors?: Record<string, string>;
+}
 
 export interface ScarMetrics {
   scar_present: boolean;
   scar_voxels?: number;
+  scar_volume_mm3?: number;
+  scar_area_mm2?: number;
   cornea_voxels?: number;
+  cornea_volume_mm3?: number;
   scar_fraction_of_cornea?: number;
+  scar_components?: number;
+  largest_component_fraction?: number;
+  scar_density?: {
+    mean?: number; median?: number; std?: number; p10?: number; p90?: number;
+    weighted_volume_mm3u?: number; tier_volume_mm3?: number[];
+  };
   scar_bounds_ijk?: { min: number[]; max: number[] };
   note?: string;
 }

@@ -60,37 +60,10 @@ def run_slicer(script_name: str, args: Sequence[str], timeout: int = 1200) -> di
     }
 
 
-def render_context_previews(input_volume: str, preview_dir: Path, max_slices: int = 9) -> dict:
+def convert_to_nifti(input_volume: str, output: str) -> dict:
+    """The only Slicer dependency in the focused app: DICOM → NIfTI."""
     return run_slicer(
-        "render_volume_context.py",
-        ["--input-volume", input_volume, "--preview-dir", str(preview_dir),
-         "--max-slices-per-orientation", str(max_slices)],
-    )
-
-
-def render_seed_previews(input_volume: str, seed_json: str, preview_dir: Path) -> dict:
-    return run_slicer(
-        "render_seed_previews.py",
-        ["--input-volume", input_volume, "--seed-json", seed_json, "--preview-dir", str(preview_dir)],
-    )
-
-
-def heuristic_seeds(input_volume: str, output_seed_json: str, qa_json: str,
-                    preview_dir: Path, feedback_json: str) -> dict:
-    return run_slicer(
-        "agent_refine_paint.py",
-        ["--input-volume", input_volume, "--output-seed-json", output_seed_json,
-         "--qa-json", qa_json, "--preview-dir", str(preview_dir),
-         "--feedback-json", feedback_json],
-    )
-
-
-def grow_from_seeds(input_volume: str, seed_json: str, output_seg: str, qa_json: str,
-                    scene: str, preview_dir: Path, seed_locality_factor: float = 0.0) -> dict:
-    return run_slicer(
-        "seeded_grow_from_seeds.py",
-        ["--input-volume", input_volume, "--seed-json", seed_json,
-         "--output-seg", output_seg, "--qa-json", qa_json, "--scene", scene,
-         "--preview-dir", str(preview_dir),
-         "--seed-locality-factor", str(seed_locality_factor)],
+        "convert_to_nifti.py",
+        ["--input-volume", input_volume, "--output", output],
+        timeout=600,
     )
