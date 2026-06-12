@@ -301,18 +301,24 @@ def sampled_indices_for_orientation(volume_shape_kji, masks_by_name, orientation
     return sorted(set(int(index) for index in indices))
 
 
-def save_previews(volume_array, masks_by_name, output_dir, prefix, spacing_ijk=None, max_slices_per_orientation=9):
+def save_previews(volume_array, masks_by_name, output_dir, prefix, spacing_ijk=None,
+                  max_slices_per_orientation=9, max_dim=None):
+    """`max_slices_per_orientation` may be an int (all orientations) OR a dict
+    {orientation: count} for per-axis density (e.g. dense axial B-scans for OCT scrub).
+    `max_dim` caps the longest PNG side (keeps payload small when rendering many slices)."""
     ensure_dir(output_dir)
     cleanup_prefix(output_dir, prefix)
     spacing_ijk = spacing_ijk or [1.0, 1.0, 1.0]
     saved = []
     manifest_items = []
     for orientation in ("axial", "coronal", "sagittal"):
+        mx = (max_slices_per_orientation.get(orientation, 9)
+              if isinstance(max_slices_per_orientation, dict) else max_slices_per_orientation)
         indices = sampled_indices_for_orientation(
             volume_array.shape,
             masks_by_name,
             orientation,
-            max_slices_per_orientation,
+            mx,
         )
         for stack_position, index in enumerate(indices):
             rgb = gray_to_rgb(slice_volume(volume_array, orientation, index))
@@ -336,6 +342,12 @@ def save_previews(volume_array, masks_by_name, output_dir, prefix, spacing_ijk=N
                     alpha=alpha,
                 )
             rgb = scale_to_physical_aspect(rgb, orientation, spacing_ijk)
+            if max_dim:
+                h, w = rgb.shape[:2]
+                longest = max(h, w)
+                if longest > max_dim:
+                    s = max_dim / longest
+                    rgb = resize_rgb_nearest(rgb, round(h * s), round(w * s))
             path = os.path.join(output_dir, f"{prefix}_{orientation}_{index:04d}.png")
             write_png_rgb(path, np.flipud(rgb))
             saved.append(path)

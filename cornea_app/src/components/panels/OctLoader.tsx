@@ -84,12 +84,17 @@ export function OctLoader() {
   const onPicked = (fs: File[]) => {
     const keep = pickFiles(fs);
     const octs = keep.filter((f) => /\.oct$/i.test(f.name));
+    // An .OCT can't be read without its companion .txt (POCT filespec); warn up front.
+    const txtStems = new Set(keep.filter((f) => /\.txt$/i.test(f.name)).map((f) => f.name.replace(/\.txt$/i, "").toLowerCase()));
+    const missing = octs.filter((o) => !txtStems.has(o.name.replace(/\.oct$/i, "").toLowerCase()));
     setScans(octs.map((f) => ({ filename: f.name, nFrames: 101, status: "queued", scarRange: [1, 101], selected: true })));
     setLoaded(false);
     setReport(null);
     setActiveId(null);
     filesRef.current = keep;
-    setStep(`${octs.length} .OCT file(s) selected${keep.length > octs.length ? ` (+${keep.length - octs.length} companions)` : ""}.`);
+    setStep(missing.length
+      ? `⚠ ${missing.length}/${octs.length} .OCT are missing their .txt companion — also pick the .txt files, or use Folder. An .OCT can't be read without it.`
+      : `${octs.length} .OCT + companion .txt selected.`);
   };
 
   const load = async () => {
@@ -232,7 +237,8 @@ export function OctLoader() {
   return (
     <div className="flex flex-col gap-2">
       <Typography variant="caption" sx={{ color: "var(--c-text-dim)" }}>
-        Load Optovue .OCT scans (or a folder), scrub & mark scar/control, then preprocess.
+        Load Optovue .OCT scans — each needs its <b>.txt</b> next to it (Folder grabs both),
+        then scrub & mark scar/control and preprocess.
       </Typography>
       <input ref={fileRef} type="file" accept=".oct,.txt" multiple hidden
         onChange={(e) => onPicked(Array.from(e.target.files ?? []))} />

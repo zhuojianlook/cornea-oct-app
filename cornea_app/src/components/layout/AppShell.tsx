@@ -17,14 +17,12 @@ export function AppShell() {
   const config = useCaseStore((s) => s.config);
   const apiError = useCaseStore((s) => s.apiError);
   const fetchConfig = useCaseStore((s) => s.fetchConfig);
-  const openCase = useCaseStore((s) => s.openCase);
 
   useEffect(() => {
-    (async () => {
-      await fetchConfig();
-      await openCase();
-    })();
-  }, [fetchConfig, openCase]);
+    // Connect to the sidecar but start blank — don't auto-open the last case or show
+    // its segmentation on refresh.
+    fetchConfig();
+  }, [fetchConfig]);
 
   if (!config) {
     return (

@@ -58,11 +58,22 @@ NIFTI_DIRECTION = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0)
 
 
 # ── 1) read .OCT ───────────────────────────────────────────────────────────
+class MissingCompanionError(ValueError):
+    """The .OCT's companion .txt filespec isn't next to it (POCT can't read without it)."""
+
+
 def read_oct_zstack(oct_path: str | Path, volume_index: int = 0) -> np.ndarray:
     """Read one volume's B-scan stack from an .OCT file → (frames, H, W) float32.
 
-    An .OCT may hold several captures; the original pipeline uses volume 0."""
+    An .OCT may hold several captures; the original pipeline uses volume 0. The
+    Optovue .OCT stores its dimensions in a companion .txt that MUST sit next to it —
+    POCT fails without it, so we check up front and raise an actionable error."""
     from oct_converter.readers import POCT
+    p = Path(oct_path)
+    if not (p.with_suffix(".txt").exists() or p.with_suffix(".TXT").exists()):
+        raise MissingCompanionError(
+            f"'{p.name}' has no companion .txt next to it — an Optovue .OCT can't be read "
+            "without it. Upload the .OCT together with its .txt (or load the whole folder).")
     vols = POCT(str(oct_path)).read_oct_volume()
     if not vols:
         raise ValueError(f"No OCT volumes found in {oct_path}")

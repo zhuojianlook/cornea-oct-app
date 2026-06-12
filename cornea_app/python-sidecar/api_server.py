@@ -720,6 +720,8 @@ def oct_volume(case_id: str, req: OctPreprocessRequest) -> dict:
     if not show_corrected:
         try:
             oct_mod.raw_oct_to_nifti(src, work, volume_index=vi)
+        except oct_mod.MissingCompanionError as exc:
+            raise HTTPException(400, str(exc))           # actionable: user forgot the .txt
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(500, f"Reading .OCT failed: {exc}")
     out = _oct_render_volume(case_id, work, preprocessed=show_corrected, extra={"oct_volume_index": vi})

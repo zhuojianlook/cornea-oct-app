@@ -86,7 +86,8 @@ export const useCaseStore = create<CaseState>()(
         const config = await api.getConfig();
         set((s) => {
           s.config = config;
-          s.caseId = s.caseId ?? config.default_case_id;
+          // Start blank on (re)load: do NOT adopt the persisted last case, so a refresh
+          // shows no volume/segmentation until the user loads or opens one.
           s.apiError = null;
         });
       } catch (e) {

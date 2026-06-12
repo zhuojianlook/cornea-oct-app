@@ -57,6 +57,10 @@ def render_context_previews(volume_nifti: Path, out_dir: Path) -> int:
     img = nib.load(str(volume_nifti))
     vol_kji = np.ascontiguousarray(np.asarray(img.dataobj).transpose(2, 1, 0))
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Dense AXIAL (= the OCT B-scan frames) so the user can actually scrub every frame;
+    # coronal/sagittal stay sampled. Size-capped so the (now ~100-slice) payload stays small.
     preview_io.save_previews(vol_kji, {}, str(out_dir), "context",
-                             spacing_ijk=_spacing(img.affine), max_slices_per_orientation=9)
+                             spacing_ijk=_spacing(img.affine),
+                             max_slices_per_orientation={"axial": 100000, "coronal": 16, "sagittal": 16},
+                             max_dim=512)
     return int(vol_kji.size)
