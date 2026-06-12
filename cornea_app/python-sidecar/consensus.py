@@ -56,10 +56,12 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
     """Align all scans to a reference (scar-anchored), warp them into the reference
     frame, vote a probabilistic consensus, and write per-scan + consensus artifacts.
     Returns the reproducibility report."""
-    cids = [c for c in case_ids if labels.corrected_path(c).exists() and _vol_path(c).exists()]
+    cids = [c for c in dict.fromkeys(case_ids)              # de-dupe so a repeated id
+            if labels.corrected_path(c).exists() and _vol_path(c).exists()]  # can't double-count
     if len(cids) < 2:
         raise ValueError("Need at least 2 scans with a segmentation for consensus.")
     ref = reference if reference in cids else cids[0]
+    ref_overridden = bool(reference) and reference != ref
 
     ref_vol_path = _vol_path(ref)
     ref_img = sitk.ReadImage(str(ref_vol_path))
@@ -112,7 +114,9 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
         p["low_correspondence"] = p["matched_fraction"] < 0.3 and p["role"] != "reference"
 
     vols = [p["scar_volume_mm3"] for p in per_scan]
-    mean = float(np.mean(vols)); std = float(np.std(vols))
+    # Sample std (ddof=1) is the correct test-retest dispersion estimator for a small
+    # set of repeat acquisitions; population std (ddof=0) understates reproducibility CV.
+    mean = float(np.mean(vols)); std = float(np.std(vols, ddof=1)) if len(vols) > 1 else 0.0
     pair = [round(_dice(warped_scars[cids[i]], warped_scars[cids[j]]), 3)
             for i in range(n) for j in range(i + 1, n)]
 
@@ -127,7 +131,8 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
            ref_img, orch.case_root(consensus_case_id) / "previews" / "volume.nii.gz", dtype=sitk.sitkFloat32)
 
     return {
-        "n_scans": n, "reference": ref, "agreement_threshold": math.floor(n / 2) + 1,
+        "n_scans": n, "reference": ref, "reference_overridden": ref_overridden,
+        "agreement_threshold": math.floor(n / 2) + 1,
         "scar_volume_mm3": {"mean": round(mean, 4), "std": round(std, 4),
                             "cv_percent": round(std / mean * 100, 2) if mean else 0.0,
                             "per_scan": vols},

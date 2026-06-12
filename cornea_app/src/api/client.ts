@@ -57,6 +57,7 @@ async function apiJson<T>(path: string, method = "GET", body?: string): Promise<
 /** Upload one or more files to a sidecar endpoint (multipart, field "files"). */
 async function apiUpload<T>(path: string, files: File[]): Promise<T> {
   const invoke = await getInvoke();
+  let text: string;
   if (invoke) {
     const payload = await Promise.all(
       files.map(async (f) => ({
@@ -64,17 +65,32 @@ async function apiUpload<T>(path: string, files: File[]): Promise<T> {
         data: btoa(String.fromCharCode(...new Uint8Array(await f.arrayBuffer()))),
       })),
     );
-    const text = (await invoke("proxy_upload", {
+    text = (await invoke("proxy_upload", {
       path,
       files: payload,
       fieldName: "files",
     })) as string;
-    return JSON.parse(text) as T;
+  } else {
+    const form = new FormData();
+    for (const f of files) form.append("files", f);
+    const res = await fetch(`${DEFAULT_BASE}${path}`, { method: "POST", body: form });
+    text = await res.text();
+    if (!res.ok) {
+      let detail = text;
+      try {
+        detail = JSON.stringify(JSON.parse(text).detail ?? text);
+      } catch {
+        /* non-JSON error body — keep the raw text */
+      }
+      throw new Error(`API error (${res.status}): ${detail}`);
+    }
   }
-  const form = new FormData();
-  for (const f of files) form.append("files", f);
-  const res = await fetch(`${DEFAULT_BASE}${path}`, { method: "POST", body: form });
-  return (await res.json()) as T;
+  // Surface a FastAPI {detail: …} error instead of returning it as if it were data.
+  const parsed = JSON.parse(text);
+  if (parsed && parsed.detail) {
+    throw new Error(`API error: ${JSON.stringify(parsed.detail)}`);
+  }
+  return parsed as T;
 }
 
 /** Absolute URL for a binary sidecar resource (volume / segmentation NIfTI). */

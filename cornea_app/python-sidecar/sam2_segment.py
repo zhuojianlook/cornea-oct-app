@@ -39,6 +39,10 @@ def _device():
 def _predictor():
     global _PREDICTOR
     if _PREDICTOR is None:
+        if not _CKPT.exists():
+            raise FileNotFoundError(
+                f"SAM2 checkpoint missing: {_CKPT}. Download sam2.1_hiera_small.pt into "
+                f"cornea_app/sam2_ckpt/ before segmenting.")
         from sam2.build_sam import build_sam2_video_predictor
         _PREDICTOR = build_sam2_video_predictor(_CFG, str(_CKPT), device=_device())
     return _PREDICTOR
@@ -171,24 +175,34 @@ def segment_plane(vol: np.ndarray, plane: str, work: Path) -> tuple[np.ndarray, 
             break
     out = np.zeros(vol.shape, bool)
     if prm is None:
+        shutil.rmtree(fdir, ignore_errors=True)     # no band found: still clean up frames
         return out, mid
     pts_xy, labels = prm
 
     predictor = _predictor()
     big = nframes > 200
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if _device() == "cuda" else _nullctx()
-    with torch.inference_mode(), autocast:
-        state = predictor.init_state(video_path=str(fdir),
-                                     offload_video_to_cpu=big, offload_state_to_cpu=big)
-        predictor.add_new_points_or_box(state, frame_idx=mid, obj_id=1,
-                                        points=pts_xy, labels=labels)
-        # propagate forward then backward from the prompt frame
-        for rev in (False, True):
-            for fidx, _ids, logits in predictor.propagate_in_video(state, reverse=rev):
-                msk = (logits[0] > 0.0).squeeze().cpu().numpy()
-                _scatter_mask(out, plane, fidx, msk)
-        predictor.reset_state(state)
-    shutil.rmtree(fdir, ignore_errors=True)
+    state = None
+    try:
+        with torch.inference_mode(), autocast:
+            state = predictor.init_state(video_path=str(fdir),
+                                         offload_video_to_cpu=big, offload_state_to_cpu=big)
+            predictor.add_new_points_or_box(state, frame_idx=mid, obj_id=1,
+                                            points=pts_xy, labels=labels)
+            # propagate forward then backward from the prompt frame
+            for rev in (False, True):
+                for fidx, _ids, logits in predictor.propagate_in_video(state, reverse=rev):
+                    msk = (logits[0] > 0.0).squeeze().cpu().numpy()
+                    _scatter_mask(out, plane, fidx, msk)
+    finally:
+        # Always release SAM2 state + frames, even on a CUDA OOM mid-propagate, so the
+        # failure doesn't leak GPU memory or a frames dir into the next plane/scan.
+        if state is not None:
+            try:
+                predictor.reset_state(state)
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(fdir, ignore_errors=True)
     return out, mid
 
 
@@ -237,19 +251,26 @@ def segment_plane_prompted(vol: np.ndarray, plane: str, work: Path, frame_points
     predictor = _predictor()
     big = nframes > 200
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if _device() == "cuda" else _nullctx()
-    with torch.inference_mode(), autocast:
-        state = predictor.init_state(video_path=str(fdir),
-                                     offload_video_to_cpu=big, offload_state_to_cpu=big)
-        for frame, pts in frame_points.items():
-            arr = np.array(pts, dtype=np.float32)
-            predictor.add_new_points_or_box(state, frame_idx=int(frame), obj_id=1,
-                                            points=arr[:, :2], labels=arr[:, 2].astype(np.int32))
-        for rev in (False, True):
-            for fidx, _ids, logits in predictor.propagate_in_video(state, reverse=rev):
-                out_msk = (logits[0] > 0.0).squeeze().cpu().numpy()
-                _scatter_mask(out, plane, fidx, out_msk)
-        predictor.reset_state(state)
-    shutil.rmtree(fdir, ignore_errors=True)
+    state = None
+    try:
+        with torch.inference_mode(), autocast:
+            state = predictor.init_state(video_path=str(fdir),
+                                         offload_video_to_cpu=big, offload_state_to_cpu=big)
+            for frame, pts in frame_points.items():
+                arr = np.array(pts, dtype=np.float32)
+                predictor.add_new_points_or_box(state, frame_idx=int(frame), obj_id=1,
+                                                points=arr[:, :2], labels=arr[:, 2].astype(np.int32))
+            for rev in (False, True):
+                for fidx, _ids, logits in predictor.propagate_in_video(state, reverse=rev):
+                    out_msk = (logits[0] > 0.0).squeeze().cpu().numpy()
+                    _scatter_mask(out, plane, fidx, out_msk)
+    finally:
+        if state is not None:
+            try:
+                predictor.reset_state(state)
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(fdir, ignore_errors=True)
     return out
 
 
@@ -291,10 +312,20 @@ def segment_volume(volume_nifti: Path, work: Path,
 
     votes = np.zeros(vol.shape, np.uint8)
     per_plane = {}
+    planes_failed = {}
     for pl in planes:
-        m, prm = segment_plane(vol, pl, work)
+        try:
+            m, prm = segment_plane(vol, pl, work)
+        except Exception as exc:  # noqa: BLE001  (e.g. CUDA OOM): record + keep other planes
+            planes_failed[pl] = str(exc)[:200]
+            per_plane[pl] = {"voxels": 0, "error": str(exc)[:200]}
+            _free_gpu()
+            continue
+        nvox = int(m.sum())
+        if nvox == 0:                               # SAM2 found no corneal band on this plane
+            planes_failed[pl] = "no cornea band found (auto-prompt failed)"
         votes += m.astype(np.uint8)
-        per_plane[pl] = {"voxels": int(m.sum()), "prompt_frame": prm}
+        per_plane[pl] = {"voxels": nvox, "prompt_frame": prm}
 
     fused = votes >= vote
     # keep the largest connected component, fill holes
@@ -305,7 +336,9 @@ def segment_volume(volume_nifti: Path, work: Path,
     fused = ndimage.binary_fill_holes(fused)
     label = fused.astype(np.uint8)
     meta = {"per_plane": per_plane, "vote_threshold": vote,
-            "cornea_voxels": int(label.sum()), "model": "sam2.1_hiera_small"}
+            "cornea_voxels": int(label.sum()), "model": "sam2.1_hiera_small",
+            "planes_failed": planes_failed,
+            "degraded": bool(planes_failed)}        # surfaced so a silent under-segment is visible
     _free_gpu()
     return label, meta
 

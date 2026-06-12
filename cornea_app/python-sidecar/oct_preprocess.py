@@ -95,14 +95,16 @@ def parse_oct_filename(filename: str) -> dict:
     toks = base.split("_")
     if len(toks) < 5:
         return {}
-    m = re.match(r"(\d{4}-\d{2}-\d{2})\s*\((\d+)\)", toks[4])
+    # The date token is "YYYY-MM-DD" optionally followed by a replicate suffix "(N)".
+    # Parse the date even when there's no "(N)" so the FIRST scan isn't left date-less.
+    m = re.match(r"(\d{4}-\d{2}-\d{2})(?:\s*\((\d+)\))?", toks[4])
     return {
         "patient_name": toks[0],
         "patient_id": toks[1],
         "study_description": toks[2],
         "laterality": toks[3],
         "study_date": m.group(1) if m else "",
-        "series_number": int(m.group(2)) if m else 1,
+        "series_number": int(m.group(2)) if (m and m.group(2)) else 1,
     }
 
 
@@ -129,6 +131,112 @@ def _to_float(val: str) -> float | None:
         return float(re.sub(r"[^0-9.\-]", "", val))
     except ValueError:
         return None
+
+
+# ── per-scan voxel geometry from the companion .txt (the source of truth) ────
+# The .OCT's companion .txt records the TRUE acquisition geometry. It varies per
+# scan (e.g. XY Scan Size1 = 4.60mm for CS019, 6.00mm for CS015), so the geometry
+# must be read per-scan, not hardcoded. The file lists several "[CL - 3D Cornea
+# Step N]" blocks; only ONE is the active 3D acquisition — the Step whose
+# "XY Scan Usage" equals the slice/frame count (the others are Usage=1 placeholders).
+def _parse_companion_full(txt_path: str | Path):
+    """Parse the companion .txt into (top-level dict, {step_num: detail dict}).
+
+    Top-level: oct_window_height, scan_depth, eye_scanned.
+    Per step: length (XY Scan Length), usage (XY Scan Usage), size1 (XY Scan
+    Size1, mm), interval1 (XY Scan Interval1, mm)."""
+    top: dict = {}
+    steps: dict = {}
+    cur_step, in_detail = None, False
+    with open(txt_path, "r", encoding="utf8", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            sm = re.match(r"\[CL - 3D Cornea Step (\d+)(\s+Detail)?\]", line)
+            if sm:
+                cur_step, in_detail = int(sm.group(1)), bool(sm.group(2))
+                steps.setdefault(cur_step, {})
+                continue
+            if line.startswith("["):                 # a non-step section resets context
+                cur_step, in_detail = None, False
+            if "=" not in line:
+                continue
+            key, val = [x.strip() for x in line.split("=", 1)]
+            k = key.lower()
+            if cur_step is None:
+                if k == "oct window height":
+                    top["oct_window_height"] = _to_float(val)
+                elif k == "scan depth":
+                    top["scan_depth"] = _to_float(val)
+                elif k == "eye scanned":
+                    top["eye_scanned"] = val
+            else:
+                s = steps[cur_step]
+                if not in_detail:
+                    if k == "xy scan length":
+                        s["length"] = _to_float(val)
+                    elif k == "xy scan usage":
+                        s["usage"] = _to_float(val)
+                else:
+                    if k == "xy scan size1":
+                        s["size1"] = _to_float(val)
+                    elif k == "xy scan interval1":
+                        s["interval1"] = _to_float(val)
+                    elif k == "xy scan usage1" and s.get("usage") is None:
+                        s["usage"] = _to_float(val)
+    return top, steps
+
+
+def companion_geometry(txt_path: str | Path, n_frames: int | None = None) -> dict:
+    """Derive per-scan voxel spacing (mm) from the companion .txt. Returns a dict
+    with any of lateral_spacing / depth_spacing / slice_spacing that could be
+    resolved (empty if the file is unreadable/unrecognised — caller falls back to
+    the Avanti constants). Picks the active acquisition Step by frame count."""
+    try:
+        top, steps = _parse_companion_full(txt_path)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not steps:
+        return {}
+
+    def usage(s: dict) -> float:
+        return s.get("usage") or 0.0
+
+    active = None
+    if n_frames:
+        active = next((s for s in steps.values() if usage(s) == n_frames), None)
+    if active is None:                                # else the most-acquired step
+        active = max(steps.values(), key=usage, default=None)
+    if not active:
+        return {}
+    geom: dict = {}
+    size1, length = active.get("size1"), active.get("length")
+    depth, win_h = top.get("scan_depth"), top.get("oct_window_height")
+    interval1 = active.get("interval1")
+    if size1 and length:
+        geom["lateral_spacing"] = size1 / length
+    if depth and win_h:
+        geom["depth_spacing"] = depth / win_h
+    if interval1:
+        geom["slice_spacing"] = interval1
+    return geom
+
+
+# Plausible Avanti 3D-Cornea voxel-spacing ranges (mm); outside these we warn so a
+# wrong-geometry volume can't silently corrupt the scar metric.
+SPACING_BOUNDS = {"lateral": (0.0050, 0.0140), "depth": (0.0025, 0.0040), "slice": (0.020, 0.060)}
+
+
+def validate_spacing(spacing_xyz) -> list:
+    """Return human-readable warnings for any (lateral, depth, slice) spacing that
+    falls outside the plausible Avanti range — purely advisory, never raises."""
+    sp = [float(s) for s in spacing_xyz[:3]]
+    names = ("lateral", "depth", "slice")
+    warns = []
+    for val, name in zip(sp, names):
+        lo, hi = SPACING_BOUNDS[name]
+        if not (lo <= val <= hi):
+            warns.append(f"{name} spacing {val:.5f}mm outside Avanti range [{lo}, {hi}]")
+    return warns
 
 
 def oct_to_dicom(oct_path: str | Path, output_path: str | Path,
@@ -424,27 +532,45 @@ def write_volume_nifti(vol_zyx: np.ndarray, out_path: str | Path,
     return str(out_path)
 
 
-def _spacing_from_params(params: dict | None):
+def _resolve_spacing(params: dict | None, companion_txt: str | Path | None = None,
+                     n_frames: int | None = None):
+    """Resolve (lateral, depth, slice) spacing with precedence: explicit params >
+    companion-.txt-derived per-scan geometry > Avanti constants. The companion is
+    the per-scan source of truth (XY Scan Size1 varies 4–6mm between scans)."""
+    geom = {}
+    if companion_txt and Path(companion_txt).exists():
+        geom = companion_geometry(companion_txt, n_frames)
     p = params or {}
-    return (float(p.get("lateral_spacing", LATERAL_SPACING)),
-            float(p.get("depth_spacing", DEPTH_SPACING)),
-            float(p.get("slice_spacing", SLICE_SPACING)))
+
+    def pick(key: str, default: float) -> float:
+        if p.get(key) is not None:
+            return float(p[key])
+        if geom.get(key) is not None:
+            return float(geom[key])
+        return default
+
+    return (pick("lateral_spacing", LATERAL_SPACING),
+            pick("depth_spacing", DEPTH_SPACING),
+            pick("slice_spacing", SLICE_SPACING))
 
 
 def raw_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
-                     volume_index: int = 0, params: dict | None = None) -> str:
+                     volume_index: int = 0, params: dict | None = None,
+                     companion_txt: str | Path | None = None) -> str:
     """Raw .OCT z-stack → NIfTI (no corrections) for inspection/scrubbing."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
-    return write_volume_nifti(vol, out_nifti, _spacing_from_params(params))
+    sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
+    return write_volume_nifti(vol, out_nifti, sp)
 
 
 def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             params: dict | None = None, volume_index: int = 0,
-                            progress=None) -> str:
+                            progress=None, companion_txt: str | Path | None = None) -> str:
     """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
+    sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
     corrected = smooth_volume(vol, params, progress=progress)
-    return write_volume_nifti(corrected, out_nifti, _spacing_from_params(params))
+    return write_volume_nifti(corrected, out_nifti, sp)
 
 
 # ── CLI: run the heavy pipeline in an isolated subprocess (called by the sidecar,
@@ -458,10 +584,12 @@ if __name__ == "__main__":
     ap.add_argument("out_nifti")
     ap.add_argument("--params", default="{}")
     ap.add_argument("--volume-index", type=int, default=0)
+    ap.add_argument("--companion-txt", default="")
     a = ap.parse_args()
     _p = _json.loads(a.params)
+    _comp = a.companion_txt or None
     if a.mode == "raw":
-        raw_oct_to_nifti(a.oct_path, a.out_nifti, volume_index=a.volume_index, params=_p)
+        raw_oct_to_nifti(a.oct_path, a.out_nifti, volume_index=a.volume_index, params=_p, companion_txt=_comp)
     else:
-        preprocess_oct_to_nifti(a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index)
+        preprocess_oct_to_nifti(a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp)
     print("OK " + str(a.out_nifti))

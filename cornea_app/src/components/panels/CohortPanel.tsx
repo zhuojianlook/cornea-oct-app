@@ -29,6 +29,7 @@ export function CohortPanel() {
   const [busy, setBusy] = useState(false);
   const [step, setStep] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
+  const pollFails = useRef(0);
   const setCaseId = useCaseStore((s) => s.setCaseId);
   const openCase = useCaseStore((s) => s.openCase);
   const exportNnunet = useCaseStore((s) => s.exportNnunet);
@@ -47,22 +48,37 @@ export function CohortPanel() {
     } catch (e) { setStep(`Scan failed: ${msg(e)}`); } finally { setBusy(false); }
   };
 
+  const stopPolling = () => {
+    if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+  };
+
   const poll = async () => {
     try {
       const s = await api.json<Status>("/api/cohort/status");
+      pollFails.current = 0;
       setStatus(s);
-      if (!s.running && pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; setBusy(false); }
-    } catch { /* keep polling */ }
+      if (!s.running) { stopPolling(); setBusy(false); }
+    } catch (e) {
+      // Tolerate transient blips, but don't poll a dead backend forever with the UI
+      // stuck busy — give up after several consecutive failures and surface it.
+      pollFails.current += 1;
+      if (pollFails.current >= 5) {
+        stopPolling();
+        setBusy(false);
+        setStep(`Lost contact with the backend while polling cohort status: ${msg(e)}`);
+      }
+    }
   };
 
   const run = async () => {
     if (!dir.trim()) return;
     setBusy(true); setStep("Starting batch…");
+    pollFails.current = 0;
     try {
       await api.json("/api/cohort/run", "POST", JSON.stringify({ directory: dir.trim(), params: {} }));
       setStep("Running — preprocess → SAM2 → scar → consensus per eye. This takes a while.");
       await poll();
-      if (pollRef.current) window.clearInterval(pollRef.current);
+      stopPolling();
       pollRef.current = window.setInterval(poll, 3000);
     } catch (e) { setStep(`Run failed: ${msg(e)}`); setBusy(false); }
   };

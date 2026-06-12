@@ -44,6 +44,25 @@ def parse_case_meta(input_volume: str | None) -> dict:
     return meta
 
 
+def resolve_case_meta(case_id: str) -> dict:
+    """Best-effort patient/eye/date/variant for a case, so EVERY row (including the
+    consensus row, the deliverable biomarker) carries a mergeable key:
+      1. consensus cases inherit the reference member's identity (variant='consensus');
+      2. OCT cases parse the ORIGINAL oct_source filename — it preserves the '(N)'
+         replicate suffix that the safe-id'd working filename collapses to '_N';
+      3. legacy cases fall back to the input_volume name."""
+    m = orch.read_manifest(case_id) or {}
+    rep = m.get("consensus_report") or {}
+    ref = rep.get("reference")
+    if ref and ref != case_id:
+        return {**resolve_case_meta(ref), "variant": "consensus"}
+    for key in ("oct_source", "input_volume"):
+        meta = parse_case_meta(m.get(key))
+        if meta.get("patient_id"):
+            return meta
+    return parse_case_meta(None)
+
+
 def _cases_with_labelmap() -> list[str]:
     if not settings.CASES_ROOT.exists():
         return []
@@ -73,7 +92,7 @@ def build_row(case_id: str) -> dict | None:
     raw = np.asarray(img.dataobj).astype(np.float32)   # comparable reflectivity for density
     m = scar_mod.quantify(arr, spacing, density_vol_ijk=raw)
     dens = m.get("scar_density", {})
-    meta = parse_case_meta((orch.read_manifest(case_id) or {}).get("input_volume"))
+    meta = resolve_case_meta(case_id)
     return {
         "case": case_id, **meta,
         "scar_present": m["scar_present"],

@@ -243,11 +243,14 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
     import sam2_segment  # lazy: only pull in torch/CUDA when actually segmenting
     import nibabel as nib
     orch.ensure_case_dirs(case_id)
+    if not req.planes:
+        raise HTTPException(400, "Request at least one plane.")
     base = _ensure_volume_nifti(case_id)            # SAM2 likes natural raw contrast
     work = orch.case_root(case_id) / "sam2_work"
+    vote = max(1, min(req.vote, len(req.planes)))   # vote can't exceed #planes (else always empty)
     with _GPU_LOCK:                                  # one SAM2/CUDA inference at a time
         label, meta = sam2_segment.segment_volume(
-            base, work, planes=tuple(req.planes), vote=req.vote)
+            base, work, planes=tuple(req.planes), vote=vote)
     if label.sum() == 0:
         raise HTTPException(500, f"SAM2 produced an empty mask: {meta}")
     # Persist as the canonical labelmap so the overlay and nnU-Net export use it.
@@ -325,6 +328,7 @@ class ScarAutoRequest(BaseModel):
     percentile: float = 88.0     # sensitivity: flag the brightest (100−percentile)% of cornea
     min_voxels: int = 500        # continuity: drop connected components smaller than this
     erode_surface: int = 6       # drop the epithelium/Bowman's/endothelium reflective rind
+    replace: bool = False        # False: merge candidates with existing scar (keep manual edits)
 
 
 @app.post("/api/case/{case_id}/scar/auto")
@@ -344,15 +348,17 @@ def scar_auto(case_id: str, req: ScarAutoRequest) -> dict:
     work = _working_volume(case_id)                 # contrast-enhanced volume the user sees
     vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)
     raw = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
+    had_scar = bool((arr == 2).any())
     scar_mask = scar_mod.detect_scar_in_cornea(vol, arr, percentile=req.percentile,
                                                min_voxels=req.min_voxels, erode_surface=req.erode_surface)
-    new_label = scar_mod.apply_scar_to_labelmap(arr, scar_mask)
+    new_label = scar_mod.apply_scar_to_labelmap(arr, scar_mask, replace=req.replace)
     labels.write_label_nifti(new_label, base, labels.corrected_path(case_id))
     postprocess.render_seg_previews(work, new_label, orch.segmentation_preview_dir(case_id), density_vol=vol)
     metrics = scar_mod.quantify(new_label, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
     orch.write_manifest_value(case_id, {"scar_metrics": metrics,
                                         "segmentation_preview_dir": str(orch.segmentation_preview_dir(case_id))})
     return {"case_info": orch.current_case_info(case_id), "metrics": metrics,
+            "merged_with_existing": had_scar and not req.replace,
             "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
 
@@ -423,6 +429,11 @@ def scar_sam2_hint(case_id: str, req: ScarHintRequest) -> dict:
     points = [p.model_dump() for p in req.points]
     if not any(p["positive"] for p in points):
         raise HTTPException(400, "Add at least one positive (scar) click.")
+    s = arr.shape
+    for p in points:                                # reject OOB clicks before the GPU lock
+        ijk = p.get("ijk") or []
+        if len(ijk) != 3 or not all(0 <= ijk[d] < s[d] for d in range(3)):
+            raise HTTPException(400, f"Click {ijk} is outside the volume {tuple(s)}.")
     base = _ensure_volume_nifti(case_id)
     work_vol = _working_volume(case_id)
     vol = np.asarray(nib.load(str(work_vol)).dataobj).astype(np.float32)
@@ -532,13 +543,29 @@ def _read_label_ijk(path: Path) -> np.ndarray:
     return np.rint(np.asarray(nib.load(str(path)).dataobj)).astype(np.uint8)
 
 
+def _consensus_case_id(cases: List[str], group: str | None = None) -> str:
+    """Deterministic consensus case id. An explicit `group` (the cohort path) wins;
+    otherwise derive a stable EYE-LEVEL id from the members' shared identity
+    (`case_<patient>_<eye>_consensus`, lowercased to match the cohort exactly) so the
+    endpoint and the cohort converge on ONE id instead of the old order-dependent
+    `{cases[0]}_consensus`. Falls back to an order-independent id if unparseable."""
+    if group:
+        return orch.safe_case_id(group)
+    m0 = orch.read_manifest(cases[0]) if cases else {}
+    meta = metrics_export.parse_case_meta(m0.get("oct_source") or m0.get("input_volume"))
+    if meta.get("patient_id") and meta.get("eye"):
+        return orch.safe_case_id(f"case_{meta['patient_id'].lower()}_{meta['eye'].lower()}_consensus")
+    return orch.safe_case_id("_".join(sorted(cases)) + "_consensus")
+
+
 def _build_consensus_case(cases: List[str], group: str | None = None,
                           reference: str | None = None, ensure: bool = True) -> tuple[str, dict]:
     """Segment each scan (if needed), register + vote a partial-overlap consensus, render
     the per-tab previews, and persist. Shared by the /consensus/build endpoint and the
     cohort batch. Returns (consensus_case_id, report)."""
     import nibabel as nib
-    if len(cases) < 2:
+    cases = list(dict.fromkeys(cases))      # de-dupe members (order-preserving) so a
+    if len(cases) < 2:                      # repeated id can't double-count in CV%
         raise ValueError("Need at least 2 scans of the same eye for consensus.")
     seg_errors: dict = {}
     if ensure:
@@ -550,7 +577,7 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
             except Exception as exc:  # noqa: BLE001
                 seg_errors[cid] = str(exc)
 
-    ccid = orch.safe_case_id(group or f"{cases[0]}_consensus")
+    ccid = _consensus_case_id(cases, group)
     orch.ensure_case_dirs(ccid)
     report = consensus_mod.build_consensus(cases, ccid, reference)
     report["segmentation_errors"] = seg_errors
@@ -621,14 +648,18 @@ def _nifti_frames(path: Path) -> int:
         return 0
 
 
-def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int) -> None:
+def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int,
+                    companion: str | None = None) -> None:
     """Run the oct_preprocess CLI in an isolated subprocess (keeps its fork-based
     parallelism away from the sidecar's CUDA/torch state). New session so a timeout can
-    reap the whole fork-pool process group."""
+    reap the whole fork-pool process group. `companion` = the .txt filespec whose
+    per-scan geometry (XY Scan Size1 etc.) is baked into the NIfTI spacing."""
     import os
     import signal
     cmd = [sys.executable, str(Path(oct_mod.__file__)), mode, str(src), str(out),
            "--params", json.dumps(params or {}), "--volume-index", str(vi)]
+    if companion:
+        cmd += ["--companion-txt", str(companion)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         _, err = proc.communicate(timeout=1200)
@@ -644,18 +675,37 @@ def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int) -> No
 
 
 def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict) -> dict:
-    """Point the case at `work` as its volume, drop stale segmentation, render grayscale."""
+    """Point the case at `work` as its volume, drop stale segmentation, render grayscale.
+    Records the resolved per-scan voxel spacing (from the companion .txt) and warns if it
+    falls outside the plausible Avanti range — a wrong-geometry volume silently corrupts
+    every downstream scar mm³/mm² metric."""
+    import nibabel as nib
+    spacing = None
+    geom_warnings: list = []
+    try:
+        spacing = [float(z) for z in nib.load(str(work)).header.get_zooms()[:3]]
+        geom_warnings = oct_mod.validate_spacing(spacing)
+    except Exception:  # noqa: BLE001
+        pass
     orch.write_manifest_value(case_id, {
         "input_volume": str(work), "corrected_volume": str(work),
-        "oct_preprocessed": preprocessed, **extra,
+        "oct_preprocessed": preprocessed, "oct_spacing": spacing, **extra,
     })
-    seg_dir = orch.segmentation_preview_dir(case_id)
-    if not preprocessed and seg_dir.exists():
+    if not preprocessed:
+        # Showing a RAW capture (fresh scrub or a switched volume_index): drop any stale
+        # segmentation from a prior capture so it can't be applied to the new volume (and
+        # write_label_nifti's shape guard can't later reject a mismatched leftover).
         import shutil
-        shutil.rmtree(seg_dir, ignore_errors=True)
+        seg_dir = orch.segmentation_preview_dir(case_id)
+        if seg_dir.exists():
+            shutil.rmtree(seg_dir, ignore_errors=True)
+        labels.corrected_path(case_id).unlink(missing_ok=True)
+        orch.case_qa_json(case_id).unlink(missing_ok=True)
+        orch.write_manifest_value(case_id, {"scar_metrics": None})
     base = _ensure_volume_nifti(case_id)
     postprocess.render_context_previews(base, orch.context_preview_dir(case_id))
-    return {"case_info": orch.current_case_info(case_id),
+    return {"case_info": orch.current_case_info(case_id), "spacing": spacing,
+            "geometry_warnings": geom_warnings,
             "images": orch.preview_images_from_dir("Context", orch.context_preview_dir(case_id))}
 
 
@@ -719,7 +769,7 @@ def oct_volume(case_id: str, req: OctPreprocessRequest) -> dict:
     show_corrected = bool(m.get("oct_preprocessed")) and work.exists() and not changed_index
     if not show_corrected:
         try:
-            oct_mod.raw_oct_to_nifti(src, work, volume_index=vi)
+            oct_mod.raw_oct_to_nifti(src, work, volume_index=vi, companion_txt=m.get("companion_txt"))
         except oct_mod.MissingCompanionError as exc:
             raise HTTPException(400, str(exc))           # actionable: user forgot the .txt
         except Exception as exc:  # noqa: BLE001
@@ -741,7 +791,7 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         raise HTTPException(400, f"Case {case_id} has no .OCT source.")
     vi = req.volume_index if req.volume_index is not None else int(m.get("oct_volume_index", 0))
     work = _oct_working_path(case_id, src)
-    _run_oct_worker("preprocess", src, work, req.params or {}, vi)
+    _run_oct_worker("preprocess", src, work, req.params or {}, vi, companion=m.get("companion_txt"))
     extra = {"oct_volume_index": vi, "oct_params": req.params or {}}
     if req.classification:
         extra["scar_classification"] = req.classification
@@ -791,10 +841,12 @@ _GPU_LOCK = threading.Lock()
 
 
 def _cohort_case_conflict(cid: str, full_path: str) -> bool:
-    """True if a case with this id already references a DIFFERENT .OCT (by full path, so
-    same-basename scans in different patient folders don't collide / get overwritten)."""
+    """True if a case with this id already references a DIFFERENT scan. Compared by
+    BASENAME (matching _oct_case_taken), so the SAME .OCT re-loaded from a different
+    location reuses its case instead of forking a "_2" duplicate. The cid already encodes
+    patient/eye/series, so a basename match within one cid is necessarily the same scan."""
     src = orch.read_manifest(cid).get("oct_source")
-    return bool(src) and str(Path(src)) != str(Path(full_path))
+    return bool(src) and Path(src).name != Path(full_path).name
 
 
 def _cohort_make_case(scan: dict, used: set) -> str:
@@ -829,13 +881,14 @@ def _cohort_worker(params: dict, do_preprocess: bool) -> None:
                     sc["case_id"] = cid
                     work = _oct_working_path(cid, sc["_scan"]["path"])
                     m = orch.read_manifest(cid)
+                    companion = sc["_scan"].get("companion")
                     if do_preprocess and not m.get("oct_preprocessed"):
                         sc["status"] = "preprocessing"
-                        _run_oct_worker("preprocess", sc["_scan"]["path"], work, params, 0)
+                        _run_oct_worker("preprocess", sc["_scan"]["path"], work, params, 0, companion=companion)
                         orch.write_manifest_value(cid, {"input_volume": str(work), "corrected_volume": str(work),
                                                         "oct_preprocessed": True, "oct_params": params})
                     elif not work.exists():
-                        _run_oct_worker("raw" if not do_preprocess else "preprocess", sc["_scan"]["path"], work, params, 0)
+                        _run_oct_worker("raw" if not do_preprocess else "preprocess", sc["_scan"]["path"], work, params, 0, companion=companion)
                         orch.write_manifest_value(cid, {"input_volume": str(work), "corrected_volume": str(work),
                                                         "oct_preprocessed": do_preprocess})
                     sc["status"] = "segmenting"
@@ -862,7 +915,14 @@ def _cohort_worker(params: dict, do_preprocess: bool) -> None:
                     g["error"] = str(exc)[:300]
             elif len(ok) == 1:
                 g["single_case"] = ok[0]
-            g["status"] = "done"
+            # Don't paint a failed group green: surface consensus/segmentation failures.
+            if g.get("error"):
+                g["status"] = "error"
+            elif not ok:
+                g["status"] = "error"
+                g["error"] = "all scans in this group failed to preprocess/segment"
+            else:
+                g["status"] = "done"
         _COHORT["done"] = True
     except Exception as exc:  # noqa: BLE001
         _COHORT["error"] = str(exc)[:500]
@@ -938,6 +998,17 @@ def export_nnunet(req: ExportRequest) -> dict:
     if not cases:
         raise HTTPException(400, "No cases with a segmentation to export. Run SAM2 first.")
     dataset_dir = export_mod.DATASET_ROOT / req.dataset_name
+    export_mod.clean_dataset(dataset_dir)           # drop orphans from a prior export
+    # Leakage guard: warn if both a consensus case and its own member repeats are in the
+    # set — training on correlated repeats of one eye (and across train/val) inflates
+    # apparent accuracy. Caller can pass an explicit `cases` subset to avoid it.
+    case_set = set(cases)
+    leakage = []
+    for cid in cases:
+        members = set(orch.read_manifest(cid).get("consensus_cases") or [])
+        overlap = members & case_set
+        if overlap:
+            leakage.append({"consensus_case": cid, "member_repeats_also_exported": sorted(overlap)})
     results = []
     for cid in cases:
         base = orch.case_root(cid) / "previews" / "volume.nii.gz"
@@ -953,7 +1024,8 @@ def export_nnunet(req: ExportRequest) -> dict:
             results.append({"case_id": cid, "exported": False, "reason": str(exc)})
     num = sum(1 for r in results if r.get("exported"))
     export_mod.write_dataset_json(dataset_dir, num)
-    return {"dataset_dir": str(dataset_dir), "num_training": num, "results": results}
+    return {"dataset_dir": str(dataset_dir), "num_training": num, "results": results,
+            "leakage_warning": leakage}
 
 
 def main() -> None:

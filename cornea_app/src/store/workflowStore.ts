@@ -76,6 +76,7 @@ interface WorkflowState {
 
   setStage: (s: Stage) => void;
   set: <K extends keyof WorkflowState>(key: K, value: WorkflowState[K]) => void;
+  resetForCase: () => void;
   initTabs: (isConsensus: boolean) => void;
   selectTab: (tab: string) => void;
   setOverlayMode: (mode: OverlayMode) => void;
@@ -136,6 +137,31 @@ export const useWorkflowStore = create<WorkflowState>()(
     set: (key, value) =>
       set((state) => {
         (state as Record<string, unknown>)[key as string] = value;
+      }),
+
+    // Clear per-case workflow state when switching cases so the previous scan's scar
+    // metrics / QA / stage / hints / tab routing can't bleed into the new one. Keeps
+    // user PREFERENCES (opacity, sensitivity, brush, pen) — only the case-specific
+    // results are reset.
+    resetForCase: () =>
+      set((s) => {
+        s.stage = 1;
+        s.segLoaded = false;
+        s.segQa = null;
+        s.scarMetrics = null;
+        s.scarSummaryInfo = null;
+        s.correcting = false;
+        s.hintMode = false;
+        s.scarHints = [];
+        s.scarEditMode = false;
+        s.scarErase = false;
+        s.previewGroup = null;
+        s.activeTab = "consensus";
+        s.overlayMode = "self";
+        s.segBusy = false;
+        s.scarBusy = false;
+        s.status = { kind: "idle", title: "Waiting", detail: "Segment the cornea to begin." };
+        s.segVersion += 1;
       }),
 
     // Multi-scan consensus: when a consensus case opens, start on the Consensus tab

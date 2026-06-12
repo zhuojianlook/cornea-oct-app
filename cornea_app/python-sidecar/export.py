@@ -22,6 +22,14 @@ NNUNET_LABELS = label_mod.NNUNET_LABELS
 DATASET_ROOT = settings.WORKSPACE_ROOT / "output" / "nnunet"
 
 
+def clean_dataset(dataset_dir: Path) -> None:
+    """Wipe imagesTr/labelsTr before a re-export so deleted/renamed cases (e.g. the old
+    "_2" duplicates) don't linger as orphan training pairs that silently inflate the set.
+    Only the two image/label subdirs are removed; any hand-added metadata is preserved."""
+    for sub in ("imagesTr", "labelsTr"):
+        shutil.rmtree(dataset_dir / sub, ignore_errors=True)
+
+
 def export_case(case_id: str, dataset_dir: Path, base_nifti: Path) -> dict:
     cid = orch.safe_case_id(case_id)
     images = dataset_dir / "imagesTr"

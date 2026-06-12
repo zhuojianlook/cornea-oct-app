@@ -191,10 +191,11 @@ export function OctLoader() {
     }
     setBusy(true);
     setReport(null);
+    let failed = 0;
     try {
       for (let k = 0; k < sel.length; k++) {
         const { s, i } = sel[k];
-        setStep(`Preprocessing ${k + 1}/${sel.length} — ${s.filename} (OCT→correct, ~25s)`);
+        setStep(`Preprocessing ${k + 1}/${sel.length} — ${s.filename} (OCT→correct, up to ~20 min if the backend is busy)`);
         patch(i, { status: "preprocessing" });
         try {
           await api.json(`/api/case/${s.caseId}/oct-preprocess`, "POST", JSON.stringify({
@@ -207,9 +208,13 @@ export function OctLoader() {
           if (s.caseId === activeId) initTabs(false);
         } catch (e) {
           patch(i, { status: "error", error: msg(e) });
+          failed++;
         }
       }
-      setStep("Preprocessing complete. Now Run SAM2 + consensus on the corrected scans.");
+      // Don't claim success when some scans failed — surface the partial result.
+      setStep(failed
+        ? `Preprocessing finished: ${sel.length - failed}/${sel.length} OK, ${failed} failed (see the red rows).`
+        : "Preprocessing complete. Now Run SAM2 + consensus on the corrected scans.");
     } catch (e) {
       setStep(`Preprocessing failed: ${msg(e)}`);
     } finally {
@@ -227,15 +232,30 @@ export function OctLoader() {
     setBusy(true);
     setReport(null);
     try {
+      // Segment each scan independently — one scan's SAM2 failure must NOT abort the
+      // whole batch; build the consensus over the scans that succeeded (the backend
+      // excludes failures too), and surface which ones dropped out.
+      const segmented: string[] = [];
+      const failed: string[] = [];
       for (const cid of ok) {
         setStep(`Segmenting ${cid} (SAM2 + scar, ~2–3 min)…`);
-        await api.json(`/api/case/${cid}/consensus-segment`, "POST", JSON.stringify({}));
+        try {
+          await api.json(`/api/case/${cid}/consensus-segment`, "POST", JSON.stringify({}));
+          segmented.push(cid);
+        } catch (e) {
+          failed.push(cid);
+          setScans((cur) => cur.map((s) => (s.caseId === cid ? { ...s, status: "error", error: msg(e) } : s)));
+        }
       }
-      let active = ok[0];
-      if (ok.length > 1) {
+      if (segmented.length < 1) {
+        setStep(`All ${ok.length} scan(s) failed to segment — see the red rows.`);
+        return;
+      }
+      let active = segmented[0];
+      if (segmented.length > 1) {
         setStep("Registering repeat scans and voting the scar…");
         const res = await api.json<{ consensus_case: string; report: ConsensusReport }>(
-          "/api/consensus/build", "POST", JSON.stringify({ cases: ok }),
+          "/api/consensus/build", "POST", JSON.stringify({ cases: segmented }),
         );
         active = res.consensus_case;
         setReport(res.report);
@@ -244,7 +264,7 @@ export function OctLoader() {
       setCaseId(active);
       await openCase();
       setStage(2);
-      setStep(null);
+      setStep(failed.length ? `Done — ${failed.length} scan(s) failed and were excluded from the consensus.` : null);
     } catch (e) {
       setStep(`SAM2 / consensus failed: ${msg(e)}`);
     } finally {

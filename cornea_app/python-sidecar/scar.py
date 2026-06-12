@@ -94,10 +94,16 @@ def detect_scar_in_cornea(vol_ijk: np.ndarray, labelmap_ijk: np.ndarray,
     return np.isin(lbl, keep) & cornea
 
 
-def apply_scar_to_labelmap(labelmap_ijk: np.ndarray, scar_mask: np.ndarray) -> np.ndarray:
-    """Return a 0/1/2 labelmap with scar overlaid on cornea (scar overrides cornea)."""
+def apply_scar_to_labelmap(labelmap_ijk: np.ndarray, scar_mask: np.ndarray,
+                           replace: bool = False) -> np.ndarray:
+    """Return a 0/1/2 labelmap with scar overlaid on cornea (scar overrides cornea).
+
+    replace=False (default): MERGE — union the new candidates with existing scar so a
+    re-run never silently erases the expert's manual scar (or finds nothing and wipes
+    it). replace=True: discard prior scar first (a clean re-detection)."""
     out = labelmap_ijk.copy()
-    out[(out == SCAR)] = CORNEA           # reset any prior scar back to cornea
+    if replace:
+        out[(out == SCAR)] = CORNEA       # clean re-detection: reset prior scar to cornea
     out[scar_mask & (out == CORNEA)] = SCAR
     return out
 

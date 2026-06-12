@@ -2,6 +2,11 @@ import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
 import { api, checkHealth, resourceUrl } from "../api/client";
 import type { AppConfig, CaseInfo } from "../api/types";
+import { useWorkflowStore } from "./workflowStore";
+
+// The last case openCase() actually switched to — so we only reset the per-case
+// workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
+let _lastOpenedCase: string | null = null;
 
 interface CaseState {
   config: AppConfig | null;
@@ -116,6 +121,11 @@ export const useCaseStore = create<CaseState>()(
       });
       try {
         const info = await api.json<CaseInfo>("/api/case", "POST", JSON.stringify({ case_id: id }));
+        if (info.case_id !== _lastOpenedCase) {
+          // Switching to a different case: clear the prior case's stale workflow state.
+          useWorkflowStore.getState().resetForCase();
+          _lastOpenedCase = info.case_id;
+        }
         set((s) => {
           s.caseInfo = info;
           s.caseId = info.case_id;

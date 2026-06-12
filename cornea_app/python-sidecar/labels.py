@@ -34,9 +34,21 @@ def best_labelmap_nnunet(case_id: str) -> tuple[np.ndarray | None, str | None]:
 
 
 def write_label_nifti(arr_ijk: np.ndarray, base_nifti: Path, dst: Path) -> Path:
+    """Write the labelmap, stamped with the base volume's affine. Atomic (write to a
+    temp then os.replace) so a crash mid-write can't corrupt the canonical labelmap, and
+    shape-guarded so a stale label from a different capture can't be stamped with the
+    wrong geometry."""
+    import os
     base = nib.load(str(base_nifti))
+    arr = np.ascontiguousarray(arr_ijk.astype(np.uint8))
+    if tuple(base.shape[:3]) != tuple(arr.shape[:3]):
+        raise ValueError(
+            f"Label shape {tuple(arr.shape[:3])} != base volume shape {tuple(base.shape[:3])}; "
+            f"refusing to stamp a mismatched affine onto {dst.name}.")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(np.ascontiguousarray(arr_ijk.astype(np.uint8)), base.affine), str(dst))
+    tmp = dst.with_name("_tmp_" + dst.name)             # keeps .nii.gz so nibabel gzips
+    nib.save(nib.Nifti1Image(arr, base.affine), str(tmp))
+    os.replace(str(tmp), str(dst))                      # atomic rename on the same filesystem
     return dst
 
 
