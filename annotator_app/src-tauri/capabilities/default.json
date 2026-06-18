@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Annotator: dialogs + broad filesystem read/write (user picks arbitrary NIfTI folders and an output folder; config lives in the app-config dir under $HOME).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "fs:default",
+    { "identifier": "fs:allow-read-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }] },
+    { "identifier": "fs:allow-write-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }] },
+    { "identifier": "fs:allow-read-dir", "allow": [{ "path": "**" }, { "path": "$HOME/**" }] },
+    { "identifier": "fs:allow-mkdir", "allow": [{ "path": "**" }, { "path": "$HOME/**" }] },
+    { "identifier": "fs:allow-exists", "allow": [{ "path": "**" }, { "path": "$HOME/**" }] }
+  ]
+}
