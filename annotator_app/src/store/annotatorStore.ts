@@ -3,7 +3,7 @@ import * as nv from "../niivue/nvController";
 import * as io from "../tauri/io";
 
 export type Pen = 0 | 1 | 2; // 0 erase, 1 cornea, 2 scar
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.1.2";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {

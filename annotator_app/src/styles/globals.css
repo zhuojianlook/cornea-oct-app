@@ -10,7 +10,7 @@ html {
   --c-surface2: #38383a;
   --c-border: #5a5a5e;
   --c-text: #e5e5ea;
-  --c-text-dim: #a6a6ac;
+  --c-text-dim: #b8b8be;
   --c-accent: #7aa6d6;
   --c-red: #ff453a;
   --c-green: #63a66a;
@@ -20,6 +20,12 @@ html {
 *::before,
 *::after {
   box-sizing: border-box;
+}
+
+/* Keyboard focus indicator for all interactive elements (incl. native list-row buttons). */
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -1px;
 }
 
 html,

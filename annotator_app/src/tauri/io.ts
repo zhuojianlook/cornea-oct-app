@@ -16,7 +16,17 @@ export interface ManifestRow {
 
 const isNifti = (n: string) => /\.nii(\.gz)?$/i.test(n);
 
+/** True only inside the Tauri desktop shell. In a plain browser (dev/preview) there is no native
+    filesystem, so the file-backed helpers below degrade gracefully instead of throwing. */
+function inTauri(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    ("__TAURI_INTERNALS__" in window || "__TAURI__" in window || "__TAURI_IPC__" in window)
+  );
+}
+
 export async function pickFolder(title = "Choose a folder of NIfTI volumes"): Promise<string | null> {
+  if (!inTauri()) return null;
   const r = await open({ directory: true, multiple: false, title });
   return typeof r === "string" ? r : null;
 }
@@ -59,6 +69,7 @@ export async function loadConfig(): Promise<AppConfig> {
 }
 
 export async function saveConfig(cfg: AppConfig): Promise<void> {
+  if (!inTauri()) return; // no native FS in the browser — skip persistence (don't block the user)
   await writeTextFile(await configPath(), JSON.stringify(cfg, null, 2));
 }
 

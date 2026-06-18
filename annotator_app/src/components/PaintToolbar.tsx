@@ -1,14 +1,22 @@
-/* Pen controls: paint/navigate, pens (cornea/scar/erase), brush size, filled-region pen, smart fill,
-   undo, clear, and drawing opacity. Disabled until a volume is loaded. */
+/* Pen controls, grouped into sections: Mode · Pen (+ size, fill) · Actions · Opacity.
+   Disabled until a volume is loaded. */
 
+import type { ReactNode } from "react";
 import { Button, Slider, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
 import { useStore, type Pen } from "../store/annotatorStore";
 
 const PENS: { value: Pen; label: string; color: string }[] = [
   { value: 1, label: "Cornea", color: "#1ab2ff" },
   { value: 2, label: "Scar", color: "#ff453a" },
-  { value: 0, label: "Erase", color: "#8e8e93" },
+  { value: 0, label: "Erase", color: "#c7c7cc" },
 ];
+
+const Label = ({ children }: { children: ReactNode }) => (
+  <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.07em", color: "var(--c-text-dim)" }}>{children}</span>
+);
+const Sep = () => <div style={{ width: 1, height: 24, background: "var(--c-border)", flex: "none" }} />;
+
+const tbSx = { py: 0.4, px: 1.1, fontSize: 12, textTransform: "none" as const, lineHeight: 1.4 };
 
 export function PaintToolbar() {
   const { loaded, penLabel, penSize, penFilled, paintMode, drawOpacity,
@@ -16,49 +24,63 @@ export function PaintToolbar() {
   const off = !loaded;
 
   return (
-    <div className="flex items-center gap-3 px-3 border-b overflow-x-auto [&>*]:shrink-0"
-      style={{ minHeight: 40, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)", opacity: off ? 0.5 : 1 }}>
+    <div className="flex items-center gap-3 px-4 border-b overflow-x-auto [&>*]:flex-none"
+      style={{ minHeight: 50, flex: "none", backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)", opacity: off ? 0.55 : 1 }}>
+
+      {/* Mode */}
       <ToggleButtonGroup size="small" exclusive disabled={off} value={paintMode ? "paint" : "nav"}
         onChange={(_, v) => v !== null && setPaintMode(v === "paint")}>
-        <ToggleButton value="paint" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>✏ Paint</ToggleButton>
-        <ToggleButton value="nav" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>✋ Navigate</ToggleButton>
+        <ToggleButton value="paint" sx={tbSx}>✏ Paint</ToggleButton>
+        <ToggleButton value="nav" sx={tbSx}>✋ Navigate</ToggleButton>
       </ToggleButtonGroup>
-      <div style={{ width: 1, height: 22, background: "var(--c-border)" }} />
 
-      <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--c-text-dim)" }}>Pen</span>
+      <Sep />
+
+      {/* Pen */}
+      <Label>Pen</Label>
       <ToggleButtonGroup size="small" exclusive disabled={off || !paintMode} value={penLabel} onChange={(_, v) => v !== null && setPenLabel(v)}>
         {PENS.map((p) => (
-          <ToggleButton key={p.value} value={p.value}>
-            <span style={{ width: 10, height: 10, borderRadius: "50%", background: p.color, marginRight: 6, display: "inline-block" }} />
+          <ToggleButton key={p.value} value={p.value} sx={tbSx}>
+            <span style={{ width: 10, height: 10, borderRadius: "50%", background: p.color, marginRight: 7,
+                           display: "inline-block", boxShadow: "0 0 0 1px rgba(0,0,0,0.35)" }} />
             {p.label}
           </ToggleButton>
         ))}
       </ToggleButtonGroup>
 
-      <Tooltip title="Brush size (voxels)">
-        <div className="flex items-center gap-2" style={{ width: 120 }}>
-          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>Size</span>
+      <Tooltip title="Brush size (voxels)" arrow>
+        <div className="flex items-center gap-2" style={{ width: 132 }}>
+          <Label>Size</Label>
           <Slider size="small" min={1} max={15} step={1} value={penSize} valueLabelDisplay="auto"
             disabled={off} onChange={(_, v) => setPenSize(v as number)} />
+          <span style={{ fontSize: 11, width: 16, textAlign: "right", color: "var(--c-text-dim)" }}>{penSize}</span>
         </div>
       </Tooltip>
-      <Tooltip title="Filled pen: draw a closed outline → fill the enclosed region (one stroke per patch).">
-        <ToggleButton size="small" value="filled" selected={penFilled} disabled={off || !paintMode}
-          onChange={() => setPenFilled(!penFilled)} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>▣ Fill region</ToggleButton>
-      </Tooltip>
-      <Tooltip title="Smart fill (GrowCut): scribble a little Cornea AND Scar on a few slices, then propagate through the whole 3-D volume by intensity similarity — so you don't paint every slice.">
-        <Button size="small" variant="contained" disabled={off} onClick={() => smartFill()}
-          sx={{ py: 0.25, px: 1.2, fontSize: 12, textTransform: "none" }}>✨ Smart fill</Button>
-      </Tooltip>
-      <Button size="small" variant="outlined" disabled={off} onClick={() => undo()}
-        sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>↶ Undo</Button>
-      <Button size="small" variant="outlined" color="inherit" disabled={off} onClick={() => clearDrawing()}
-        sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Clear</Button>
 
-      <Tooltip title="Label overlay opacity">
-        <div className="flex items-center gap-2" style={{ width: 120 }}>
-          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>Opacity</span>
-          <Slider size="small" min={0.1} max={1} step={0.05} value={drawOpacity}
+      <Tooltip title="Filled pen: draw a closed outline → fill the enclosed region (one stroke per patch)." arrow>
+        <ToggleButton size="small" value="filled" selected={penFilled} disabled={off || !paintMode}
+          onChange={() => setPenFilled(!penFilled)} sx={tbSx}>▣ Fill region</ToggleButton>
+      </Tooltip>
+
+      <Sep />
+
+      {/* Actions */}
+      <Tooltip title="Smart fill (GrowCut): scribble a little Cornea AND Scar on a few slices, then propagate through the whole 3-D volume by intensity similarity — so you don't paint every slice." arrow>
+        <span>
+          <Button size="small" variant="contained" disableElevation disabled={off} onClick={() => smartFill()} sx={tbSx}>✨ Smart fill</Button>
+        </span>
+      </Tooltip>
+      <Button size="small" variant="outlined" disabled={off} onClick={() => undo()} sx={tbSx}>↶ Undo</Button>
+      <Button size="small" variant="outlined" color="inherit" disabled={off} onClick={() => clearDrawing()} sx={tbSx}>Clear</Button>
+
+      <Sep />
+
+      {/* Opacity */}
+      <Tooltip title="Label overlay opacity" arrow>
+        <div className="flex items-center gap-2" style={{ width: 150 }}>
+          <Label>Opacity</Label>
+          <Slider size="small" min={0.1} max={1} step={0.05} value={drawOpacity} valueLabelDisplay="auto"
+            valueLabelFormat={(v) => `${Math.round(v * 100)}%`}
             disabled={off} onChange={(_, v) => setDrawOpacity(v as number)} />
         </div>
       </Tooltip>

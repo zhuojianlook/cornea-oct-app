@@ -5,6 +5,7 @@ import { VolumeBrowser } from "./components/VolumeBrowser";
 import { AnnotatorCanvas } from "./components/AnnotatorCanvas";
 import { PaintToolbar } from "./components/PaintToolbar";
 import { SaveBar } from "./components/SaveBar";
+import { StatusBar } from "./components/StatusBar";
 import { UpdateBanner } from "./components/UpdateBanner";
 
 export default function App() {
@@ -27,13 +28,14 @@ export default function App() {
       <SaveBar />
       <PaintToolbar />
       <div className="flex flex-1 min-h-0">
-        <aside className="flex-none overflow-y-auto border-r" style={{ width: 280, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}>
+        <aside className="flex-none border-r" style={{ width: 292, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}>
           <VolumeBrowser />
         </aside>
         <main className="flex flex-1 min-h-0 min-w-0">
           <AnnotatorCanvas />
         </main>
       </div>
+      <StatusBar />
     </div>
   );
 }

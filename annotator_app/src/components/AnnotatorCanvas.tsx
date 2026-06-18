@@ -2,11 +2,12 @@
    paint/navigate, sized brush cursor coloured by pen, hidden in 3D / navigate). */
 
 import { useEffect, useRef, useState } from "react";
-import { ToggleButton, ToggleButtonGroup } from "@mui/material";
+import { CircularProgress, ToggleButton, ToggleButtonGroup } from "@mui/material";
 import { attach, setView, webglFailure, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 
 const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff453a" };
+const PEN_NAME: Record<number, string> = { 0: "Erase", 1: "Cornea", 2: "Scar" };
 const VIEWS: ViewName[] = ["multi", "axial", "coronal", "sagittal", "render"];
 
 export function AnnotatorCanvas() {
@@ -15,6 +16,7 @@ export function AnnotatorCanvas() {
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
   const [brush, setBrush] = useState<{ x: number; y: number } | null>(null);
   const loaded = useStore((s) => s.loaded);
+  const busy = useStore((s) => s.busy);
   const paintMode = useStore((s) => s.paintMode);
   const penLabel = useStore((s) => s.penLabel);
   const penSize = useStore((s) => s.penSize);
@@ -37,15 +39,28 @@ export function AnnotatorCanvas() {
 
   return (
     <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
-      <div className="flex items-center gap-2 px-3 border-b" style={{ height: 36, borderColor: "var(--c-border)" }}>
+      {/* View bar */}
+      <div className="flex items-center gap-3 px-4 border-b flex-none min-w-0" style={{ height: 44, borderColor: "var(--c-border)" }}>
         <ToggleButtonGroup size="small" exclusive value={view} onChange={(_, v) => { if (v) { setV(v); setView(v); } }}>
           {VIEWS.map((vw) => (
-            <ToggleButton key={vw} value={vw} style={{ textTransform: "capitalize" }}>{vw === "render" ? "3D" : vw}</ToggleButton>
+            <ToggleButton key={vw} value={vw} sx={{ py: 0.4, px: 1.25, fontSize: 12, textTransform: "capitalize" }}>
+              {vw === "render" ? "3D" : vw}
+            </ToggleButton>
           ))}
         </ToggleButtonGroup>
         <span className="flex-1" />
-        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>{volName ?? "no volume"}</span>
+        {loaded && paintMode && view !== "render" && (
+          <span className="flex items-center gap-1.5" style={{ fontSize: 11, color: "var(--c-text-dim)" }}>
+            <span style={{ width: 9, height: 9, borderRadius: "50%", background: PEN_COLOR[penLabel],
+                           display: "inline-block", boxShadow: "0 0 0 1px rgba(0,0,0,0.35)" }} />
+            {PEN_NAME[penLabel]} · {penSize}px
+          </span>
+        )}
+        <span className="truncate flex-none" style={{ fontSize: 12, maxWidth: 240, color: loaded ? "var(--c-text)" : "var(--c-text-dim)" }}
+          title={volName ?? ""}>{volName ?? "no volume"}</span>
       </div>
+
+      {/* Canvas + overlays */}
       <div
         className="relative flex-1 min-h-0 min-w-0"
         onMouseMove={(e) => {
@@ -64,9 +79,24 @@ export function AnnotatorCanvas() {
             background: penLabel === 0 ? "transparent" : `${PEN_COLOR[penLabel]}22`,
           }} />
         )}
+        {/* Opaque cover when nothing is shown yet (hides niivue's default canvas text). */}
         {!loaded && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ color: "var(--c-text-dim)" }}>
-            <span>Select a volume from the left to annotate.</span>
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6"
+            style={{ background: "var(--c-bg)", color: "var(--c-text-dim)" }}>
+            {busy ? (
+              <>
+                <CircularProgress size={26} />
+                <span style={{ fontSize: 13 }}>Loading volume…</span>
+              </>
+            ) : (
+              <>
+                <span style={{ fontSize: 40, opacity: 0.5 }}>🩻</span>
+                <span style={{ fontSize: 14, color: "var(--c-text)" }}>No volume loaded</span>
+                <span style={{ fontSize: 12, maxWidth: 320 }}>
+                  Pick a folder and choose a volume on the left to start annotating.
+                </span>
+              </>
+            )}
           </div>
         )}
       </div>
