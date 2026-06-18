@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Cornea Annotator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.cornea.annotator",
   "build": {
     "frontendDist": "../dist",
@@ -26,6 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -35,6 +36,14 @@
     ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/zhuojianlook/cornea-oct-app/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZFNjVFQThCQ0Q0MkMyRDQKUldUVXdrTE5pK3BsL2lRNEpCWnVOTCt0eXcxSGVjUkZXendlV2U0RzRXL2N1ZFF0Z2tYYzVsMmMK"
     }
   }
 }

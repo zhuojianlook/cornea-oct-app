@@ -8,10 +8,10 @@ html {
   --c-bg: #1c1c1e;
   --c-surface: #2c2c2e;
   --c-surface2: #38383a;
-  --c-border: #48484a;
+  --c-border: #5a5a5e;
   --c-text: #e5e5ea;
-  --c-text-dim: #8e8e93;
-  --c-accent: #5a7fa8;
+  --c-text-dim: #a6a6ac;
+  --c-accent: #7aa6d6;
   --c-red: #ff453a;
   --c-green: #63a66a;
 }

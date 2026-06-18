@@ -14,7 +14,7 @@ export function LoginGate() {
   const [name, setName] = useState("");
 
   return (
-    <div className="flex h-screen w-screen items-center justify-center" style={{ backgroundColor: "var(--c-bg)", color: "var(--c-text)" }}>
+    <div className="flex h-full w-full items-center justify-center" style={{ backgroundColor: "var(--c-bg)", color: "var(--c-text)" }}>
       <div className="flex flex-col gap-4 p-8 rounded-lg" style={{ width: 420, backgroundColor: "var(--c-surface)", border: "1px solid var(--c-border)" }}>
         <div>
           <Typography variant="h6">Cornea Ground-Truth Annotator</Typography>

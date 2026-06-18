@@ -53,7 +53,15 @@ Outputs go to `src-tauri/target/release/bundle/`:
 - **Windows**: `.msi` / `.exe` (build on Windows)
 
 Tauri does **not** cross-compile — build each OS on that OS, or use the included GitHub Actions workflow
-(`.github/workflows/build.yml`) to produce all three from CI.
+(`.github/workflows/build-annotator.yml`, at the repo root) to produce all three from CI.
+
+## Updating
+From **v0.1.1** on, the app has a built-in updater: on launch it checks the latest GitHub release and,
+if a newer **signed** build exists, shows an "Install & restart" banner (one click — download, verify,
+relaunch). Updates are verified against the public key in `src-tauri/tauri.conf.json`; CI signs each
+release with the matching private key (stored as the `TAURI_SIGNING_PRIVATE_KEY` Actions secret) and
+publishes `latest.json`. The updater only applies versions released *after* the one introducing it, so
+**v0.1.0 → v0.1.1 must be installed manually once**; subsequent updates are automatic.
 
 ## Notes
 - Reuses the main app's hardened brush UX (paint/navigate toggle, brush-size cursor, filled pen, GrowCut
