@@ -1,0 +1,85 @@
+name: build-cornea
+
+# Builds the Cornea OCT desktop shell (Route A: native Tauri window that spawns the user's Python
+# sidecar). Download installers from the run's Artifacts; a `cornea-v*` tag also cuts a Release.
+# The shell does NOT bundle Python/torch — users still need the sidecar's Python deps installed.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["feat/cornea-tauri"]
+    tags: ["cornea-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            label: macos-arm64
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            label: macos-intel
+          - platform: ubuntu-22.04
+            args: ""
+            label: linux
+          - platform: windows-latest
+            args: ""
+            label: windows
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install JS deps
+        working-directory: cornea_app
+        run: npm install
+
+      - name: Build app + (on tag) publish Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Distinct signing key from the annotator so the two apps' updaters stay independent.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CORNEA_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CORNEA_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: cornea_app
+          args: ${{ matrix.args }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ${{ github.ref_type == 'tag' && format('Cornea OCT {0}', github.ref_name) || '' }}
+          releaseDraft: false
+          prerelease: false
+
+      - name: Upload installers as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cornea-${{ matrix.label }}
+          if-no-files-found: warn
+          path: |
+            cornea_app/src-tauri/target/**/release/bundle/**/*.dmg
+            cornea_app/src-tauri/target/**/release/bundle/**/*.app.tar.gz
+            cornea_app/src-tauri/target/**/release/bundle/**/*.AppImage
+            cornea_app/src-tauri/target/**/release/bundle/**/*.deb
+            cornea_app/src-tauri/target/**/release/bundle/**/*.rpm
+            cornea_app/src-tauri/target/**/release/bundle/**/*.msi
+            cornea_app/src-tauri/target/**/release/bundle/**/*.exe
+            cornea_app/src-tauri/target/**/release/bundle/**/*.sig
