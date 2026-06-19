@@ -5,7 +5,7 @@ import { create } from "zustand";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
-export const APP_VERSION = "0.0.1";
+export const APP_VERSION = "0.0.2";
 
 interface UpdaterState {
   update: Update | null;
