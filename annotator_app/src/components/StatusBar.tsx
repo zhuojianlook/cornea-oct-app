@@ -1,7 +1,7 @@
 /* Slim footer: live status message (left), active volume + session id (right). */
 
 import { CircularProgress } from "@mui/material";
-import { useStore } from "../store/annotatorStore";
+import { useStore, APP_VERSION } from "../store/annotatorStore";
 
 export function StatusBar() {
   const { status, busy, sessionId, activeVolume, updateMsg, updateBusy } = useStore();
@@ -15,6 +15,7 @@ export function StatusBar() {
       <span className="flex-1" />
       {activeVolume && <span className="truncate flex-none" style={{ maxWidth: 320 }} title={activeVolume.name}>{activeVolume.name}</span>}
       <span title="Session id — this annotation occasion (one per app launch)">⧗ {sessionId}</span>
+      <span className="flex-none" style={{ opacity: 0.8 }} title="App version">v{APP_VERSION}</span>
     </footer>
   );
 }
