@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2; // 0 erase, 1 cornea, 2 scar
-export const APP_VERSION = "0.1.8";
+export const APP_VERSION = "0.1.9";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {

@@ -1,5 +1,21 @@
 use tauri::Manager;
 
+// Restart after an update. Tauri's relaunch() can silently no-op on Linux AppImages, so on Linux we
+// exec the (already-updated) $APPIMAGE directly — exec replaces this process, guaranteeing a restart
+// into the new version. Falls back to Tauri's restart elsewhere / if exec fails.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+  #[cfg(target_os = "linux")]
+  {
+    if let Ok(appimage) = std::env::var("APPIMAGE") {
+      use std::os::unix::process::CommandExt;
+      let err = std::process::Command::new(&appimage).exec(); // only returns on failure
+      log::error!("exec restart failed: {err}");
+    }
+  }
+  app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   // Linux AppImage self-update: Tauri downloads the new AppImage to a temp dir and renames it over
@@ -16,6 +32,7 @@ pub fn run() {
     .plugin(tauri_plugin_fs::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_process::init())
+    .invoke_handler(tauri::generate_handler![restart_app])
     .setup(|app| {
       // Self-update (desktop only; the updater crate isn't built for mobile targets).
       #[cfg(desktop)]
