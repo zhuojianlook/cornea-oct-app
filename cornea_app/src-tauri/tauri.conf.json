@@ -39,7 +39,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://zhuojianlook.github.io/cornea-oct-app/cornea-latest.json"
+        "https://github.com/zhuojianlook/cornea-oct-app/releases/download/cornea-updater/cornea-latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk1Q0NFQzY3MzRENjRFM0QKUldROVR0WTBaK3pNbFJSbkt2WnRCcHJPQnRkU2w1R3hUZXpQa2gzMmR5NlNTSnpZMW03VzA3dC8K"
     }

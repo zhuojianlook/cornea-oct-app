@@ -8,13 +8,20 @@ import json
 import os
 from pathlib import Path
 
-_STATE_FILE = Path(__file__).parent / ".sidecar_state.json"
+# Optional data-dir override: a packaged/installed app sets CORNEA_DATA_DIR (the OS app-data dir,
+# passed by the Tauri shell) so cases + state are written somewhere user-writable instead of the
+# read-only app bundle. Unset (dev / run-from-source) keeps the original in-repo paths exactly.
+_DATA_DIR = os.environ.get("CORNEA_DATA_DIR")
+_STATE_FILE = (Path(_DATA_DIR) / ".sidecar_state.json") if _DATA_DIR else (Path(__file__).parent / ".sidecar_state.json")
 _PERSIST_KEYS = ("slicer_executable", "default_case_id")
 
-# python-sidecar/ -> cornea_app/ -> Integration/
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+# python-sidecar/ -> cornea_app/ -> Integration/ (dev); or CORNEA_DATA_DIR when packaged.
+WORKSPACE_ROOT = Path(_DATA_DIR) if _DATA_DIR else Path(__file__).resolve().parents[2]
 CASES_ROOT = WORKSPACE_ROOT / "cases"
 SLICER_BRIDGE_DIR = WORKSPACE_ROOT / "slicer_bridge"
+if _DATA_DIR:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    CASES_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_SLICER_EXECUTABLE = os.environ.get(
     "SLICER_EXECUTABLE",

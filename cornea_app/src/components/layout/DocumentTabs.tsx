@@ -8,6 +8,7 @@ import { useEffect } from "react";
 import { ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
+import { useUpdater } from "../../store/updaterStore";
 import type { ConsensusReport, ConsensusScan } from "../../api/types";
 
 // case_cs001_od_v3 → "v3"; falls back to the last underscore segment.
@@ -21,6 +22,9 @@ export function DocumentTabs() {
   const initTabs = useWorkflowStore((s) => s.initTabs);
   const selectTab = useWorkflowStore((s) => s.selectTab);
   const setOverlayMode = useWorkflowStore((s) => s.setOverlayMode);
+  const updBusy = useUpdater((s) => s.busy);
+  const updMsg = useUpdater((s) => s.msg);
+  const checkUpdates = useUpdater((s) => s.check);
 
   const m = caseInfo?.manifest as Record<string, unknown> | undefined;
   const scans = (m?.consensus_cases as string[] | undefined) ?? null;
@@ -111,6 +115,19 @@ export function DocumentTabs() {
           )}
         </>
       )}
+
+      {/* Manual update check (the app also checks silently on launch). */}
+      <div className="flex items-center gap-2" style={{ marginLeft: "auto" }}>
+        {updMsg && <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{updMsg}</span>}
+        <Tooltip title="Check for a newer version and install it in-app" arrow>
+          <button onClick={() => checkUpdates(true)} disabled={updBusy}
+            className="text-[11px] whitespace-nowrap"
+            style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4,
+                     color: "var(--c-text-dim)", cursor: updBusy ? "default" : "pointer", padding: "2px 8px" }}>
+            {updBusy ? "Checking…" : "⟳ Updates"}
+          </button>
+        </Tooltip>
+      </div>
     </div>
   );
 }

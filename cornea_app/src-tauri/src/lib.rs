@@ -62,15 +62,20 @@ fn spawn_sidecar(app: &tauri::AppHandle) -> Option<Child> {
     let sidecar_dir = res.join("python-sidecar");
     let script = sidecar_dir.join("api_server.py");
     let python = std::env::var("CORNEA_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    match Command::new(&python)
-        .arg(&script)
+
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
         .arg("--port")
         .arg(SIDECAR_PORT)
         .current_dir(&sidecar_dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    // Installed app: write cases/state to the OS app-data dir, not the read-only bundle.
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&data_dir);
+        cmd.env("CORNEA_DATA_DIR", &data_dir);
+    }
+    match cmd.spawn() {
         Ok(child) => {
             log::info!("spawned sidecar: {python} {script:?} --port {SIDECAR_PORT}");
             Some(child)

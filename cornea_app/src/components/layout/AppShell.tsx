@@ -6,22 +6,26 @@
 import { useEffect } from "react";
 import { Alert } from "@mui/material";
 import { useCaseStore } from "../../store/caseStore";
+import { useUpdater } from "../../store/updaterStore";
 import { DocumentTabs } from "./DocumentTabs";
 import { Sidebar } from "./Sidebar";
 import { Toolbar } from "./Toolbar";
 import { StageStepper } from "../stepper/StageStepper";
 import { VolumeCanvas } from "../viewer/VolumeCanvas";
+import { UpdateBanner } from "../UpdateBanner";
 
 export function AppShell() {
   const config = useCaseStore((s) => s.config);
   const apiError = useCaseStore((s) => s.apiError);
   const fetchConfig = useCaseStore((s) => s.fetchConfig);
+  const checkUpdates = useUpdater((s) => s.check);
 
   useEffect(() => {
     // Connect to the sidecar but start blank — don't auto-open the last case or show
     // its segmentation on refresh.
     fetchConfig();
-  }, [fetchConfig]);
+    checkUpdates(false); // silent launch check; the banner only shows if an update exists
+  }, [fetchConfig, checkUpdates]);
 
   if (!config) {
     return (
@@ -62,6 +66,7 @@ export function AppShell() {
         </Alert>
       )}
 
+      <UpdateBanner />
       <DocumentTabs />
 
       {/* Fluid: the workspace fills whatever width Chrome allocates (w-full). A modest min-width is
