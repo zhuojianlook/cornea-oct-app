@@ -1,13 +1,18 @@
-/* App header: brand, who is annotating (+ switch user), the output folder, and Save ground truth.
-   Transient status + session id live in the bottom StatusBar, keeping this header uncluttered. */
+/* App header: brand, who is annotating (+ switch user), output folder, Save ground truth, and the
+   meta controls (check for updates, About, language toggle). Transient status + session id + version
+   live in the bottom StatusBar. */
 
-import { Button, Tooltip } from "@mui/material";
+import { useState } from "react";
+import { Button, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
 import { useStore } from "../store/annotatorStore";
+import { tr } from "../i18n";
+import { AboutDialog } from "./AboutDialog";
 
 export function SaveBar() {
-  const { activeUser, outputDir, loaded, busy, save, chooseOutputDir } = useStore();
+  const { activeUser, outputDir, loaded, busy, save, chooseOutputDir, lang, setLang } = useStore();
   const checkUpdates = useStore((s) => s.checkUpdates);
   const updateBusy = useStore((s) => s.updateBusy);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const outName = outputDir ? outputDir.split(/[/\\]/).filter(Boolean).pop() : null;
 
   return (
@@ -18,51 +23,62 @@ export function SaveBar() {
         <span className="flex items-center justify-center rounded-md"
           style={{ width: 28, height: 28, background: "var(--c-accent)", color: "#fff", fontSize: 16, fontWeight: 700 }}>◎</span>
         <div className="leading-tight">
-          <div style={{ fontSize: 13, fontWeight: 600 }}>Ground-Truth Annotator</div>
-          <div style={{ fontSize: 10, color: "var(--c-text-dim)" }}>Cornea scar segmentation</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>{tr(lang, "app.title")}</div>
+          <div style={{ fontSize: 10, color: "var(--c-text-dim)" }}>{tr(lang, "app.subtitle")}</div>
         </div>
       </div>
 
       <div style={{ width: 1, height: 26, background: "var(--c-border)" }} className="flex-none mx-1" />
 
       {/* Identity */}
-      <Tooltip title="The active annotator — recorded with every saved label for inter-/intra-observer analysis" arrow>
+      <Tooltip title={tr(lang, "save.userTip")} arrow>
         <span className="flex items-center gap-1.5 rounded-full flex-none"
           style={{ fontSize: 12, padding: "4px 10px", background: "var(--c-surface)", border: "1px solid var(--c-border)" }}>
           <span style={{ fontSize: 12 }}>👤</span><b>{activeUser}</b>
         </span>
       </Tooltip>
-      <Button variant="text" title="Switch to a different annotator"
+      <Button variant="text" title={tr(lang, "save.switchTip")}
         onClick={() => useStore.setState({ activeUser: null, loaded: false, activeVolume: null })}
-        sx={{ fontSize: 11, minWidth: 0, px: 0.75, color: "var(--c-text-dim)" }}>switch</Button>
+        sx={{ fontSize: 11, minWidth: 0, px: 0.75, color: "var(--c-text-dim)" }}>{tr(lang, "save.switch")}</Button>
 
       <div className="flex-1" />
 
       {/* Output folder */}
-      <Tooltip title={outputDir ? `Ground-truth output folder:\n${outputDir}` : "Choose where annotations are saved"} arrow>
+      <Tooltip title={outputDir ? `${tr(lang, "save.outputTip")}\n${outputDir}` : tr(lang, "save.outputTip")} arrow>
         <Button variant="outlined" onClick={() => chooseOutputDir()} sx={{ fontSize: 11, maxWidth: 220 }}>
-          <span className="truncate">{outName ? `📁 ${outName}` : "Set output folder…"}</span>
+          <span className="truncate">{outName ? `📁 ${outName}` : tr(lang, "save.setOutput")}</span>
         </Button>
       </Tooltip>
 
       {/* Save */}
       <Button variant="contained" color="success" disableElevation disabled={!loaded || busy} onClick={() => save()}
-        sx={{ fontWeight: 600, px: 1.75 }}
-        title="Write the painted labelmap (0/1/2) + a manifest row tagged with your username and this session">
-        Save ground truth
+        sx={{ fontWeight: 600, px: 1.75 }} title={tr(lang, "save.saveTip")}>
+        {tr(lang, "save.save")}
       </Button>
 
       <div style={{ width: 1, height: 26, background: "var(--c-border)" }} className="flex-none mx-1" />
 
-      {/* Manual update check (auto-checks on launch too) */}
-      <Tooltip title="Check for a newer version and install it in-app" arrow>
+      {/* Updates */}
+      <Tooltip title={tr(lang, "updates.tip")} arrow>
         <span className="flex-none">
           <Button variant="text" disabled={updateBusy} onClick={() => checkUpdates(true)}
             sx={{ fontSize: 11, minWidth: 0, px: 0.75, color: "var(--c-text-dim)" }}>
-            {updateBusy ? "Checking…" : "⟳ Updates"}
+            {updateBusy ? tr(lang, "updates.checking") : `⟳ ${tr(lang, "updates.label")}`}
           </Button>
         </span>
       </Tooltip>
+
+      {/* About */}
+      <Button variant="text" onClick={() => setAboutOpen(true)}
+        sx={{ fontSize: 11, minWidth: 0, px: 0.75, color: "var(--c-text-dim)" }}>{tr(lang, "about.label")}</Button>
+
+      {/* Language toggle */}
+      <ToggleButtonGroup size="small" exclusive value={lang} onChange={(_, v) => v && setLang(v)} className="flex-none">
+        <ToggleButton value="en" sx={{ py: 0, px: 1, fontSize: 11, textTransform: "none" }}>EN</ToggleButton>
+        <ToggleButton value="zh" sx={{ py: 0, px: 1, fontSize: 11, textTransform: "none" }}>中文</ToggleButton>
+      </ToggleButtonGroup>
+
+      <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
     </header>
   );
 }

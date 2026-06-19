@@ -7,7 +7,7 @@ import { readFile, writeFile, readTextFile, writeTextFile, readDir, mkdir, exist
 import { appConfigDir, join, basename } from "@tauri-apps/api/path";
 
 export interface VolumeEntry { name: string; path: string; }
-export interface AppConfig { users: string[]; outputDir: string | null; lastFolder: string | null; }
+export interface AppConfig { users: string[]; outputDir: string | null; lastFolder: string | null; lang: "en" | "zh"; }
 export interface ManifestRow {
   username: string; volume_stem: string; volume_path: string;
   session_id: string; saved_at: string; cornea_voxels: number; scar_voxels: number;
@@ -62,10 +62,11 @@ export async function loadConfig(): Promise<AppConfig> {
     const p = await configPath();
     if (await exists(p)) {
       const d = JSON.parse(await readTextFile(p));
-      return { users: Array.isArray(d.users) ? d.users : [], outputDir: d.outputDir ?? null, lastFolder: d.lastFolder ?? null };
+      return { users: Array.isArray(d.users) ? d.users : [], outputDir: d.outputDir ?? null,
+               lastFolder: d.lastFolder ?? null, lang: d.lang === "zh" ? "zh" : "en" };
     }
   } catch { /* fall through to defaults */ }
-  return { users: [], outputDir: null, lastFolder: null };
+  return { users: [], outputDir: null, lastFolder: null, lang: "en" };
 }
 
 export async function saveConfig(cfg: AppConfig): Promise<void> {

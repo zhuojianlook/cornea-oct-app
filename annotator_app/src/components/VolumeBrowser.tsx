@@ -3,9 +3,10 @@
 
 import { Button } from "@mui/material";
 import { useStore } from "../store/annotatorStore";
+import { tr } from "../i18n";
 
 export function VolumeBrowser() {
-  const { folder, volumes, activeVolume, annotated, busy, pickFolder, openVolume } = useStore();
+  const { folder, volumes, activeVolume, annotated, busy, pickFolder, openVolume, lang } = useStore();
   const folderName = folder ? folder.split(/[/\\]/).filter(Boolean).pop() : null;
   const nDone = volumes.filter((v) => annotated.has(v.name.replace(/\.nii(\.gz)?$/i, ""))).length;
 
@@ -13,10 +14,10 @@ export function VolumeBrowser() {
     <div className="flex flex-col h-full min-h-0">
       {/* Header */}
       <div className="flex items-center justify-between px-4 pt-3 pb-2 flex-none">
-        <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.07em", color: "var(--c-text-dim)" }}>Volumes</span>
+        <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.07em", color: "var(--c-text-dim)" }}>{tr(lang, "vol.volumes")}</span>
         {volumes.length > 0 && (
           <span style={{ fontSize: 10, color: "var(--c-text-dim)" }}>
-            {nDone > 0 && <b style={{ color: "var(--c-green)" }}>{nDone} done</b>}{nDone > 0 ? " / " : ""}{volumes.length}
+            {nDone > 0 && <b style={{ color: "var(--c-green)" }}>{nDone} {tr(lang, "vol.done")}</b>}{nDone > 0 ? " / " : ""}{volumes.length}
           </span>
         )}
       </div>
@@ -24,7 +25,7 @@ export function VolumeBrowser() {
       {/* Folder picker + path pill */}
       <div className="px-4 flex flex-col gap-1.5 flex-none">
         <Button variant="outlined" size="small" fullWidth disabled={busy} onClick={() => pickFolder()}>
-          {folder ? "Change folder…" : "Pick folder of NIfTI…"}
+          {folder ? tr(lang, "vol.change") : tr(lang, "vol.pick")}
         </Button>
         {folderName && (
           <div className="flex items-center gap-1.5 rounded px-2 py-1 truncate" title={folder ?? ""}
@@ -39,13 +40,13 @@ export function VolumeBrowser() {
         {!folder && (
           <div className="flex flex-col items-center text-center gap-1 px-3" style={{ marginTop: 28, color: "var(--c-text-dim)" }}>
             <span style={{ fontSize: 26, opacity: 0.6 }}>📂</span>
-            <span style={{ fontSize: 12 }}>No folder selected</span>
-            <span style={{ fontSize: 11 }}>Pick a folder of preprocessed <b>.nii / .nii.gz</b> volumes to begin.</span>
+            <span style={{ fontSize: 12 }}>{tr(lang, "vol.noFolder")}</span>
+            <span style={{ fontSize: 11 }}>{tr(lang, "vol.noFolderHint")}</span>
           </div>
         )}
         {folder && volumes.length === 0 && (
           <div className="text-center px-3" style={{ marginTop: 24, fontSize: 11, color: "var(--c-text-dim)" }}>
-            No <b>.nii / .nii.gz</b> files in this folder.
+            {tr(lang, "vol.noFiles")}
           </div>
         )}
         {volumes.map((v) => {

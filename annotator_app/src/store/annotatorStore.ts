@@ -1,11 +1,12 @@
 import { create } from "zustand";
 import type { Update } from "@tauri-apps/plugin-updater";
+import type { Lang } from "../i18n";
 import * as nv from "../niivue/nvController";
 import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2; // 0 erase, 1 cornea, 2 scar
-export const APP_VERSION = "0.1.4";
+export const APP_VERSION = "0.1.5";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {
@@ -30,6 +31,7 @@ interface State {
   // ui
   busy: boolean;
   status: string;
+  lang: Lang;
   // self-update
   update: Update | null;
   updateBusy: boolean;
@@ -37,6 +39,7 @@ interface State {
   updateMsg: string;
 
   init: () => Promise<void>;
+  setLang: (l: Lang) => void;
   checkUpdates: (manual: boolean) => Promise<void>;
   installUpdate: () => Promise<void>;
   dismissUpdate: () => void;
@@ -74,6 +77,7 @@ export const useStore = create<State>((set, get) => ({
   drawOpacity: 0.6,
   busy: false,
   status: "Select or add a user to begin.",
+  lang: "en",
   update: null,
   updateBusy: false,
   updatePct: null,
@@ -81,7 +85,12 @@ export const useStore = create<State>((set, get) => ({
 
   init: async () => {
     const cfg = await io.loadConfig();
-    set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder });
+    set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder, lang: cfg.lang });
+  },
+
+  setLang: (l) => {
+    set({ lang: l });
+    void io.saveConfig({ users: get().users, outputDir: get().outputDir, lastFolder: get().folder, lang: l });
   },
 
   // Check the GitHub release feed. `manual` surfaces "up to date"/error feedback; the silent
@@ -118,7 +127,7 @@ export const useStore = create<State>((set, get) => ({
     if (!u) return;
     const users = Array.from(new Set([...get().users, u])).sort();
     set({ users });
-    await io.saveConfig({ users, outputDir: get().outputDir, lastFolder: get().folder });
+    await io.saveConfig({ users, outputDir: get().outputDir, lastFolder: get().folder, lang: get().lang });
     await get().selectUser(u);
   },
 
@@ -135,7 +144,7 @@ export const useStore = create<State>((set, get) => ({
     try {
       const volumes = await io.listNifti(folder);
       set({ folder, volumes, status: `${volumes.length} volume(s) found. Select one to annotate.` });
-      await io.saveConfig({ users: get().users, outputDir: get().outputDir, lastFolder: folder });
+      await io.saveConfig({ users: get().users, outputDir: get().outputDir, lastFolder: folder, lang: get().lang });
     } catch (e) {
       set({ status: `Could not list folder: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
@@ -163,7 +172,7 @@ export const useStore = create<State>((set, get) => ({
     const dir = await io.pickFolder("Choose where to save ground-truth output");
     if (!dir) return;
     set({ outputDir: dir });
-    await io.saveConfig({ users: get().users, outputDir: dir, lastFolder: get().folder });
+    await io.saveConfig({ users: get().users, outputDir: dir, lastFolder: get().folder, lang: get().lang });
     if (get().activeUser) set({ annotated: await io.annotatedStems(dir, get().activeUser!) });
   },
 
