@@ -9,6 +9,7 @@ const STAGES = [
 export function StageStepper() {
   const stage = useWorkflowStore((s) => s.stage);
   const setStage = useWorkflowStore((s) => s.setStage);
+  const correcting = useWorkflowStore((s) => s.correcting);
 
   return (
     <div
@@ -20,10 +21,13 @@ export function StageStepper() {
         return (
           <div key={st.id} className="flex items-center">
             <button
-              onClick={() => setStage(st.id as Stage)}
+              onClick={() => { if (!correcting) setStage(st.id as Stage); }}
+              disabled={correcting}
+              title={correcting ? "Save or Cancel the correction first" : undefined}
               className="flex items-center gap-2 px-3 py-1 rounded text-xs"
               style={{
-                cursor: "pointer",
+                cursor: correcting ? "not-allowed" : "pointer",
+                opacity: correcting && !active ? 0.4 : 1,
                 backgroundColor: active ? "var(--c-accent)" : "transparent",
                 color: active ? "#fff" : "var(--c-text)",
               }}

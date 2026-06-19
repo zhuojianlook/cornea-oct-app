@@ -19,6 +19,9 @@ output/
 # SAM2 model checkpoint (downloaded, not tracked)
 cornea_app/sam2_ckpt/
 
+# Isolated nnU-Net training venv (created on demand, reuses system torch)
+cornea_app/.venv-nnunet/
+
 # Local tooling / agent scratch
 .agents/
 .claude/
@@ -29,3 +32,6 @@ cornea_app/sam2_ckpt/
 
 # sidecar persisted state (no secrets)
 cornea_app/python-sidecar/.sidecar_state.json
+
+# Playwright MCP automation artifacts (snapshots, console logs, screenshots)
+.playwright-mcp/

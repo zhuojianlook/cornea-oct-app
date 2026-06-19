@@ -160,6 +160,95 @@ def align_transform(fixed_vol_path: Path, fixed_label_path: Path,
     return base, mode
 
 
+# ── Stronger VOLUMETRIC registration (rigid → affine → denser cornea-driven BSpline) ──
+# Additive: the production cascade above is untouched. This recovers scale/shear (affine) + more
+# optical warp (denser BSpline) on the CORRECTED volumes, to tighten replicate alignment so the
+# post-segmentation scar overlaps better. Every stage is GUARDED on cornea Dice (best-of-previous),
+# and the BSpline is cornea-MASKED + regularised, so it aligns the cornea (carrying the scar inside
+# it) rather than deforming the scar to fake overlap. Volume CV is unaffected (measured native).
+def _affine_intensity(fi: sitk.Image, mi: sitk.Image, base: sitk.Transform) -> sitk.Transform:
+    """12-DOF affine (Mattes MI) starting from the rigid base — recovers scale/shear between repeats."""
+    R = sitk.ImageRegistrationMethod()
+    R.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    R.SetMetricSamplingStrategy(R.RANDOM)
+    R.SetMetricSamplingPercentage(0.05, seed=1)
+    R.SetInterpolator(sitk.sitkLinear)
+    R.SetOptimizerAsRegularStepGradientDescent(
+        learningRate=0.5, minStep=1e-4, numberOfIterations=80,
+        relaxationFactor=0.7, gradientMagnitudeTolerance=1e-6)
+    R.SetOptimizerScalesFromPhysicalShift()
+    R.SetShrinkFactorsPerLevel([2, 1])
+    R.SetSmoothingSigmasPerLevel([1.0, 0.0])
+    R.SetMovingInitialTransform(base)               # rigid as the starting point
+    R.SetInitialTransform(sitk.AffineTransform(3), inPlace=False)
+    aff = R.Execute(fi, mi)
+    return sitk.CompositeTransform([base, aff])
+
+
+def _strong_bspline(fb: sitk.Image, mb: sitk.Image, base: sitk.Transform,
+                    cornea_mask_b: sitk.Image, mesh=(8, 8, 6)) -> sitk.Transform:
+    """Denser cornea-masked BSpline (8x8x6 mesh vs the production 4^3) for residual optical warp."""
+    bspline = sitk.BSplineTransformInitializer(fb, list(mesh), order=3)
+    R = sitk.ImageRegistrationMethod()
+    R.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    R.SetMetricSamplingStrategy(R.RANDOM)
+    R.SetMetricSamplingPercentage(0.12, seed=1)
+    R.SetInterpolator(sitk.sitkLinear)
+    R.SetMetricFixedMask(cornea_mask_b)
+    R.SetOptimizerAsLBFGSB(
+        gradientConvergenceTolerance=1e-5, numberOfIterations=60,
+        maximumNumberOfCorrections=5, maximumNumberOfFunctionEvaluations=200,
+        costFunctionConvergenceFactor=1e7)
+    R.SetShrinkFactorsPerLevel([1])
+    R.SetSmoothingSigmasPerLevel([0.0])
+    R.SetMovingInitialTransform(base)
+    R.SetInitialTransform(bspline, inPlace=True)
+    R.Execute(fb, mb)
+    return sitk.CompositeTransform([base, bspline])
+
+
+def align_transform_v2(fixed_vol_path: Path, fixed_label_path: Path,
+                       moving_vol_path: Path, moving_label_path: Path) -> tuple[sitk.Transform, str]:
+    """Stronger volumetric alignment: rigid → affine → denser cornea-driven BSpline, each kept only
+    if it improves (rigid/affine) or doesn't degrade (BSpline) cornea overlap. Same return contract
+    as align_transform. Use for tighter replicate alignment / scar-overlap reproducibility."""
+    fvol, mvol = _read_vol(fixed_vol_path), _read_vol(moving_vol_path)
+    flab, mlab = _read_label(fixed_label_path), _read_label(moving_label_path)
+    fi, mi = _iso(fvol), _iso(mvol)
+    flab_iso = _iso(flab, interp=sitk.sitkNearestNeighbor)
+    ref_cm_iso = sitk.GetArrayFromImage(flab_iso) >= CORNEA_MIN
+
+    ident = identity()
+    d_id = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, ident)
+    # Stage 1: rigid (best-of-identity)
+    try:
+        rigid = _rigid_intensity(fi, mi)
+        d_rig = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, rigid)
+    except Exception:  # noqa: BLE001
+        rigid, d_rig = ident, -1.0
+    base, base_dice, mode = (rigid, d_rig, "rigid") if d_rig > d_id else (ident, d_id, "identity")
+    # Stage 2: affine (best-of-rigid)
+    try:
+        aff = _affine_intensity(fi, mi, base)
+        d_aff = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, aff)
+        if d_aff > base_dice:
+            base, base_dice, mode = aff, d_aff, ("rigid+affine" if base is rigid else "affine")
+    except Exception:  # noqa: BLE001
+        pass
+    # Stage 3: denser cornea-masked BSpline (anti-overfit guard on cornea Dice)
+    fb, mb = _iso(fvol, iso=ISO_B), _iso(mvol, iso=ISO_B)
+    flab_b = _iso(flab, interp=sitk.sitkNearestNeighbor, iso=ISO_B)
+    cornea_mask = sitk.Cast(sitk.BinaryDilate(sitk.BinaryThreshold(flab_b, CORNEA_MIN, 255, 1, 0), [4, 4, 2]), sitk.sitkUInt8)
+    try:
+        comp = _strong_bspline(fb, mb, base, cornea_mask)
+        d_bsp = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, comp)
+        if d_bsp >= base_dice - 0.002:
+            return comp, mode + "+bspline"
+    except Exception:  # noqa: BLE001
+        pass
+    return base, mode
+
+
 def resample_label(label_path: Path, fixed_path: Path, tx: sitk.Transform) -> np.ndarray:
     fixed = _read_vol(fixed_path)
     out = sitk.Resample(_read_label(label_path), fixed, tx, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)

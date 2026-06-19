@@ -115,6 +115,38 @@ def preview_images_from_dir(group: str, directory: Path) -> list[dict]:
     return images
 
 
+def preview_listing_from_dir(group: str, directory: Path, src_base: str) -> list[dict]:
+    """Like preview_images_from_dir but returns a lazy `src` URL (``src_base/<file>``) for
+    each PNG instead of an inline base64 data-URL. The client then loads only the slice on
+    screen, so a DENSE group (every slice of a scrub) is cheap to list and to view — the
+    base64 form would inline every slice (tens of MB) into one response."""
+    if not directory.exists():
+        return []
+    meta = preview_metadata_by_file(directory)
+    images = []
+    for path in png_paths_in_dir(directory):
+        m = meta.get(path.name, {})
+        try:
+            ver = int(path.stat().st_mtime)   # cache-bust: re-rendered PNGs get a new URL
+        except OSError:
+            ver = 0
+        images.append({
+            "label": f"{group} / {path.name}",
+            "path": str(path),
+            "group": group,
+            "file_name": path.name,
+            "data_url": "",
+            "src": f"{src_base}/{path.name}?v={ver}",
+            "orientation": m.get("orientation"),
+            "slice_index": m.get("slice_index"),
+            "source_width": m.get("source_width"),
+            "source_height": m.get("source_height"),
+            "image_width": m.get("image_width"),
+            "image_height": m.get("image_height"),
+        })
+    return images
+
+
 def current_case_info(case_id: str) -> dict:
     cid = safe_case_id(case_id)
     root = case_root(cid)

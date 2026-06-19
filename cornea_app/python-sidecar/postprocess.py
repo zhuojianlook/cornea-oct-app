@@ -25,11 +25,17 @@ def _spacing(affine: np.ndarray) -> list[float]:
 
 
 def render_seg_previews(volume_nifti: Path, arr_ijk: np.ndarray, out_dir: Path,
-                        density_vol: np.ndarray | None = None) -> int:
+                        density_vol: np.ndarray | None = None,
+                        dense_rotated: bool = False) -> int:
     """Render segmentation overlay PNGs from a labelmap, in-process (numpy).
 
     When `density_vol` is given, the scar is shown in 3 reflectivity tiers
-    (diffuse → dense) instead of flat red, so the mix of opacities is visible."""
+    (diffuse → dense) instead of flat red, so the mix of opacities is visible.
+
+    `dense_rotated=True` renders EVERY slice with the same rotation/size as the grayscale
+    context previews — used for the gallery's 3rd before/after panel so the overlay scrubs
+    in lock-step with raw/corrected (display-only; the clickable segmentation group stays
+    sparse + unrotated, so scar-edit/hint coordinates are unaffected)."""
     img = nib.load(str(volume_nifti))
     vol_kji = np.ascontiguousarray(np.asarray(img.dataobj).transpose(2, 1, 0))
     scar = arr_ijk == SCAR
@@ -46,8 +52,19 @@ def render_seg_previews(volume_nifti: Path, arr_ijk: np.ndarray, out_dir: Path,
     else:
         masks_by_name["scar"] = np.ascontiguousarray(scar.transpose(2, 1, 0))
     out_dir.mkdir(parents=True, exist_ok=True)
-    preview_io.save_previews(vol_kji, masks_by_name, str(out_dir), "segmentation",
-                             spacing_ijk=_spacing(img.affine), max_slices_per_orientation=9)
+    if dense_rotated:
+        preview_io.save_previews(
+            vol_kji, masks_by_name, str(out_dir), "segmentation",
+            spacing_ijk=_spacing(img.affine),
+            max_slices_per_orientation={"axial": 100000, "coronal": 100000, "sagittal": 100000},
+            max_dim=512, rotate={"sagittal": -1, "axial": 2}, compress_level=1)
+    else:
+        # Rotate + size-cap IDENTICALLY to the grayscale context previews so the segmentation
+        # overlay is geometrically the SAME as the before/after slices (clicks are made rotation-
+        # aware via the manifest's rotate_k, so scar edit/hint coordinates still map correctly).
+        preview_io.save_previews(vol_kji, masks_by_name, str(out_dir), "segmentation",
+                                 spacing_ijk=_spacing(img.affine), max_slices_per_orientation=9,
+                                 max_dim=512, rotate={"sagittal": -1, "axial": 2})
     return int(masks_by_name["cornea"].sum())
 
 
@@ -57,10 +74,16 @@ def render_context_previews(volume_nifti: Path, out_dir: Path) -> int:
     img = nib.load(str(volume_nifti))
     vol_kji = np.ascontiguousarray(np.asarray(img.dataobj).transpose(2, 1, 0))
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Dense AXIAL (= the OCT B-scan frames) so the user can actually scrub every frame;
-    # coronal/sagittal stay sampled. Size-capped so the (now ~100-slice) payload stays small.
+    # DENSE in ALL three orientations so scrubbing the raw volume never skips a slice
+    # (sagittal/coronal used to be sampled to 16, so dragging the slider jumped ~30 slices
+    # at a time — see the OCT smoothness review, which scrubs every sagittal slice). The
+    # PNGs are served lazily as URLs (one per request), so a dense group stays cheap on the
+    # client. Size-capped per slice so each PNG is small.
+    # Rotate for review so the cornea surface sits on top: sagittal 90° clockwise (k=-1),
+    # axial 180° (k=2). Display-only — segmentation previews are NOT rotated, so the scar
+    # edit / hint coordinate mapping is untouched.
     preview_io.save_previews(vol_kji, {}, str(out_dir), "context",
                              spacing_ijk=_spacing(img.affine),
-                             max_slices_per_orientation={"axial": 100000, "coronal": 16, "sagittal": 16},
-                             max_dim=512)
+                             max_slices_per_orientation={"axial": 100000, "coronal": 100000, "sagittal": 100000},
+                             max_dim=512, rotate={"sagittal": -1, "axial": 2})
     return int(vol_kji.size)

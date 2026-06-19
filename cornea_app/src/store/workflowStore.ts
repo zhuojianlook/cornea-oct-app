@@ -45,12 +45,16 @@ interface WorkflowState {
 
   // correction drawing
   penLabel: PenLabel;
+  penSize: number;        // brush thickness (voxels)
+  penFilled: boolean;     // filled pen: draw a closed outline → fill the enclosed region
+  paintMode: boolean;     // true = brush paints; false = navigate (click moves crosshair, no paint)
   drawOpacity: number;
   correcting: boolean;
 
   // scar
   scarMetrics: ScarMetrics | null;
   scarSensitivity: number; // 1–40; higher highlights more (percentile = 100 − this)
+  scarMethod: string; // scar strategy: hysteresis | normal_anchor | robust_mad | morph_lcc | brightness
   scarSummaryInfo: string | null;
 
   // SAM2 scar hints (click to guide)
@@ -69,6 +73,10 @@ interface WorkflowState {
   activeTab: string; // "consensus" or a scan caseId
   overlayMode: OverlayMode; // for a scan tab: its own scar vs the consensus
 
+  // Subgroup review: the consensus case to return to after focusing one of its scans
+  // to correct it (survives the case switch — deliberately NOT cleared by resetForCase).
+  reviewConsensusId: string | null;
+
   // busy + status
   segBusy: boolean;
   scarBusy: boolean;
@@ -84,8 +92,15 @@ interface WorkflowState {
   runSam2: () => Promise<void>;
   loadCorrectionLayer: () => Promise<void>;
   saveCorrection: () => Promise<void>;
+  cancelCorrection: () => Promise<void>;
+  undoCorrection: () => void;
   setPenLabel: (label: PenLabel) => void;
+  setPenSize: (n: number) => void;
+  setPenFilled: (f: boolean) => void;
+  setPaintMode: (on: boolean) => void;
+  runSmartFill: () => void;
   runScarAuto: () => Promise<void>;
+  runScarAutoSam2: () => Promise<void>;
   addScarHint: (hint: ScarHint) => void;
   clearScarHints: () => void;
   applyScarHints: () => Promise<void>;
@@ -106,11 +121,15 @@ export const useWorkflowStore = create<WorkflowState>()(
     segQa: null,
 
     penLabel: 1,
+    penSize: 3,
+    penFilled: false,
+    paintMode: true,
     drawOpacity: 0.5,
     correcting: false,
 
     scarMetrics: null,
     scarSensitivity: 10,
+    scarMethod: "hysteresis",
     scarSummaryInfo: null,
 
     hintMode: false,
@@ -124,6 +143,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     previewGroup: null,
     activeTab: "consensus",
     overlayMode: "self",
+    reviewConsensusId: null,
 
     segBusy: false,
     scarBusy: false,
@@ -143,7 +163,8 @@ export const useWorkflowStore = create<WorkflowState>()(
     // metrics / QA / stage / hints / tab routing can't bleed into the new one. Keeps
     // user PREFERENCES (opacity, sensitivity, brush, pen) — only the case-specific
     // results are reset.
-    resetForCase: () =>
+    resetForCase: () => {
+      nv.endDrawing();   // a case switch must clear any live drawing bitmap (else it leaks onto the new case)
       set((s) => {
         s.stage = 1;
         s.segLoaded = false;
@@ -162,7 +183,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.scarBusy = false;
         s.status = { kind: "idle", title: "Waiting", detail: "Segment the cornea to begin." };
         s.segVersion += 1;
-      }),
+      });
+    },
 
     // Multi-scan consensus: when a consensus case opens, start on the Consensus tab
     // (voted map); a single case clears tab routing so the gallery auto-selects.
@@ -224,15 +246,22 @@ export const useWorkflowStore = create<WorkflowState>()(
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
       try {
+        // Hide the committed colour overlay so it can't blend UNDER the editable drawing layer
+        // (two translucent label layers → muddy colours / erase looks like a no-op).
+        nv.removeSegmentation();
         await nv.loadDrawing(resourceUrl(`/api/case/${caseId}/segmentation-drawing.nii.gz?t=${Date.now()}`));
         nv.setDrawOpacity(get().drawOpacity);
-        nv.setPen(get().penLabel || 1);
+        nv.setPenSize(get().penSize);
+        const lbl = get().penLabel == null ? 1 : get().penLabel;   // keep Erase (0); only default null→1
+        nv.setPen(lbl, get().penFilled);
         set((s) => {
           s.correcting = true;
-          if (!s.penLabel) s.penLabel = 1;
-          s.status = { kind: "working", title: "Correcting segmentation", detail: "Pen: cornea=1, scar=3, background=2 (erase). Then Save correction." };
+          s.paintMode = true;   // start in paint mode (loadDrawing enabled the pen)
+          if (s.penLabel == null) s.penLabel = 1;
+          s.status = { kind: "working", title: "Correcting segmentation", detail: "Paint/Navigate toggle in the pen bar. Pen: cornea=blue, scar=red, background=orange (erase). Brush size, Fill region, Smart fill, Undo; then Save or Cancel." };
         });
       } catch (e) {
+        nv.endDrawing();
         set((s) => {
           s.status = { kind: "error", title: "Could not load correction layer", detail: e instanceof Error ? e.message : String(e) };
         });
@@ -251,6 +280,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (!bytes) throw new Error("Could not export the correction drawing.");
         const file = new File([bytes as unknown as BlobPart], "seg-drawing.nii.gz");
         const res = await api.upload<{ qa: Record<string, unknown> }>(`/api/case/${caseId}/segmentation/from-drawing`, [file]);
+        nv.endDrawing();   // clear the drawing bitmap BEFORE reloading the overlay (else it double-renders)
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
         set((s) => {
           s.segQa = res.qa;
@@ -270,11 +300,52 @@ export const useWorkflowStore = create<WorkflowState>()(
       }
     },
 
+    cancelCorrection: async () => {
+      // Discard the drawing edits and restore the committed overlay, without writing anything.
+      const caseId = useCaseStore.getState().caseId;
+      nv.endDrawing();
+      if (caseId) {
+        try { await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity); } catch { /* nothing to restore */ }
+      }
+      set((s) => {
+        s.correcting = false;
+        s.status = { kind: "idle", title: "Correction cancelled", detail: "Edits discarded; the labelmap is unchanged." };
+      });
+    },
+
+    undoCorrection: () => {
+      nv.undoDrawing();
+    },
+
     setPenLabel: (label) => {
-      nv.setPen(label);
+      nv.setPen(label, get().penFilled);
       set((s) => {
         s.penLabel = label;
       });
+    },
+
+    setPenSize: (n) => {
+      nv.setPenSize(n);
+      set((s) => { s.penSize = n; });
+    },
+
+    setPenFilled: (f) => {
+      nv.setPen(get().penLabel, f);   // re-arm the current pen as filled/unfilled
+      set((s) => { s.penFilled = f; });
+    },
+
+    setPaintMode: (on) => {
+      // Paint mode: brush draws. Navigate mode: drawing off → left-click moves the crosshair / scrubs
+      // slices without painting (resolves the crosshair-vs-paint input overlap).
+      if (on) nv.setPen(get().penLabel, get().penFilled);
+      nv.setDrawingEnabled(on);
+      set((s) => { s.paintMode = on; });
+    },
+
+    runSmartFill: () => {
+      // GrowCut propagates the scribbled bg/cornea/scar labels through the whole 3-D volume.
+      nv.smartFill();
+      set((s) => { s.segVersion = s.segVersion + 1; });
     },
 
     runScarAuto: async () => {
@@ -289,7 +360,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         const res = await api.json<{ metrics: ScarMetrics }>(
           `/api/case/${caseId}/scar/auto`,
           "POST",
-          JSON.stringify({ percentile }),
+          JSON.stringify({ percentile, method: get().scarMethod }),
         );
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
         set((s) => {
@@ -303,6 +374,40 @@ export const useWorkflowStore = create<WorkflowState>()(
       } catch (e) {
         set((s) => {
           s.status = { kind: "error", title: "Scar detection failed", detail: e instanceof Error ? e.message : String(e) };
+        });
+      } finally {
+        set((s) => {
+          s.scarBusy = false;
+        });
+      }
+    },
+
+    runScarAutoSam2: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => {
+        s.scarBusy = true;
+        s.status = { kind: "working", title: "Auto scar (SAM2 · 3 views)", detail: "Seeding from the brightest in-cornea tissue, running SAM2 on axial/coronal/sagittal as videos, then taking the ≥2-of-3 consensus. This takes ~1–2 min." };
+      });
+      try {
+        const percentile = Math.min(99, Math.max(60, 100 - get().scarSensitivity));
+        const res = await api.json<{ metrics: ScarMetrics }>(
+          `/api/case/${caseId}/scar/auto-sam2`,
+          "POST",
+          JSON.stringify({ percentile }),
+        );
+        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        set((s) => {
+          s.scarMetrics = res.metrics;
+          s.segLoaded = true;
+          s.segVersion += 1;
+          s.status = res.metrics.scar_present
+            ? { kind: "done", title: "Scar (SAM2 3-view consensus)", detail: `${res.metrics.scar_volume_mm3 ?? 0} mm³ · ${res.metrics.scar_area_mm2 ?? 0} mm² en-face (${Math.round((res.metrics.scar_fraction_of_cornea ?? 0) * 100)}% of cornea). Correct it, then export.` }
+            : { kind: "done", title: "No scar found", detail: "3-view SAM2 consensus flagged nothing — raise sensitivity, or use clicks." };
+        });
+      } catch (e) {
+        set((s) => {
+          s.status = { kind: "error", title: "Auto scar (SAM2) failed", detail: e instanceof Error ? e.message : String(e) };
         });
       } finally {
         set((s) => {

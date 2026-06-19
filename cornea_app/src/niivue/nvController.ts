@@ -50,6 +50,22 @@ export function attach(canvas: HTMLCanvasElement): Niivue | null {
     });
     nv.attachToCanvas(canvas);
     nv.setSliceType(SLICE.multi);
+    if (typeof window !== "undefined") (window as unknown as { nv: Niivue }).nv = nv;  // debug/testing hook
+    // Distinct overlay colors so cornea (label 1) and scar (label 2) are easy to tell apart in the
+    // 3D/WebGL viewer (the default "warm" ramp makes both warm). With cal_min 0.9 / cal_max 2.1,
+    // label 1 lands at LUT index ~21 (blue = cornea) and label 2 at ~234 (red = scar); index 0 (bg)
+    // is transparent. Matches the 2D viewer's blue-cornea / red-scar convention.
+    try {
+      // Cornea (idx 1–120) is semi-transparent so the opaque scar (idx 132–255) shows THROUGH the
+      // cornea shell in the 3D render (otherwise the blue cornea occludes the embedded red scar).
+      nv.addColormap("corneaScar", {
+        R: [0, 50, 50, 255, 255],
+        G: [0, 140, 140, 58, 58],
+        B: [0, 255, 255, 71, 71],
+        A: [0, 90, 90, 255, 255],
+        I: [0, 1, 120, 132, 255],
+      });
+    } catch { /* older niivue without addColormap → loadSegmentation falls back to "warm" */ }
     webglError = null;
     return nv;
   } catch (e) {
@@ -75,18 +91,65 @@ export function hasVolume(): boolean {
 }
 
 // ── Drawing layer (interactive seed editing) ───────────────────────────────
+// Drawing-layer colours per pen label, matching the segmentation convention so painting shows the
+// RIGHT colour (1 cornea=blue, 2 background=orange, 3 scar=red). Slightly muted + drawn translucent
+// (drawOpacity) so the editable layer reads as "in progress". Index 0 (unpainted) is transparent.
+const DRAW_CMAP = {
+  R: [0, 70, 230, 235],
+  G: [0, 160, 150, 95],
+  B: [0, 235, 70, 95],
+  A: [0, 255, 255, 255],
+  I: [0, 1, 2, 3],
+  labels: ["", "cornea", "background", "scar"],
+};
+
 /** Load a label NIfTI as the editable drawing bitmap (no binarize → keep 1/2/3). */
 export async function loadDrawing(url: string): Promise<void> {
   if (!nv) throw new Error("Niivue not attached");
-  await nv.loadDrawingFromUrl(url, false);
+  // loadDrawingFromUrl returns FALSE (doesn't throw) on a fetch failure or dimension mismatch; if we
+  // ignored it, setDrawingEnabled would create a BLANK drawing and the user would paint on an empty
+  // layer (silent loss of the segmentation). Surface it as an error instead.
+  const ok = await nv.loadDrawingFromUrl(url, false);
+  if (!ok) throw new Error("Correction layer failed to load (segmentation drawing missing or mismatched).");
+  try { nv.setDrawColormap(DRAW_CMAP as unknown as string); } catch { /* older niivue → default LUT */ }
   nv.setDrawingEnabled(true);
 }
 
-/** Pen label: 0 erase, 1 cornea, 2 background, 3 scar. */
-export function setPen(label: number): void {
+/** End correction: stop the pen AND clear the drawing bitmap so it can't linger over the committed
+ *  overlay or leak into other stages/cases (a stale drawBitmap renders even when drawing is disabled). */
+export function endDrawing(): void {
+  if (!nv) return;
+  nv.setDrawingEnabled(false);
+  try { nv.closeDrawing(); } catch { /* no-op if no drawing */ }
+  nv.drawScene();
+}
+
+/** Undo the last brush stroke / smart fill (niivue keeps a drawing undo stack). */
+export function undoDrawing(): void {
+  if (!nv) return;
+  try { nv.drawUndo(); nv.drawScene(); } catch { /* nothing to undo */ }
+}
+
+/** Pen label: 0 erase, 1 cornea, 2 background, 3 scar. `filled`=true auto-fills a closed outline
+ *  (draw a loop around a region → the enclosed area is painted), so a whole patch is one stroke. */
+export function setPen(label: number, filled = false): void {
   if (!nv) return;
   nv.setDrawingEnabled(true);
-  nv.setPenValue(label, false);
+  nv.setPenValue(label, filled);
+}
+
+/** Brush thickness (voxels). */
+export function setPenSize(size: number): void {
+  if (!nv) return;
+  nv.opts.penSize = Math.max(1, Math.round(size));
+}
+
+/** Smart 3-D fill: GrowCut propagates the scribbled labels (bg/cornea/scar) through the whole volume by
+ *  intensity similarity, so the user seeds a few slices and the rest of every view is filled in. */
+export function smartFill(): void {
+  if (!nv) return;
+  nv.drawGrowCut();
+  nv.drawScene();
 }
 
 export function setDrawingEnabled(on: boolean): void {
@@ -119,8 +182,13 @@ export async function loadSegmentation(url: string, opacity: number): Promise<vo
   if (!nv) throw new Error("Niivue not attached");
   // Remove a prior segmentation overlay (any volume past the base).
   while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
-  // Labels are 0=bg (transparent, below cal_min), 1=cornea, 2=scar.
-  await nv.addVolumeFromUrl({ url, colormap: "warm", opacity, cal_min: 0.9, cal_max: 2.1 });
+  // Labels are 0=bg (transparent, below cal_min), 1=cornea (blue), 2=scar (red) via "corneaScar"
+  // (falls back to "warm" if the custom colormap wasn't registered).
+  let cmap = "warm";
+  try {
+    if ((nv.colormaps?.() ?? []).includes("corneaScar")) cmap = "corneaScar";
+  } catch { /* keep warm */ }
+  await nv.addVolumeFromUrl({ url, colormap: cmap, opacity, cal_min: 0.9, cal_max: 2.1 });
   segUrl = url;
   nv.updateGLVolume();
 }

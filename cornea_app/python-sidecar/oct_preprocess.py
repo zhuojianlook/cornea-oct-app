@@ -408,19 +408,29 @@ def _side_correction_quadratic_bias(boundary: np.ndarray, quadratic: np.ndarray,
 
 
 def _fit_quadratic_ransac(edge: np.ndarray, residual_threshold: float) -> np.ndarray:
+    """Faithful to DICOMSmootherSteps.fit_quadratic_ransac: sklearn RANSAC quadratic fit of the
+    corneal boundary (degree-2 polynomial, min_samples=0.3, fixed seed)."""
     x = np.arange(len(edge)).reshape(-1, 1)
-    model = make_pipeline(PolynomialFeatures(degree=2), LinearRegression())
-    ransac = RANSACRegressor(estimator=model, min_samples=0.3,
-                             residual_threshold=residual_threshold, random_state=42)
-    ransac.fit(x, edge)
-    return ransac.predict(x)
+    try:
+        model = make_pipeline(PolynomialFeatures(degree=2), LinearRegression())
+        ransac = RANSACRegressor(estimator=model, min_samples=0.3,
+                                 residual_threshold=residual_threshold, random_state=42)
+        ransac.fit(x, edge)
+        return ransac.predict(x)
+    except Exception:  # noqa: BLE001
+        # RANSAC found no valid consensus (degenerate/noisy edge, e.g. an artifacted scan) → plain
+        # degree-2 least squares so the scan still preprocesses instead of crashing the whole run.
+        xv = np.arange(len(edge))
+        if len(edge) >= 3:
+            return np.polyval(np.polyfit(xv, np.asarray(edge, float), 2), xv)
+        return np.asarray(edge, float)
 
 
 def _warp_by_displacement(img: np.ndarray, displacement: np.ndarray) -> np.ndarray:
     H, W = img.shape
     warped = np.zeros_like(img)
     for x in range(W):
-        shift = int(round(displacement[x]))
+        shift = int(displacement[x])   # truncate toward zero (faithful to warp_image_by_edge)
         if shift > 0:
             nh = H - shift
             if nh > 0:
@@ -452,10 +462,32 @@ def _edge_worker(packed):
     return _merged_side_edge(sl, p)
 
 
+def _interp_bad_displacement(disp: np.ndarray, bad_cols, good_cols) -> np.ndarray:
+    """Replace the DISPLACEMENT (not the edge) at bad columns with a smooth interpolation from the
+    GOOD anchor columns, so a bad column gets a correction consistent with its good neighbours.
+    Interpolating the displacement (the correction field) rather than the detected edge avoids the
+    overshoot that enlarged real curvature, and preserves the underlying tissue shape."""
+    if not bad_cols:
+        return disp
+    W = len(disp)
+    bad = [c for c in bad_cols if 0 <= c < W]
+    if good_cols:
+        anchors = sorted({c for c in good_cols if 0 <= c < W} - set(bad))
+    else:
+        bad_set = set(bad)
+        anchors = [c for c in range(W) if c not in bad_set]
+    if bad and len(anchors) >= 2:
+        anchors = np.array(anchors)
+        disp[bad] = np.interp(np.array(bad), anchors, disp[anchors])
+    return disp
+
+
 def _warp_worker(packed):
-    sl, active_edge, residual, corr_factor = packed
+    sl, active_edge, residual, corr_factor, bad_cols, good_cols = packed
     quad = _fit_quadratic_ransac(active_edge, residual)
-    return _warp_by_displacement(sl, (quad - active_edge) * corr_factor)
+    disp = (quad - active_edge) * corr_factor
+    disp = _interp_bad_displacement(disp, bad_cols, good_cols)
+    return _warp_by_displacement(sl, disp)
 
 
 def _map_slices(worker, items, progress, lo, hi, workers):
@@ -503,16 +535,26 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     # 1) per-slice corrected boundary (the expensive bilateral+edge+RANSAC) — parallel.
     edges = np.array(_map_slices(_edge_worker, [(sag[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
 
-    # 2) 3D active correction: snap each slice's edge toward its neighbours' median.
+    # 2) 3D active correction — faithful to DICOMSmootherSteps.process_slice_with_3d_active: snap
+    #    each slice's edge toward the median of ITSELF + its available neighbours (boundaries
+    #    included), where the deviation exceeds the threshold.
     active = edges.copy()
-    for i in range(1, n - 1):
-        med = np.median(np.stack([edges[i - 1], edges[i + 1]]), axis=0)
+    for i in range(n):
+        stack = [edges[i]]
+        if i > 0:
+            stack.append(edges[i - 1])
+        if i < n - 1:
+            stack.append(edges[i + 1])
+        med = np.median(np.stack(stack), axis=0)
         dev = np.abs(edges[i] - med)
         active[i][dev > active_threshold] = med[dev > active_threshold]
 
     # 3) flatten each slice to its quadratic via column warp — parallel — then revert.
     res = float(p["residual_threshold"])
-    warped = _map_slices(_warp_worker, [(sag[i], active[i], res, corr_factor) for i in range(n)], progress, 0.5, 1.0, workers)
+    bad_cols = [int(c) for c in (p.get("force_columns") or [])]
+    good_cols = [int(c) for c in (p.get("good_columns") or [])]
+    items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols) for i in range(n)]
+    warped = _map_slices(_warp_worker, items, progress, 0.5, 1.0, workers)
     return revert_sagittal(np.array(warped))
 
 
@@ -522,13 +564,19 @@ def write_volume_nifti(vol_zyx: np.ndarray, out_path: str | Path,
     """Write a (frames, rows, cols) = (z, y, x) array as a NIfTI with explicit spacing
     (mm) and direction — bypassing the multi-frame-DICOM spacing loss so the geometry
     that drives scar mm³ is exactly right."""
+    import os
     import SimpleITK as sitk
     img = sitk.GetImageFromArray(np.ascontiguousarray(vol_zyx))
     img.SetSpacing(tuple(float(s) for s in spacing_xyz))
     img.SetDirection(tuple(float(d) for d in direction))
     img.SetOrigin((0.0, 0.0, 0.0))
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    sitk.WriteImage(img, str(out_path))
+    # Write atomically (tmp + replace) so a killed/crashed worker can never leave a truncated
+    # NIfTI at the real path — a later reader (e.g. the raw-scrub cache) must never see a
+    # half-written volume. The temp keeps the .nii.gz suffix so SimpleITK still gzips it.
+    tmp = f"{out_path}.tmp.nii.gz"
+    sitk.WriteImage(img, tmp)
+    os.replace(tmp, str(out_path))
     return str(out_path)
 
 
@@ -573,23 +621,140 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     return write_volume_nifti(corrected, out_nifti, sp)
 
 
+# ── Diagnostic: render EVERY processing step for the central sagittal slice ──
+# (mirrors the Streamlit generate_visualization_steps filmstrip; adds coronal steps on request).
+_C_RED, _C_GREEN, _C_BLUE, _C_MAGENTA = (255, 64, 64), (64, 220, 96), (90, 150, 255), (235, 90, 235)
+
+
+def _png_bytes(rgb: np.ndarray) -> bytes:
+    """Encode an HxWx3 uint8 array to PNG with only stdlib (no preview_io dependency)."""
+    import struct
+    import zlib
+    rgb = np.ascontiguousarray(np.asarray(rgb, np.uint8))
+    H, W, _ = rgb.shape
+    sl = np.empty((H, 1 + W * 3), np.uint8)
+    sl[:, 0] = 0
+    sl[:, 1:] = rgb.reshape(H, W * 3)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(sl.tobytes(), 6)) + chunk(b"IEND", b""))
+
+
+def _gray_rgb(img2d: np.ndarray) -> np.ndarray:
+    g = np.asarray(img2d, np.float32)
+    f = g[np.isfinite(g)]
+    lo, hi = (float(np.percentile(f, 1)), float(np.percentile(f, 99))) if f.size else (0.0, 1.0)
+    if hi <= lo:
+        hi = lo + 1.0
+    u = (np.clip((g - lo) / (hi - lo), 0.0, 1.0) * 255).astype(np.uint8)
+    return np.stack([u, u, u], -1)
+
+
+def _draw_curve(rgb: np.ndarray, y_per_x: np.ndarray, color, dashed: bool = False) -> np.ndarray:
+    H, W = rgb.shape[:2]
+    for x in range(min(W, len(y_per_x))):
+        if dashed and (x // 5) % 2:
+            continue
+        yy = int(round(float(y_per_x[x])))
+        for dy in (-1, 0, 1):
+            if 0 <= yy + dy < H:
+                rgb[yy + dy, x] = color
+    return rgb
+
+
+def _disp_resize(rgb: np.ndarray, out_h: int = 320, out_w: int = 460) -> np.ndarray:
+    H, W = rgb.shape[:2]
+    if H == out_h and W == out_w:
+        return rgb
+    ri = np.linspace(0, H - 1, out_h).round().astype(int)
+    ci = np.linspace(0, W - 1, out_w).round().astype(int)
+    return np.ascontiguousarray(rgb[ri][:, ci])
+
+
+def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
+                     bad_cols=None, workers=None):
+    """Return [(label, rgb_uint8)] for every preprocessing step on the CENTRAL sagittal slice.
+    Faithful to the per-slice pipeline; the final warp reflects the current bad-column selection
+    so the filmstrip shows exactly what a re-run would produce."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    res = float(p["residual_threshold"]); cf = float(p.get("corr_factor", 1.0)); at = float(p.get("active_threshold", 5.0))
+    vol = read_oct_zstack(oct_path, volume_index)
+    sag = reformat_to_sagittal(vol)                 # (lateral, depth, frames)
+    n = sag.shape[0]; idx = n // 2
+    sl = sag[idx].astype(np.float32)
+    steps = []
+
+    def add(label, rgb):
+        steps.append((label, _disp_resize(rgb)))
+
+    add(f"1. Original — central sagittal slice ({idx}/{n})", _gray_rgb(sl))
+    heq = _histeq(sl)
+    add("2. Histogram equalized", _gray_rgb(heq))
+    filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+                               int(p["d"]), int(p["sigmaColor"]), int(p["sigmaSpace"]))
+    add("3. Bilateral filtered", _gray_rgb(filt))
+    raw_edge = _detect_surface_gradient(filt, p["sigma"])
+    add("4. Surface edge detected (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED))
+    merged = _merged_side_edge(sl, p)
+    add("5. Side-corrected boundary (green)", _draw_curve(_gray_rgb(sl), merged, _C_GREEN))
+    quad = _fit_quadratic_ransac(merged, res)
+    im6 = _draw_curve(_gray_rgb(sl), merged, _C_GREEN)
+    add("6. Quadratic fit — green=edge, blue=fit", _draw_curve(im6, quad, _C_BLUE, dashed=True))
+    nb = [merged]
+    if idx > 0:
+        nb.append(_merged_side_edge(sag[idx - 1].astype(np.float32), p))
+    if idx < n - 1:
+        nb.append(_merged_side_edge(sag[idx + 1].astype(np.float32), p))
+    med = np.median(np.stack(nb), axis=0)
+    active_e = merged.copy(); dvv = np.abs(merged - med); active_e[dvv > at] = med[dvv > at]
+    quad_a = _fit_quadratic_ransac(active_e, res)
+    im7 = _draw_curve(_gray_rgb(sl), active_e, _C_MAGENTA)
+    add("7. 3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True))
+    # Final warp: same logic as smooth_volume — bad-column displacement interpolated from good
+    # neighbours (so the filmstrip matches a real re-run).
+    bad = sorted(set(int(c) for c in (bad_cols or [])))
+    disp = (quad_a - active_e) * cf
+    disp = _interp_bad_displacement(disp, bad, [int(c) for c in (p.get("good_columns") or [])])
+    warped = _warp_by_displacement(sag[idx], disp)
+    add("8. Final corrected — column warp", _gray_rgb(warped.astype(np.float32)))
+    return steps
+
+
 # ── CLI: run the heavy pipeline in an isolated subprocess (called by the sidecar,
 #    so the fork-based parallelism never touches the sidecar's CUDA/torch state) ──
 if __name__ == "__main__":
     import argparse
     import json as _json
     ap = argparse.ArgumentParser(description="OCT preprocessing worker")
-    ap.add_argument("mode", choices=["raw", "preprocess"])
+    ap.add_argument("mode", choices=["raw", "preprocess", "steps"])
     ap.add_argument("oct_path")
-    ap.add_argument("out_nifti")
+    ap.add_argument("out_nifti")   # for mode=steps this is the OUTPUT DIRECTORY for the step PNGs
     ap.add_argument("--params", default="{}")
     ap.add_argument("--volume-index", type=int, default=0)
     ap.add_argument("--companion-txt", default="")
+    ap.add_argument("--bad-cols", default="[]")
     a = ap.parse_args()
     _p = _json.loads(a.params)
     _comp = a.companion_txt or None
     if a.mode == "raw":
         raw_oct_to_nifti(a.oct_path, a.out_nifti, volume_index=a.volume_index, params=_p, companion_txt=_comp)
+    elif a.mode == "steps":
+        _steps = preprocess_steps(a.oct_path, params=_p, volume_index=a.volume_index, companion_txt=_comp,
+                                  bad_cols=_json.loads(a.bad_cols or "[]"))
+        _outdir = Path(a.out_nifti)
+        _outdir.mkdir(parents=True, exist_ok=True)
+        for old in _outdir.glob("step_*.png"):   # clear stale steps from a prior run
+            old.unlink()
+        _labels = []
+        for _i, (_label, _rgb) in enumerate(_steps):
+            _fn = f"step_{_i:02d}.png"
+            (_outdir / _fn).write_bytes(_png_bytes(_rgb))
+            _labels.append({"label": _label, "file": _fn})
+        (_outdir / "labels.json").write_text(_json.dumps(_labels))
     else:
         preprocess_oct_to_nifti(a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp)
     print("OK " + str(a.out_nifti))

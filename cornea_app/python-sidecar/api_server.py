@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import List
 
@@ -27,6 +31,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 import settings
@@ -37,10 +42,12 @@ import slicer_runner
 import masks
 import scar as scar_mod
 import export as export_mod
+import nnunet_train as nntrain
 import preprocess
 import postprocess
 import metrics_export
 import consensus as consensus_mod
+import normal_baseline
 import oct_preprocess as oct_mod
 import cohort as cohort_mod
 
@@ -171,6 +178,113 @@ def get_volume_nifti(case_id: str) -> FileResponse:
     return FileResponse(str(dst), media_type="application/gzip", filename="volume.nii.gz")
 
 
+def _scan_filename_stem(case_id: str) -> str:
+    """A human-recognizable download stem: the ORIGINAL source scan filename (what the user sees in
+    the loader, e.g. 'CS001_14145_3D Cornea_OD_2024-07-11'), minus its extension. Falls back to the
+    case_id when no source is recorded. So a downloaded file matches the scan it came from."""
+    cid = orch.safe_case_id(case_id)
+    try:
+        m = orch.read_manifest(cid)
+        src = m.get("oct_source") or m.get("companion_txt") or ""
+        if src:
+            base = os.path.basename(str(src)).strip()
+            base = re.sub(r"\.(oct|txt|nii\.gz|nii|nrrd|dcm)$", "", base, flags=re.IGNORECASE).strip()
+            if base:
+                return base
+    except Exception:  # noqa: BLE001 — naming is best-effort; never block a download
+        pass
+    return cid
+
+
+@app.get("/api/case/{case_id}/preprocessed.nii.gz")
+def download_preprocessed_nifti(case_id: str) -> FileResponse:
+    """Download ONE preprocessed (corrected) scan as a NIfTI, named ``<case_id>.nii.gz``.
+
+    Same bytes as the working volume the viewer/pipeline use, but with a per-scan
+    filename so a folder of these drops straight into the ground-truth annotator app
+    (each file's stem becomes the scan id → clean inter-/intra-observer grouping).
+    404 until the scan has actually been preprocessed."""
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, f"No such case: {case_id}")
+    try:
+        dst = _working_volume(cid)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(404, f"No preprocessed volume for {case_id}: {exc}")
+    if not Path(dst).exists():
+        raise HTTPException(404, f"No preprocessed volume for {case_id}. Preprocess the scan first.")
+    return FileResponse(str(dst), media_type="application/gzip", filename=f"{_scan_filename_stem(cid)}.nii.gz")
+
+
+@app.get("/api/preprocessed-zip")
+def download_preprocessed_zip(cases: str = "") -> FileResponse:
+    """Bundle several preprocessed scans into one ``.zip`` — a folder-ready SET for
+    manual ground-truth segmentation. Each entry is ``<case_id>.nii.gz`` (the working
+    volume), so unzipping gives a directory the annotator app can open directly.
+
+    ``cases`` is a comma-separated list of case ids. Ids are normalized with
+    ``safe_case_id`` (so two inputs that normalize to the same id collapse to one
+    entry); missing/un-preprocessed ids are skipped. The zip contains whatever
+    resolved. 404 only if none resolved."""
+    ids = [c.strip() for c in cases.split(",") if c.strip()]
+    if not ids:
+        raise HTTPException(400, "No cases specified.")
+    tmp = tempfile.NamedTemporaryFile(prefix="preprocessed_", suffix=".zip", delete=False)
+    included: list[str] = []
+    missing: list[str] = []
+    try:
+        # .nii.gz is already gzip-compressed → ZIP_STORED avoids pointless re-compression.
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
+            seen: set[str] = set()
+            used_names: set[str] = set()
+            for raw in ids:
+                cid = orch.safe_case_id(raw)
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                if not orch.case_root(cid).exists():
+                    missing.append(raw)
+                    continue
+                try:
+                    src = _working_volume(cid)
+                except Exception:  # noqa: BLE001 — skip a bad scan, keep the rest of the set
+                    missing.append(raw)
+                    continue
+                if src and Path(src).exists():
+                    # Name each entry after the source scan; disambiguate rare collisions with the case id.
+                    stem = _scan_filename_stem(cid)
+                    arc = f"{stem}.nii.gz"
+                    if arc in used_names:
+                        arc = f"{stem}__{cid}.nii.gz"
+                    used_names.add(arc)
+                    zf.write(str(src), arcname=arc)
+                    included.append(cid)
+                else:
+                    missing.append(raw)
+        tmp.close()
+    except Exception as exc:  # noqa: BLE001
+        tmp.close()
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise HTTPException(500, f"Zip build failed: {exc}")
+    if not included:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise HTTPException(404, f"No preprocessed volumes found for: {', '.join(missing) or cases}")
+    return FileResponse(
+        tmp.name,
+        media_type="application/zip",
+        filename="preprocessed_scans.zip",
+        background=BackgroundTask(os.unlink, tmp.name),  # delete the temp zip after it streams
+    )
+
+
 class PreprocessRequest(BaseModel):
     enabled: bool = True
     sigma: float | None = None        # in-plane gaussian sigma (voxels)
@@ -212,8 +326,26 @@ def _preview_group_dir(case_id: str, group: str) -> Path:
 
 @app.get("/api/case/{case_id}/previews/{group}")
 def list_previews(case_id: str, group: str) -> dict:
-    images = orch.preview_images_from_dir(group, _preview_group_dir(case_id, group))
+    # Lazy `src` URLs (not inline base64): the gallery loads only the slice on screen, so a
+    # DENSE context group (every slice, for skip-free scrubbing) lists cheaply. The src_base
+    # repeats the raw `group` string the client asked for; the file route re-resolves it the
+    # same way (_preview_group_dir applies safe_case_id), so they land on the same folder.
+    src_base = f"/api/case/{case_id}/preview-file/{group}"
+    images = orch.preview_listing_from_dir(group, _preview_group_dir(case_id, group), src_base)
     return {"group": group, "images": images}
+
+
+@app.get("/api/case/{case_id}/preview-file/{group}/{name}")
+def get_preview_file(case_id: str, group: str, name: str) -> FileResponse:
+    """Serve one preview PNG (referenced lazily by list_previews) — keeps a dense scrub
+    group off the JSON payload. Path-traversal-guarded: a bare *.png basename only."""
+    safe_name = Path(name).name
+    if safe_name != name or not safe_name.lower().endswith(".png"):
+        raise HTTPException(400, "Invalid preview file name.")
+    p = _preview_group_dir(case_id, group) / safe_name
+    if not p.exists():
+        raise HTTPException(404, "Preview not found.")
+    return FileResponse(str(p), media_type="image/png")
 
 
 @app.post("/api/case/{case_id}/context-previews")
@@ -222,11 +354,32 @@ def context_previews(case_id: str) -> dict:
     so the 2D gallery can show the raw OCT before any segmentation."""
     orch.ensure_case_dirs(case_id)
     src = _working_volume(case_id)
+    ctx = orch.context_preview_dir(case_id)
     try:
-        postprocess.render_context_previews(src, orch.context_preview_dir(case_id))
+        postprocess.render_context_previews(src, ctx)
+        (ctx / ".rev3").write_text("")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"Context preview render failed: {exc}")
-    return {"images": orch.preview_images_from_dir("Context", orch.context_preview_dir(case_id))}
+    # Lazy listing (not base64): a dense context group is large; the gallery loads slices on
+    # demand via /preview-file. (Callers that just trigger a render ignore this anyway.)
+    src_base = f"/api/case/{case_id}/preview-file/context"
+    return {"images": orch.preview_listing_from_dir("Context", ctx, src_base)}
+
+
+@app.post("/api/case/{case_id}/refresh-panel")
+def refresh_panel(case_id: str) -> dict:
+    """Re-render this scan's dense+rotated own-segmentation overlay (context_seg) from its
+    CURRENT labelmap, so the subgroup grid's "per scan" scar reflects a correction made in the
+    focused single-scan view. (context_cons is the vote — it only changes on a consensus rebuild.)"""
+    arr, _ = labels.best_labelmap_nnunet(case_id)
+    if arr is None:
+        return {"ok": False, "reason": "no segmentation"}
+    base = _ensure_volume_nifti(case_id)
+    try:
+        postprocess.render_seg_previews(base, arr, _preview_group_dir(case_id, "context_seg"), dense_rotated=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Panel refresh failed: {exc}")
+    return {"ok": True}
 
 
 # ── Stage 1: SAM2 cornea segmentation ──────────────────────────────────────
@@ -323,12 +476,84 @@ def get_segmentation_nifti(case_id: str) -> FileResponse:
     return FileResponse(str(dst), media_type="application/gzip", filename="segmentation.nii.gz")
 
 
+@app.get("/api/case/{case_id}/agreement.nii.gz")
+def get_agreement_nifti(case_id: str, tol_mm: float = 0.0) -> FileResponse:
+    """The replicate-agreement map written by consensus.build_consensus: per-voxel % of member
+    scans whose scar covers it (0 / 33 / 66 / 100 for 3 scans). Powers the 3D overlap viewer.
+    With `tol_mm` > 0, re-scores allowing that boundary slack (mm) — small residual shifts no longer
+    read as disagreement, so the fringe collapses into the core."""
+    strict = orch.case_root(case_id) / "previews" / "agreement.nii.gz"
+    if not strict.exists():
+        raise HTTPException(404, "No agreement map — build a consensus over the replicate scans first.")
+    if tol_mm <= 0:
+        return FileResponse(str(strict), media_type="application/gzip", filename="agreement.nii.gz")
+    try:
+        agr, _ = consensus_mod.tolerant_agreement(case_id, tol_mm)
+        base = orch.case_root(case_id) / "previews" / "volume.nii.gz"
+        dst = orch.case_root(case_id) / "previews" / "agreement_tol.nii.gz"
+        labels.write_label_nifti(agr, base, dst)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Tolerant agreement failed: {exc}")
+    return FileResponse(str(dst), media_type="application/gzip", filename="agreement_tol.nii.gz")
+
+
+@app.get("/api/case/{case_id}/scan/{member}/{kind}.nii.gz")
+def get_warped_scan(case_id: str, member: str, kind: str) -> FileResponse:
+    """A consensus member's volume (or label) WARPED into the reference frame — written by
+    build_consensus to scans/<member>/. `kind` ∈ {volume,label}. Powers the volume-alignment viewer
+    (overlay the registered replicate volumes to see whether the scans actually align)."""
+    if kind not in ("volume", "label"):
+        raise HTTPException(400, "kind must be 'volume' or 'label'.")
+    p = orch.case_root(case_id) / "scans" / orch.safe_case_id(member) / f"{kind}.nii.gz"
+    if not p.exists():
+        raise HTTPException(404, f"No warped {kind} for {member} — rebuild the consensus.")
+    return FileResponse(str(p), media_type="application/gzip", filename=f"{kind}.nii.gz")
+
+
+@app.get("/api/case/{case_id}/agreement-stats")
+def get_agreement_stats(case_id: str, tol_mm: float = 0.0) -> dict:
+    """Reproducibility readout for the overlap viewer at boundary tolerance `tol_mm`: tier volumes +
+    mean pairwise tolerant Dice, plus the NATIVE per-scan scar biomarker (mean ± CV) from the report."""
+    try:
+        _, stats = consensus_mod.tolerant_agreement(case_id, tol_mm)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(404, f"No tolerant agreement available: {exc}")
+    report = orch.read_manifest(case_id).get("consensus_report") or {}
+    vol = report.get("scar_volume_mm3") or {}
+    stats["native_scar_mm3"] = vol.get("mean")
+    stats["native_scar_cv_percent"] = vol.get("cv_percent")
+    stats["strict_pairwise_dice"] = report.get("mean_pairwise_scar_dice")
+    return stats
+
+
+# ── Normal reflectivity baseline (from control scans) ──────────────────────
+class NormalProfileRequest(BaseModel):
+    case_ids: List[str] | None = None   # default: all labelled control-tagged cases
+
+
+@app.get("/api/normal-profile")
+def normal_profile_status() -> dict:
+    """Whether a control-derived normal reflectivity baseline exists + which controls are available."""
+    return normal_baseline.profile_info()
+
+
+@app.post("/api/normal-profile/build")
+def normal_profile_build(req: NormalProfileRequest) -> dict:
+    """Build the normal reflectivity profile (vs relative corneal depth) from the labelled control
+    scans, so depth-normalised scar detection flags only EXCESS over normal (no Bowman's false scar)."""
+    try:
+        return normal_baseline.build_profile(req.case_ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
 # ── Stage 3: scar detection + quantification ───────────────────────────────
 class ScarAutoRequest(BaseModel):
     percentile: float = 88.0     # sensitivity: flag the brightest (100−percentile)% of cornea
     min_voxels: int = 500        # continuity: drop connected components smaller than this
     erode_surface: int = 6       # drop the epithelium/Bowman's/endothelium reflective rind
     replace: bool = False        # False: merge candidates with existing scar (keep manual edits)
+    method: str = "hysteresis"   # strategy: hysteresis | normal_anchor | robust_mad | morph_lcc | brightness
 
 
 @app.post("/api/case/{case_id}/scar/auto")
@@ -349,12 +574,34 @@ def scar_auto(case_id: str, req: ScarAutoRequest) -> dict:
     vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)
     raw = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
     had_scar = bool((arr == 2).any())
-    scar_mask = scar_mod.detect_scar_in_cornea(vol, arr, percentile=req.percentile,
-                                               min_voxels=req.min_voxels, erode_surface=req.erode_surface)
+    # Run the selected scar STRATEGY (default hysteresis — benchmarked most reproducible) on the RAW
+    # reflectivity volume, NOT the per-scan contrast-normalised working volume: the same physical
+    # reflectivity then reads as scar in every replicate (comparable across scans/eyes, like the density
+    # metric; live CS001-OS Dice 0.745→0.79 switching work→raw). `method` lets the strategies be
+    # A/B-compared in the viewer. The expert still prunes/extends.
+    method = (req.method or "hysteresis").lower()
+    profile_note = ""
+    if method in ("depthnorm", "control", "normal_profile"):
+        # Depth-normalised: flag scar as EXCESS over the NORMAL corneal reflectivity profile (per
+        # relative depth), so normal Bowman's/anterior brightness isn't mistaken for scar. Use the
+        # CONTROL-derived profile when one has been built, else self-normalise from this scan.
+        atlas = normal_baseline.load_profile()        # 3-D control atlas (depth×radius×meridian) or None
+        zres = normal_baseline.atlas_z(raw, arr, nib.load(str(base)).header.get_zooms()[:3], atlas) if atlas else None
+        if zres is not None:
+            z, cornea_m, roi_m = zres
+            kabs = max(2.0, normal_baseline.load_kabs() + (req.percentile - 92.0) * 0.05)  # sensitivity nudge
+            scar_mask = scar_mod.scar_from_z(z, cornea_m, roi_m, k_abs=kabs)
+            profile_note = f" (control atlas k={kabs:.1f})"
+        else:
+            scar_mask = scar_mod.detect_scar_depthnorm(raw, arr, phi_percentile=req.percentile)
+            profile_note = " (self)"
+    else:
+        scar_mask = scar_mod.scar_detector(req.method)(raw, arr, req.percentile)
     new_label = scar_mod.apply_scar_to_labelmap(arr, scar_mask, replace=req.replace)
     labels.write_label_nifti(new_label, base, labels.corrected_path(case_id))
     postprocess.render_seg_previews(work, new_label, orch.segmentation_preview_dir(case_id), density_vol=vol)
     metrics = scar_mod.quantify(new_label, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
+    metrics["scar_method"] = (req.method or "hysteresis") + profile_note
     orch.write_manifest_value(case_id, {"scar_metrics": metrics,
                                         "segmentation_preview_dir": str(orch.segmentation_preview_dir(case_id))})
     return {"case_info": orch.current_case_info(case_id), "metrics": metrics,
@@ -468,6 +715,72 @@ def scar_sam2_hint(case_id: str, req: ScarHintRequest) -> dict:
             "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
 
+class ScarAutoSam2Request(BaseModel):
+    percentile: float = 88.0       # brightness cut for the candidate + final hyper-reflective constraint
+    erode_surface: int = 6         # drop epithelium/Bowman's/endothelium rind before seeding
+    smooth: float = 2.5            # in-plane smoothing for the brightness candidate
+    vote: int = 2                  # consensus: keep voxels ≥ this many of the 3 views agree
+    min_voxels: int = 200          # drop connected components smaller than this
+    max_seeds: int = 5             # how many bright components to seed SAM2 from
+    replace: bool = False          # False: merge with existing scar (keep manual edits)
+    use_scar_range: bool = True    # confine to the frames marked as containing scar (if any)
+
+
+@app.post("/api/case/{case_id}/scar/auto-sam2")
+def scar_auto_sam2(case_id: str, req: ScarAutoSam2Request) -> dict:
+    """Automatic scar via the cornea-style strategy: auto-seed from the brightest in-cornea region
+    (optionally within the marked scar frame-range), run SAM2 on axial+coronal+sagittal as videos,
+    keep the ≥`vote`-of-3 CONSENSUS, then constrain to hyper-reflective tissue. No clicks needed."""
+    import nibabel as nib
+    orch.ensure_case_dirs(case_id)
+    arr, _ = labels.best_labelmap_nnunet(case_id)
+    if arr is None or not ((arr == 1) | (arr == 2)).any():
+        raise HTTPException(400, "No cornea segmentation yet. Run SAM2 first.")
+    base = _ensure_volume_nifti(case_id)            # raw: geometry + comparable reflectivity (density)
+    work_vol = _working_volume(case_id)             # contrast-enhanced volume the user sees
+    vol = np.asarray(nib.load(str(work_vol)).dataobj).astype(np.float32)
+    raw = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
+    spacing = nib.load(str(base)).header.get_zooms()
+    # Confine to the marked scar frames (the user knows where scar is) — removes out-of-range
+    # false positives and focuses the seeds. No-op if no range was marked.
+    m = orch.read_manifest(case_id)
+    frame_mask = scar_mod.frame_range_mask(arr.shape, spacing, m.get("scar_range")) if req.use_scar_range else None
+    seeds, bright = scar_mod.auto_scar_seeds(vol, arr, percentile=req.percentile, erode_surface=req.erode_surface,
+                                             smooth=req.smooth, frame_mask=frame_mask, max_seeds=req.max_seeds)
+    if not seeds:
+        raise HTTPException(422, "No hyper-reflective scar candidate found in the cornea"
+                                 + (" (within the marked frames)." if frame_mask is not None else "."))
+    work = orch.case_root(case_id) / "sam2_work"
+    with _GPU_LOCK:                                  # one SAM2/CUDA inference at a time
+        fused, meta = sam2_segment.segment_scar_consensus(base, arr, seeds, work, vote=req.vote)
+    # Constrain the 3-view consensus to hyper-reflective tissue + coherent components (as the click path does).
+    from scipy import ndimage
+    scar_c = fused & bright
+    lbl, n = ndimage.label(scar_c)
+    if n:
+        sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
+        scar_c = np.isin(lbl, [i + 1 for i, s in enumerate(sizes) if s >= req.min_voxels])
+    meta["seeds"] = seeds
+    meta["constrained_voxels"] = int(scar_c.sum())
+    if scar_c.sum() == 0:
+        raise HTTPException(422, "3-view SAM2 consensus found no hyper-reflective scar — try a lower "
+                                 "percentile or vote=1.")
+    cornea = (arr == 1) | (arr == 2)
+    existing = arr == 2
+    new_scar = (scar_c if req.replace else (existing | scar_c)) & cornea
+    new_label = np.where(cornea, 1, 0).astype(np.uint8)
+    new_label[new_scar] = 2
+    labels.write_label_nifti(new_label, base, labels.corrected_path(case_id))
+    postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=vol)
+    metrics = scar_mod.quantify(new_label, spacing, density_vol_ijk=raw)
+    metrics["scar_auto_sam2"] = meta
+    orch.write_manifest_value(case_id, {"scar_metrics": metrics,
+                                        "segmentation_preview_dir": str(orch.segmentation_preview_dir(case_id))})
+    return {"case_info": orch.current_case_info(case_id), "metrics": metrics,
+            "merged_with_existing": bool((arr == 2).any()) and not req.replace,
+            "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
+
+
 class MetricsSummaryRequest(BaseModel):
     cases: List[str] | None = None   # default: all cases with a labelmap
 
@@ -527,6 +840,12 @@ def consensus_segment_case(case_id: str) -> dict:
     _ensure_segmented(case_id)
     arr, _ = labels.best_labelmap_nnunet(case_id)
     base = _ensure_volume_nifti(case_id)
+    # Render this scan's own cornea+scar as a dense+rotated overlay for the gallery's 3rd
+    # before/after panel ("This scan") — available even for a single-scan subgroup (no consensus).
+    try:
+        postprocess.render_seg_previews(base, arr, _preview_group_dir(case_id, "context_seg"), dense_rotated=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[consensus-segment] context_seg render skipped for {case_id}: {exc}", file=sys.stderr)
     m = scar_mod.quantify(arr, nib.load(str(base)).header.get_zooms())
     return {"case_id": case_id, "scar_present": m["scar_present"],
             "scar_volume_mm3": m["scar_volume_mm3"]}
@@ -536,6 +855,7 @@ class ConsensusBuildRequest(BaseModel):
     cases: List[str]
     reference: str | None = None
     group: str | None = None
+    subgroup: str | None = None   # replicate set WITHIN the eye (e.g. "posterior"); "1"/blank = default
 
 
 def _read_label_ijk(path: Path) -> np.ndarray:
@@ -543,26 +863,47 @@ def _read_label_ijk(path: Path) -> np.ndarray:
     return np.rint(np.asarray(nib.load(str(path)).dataobj)).astype(np.uint8)
 
 
-def _consensus_case_id(cases: List[str], group: str | None = None) -> str:
-    """Deterministic consensus case id. An explicit `group` (the cohort path) wins;
-    otherwise derive a stable EYE-LEVEL id from the members' shared identity
-    (`case_<patient>_<eye>_consensus`, lowercased to match the cohort exactly) so the
-    endpoint and the cohort converge on ONE id instead of the old order-dependent
-    `{cases[0]}_consensus`. Falls back to an order-independent id if unparseable."""
+def _subgroup_slug(subgroup: str | None) -> str:
+    """Normalise a subgroup label for a case-id segment. The default subgroup ("1"/blank)
+    yields "" so the id stays the back-compatible `case_<pid>_<eye>_consensus`; a real
+    subgroup ("posterior") becomes a slug inserted before `_consensus`."""
+    s = (subgroup or "").strip().lower()
+    if s in ("", "1"):
+        return ""
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9_-]+", "-", s)).strip("-")
+
+
+def _consensus_case_id(cases: List[str], group: str | None = None, subgroup: str | None = None) -> str:
+    """Deterministic consensus case id. An explicit `group` (the cohort path) wins; otherwise
+    derive a stable EYE×SUBGROUP id from the members' shared identity
+    (`case_<patient>_<eye>[_<subgroup>]_consensus`, lowercased to match the cohort) so the
+    endpoint and the cohort converge on ONE id, and two subgroups of the SAME eye don't collide.
+    Falls back to an order-independent id if unparseable."""
     if group:
         return orch.safe_case_id(group)
+    sub = _subgroup_slug(subgroup)
+    seg = f"_{sub}" if sub else ""
     m0 = orch.read_manifest(cases[0]) if cases else {}
-    meta = metrics_export.parse_case_meta(m0.get("oct_source") or m0.get("input_volume"))
-    if meta.get("patient_id") and meta.get("eye"):
-        return orch.safe_case_id(f"case_{meta['patient_id'].lower()}_{meta['eye'].lower()}_consensus")
-    return orch.safe_case_id("_".join(sorted(cases)) + "_consensus")
+    # Prefer a user-corrected patient/eye persisted on the case (group-header edit); fall back
+    # to parsing the original filename.
+    pid = (m0.get("patient_id") or "").strip()
+    eye = (m0.get("eye") or "").strip()
+    if not (pid and eye):
+        meta = metrics_export.parse_case_meta(m0.get("oct_source") or m0.get("input_volume"))
+        pid = pid or meta.get("patient_id", "")
+        eye = eye or meta.get("eye", "")
+    if pid and eye:
+        return orch.safe_case_id(f"case_{pid.lower()}_{eye.lower()}{seg}_consensus")
+    return orch.safe_case_id("_".join(sorted(cases)) + seg + "_consensus")
 
 
 def _build_consensus_case(cases: List[str], group: str | None = None,
-                          reference: str | None = None, ensure: bool = True) -> tuple[str, dict]:
+                          reference: str | None = None, ensure: bool = True,
+                          subgroup: str | None = None) -> tuple[str, dict]:
     """Segment each scan (if needed), register + vote a partial-overlap consensus, render
     the per-tab previews, and persist. Shared by the /consensus/build endpoint and the
-    cohort batch. Returns (consensus_case_id, report)."""
+    cohort batch. `subgroup` keeps replicate sets of the SAME eye (e.g. posterior vs inferior)
+    in separate consensus cases. Returns (consensus_case_id, report)."""
     import nibabel as nib
     cases = list(dict.fromkeys(cases))      # de-dupe members (order-preserving) so a
     if len(cases) < 2:                      # repeated id can't double-count in CV%
@@ -577,10 +918,12 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
             except Exception as exc:  # noqa: BLE001
                 seg_errors[cid] = str(exc)
 
-    ccid = _consensus_case_id(cases, group)
+    ccid = _consensus_case_id(cases, group, subgroup)
     orch.ensure_case_dirs(ccid)
     report = consensus_mod.build_consensus(cases, ccid, reference)
     report["segmentation_errors"] = seg_errors
+    sub_label = (subgroup or "1").strip() or "1"
+    report["subgroup"] = sub_label
 
     cons_vol = orch.case_root(ccid) / "previews" / "volume.nii.gz"
     cons_lab = _read_label_ijk(labels.corrected_path(ccid))
@@ -595,10 +938,26 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
         cons_clipped = np.where(data_mask, cons_lab, 0).astype(np.uint8)
         postprocess.render_seg_previews(svol, slab, _preview_group_dir(ccid, f"scan_{cid}_self"))
         postprocess.render_seg_previews(svol, cons_clipped, _preview_group_dir(ccid, f"scan_{cid}_cons"))
+        # Dense+rotated overlays in the SCAN's NATIVE frame for the gallery's 3rd before/after
+        # panel (aligns slice-for-slice with raw/corrected): own cornea+scar (context_seg) and
+        # the subgroup consensus mapped to native (context_cons). Convenience — never fail build.
+        try:
+            nat_vol = orch.case_root(cid) / "previews" / "volume.nii.gz"
+            own = _read_label_ijk(labels.corrected_path(cid))
+            postprocess.render_seg_previews(nat_vol, own, _preview_group_dir(cid, "context_seg"), dense_rotated=True)
+            cons_native = scans_dir / cid / "cons_native.nii.gz"
+            if cons_native.exists():
+                postprocess.render_seg_previews(nat_vol, _read_label_ijk(cons_native),
+                                                _preview_group_dir(cid, "context_cons"), dense_rotated=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[consensus] native before/after panel skipped for {cid}: {exc}", file=sys.stderr)
+        # Link the scan back to its consensus + subgroup (frontend panel + metrics attribution).
+        orch.write_manifest_value(cid, {"consensus_case": ccid, "scar_subgroup": sub_label})
 
     orch.write_manifest_value(ccid, {
         "input_volume": str(cons_vol), "corrected_volume": str(cons_vol),
         "consensus_report": report, "consensus_cases": report["scans"], "reference": report["reference"],
+        "scar_subgroup": sub_label,
     })
     return ccid, report
 
@@ -610,7 +969,7 @@ def consensus_build(req: ConsensusBuildRequest) -> dict:
     if len(req.cases) < 2:
         raise HTTPException(400, "Upload at least 2 scans of the same eye for consensus.")
     try:
-        ccid, report = _build_consensus_case(req.cases, req.group, req.reference)
+        ccid, report = _build_consensus_case(req.cases, req.group, req.reference, subgroup=req.subgroup)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"consensus_case": ccid, "report": report,
@@ -627,6 +986,11 @@ class OctPreprocessRequest(BaseModel):
     volume_index: int | None = None
     classification: str | None = None   # "scar" | "control" (no scar) | None
     scar_range: List[int] | None = None  # [start_frame, end_frame], 1-based
+    patient: str | None = None  # user-corrected identity (group header edit); overrides filename parse
+    eye: str | None = None      # "OD"/"OS"; "?" / blank are ignored
+    force_columns: List[int] | None = None  # BAD frame indices to re-correct ("re-run preprocessing")
+    good_columns: List[int] | None = None    # GOOD/anchor frame indices guiding the re-correction
+                                             # (all reuse the scan's persisted settings)
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -649,17 +1013,20 @@ def _nifti_frames(path: Path) -> int:
 
 
 def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int,
-                    companion: str | None = None) -> None:
+                    companion: str | None = None, extra: list | None = None) -> None:
     """Run the oct_preprocess CLI in an isolated subprocess (keeps its fork-based
     parallelism away from the sidecar's CUDA/torch state). New session so a timeout can
     reap the whole fork-pool process group. `companion` = the .txt filespec whose
-    per-scan geometry (XY Scan Size1 etc.) is baked into the NIfTI spacing."""
+    per-scan geometry (XY Scan Size1 etc.) is baked into the NIfTI spacing. `extra` =
+    mode-specific flags (e.g. --bad-cols for the steps filmstrip)."""
     import os
     import signal
     cmd = [sys.executable, str(Path(oct_mod.__file__)), mode, str(src), str(out),
            "--params", json.dumps(params or {}), "--volume-index", str(vi)]
     if companion:
         cmd += ["--companion-txt", str(companion)]
+    if extra:
+        cmd += [str(x) for x in extra]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         _, err = proc.communicate(timeout=1200)
@@ -674,7 +1041,51 @@ def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int,
         raise HTTPException(500, f"OCT {mode} failed: {(err or '')[-800:]}")
 
 
-def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict) -> dict:
+def _previews_fresh(out_dir: Path, base: Path) -> bool:
+    """True if the slice PNGs in out_dir are present, render-current (.rev3 marker), and
+    newer than the volume — so we can skip the expensive re-render on a repeat scrub."""
+    manifest = out_dir / "preview_manifest.json"
+    marker = out_dir / ".rev3"   # bump when the render changes (rotation / dense slices) to invalidate old PNGs
+    if not (manifest.exists() and marker.exists()):
+        return False
+    try:
+        return manifest.stat().st_mtime >= base.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _ensure_raw_snapshot(case_id: str, raw_dir: Path) -> bool:
+    """Render the pre-correction ("before") slices into raw_dir from a FRESH conversion of
+    the original .OCT — never from the working volume (which is the CORRECTED one once a scan
+    has been preprocessed). Copying the working context/ was the "before == after" bug: that
+    directory already held the corrected slices, so both panels showed corrected. Idempotent:
+    a no-op once a CURRENT (.rev3) snapshot exists — an older one (the buggy corrected-as-raw
+    snapshot, or a sparse render) is regenerated. Returns True if present afterwards."""
+    if (raw_dir / "preview_manifest.json").exists() and (raw_dir / ".rev3").exists():
+        return True
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not src or not Path(src).exists():
+        return False
+    vi = int(m.get("oct_volume_index", 0))
+    tmp = orch.case_root(case_id) / "input" / "_raw_snapshot.nii.gz"
+    try:
+        oct_mod.raw_oct_to_nifti(src, tmp, volume_index=vi, companion_txt=m.get("companion_txt"))
+        postprocess.render_context_previews(tmp, raw_dir)
+        (raw_dir / ".rev3").write_text("")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[oct] raw before/after snapshot failed: {exc}", file=sys.stderr)
+        return False
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict,
+                       render_previews: bool = True) -> dict:
     """Point the case at `work` as its volume, drop stale segmentation, render grayscale.
     Records the resolved per-scan voxel spacing (from the companion .txt) and warns if it
     falls outside the plausible Avanti range — a wrong-geometry volume silently corrupts
@@ -699,14 +1110,29 @@ def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict
         seg_dir = orch.segmentation_preview_dir(case_id)
         if seg_dir.exists():
             shutil.rmtree(seg_dir, ignore_errors=True)
+        # Drop the before/after 3rd-panel overlays too — they belong to the dropped segmentation.
+        for grp in ("context_seg", "context_cons"):
+            shutil.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
         labels.corrected_path(case_id).unlink(missing_ok=True)
         orch.case_qa_json(case_id).unlink(missing_ok=True)
         orch.write_manifest_value(case_id, {"scar_metrics": None})
     base = _ensure_volume_nifti(case_id)
-    postprocess.render_context_previews(base, orch.context_preview_dir(case_id))
+    if render_previews:
+        # context/ holds the CURRENT working slices (raw while scrubbing, corrected after
+        # preprocessing) so the single "Slices" view always matches the working volume. For a
+        # CORRECTED scan, also ensure the "before" snapshot exists — rendered from the original
+        # .OCT (NEVER copied from context/, which now holds corrected slices). Cache: skip the
+        # (expensive) re-render when the slices are already up to date.
+        ctx = orch.context_preview_dir(case_id)
+        if preprocessed:
+            _ensure_raw_snapshot(case_id, _preview_group_dir(case_id, "context_raw"))
+        if not _previews_fresh(ctx, base):
+            postprocess.render_context_previews(base, ctx)
+            (ctx / ".rev3").write_text("")
+    # The gallery pulls slices lazily via /previews + /preview-file, so don't base64 the (now
+    # DENSE) context group into this response — it would inline tens of MB the frontend ignores.
     return {"case_info": orch.current_case_info(case_id), "spacing": spacing,
-            "geometry_warnings": geom_warnings,
-            "images": orch.preview_images_from_dir("Context", orch.context_preview_dir(case_id))}
+            "geometry_warnings": geom_warnings, "images": []}
 
 
 @app.post("/api/oct/upload")
@@ -767,13 +1193,23 @@ def oct_volume(case_id: str, req: OctPreprocessRequest) -> dict:
     # If the case is already corrected (and we're not switching capture), RE-SHOW the
     # corrected volume rather than reverting it to raw — re-inspecting must not clobber it.
     show_corrected = bool(m.get("oct_preprocessed")) and work.exists() and not changed_index
-    if not show_corrected:
+    # Cache the raw conversion: a raw z-stack already materialised for this same capture can
+    # be reused as-is, so re-clicking a scan is instant instead of re-reading + reconverting
+    # the .OCT every time (the main cause of slow scan-to-scan scrubbing). Validate the cached
+    # file (>1 frame) so a truncated leftover from a killed preprocess can't be served — fall
+    # through to a fresh conversion, which self-heals it.
+    reuse_raw = (work.exists() and not changed_index and not m.get("oct_preprocessed")
+                 and _nifti_frames(work) > 1)
+    if not show_corrected and not reuse_raw:
         try:
             oct_mod.raw_oct_to_nifti(src, work, volume_index=vi, companion_txt=m.get("companion_txt"))
         except oct_mod.MissingCompanionError as exc:
             raise HTTPException(400, str(exc))           # actionable: user forgot the .txt
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(500, f"Reading .OCT failed: {exc}")
+    # Render the slice PNGs the 2D gallery shows — but _oct_render_volume now CACHES them
+    # (skips the render when up to date), so a repeat scrub is cheap while a first view still
+    # gets its slices immediately (no extra on-demand round-trip).
     out = _oct_render_volume(case_id, work, preprocessed=show_corrected, extra={"oct_volume_index": vi})
     out["n_frames"] = _nifti_frames(work)
     out["preprocessed"] = show_corrected
@@ -791,16 +1227,111 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         raise HTTPException(400, f"Case {case_id} has no .OCT source.")
     vi = req.volume_index if req.volume_index is not None else int(m.get("oct_volume_index", 0))
     work = _oct_working_path(case_id, src)
-    _run_oct_worker("preprocess", src, work, req.params or {}, vi, companion=m.get("companion_txt"))
-    extra = {"oct_volume_index": vi, "oct_params": req.params or {}}
-    if req.classification:
-        extra["scar_classification"] = req.classification
-    if req.scar_range:
-        extra["scar_range"] = req.scar_range
+    # Snapshot the pre-correction ("before") slices for the before/after view. If the scan was
+    # already scrubbed, context/ holds the genuine RAW slices (not yet corrected) — copy them
+    # cheaply BEFORE the correction overwrites the working volume, so we don't re-decode the
+    # .OCT. Otherwise _oct_render_volume renders the "before" from a fresh .OCT conversion (it
+    # must never copy the post-correction context/). Convenience only — never block preprocess.
+    raw_dir = _preview_group_dir(case_id, "context_raw")
+    ctx = orch.context_preview_dir(case_id)
+    if (not (raw_dir / "preview_manifest.json").exists()
+            and not m.get("oct_preprocessed")
+            and (ctx / "preview_manifest.json").exists()):
+        try:
+            import shutil
+            shutil.copytree(ctx, raw_dir, dirs_exist_ok=True)   # context/ is genuine RAW here
+            (raw_dir / ".rev3").write_text("")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[oct-preprocess] raw snapshot copy skipped: {exc}", file=sys.stderr)
+    # Merge persisted settings so a viewer "re-run on bad columns" reuses the scan's original
+    # params / classification / scar range and just ADDS the force_columns override (which then
+    # sticks, so the user's column fix survives later re-runs). A normal preprocess (full params
+    # from the loader, no force_columns) keeps its prior behaviour.
+    eff_params = {**(m.get("oct_params") or {}), **(req.params or {})}
+
+    def _int_list(xs):
+        out = []
+        for c in xs or []:
+            try:
+                out.append(int(c))
+            except (ValueError, TypeError):
+                pass
+        return out
+
+    if req.force_columns is not None:
+        eff_params["force_columns"] = _int_list(req.force_columns)
+    if req.good_columns is not None:
+        eff_params["good_columns"] = _int_list(req.good_columns)
+    eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
+    eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
+    cls = req.classification or m.get("scar_classification")
+    sr = req.scar_range or m.get("scar_range")
+    _run_oct_worker("preprocess", src, work, eff_params, vi, companion=m.get("companion_txt"))
+    # The corrected volume just changed → drop any segmentation built on the OLD correction so a
+    # stale overlay can't show on the re-corrected volume (the user re-runs SAM2 next).
+    import shutil as _sh
+    seg_dir = orch.segmentation_preview_dir(case_id)
+    if seg_dir.exists():
+        _sh.rmtree(seg_dir, ignore_errors=True)
+    for grp in ("context_seg", "context_cons"):
+        _sh.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
+    labels.corrected_path(case_id).unlink(missing_ok=True)
+    orch.case_qa_json(case_id).unlink(missing_ok=True)
+    extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None}
+    if cls:
+        extra["scar_classification"] = cls
+    if sr:
+        extra["scar_range"] = sr
+    # A patient/eye corrected in the group header overrides the filename-parsed identity for
+    # the later consensus naming + export — persist it so the correction isn't lost. Normalize
+    # to the SAME space the filename parser uses (UPPER patient; eye constrained to OD/OS with
+    # common synonyms mapped), so an override-named case still groups/merges with parsed ones.
+    # An unrecognized/"?"/blank eye is ignored so it never clobbers a good filename parse.
+    if req.patient and req.patient.strip():
+        extra["patient_id"] = req.patient.strip().upper()
+    if req.eye and req.eye.strip():
+        eye = req.eye.strip().upper()
+        eye = {"R": "OD", "RIGHT": "OD", "L": "OS", "LEFT": "OS"}.get(eye, eye)
+        if eye in ("OD", "OS"):
+            extra["eye"] = eye
     out = _oct_render_volume(case_id, work, preprocessed=True, extra=extra)
     out["preprocessed"] = True
     out["n_frames"] = _nifti_frames(work)
     return out
+
+
+@app.post("/api/case/{case_id}/oct-preprocess-steps")
+def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Render EVERY preprocessing step for the central sagittal slice (original → hist-eq →
+    bilateral → edge → side-correct → quadratic fit → 3D active → final warp). Diagnostic
+    filmstrip — does NOT touch the working volume. Reuses the scan's persisted params, plus the
+    current bad-column selection (or the persisted one on a plain double-click), so the steps
+    reflect exactly what a re-run would do. Returns base64 PNGs (small, one-shot)."""
+    import base64
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not src or not Path(src).exists():
+        raise HTTPException(400, f"Case {case_id} has no .OCT source.")
+    vi = req.volume_index if req.volume_index is not None else int(m.get("oct_volume_index", 0))
+    eff_params = {**(m.get("oct_params") or {}), **(req.params or {})}
+    # Honor explicit bad columns if the caller sent them (Fix-columns), else fall back to the
+    # persisted set (a plain double-click), so the filmstrip's final warp matches a real re-run.
+    persisted = m.get("oct_params") or {}
+    bad = [int(c) for c in (req.force_columns if req.force_columns is not None else persisted.get("force_columns") or [])]
+    out_dir = _preview_group_dir(case_id, "oct_steps")
+    extra = ["--bad-cols", json.dumps(bad)]
+    _run_oct_worker("steps", src, out_dir, eff_params, vi, companion=m.get("companion_txt"), extra=extra)
+    try:
+        manifest = json.loads((out_dir / "labels.json").read_text())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT steps produced no output: {exc}")
+    steps = []
+    for it in manifest:
+        fp = out_dir / it["file"]
+        if fp.exists():
+            b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+            steps.append({"label": it["label"], "data_url": f"data:image/png;base64,{b64}"})
+    return {"steps": steps}
 
 
 class OctLoadDirRequest(BaseModel):
@@ -824,9 +1355,104 @@ def oct_load_dir(req: OctLoadDirRequest) -> dict:
     cases = []
     for it in items:
         cid = _cohort_make_case(it, used)   # references in place + pairs companion
+        # Report whether this scan was ALREADY corrected in a prior session (loaded in place,
+        # so its manifest survives) — the loader colours those scans as done.
         cases.append({"case_id": cid, "filename": it["filename"], "patient": it["patient"],
-                      "eye": it["eye"], "has_companion": bool(it["companion"]), "preprocessed": False})
+                      "eye": it["eye"], "has_companion": bool(it["companion"]),
+                      "preprocessed": bool(orch.read_manifest(cid).get("oct_preprocessed"))})
     return {"cases": cases}
+
+
+@app.post("/api/oct/pick-dir")
+def oct_pick_dir() -> dict:
+    """Open a NATIVE folder picker on the sidecar host and return the chosen absolute
+    path, so a local user can select a folder with one click instead of typing it. This
+    only makes sense for the normal local-app case (browser + sidecar share a desktop);
+    on a headless/remote host there's no display, so we fail with a clear message and the
+    user falls back to typing the path or to "Pick files". The folder is still loaded in
+    place via /api/oct/load-dir afterwards — nothing is uploaded."""
+    import os
+    import shutil
+
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        raise HTTPException(400, "No desktop on the sidecar host — type the folder path instead.")
+    zenity = shutil.which("zenity")
+    if not zenity:
+        raise HTTPException(400, "Native folder picker (zenity) isn't installed — type the folder path instead.")
+    try:
+        proc = subprocess.run(
+            [zenity, "--file-selection", "--directory", "--title=Select the OCT scans folder"],
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(408, "Folder picker timed out — try again.")
+    except OSError as e:
+        raise HTTPException(500, f"Couldn't open the folder picker: {e}")
+    # returncode 0 with a path = a folder was chosen. Otherwise zenity's exit code 1 is
+    # ambiguous — it covers BOTH a genuine user cancel/close AND a launch failure (DISPLAY
+    # is set but the X authority/cookie denies access, no desktop portal, GTK init failed).
+    # zenity also prints harmless GTK/accessibility warnings to stderr even on a clean
+    # cancel, so we can't treat *any* stderr as an error; match only the fatal display
+    # signatures and surface those, and log-but-ignore the rest (a true cancel is a no-op).
+    if proc.returncode == 0 and proc.stdout.strip():
+        return {"directory": proc.stdout.strip()}
+    err = (proc.stderr or "").strip()
+    fatal = ("cannot open display", "unable to init server", "could not open display",
+             "failed to parse", "authorization required")
+    if err and any(sig in err.lower() for sig in fatal):
+        raise HTTPException(500, f"Folder picker couldn't open a window: {err[:300]}")
+    if err:
+        print(f"[pick-dir] zenity exited {proc.returncode} (treated as cancel); stderr: {err[:300]}", file=sys.stderr)
+    return {"directory": None}
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+@app.get("/api/cases/stat")
+def cases_stat() -> dict:
+    """How many cases are persisted on disk (drives the Wipe button's count). Cheap — counts
+    directories only, no size walk."""
+    root = settings.CASES_ROOT
+    n = sum(1 for c in root.iterdir() if c.is_dir()) if root.exists() else 0
+    return {"count": n, "cases_root": str(root)}
+
+
+@app.post("/api/cases/wipe")
+def cases_wipe() -> dict:
+    """DESTRUCTIVE: delete every persisted case under CASES_ROOT (corrected volumes,
+    segmentations, labels, previews, manifests). Used to get a clean slate so a re-upload of
+    the same scans starts fresh instead of reusing the deterministic case folder + its old
+    output. Removes the case folders but keeps CASES_ROOT itself for new uploads."""
+    import shutil
+    root = settings.CASES_ROOT
+    # Guard: only ever operate on a real, expected "cases" directory — never a parent/other path.
+    if not root.exists() or not root.is_dir() or root.name != "cases":
+        raise HTTPException(400, f"Refusing to wipe — unexpected cases root: {root}")
+    with _COHORT_LOCK:
+        if _COHORT.get("running"):
+            raise HTTPException(409, "A cohort batch is running — stop it before wiping cases.")
+    removed, freed = 0, 0
+    for child in list(root.iterdir()):
+        try:
+            if child.is_dir():
+                freed += _dir_size(child)
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                freed += child.stat().st_size
+                child.unlink()
+            removed += 1
+        except OSError as e:
+            print(f"[wipe] could not remove {child}: {e}", file=sys.stderr)
+    return {"removed": removed, "freed_bytes": freed}
 
 
 # ── Cohort batch: mass-produce the labeled training set ─────────────────────
@@ -1026,6 +1652,69 @@ def export_nnunet(req: ExportRequest) -> dict:
     export_mod.write_dataset_json(dataset_dir, num)
     return {"dataset_dir": str(dataset_dir), "num_training": num, "results": results,
             "leakage_warning": leakage}
+
+
+# ── nnU-Net training proof-of-concept (per-scan labels, isolated venv) ──────
+class TrainRequest(BaseModel):
+    mode: str = "single3"      # "single3" (bg/cornea/scar) | "cascade" (cornea, then scar-in-cornea)
+    config: str = "2d"         # "2d" | "3d_fullres"
+    length: str = "short"      # "short" (~10 epochs) | "full" (1000 epochs)
+
+
+@app.get("/api/train/nnunet/status")
+def train_status() -> dict:
+    """Live training status + the per-scan cases that WOULD be used (consensus excluded)."""
+    st = nntrain.status()
+    st["candidate_cases"] = nntrain.per_scan_segmented_cases()
+    return st
+
+
+@app.post("/api/train/nnunet/setup")
+def train_setup() -> dict:
+    """Create the isolated nnU-Net venv if absent (reuses system torch). Runs in the background;
+    poll /status for venv_ready."""
+    if nntrain.venv_ready():
+        return {"venv_ready": True, "already": True}
+
+    def _bg():
+        try:
+            nntrain.ensure_venv()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[nnunet] venv setup failed: {exc}", file=sys.stderr)
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return {"venv_ready": False, "started": True}
+
+
+@app.post("/api/train/nnunet/start")
+def train_start(req: TrainRequest) -> dict:
+    """Build the per-scan dataset(s) across all subgroups and run the standard nnU-Net workflow
+    (plan_and_preprocess → train) in the isolated venv. Returns immediately; poll /status."""
+    try:
+        return nntrain.start_training(req.mode, req.config, req.length, _ensure_volume_nifti)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+
+
+# ── Serve the built frontend (single-port mode) ────────────────────────────
+# When cornea_app/dist exists (after `npm run build`), the sidecar also serves the
+# React UI, so the whole app runs as ONE process on :8765 — handy where a separate
+# Vite dev server can't be kept alive. Mounted LAST so all /api/* routes win first.
+_DIST = Path(__file__).resolve().parents[1] / "dist"
+if _DIST.exists():
+    from fastapi.staticfiles import StaticFiles
+
+    # Serve index.html with no-cache so a fresh `npm run build` shows up on a plain reload (the
+    # hashed asset filenames bust their own cache; only the entry HTML must always be revalidated —
+    # otherwise the browser keeps a stale index pointing at the old JS bundle). Registered BEFORE
+    # the catch-all mount so these exact paths win.
+    @app.get("/", include_in_schema=False)
+    @app.get("/index.html", include_in_schema=False)
+    def _spa_index() -> FileResponse:
+        return FileResponse(str(_DIST / "index.html"), media_type="text/html",
+                            headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="spa")
 
 
 def main() -> None:
