@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -283,6 +284,90 @@ def download_preprocessed_zip(cases: str = "") -> FileResponse:
         filename="preprocessed_scans.zip",
         background=BackgroundTask(os.unlink, tmp.name),  # delete the temp zip after it streams
     )
+
+
+class SavePreprocessedRequest(BaseModel):
+    dest: str
+
+
+@app.post("/api/case/{case_id}/save-preprocessed")
+def save_preprocessed(case_id: str, req: SavePreprocessedRequest) -> dict:
+    """Native-save (Tauri shell): copy a scan's preprocessed/working volume to a user-chosen path
+    (picked via the desktop Save dialog), so the user controls the destination."""
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, f"No such case: {case_id}")
+    try:
+        src = _working_volume(cid)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(404, f"No preprocessed volume for {case_id}: {exc}")
+    if not Path(src).exists():
+        raise HTTPException(404, f"No preprocessed volume for {case_id}. Preprocess the scan first.")
+    dest = Path(req.dest).expanduser()
+    try:
+        if dest.parent:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(src), str(dest))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Save failed: {exc}")
+    return {"ok": True, "dest": str(dest)}
+
+
+class SaveZipRequest(BaseModel):
+    cases: List[str]
+    dest: str
+
+
+@app.post("/api/preprocessed-zip-save")
+def save_preprocessed_zip(req: SaveZipRequest) -> dict:
+    """Native-save (Tauri shell): write a folder-ready .zip of several preprocessed scans to a
+    user-chosen path. Entries are named after the source scans, like /api/preprocessed-zip."""
+    ids = [c.strip() for c in req.cases if c and c.strip()]
+    if not ids:
+        raise HTTPException(400, "No cases specified.")
+    dest = Path(req.dest).expanduser()
+    included: list[str] = []
+    missing: list[str] = []
+    try:
+        if dest.parent:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(str(dest), "w", compression=zipfile.ZIP_STORED) as zf:
+            seen: set[str] = set()
+            used_names: set[str] = set()
+            for raw in ids:
+                cid = orch.safe_case_id(raw)
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                if not orch.case_root(cid).exists():
+                    missing.append(raw)
+                    continue
+                try:
+                    src = _working_volume(cid)
+                except Exception:  # noqa: BLE001
+                    missing.append(raw)
+                    continue
+                if src and Path(src).exists():
+                    stem = _scan_filename_stem(cid)
+                    arc = f"{stem}.nii.gz"
+                    if arc in used_names:
+                        arc = f"{stem}__{cid}.nii.gz"
+                    used_names.add(arc)
+                    zf.write(str(src), arcname=arc)
+                    included.append(cid)
+                else:
+                    missing.append(raw)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Zip save failed: {exc}")
+    if not included:
+        try:
+            os.unlink(str(dest))
+        except OSError:
+            pass
+        raise HTTPException(404, f"No preprocessed volumes found for: {', '.join(missing) or req.cases}")
+    return {"ok": True, "dest": str(dest), "n": len(included)}
 
 
 class PreprocessRequest(BaseModel):

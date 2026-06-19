@@ -85,10 +85,13 @@ const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 let _seq = 0;
 const uid = (p: string) => `${p}${++_seq}`;
 
-// Download preprocessed scans straight from the sidecar for manual ground-truth segmentation.
-// The endpoint sets Content-Disposition: attachment, so the browser saves the file (the anchor's
-// `download` is just a same-origin hint). A downloaded set unzips to a folder of <case_id>.nii.gz
-// that the companion annotator app opens directly.
+// Download preprocessed scans for manual ground-truth segmentation. In the Tauri desktop shell we
+// pop a NATIVE "Save As" dialog (the webview won't prompt) and have the sidecar write the file to the
+// chosen path; in a plain browser we fall back to a normal download (saves to ~/Downloads).
+function inTauri(): boolean {
+  return typeof window !== "undefined" &&
+    ("__TAURI_INTERNALS__" in window || "__TAURI__" in window || "__TAURI_IPC__" in window);
+}
 const triggerDownload = (href: string, name: string) => {
   const a = document.createElement("a");
   a.href = href;
@@ -98,11 +101,20 @@ const triggerDownload = (href: string, name: string) => {
   a.click();
   a.remove();
 };
-// Fetch the bytes then save via a blob URL — this GUARANTEES the saved filename matches the source
-// scan (a cross-origin <a download> would otherwise be ignored). Falls back to a direct link (the
-// endpoint also sets Content-Disposition to the same name) if the fetch fails.
 async function downloadPreprocessed(cid: string, octName: string) {
   const name = `${octName.replace(/\.oct$/i, "")}.nii.gz`;
+  if (inTauri()) {
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const dest = await save({ defaultPath: name });
+      if (!dest) return; // user cancelled
+      await api.json(`/api/case/${encodeURIComponent(cid)}/save-preprocessed`, "POST", JSON.stringify({ dest }));
+    } catch (e) {
+      alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return;
+  }
+  // Browser: fetch bytes → blob URL so the saved filename matches the source scan.
   const path = `/api/case/${encodeURIComponent(cid)}/preprocessed.nii.gz`;
   try {
     const res = await fetch(resourceUrl(path));
@@ -114,13 +126,24 @@ async function downloadPreprocessed(cid: string, octName: string) {
     triggerDownload(resourceUrl(path), name);
   }
 }
-const downloadPreprocessedZip = (cids: string[]) => {
+async function downloadPreprocessedZip(cids: string[]) {
   if (!cids.length) return;
+  if (inTauri()) {
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const dest = await save({ defaultPath: "preprocessed_scans.zip" });
+      if (!dest) return; // user cancelled
+      await api.json(`/api/preprocessed-zip-save`, "POST", JSON.stringify({ cases: cids, dest }));
+    } catch (e) {
+      alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return;
+  }
   triggerDownload(
     resourceUrl(`/api/preprocessed-zip?cases=${cids.map(encodeURIComponent).join(",")}`),
     "preprocessed_scans.zip",
   );
-};
+}
 
 export function OctLoader() {
   const fileRef = useRef<HTMLInputElement | null>(null);
