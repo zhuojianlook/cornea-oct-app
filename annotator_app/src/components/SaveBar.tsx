@@ -6,6 +6,8 @@ import { useStore } from "../store/annotatorStore";
 
 export function SaveBar() {
   const { activeUser, outputDir, loaded, busy, save, chooseOutputDir } = useStore();
+  const checkUpdates = useStore((s) => s.checkUpdates);
+  const updateBusy = useStore((s) => s.updateBusy);
   const outName = outputDir ? outputDir.split(/[/\\]/).filter(Boolean).pop() : null;
 
   return (
@@ -49,6 +51,18 @@ export function SaveBar() {
         title="Write the painted labelmap (0/1/2) + a manifest row tagged with your username and this session">
         Save ground truth
       </Button>
+
+      <div style={{ width: 1, height: 26, background: "var(--c-border)" }} className="flex-none mx-1" />
+
+      {/* Manual update check (auto-checks on launch too) */}
+      <Tooltip title="Check for a newer version and install it in-app" arrow>
+        <span className="flex-none">
+          <Button variant="text" disabled={updateBusy} onClick={() => checkUpdates(true)}
+            sx={{ fontSize: 11, minWidth: 0, px: 0.75, color: "var(--c-text-dim)" }}>
+            {updateBusy ? "Checking…" : "⟳ Updates"}
+          </Button>
+        </span>
+      </Tooltip>
     </header>
   );
 }

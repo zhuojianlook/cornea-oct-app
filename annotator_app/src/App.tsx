@@ -11,7 +11,8 @@ import { UpdateBanner } from "./components/UpdateBanner";
 export default function App() {
   const activeUser = useStore((s) => s.activeUser);
   const init = useStore((s) => s.init);
-  useEffect(() => { init(); }, [init]);
+  const checkUpdates = useStore((s) => s.checkUpdates);
+  useEffect(() => { init(); checkUpdates(false); }, [init, checkUpdates]);
 
   if (!activeUser) {
     return (

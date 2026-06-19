@@ -1,9 +1,11 @@
 import { create } from "zustand";
+import type { Update } from "@tauri-apps/plugin-updater";
 import * as nv from "../niivue/nvController";
 import * as io from "../tauri/io";
+import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2; // 0 erase, 1 cornea, 2 scar
-const APP_VERSION = "0.1.2";
+const APP_VERSION = "0.1.3";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {
@@ -28,8 +30,16 @@ interface State {
   // ui
   busy: boolean;
   status: string;
+  // self-update
+  update: Update | null;
+  updateBusy: boolean;
+  updatePct: number | null;
+  updateMsg: string;
 
   init: () => Promise<void>;
+  checkUpdates: (manual: boolean) => Promise<void>;
+  installUpdate: () => Promise<void>;
+  dismissUpdate: () => void;
   addUser: (name: string) => Promise<void>;
   selectUser: (name: string) => Promise<void>;
   pickFolder: () => Promise<void>;
@@ -64,11 +74,44 @@ export const useStore = create<State>((set, get) => ({
   drawOpacity: 0.6,
   busy: false,
   status: "Select or add a user to begin.",
+  update: null,
+  updateBusy: false,
+  updatePct: null,
+  updateMsg: "",
 
   init: async () => {
     const cfg = await io.loadConfig();
     set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder });
   },
+
+  // Check the GitHub release feed. `manual` surfaces "up to date"/error feedback; the silent
+  // launch check only speaks up when an update actually exists (shows the banner).
+  checkUpdates: async (manual) => {
+    if (get().updateBusy) return;
+    set({ updateBusy: true, updateMsg: manual ? "Checking for updates…" : "" });
+    try {
+      const u = await checkForUpdate();
+      if (u) set({ update: u, updateMsg: "" });
+      else set({ update: null, updateMsg: manual ? `You're on the latest version (v${APP_VERSION}).` : "" });
+    } catch (e) {
+      set({ updateMsg: manual ? `Update check failed: ${e instanceof Error ? e.message : String(e)}` : "" });
+    } finally {
+      set({ updateBusy: false });
+      if (manual) setTimeout(() => { if (get().updateMsg.startsWith("You're on")) set({ updateMsg: "" }); }, 6000);
+    }
+  },
+  installUpdate: async () => {
+    const u = get().update;
+    if (!u || get().updateBusy) return;
+    set({ updateBusy: true, updatePct: null, updateMsg: "Downloading update…" });
+    try {
+      await installAndRelaunch(u, (p) => set({ updatePct: p }));
+      // relaunch() replaces the process on success; nothing runs after.
+    } catch (e) {
+      set({ updateBusy: false, updatePct: null, updateMsg: `Update failed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  },
+  dismissUpdate: () => set({ update: null, updateMsg: "" }),
 
   addUser: async (name) => {
     const u = name.trim();

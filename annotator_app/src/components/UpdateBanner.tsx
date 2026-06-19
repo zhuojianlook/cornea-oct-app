@@ -1,62 +1,40 @@
-/* On launch, checks for a newer signed release and, if one exists, shows a slim banner offering a
-   one-click "Install & restart". Renders nothing when up to date or outside the desktop shell. */
+/* Shows when a newer signed release is available (from the launch check or the manual "Check for
+   updates" button). Offers a one-click "Install & restart". Update state lives in the store so the
+   header button and this banner stay in sync. */
 
-import { useEffect, useState } from "react";
 import { Button, LinearProgress } from "@mui/material";
-import type { Update } from "@tauri-apps/plugin-updater";
-import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
+import { useStore } from "../store/annotatorStore";
 
 export function UpdateBanner() {
-  const [update, setUpdate] = useState<Update | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [pct, setPct] = useState<number | null>(null);
-  const [err, setErr] = useState("");
-  const [dismissed, setDismissed] = useState(false);
+  const update = useStore((s) => s.update);
+  const updateBusy = useStore((s) => s.updateBusy);
+  const updatePct = useStore((s) => s.updatePct);
+  const installUpdate = useStore((s) => s.installUpdate);
+  const dismissUpdate = useStore((s) => s.dismissUpdate);
 
-  useEffect(() => {
-    let alive = true;
-    checkForUpdate().then((u) => { if (alive) setUpdate(u); }).catch(() => {});
-    return () => { alive = false; };
-  }, []);
-
-  if (!update || dismissed) return null;
-
-  const install = async () => {
-    setBusy(true);
-    setErr("");
-    try {
-      await installAndRelaunch(update, setPct);
-      // relaunch() replaces the process; nothing runs after this on success.
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-      setBusy(false);
-    }
-  };
+  if (!update) return null;
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "6px 12px",
-                  background: "var(--c-accent)", color: "#fff", fontSize: 13 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "6px 16px",
+                  background: "var(--c-accent)", color: "#fff", fontSize: 13, flex: "none" }}>
       <span>
         ⬆ Update available — <b>v{update.version}</b>
         {update.currentVersion ? ` (you have v${update.currentVersion})` : ""}.
       </span>
-      {err && <span style={{ color: "#ffd7d3" }}>Update failed: {err}</span>}
       <div style={{ flex: 1 }} />
-      {busy ? (
+      {updateBusy ? (
         <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 180 }}>
-          <LinearProgress variant={pct == null ? "indeterminate" : "determinate"} value={pct ?? 0}
+          <LinearProgress variant={updatePct == null ? "indeterminate" : "determinate"} value={updatePct ?? 0}
             sx={{ flex: 1, minWidth: 120 }} />
-          <span style={{ width: 64, textAlign: "right" }}>{pct == null ? "installing…" : `${pct}%`}</span>
+          <span style={{ width: 64, textAlign: "right" }}>{updatePct == null ? "installing…" : `${updatePct}%`}</span>
         </span>
       ) : (
         <>
-          <Button size="small" variant="contained" onClick={install}
+          <Button size="small" variant="contained" onClick={() => installUpdate()}
             sx={{ bgcolor: "#fff", color: "var(--c-accent)", "&:hover": { bgcolor: "#f0f0f0" } }}>
             Install &amp; restart
           </Button>
-          <Button size="small" variant="text" onClick={() => setDismissed(true)} sx={{ color: "#fff" }}>
-            Later
-          </Button>
+          <Button size="small" variant="text" onClick={() => dismissUpdate()} sx={{ color: "#fff" }}>Later</Button>
         </>
       )}
     </div>
