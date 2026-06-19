@@ -66,7 +66,7 @@ jobs:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('Cornea OCT {0}', github.ref_name) || '' }}
           releaseDraft: false
-          prerelease: false
+          prerelease: true
 
       - name: Upload installers as artifacts
         uses: actions/upload-artifact@v4
