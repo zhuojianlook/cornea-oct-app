@@ -65,6 +65,17 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   try { nv.setDrawColormap(DRAW_CMAP as unknown as string); } catch { /* default LUT */ }
   nv.setDrawOpacity(drawOpacity);
   nv.setDrawingEnabled(true);
+  // Keep the per-view slice scrollbars (#1) in sync when the user scroll-wheels through slices.
+  // Ignore the location changes niivue fires from its OWN paint mousedown/drag: its native canvas
+  // listener runs before React's onMouseDown sets strokeActive, so also gate on uiData.mousedown
+  // (set true at the very start of mouseDownListener) so the readout never follows the brush.
+  (nv as unknown as { onLocationChange: (loc: unknown) => void }).onLocationChange = () => {
+    if (strokeActive) return;
+    const ui = (nv as unknown as { uiData?: { mousedown?: boolean } }).uiData;
+    if (ui?.mousedown && nv!.opts.drawingEnabled) return; // a paint click/drag is in progress
+    const v = currentVox();
+    if (v && sliceListener) sliceListener(v);
+  };
   nv.drawScene();
 }
 
@@ -93,6 +104,42 @@ export function lockCrosshair(): void {
 export function restoreCrosshair(): void {
   if (!nv || !savedCrosshair) return;
   (nv.scene as unknown as { crosshairPos: Float32Array }).crosshairPos = savedCrosshair.slice();
+  nv.drawScene();
+}
+
+// ── Slice navigation (per-view scrollbars, #1) ───────────────────────────────
+let strokeActive = false;
+let sliceListener: ((vox: [number, number, number]) => void) | null = null;
+/** Register a callback fired on scroll/navigation with the current [x,y,z] voxel slice indices. */
+export function setSliceListener(fn: ((vox: [number, number, number]) => void) | null): void { sliceListener = fn; }
+/** Mark a paint stroke active so the slice readout doesn't follow the brush mid-stroke. */
+export function setStroke(active: boolean): void { strokeActive = active; }
+
+/** Per-axis voxel counts [nx, ny, nz] of the loaded volume (RAS/display order), or null. */
+export function getDims(): [number, number, number] | null {
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  if (!dr || dr.length < 4) return null;
+  return [dr[1], dr[2], dr[3]];
+}
+/** Current crosshair as integer voxel indices [x, y, z] (matches niivue's convertFrac2Vox). */
+export function currentVox(): [number, number, number] | null {
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  const cp = nv?.scene?.crosshairPos as Float32Array | undefined;
+  if (!dr || !cp || dr.length < 4) return null;
+  const ix = (a: number) => Math.max(0, Math.min(dr[a + 1] - 1, Math.round(cp[a] * dr[a + 1] - 0.5)));
+  return [ix(0), ix(1), ix(2)];
+}
+/** Jump the through-plane slice for a voxel axis (0=x/sagittal, 1=y/coronal, 2=z/axial) without
+    disturbing the two in-plane coords. crosshairPos[axis] = (slice + 0.5)/n — niivue's exact
+    voxel→frac, so the slider lands on voxel centres and round-trips with niivue's own scroll. */
+export function setVoxAxis(axis: 0 | 1 | 2, slice: number): void {
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  const cp = nv?.scene?.crosshairPos as Float32Array | undefined;
+  if (!nv || !dr || !cp || dr.length < 4) return;
+  const n = dr[axis + 1];
+  const s = Math.max(0, Math.min(n - 1, Math.round(slice)));
+  cp[axis] = (s + 0.5) / n;
+  lockCrosshair();          // a subsequent paint stroke restores to THIS slice, not the previous one
   nv.drawScene();
 }
 
@@ -144,12 +191,19 @@ function remapLabel(from: number, to: number): void {
     nearest scribbled seed (cornea=1, scar=2, AND background=3), then background seeds map back to 0.
     Without background seeds GrowCut floods the whole volume into cornea/scar; the background pen lets
     the user mark "this is NOT cornea" so the grown region stops at a real boundary. */
-export function smartFill(): void {
-  if (!nv) return;
+export function smartFill(): { ok: boolean; reason?: "no-volume" | "no-seeds" } {
+  if (!nv || !nv.drawBitmap) return { ok: false, reason: "no-volume" };
+  const b = nv.drawBitmap;
+  let seeded = false;
+  for (let i = 0; i < b.length; i++) if (b[i] !== 0) { seeded = true; break; }
+  if (!seeded) return { ok: false, reason: "no-seeds" }; // GrowCut on a blank drawing is a no-op
   nv.drawGrowCut();
   remapLabel(BG_SEED, 0);
+  // Snapshot the FINAL (remapped) state so Undo/Redo are consistent with what's shown.
+  try { (nv as unknown as { drawAddUndoBitmap: () => void }).drawAddUndoBitmap(); } catch { /* best-effort */ }
   try { nv.refreshDrawing(true); } catch { /* texture refresh best-effort */ }
   nv.drawScene();
+  return { ok: true };
 }
 export function undoDrawing(): void { if (nv) { try { nv.drawUndo(); nv.drawScene(); } catch { /* nothing */ } } }
 

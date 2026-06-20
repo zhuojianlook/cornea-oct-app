@@ -71,7 +71,9 @@ export async function loadConfig(): Promise<AppConfig> {
 
 export async function saveConfig(cfg: AppConfig): Promise<void> {
   if (!inTauri()) return; // no native FS in the browser — skip persistence (don't block the user)
-  await writeTextFile(await configPath(), JSON.stringify(cfg, null, 2));
+  try {
+    await writeTextFile(await configPath(), JSON.stringify(cfg, null, 2));
+  } catch { /* config persistence is best-effort — must never reject and abort an annotation Save */ }
 }
 
 // ── ground-truth output: labelmap file + manifest (json + csv) ───────────────

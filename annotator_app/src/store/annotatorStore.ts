@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.11";
+export const APP_VERSION = "0.1.12";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {
@@ -22,6 +22,8 @@ interface State {
   loaded: boolean;
   annotated: Set<string>;          // volume stems this user already saved (this output dir)
   volumeStartMs: number;
+  dims: [number, number, number] | null;   // [nx, ny, nz] of the loaded volume
+  vox: [number, number, number];           // current crosshair slice indices [x, y, z]
   // pen
   penLabel: Pen;
   penSize: number;
@@ -53,6 +55,8 @@ interface State {
   setPenFilled: (f: boolean) => void;
   setPaintMode: (on: boolean) => void;
   setDrawOpacity: (o: number) => void;
+  setSliceAxis: (axis: 0 | 1 | 2, s: number) => void;
+  syncVox: () => void;
   smartFill: () => void;
   undo: () => void;
   clearDrawing: () => void;
@@ -70,6 +74,8 @@ export const useStore = create<State>((set, get) => ({
   loaded: false,
   annotated: new Set(),
   volumeStartMs: 0,
+  dims: null,
+  vox: [0, 0, 0],
   penLabel: 2,
   penSize: 3,
   penFilled: false,
@@ -159,7 +165,9 @@ export const useStore = create<State>((set, get) => ({
       await nv.loadVolumeBytes(bytes, v.name, get().drawOpacity);
       nv.setPenSize(get().penSize);
       nv.setPen(get().penLabel, get().penFilled);
+      nv.setSliceListener((vx) => set({ vox: vx })); // keep slice scrollbars synced to scroll-wheel nav
       set({ activeVolume: v, loaded: true, paintMode: true, volumeStartMs: Date.now(),
+            dims: nv.getDims(), vox: nv.currentVox() ?? [0, 0, 0],
             status: `Annotating ${v.name}. Paint cornea/scar; Smart fill helps; then Save.` });
     } catch (e) {
       set({ status: `Failed to load volume: ${e instanceof Error ? e.message : String(e)}` });
@@ -181,7 +189,23 @@ export const useStore = create<State>((set, get) => ({
   setPenFilled: (f) => { nv.setPen(get().penLabel, f); set({ penFilled: f }); },
   setPaintMode: (on) => { if (on) { nv.setPen(get().penLabel, get().penFilled); nv.lockCrosshair(); } nv.setDrawingEnabled(on); set({ paintMode: on }); },
   setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
-  smartFill: () => nv.smartFill(),
+  setSliceAxis: (axis, s) => {
+    nv.setVoxAxis(axis, s);
+    const vox = [...get().vox] as [number, number, number];
+    vox[axis] = Math.round(s);
+    set({ vox });
+  },
+  syncVox: () => { const v = nv.currentVox(); if (v) set({ vox: v }); },
+  smartFill: () => {
+    const r = nv.smartFill();
+    if (!r.ok) {
+      set({ status: r.reason === "no-seeds"
+        ? "Smart fill needs seeds — scribble a little Cornea and Background (and Scar), then Smart fill."
+        : "Load a volume first." });
+      return;
+    }
+    set({ status: "Smart fill done. If the cornea over-grew, add Background seeds around it and Smart fill again." });
+  },
   undo: () => nv.undoDrawing(),
   clearDrawing: () => { nv.clearDrawing(); set({ status: "Cleared — blank drawing." }); },
 
