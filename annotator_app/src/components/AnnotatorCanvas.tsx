@@ -3,19 +3,19 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CircularProgress, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr } from "../i18n";
 
-const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff453a" };
-const PEN_KEY = { 0: "pen.erase", 1: "pen.cornea", 2: "pen.scar" } as const;
+const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff453a", 3: "#9aa0aa" };
+const PEN_KEY = { 0: "pen.erase", 1: "pen.cornea", 2: "pen.scar", 3: "pen.background" } as const;
 const VIEWS: ViewName[] = ["multi", "axial", "coronal", "sagittal", "render"];
 
 export function AnnotatorCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [view, setV] = useState<ViewName>("multi");
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
-  const [brush, setBrush] = useState<{ x: number; y: number } | null>(null);
+  const [brush, setBrush] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const loaded = useStore((s) => s.loaded);
   const busy = useStore((s) => s.busy);
   const paintMode = useStore((s) => s.paintMode);
@@ -65,18 +65,26 @@ export function AnnotatorCanvas() {
       {/* Canvas + overlays */}
       <div
         className="relative flex-1 min-h-0 min-w-0"
+        onMouseDown={() => { if (painting) restoreCrosshair(); }}
+        onMouseUp={() => { if (painting) restoreCrosshair(); }}
         onMouseMove={(e) => {
+          // #2 — painting must not drag the crosshair (other views stay on the chosen slice). While a
+          // paint stroke is active (left button down) restore the crosshair niivue just moved; otherwise
+          // (hover / navigate) remember the current crosshair so a stroke can snap back to it.
+          if (painting && (e.buttons & 1)) restoreCrosshair(); else lockCrosshair();
           if (!painting) { if (brush) setBrush(null); return; }
           const r = e.currentTarget.getBoundingClientRect();
-          setBrush({ x: e.clientX - r.left, y: e.clientY - r.top });
+          const x = e.clientX - r.left, y = e.clientY - r.top;
+          const sz = brushScreenSize(x, y); // accurate voxel→screen size; fall back to a rough estimate
+          setBrush({ x, y, w: sz ? Math.max(3, sz.w) : penSize * 3, h: sz ? Math.max(3, sz.h) : penSize * 3 });
         }}
         onMouseLeave={() => setBrush(null)}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting ? "crosshair" : "default" }} />
         {showBrush && (
-          <div className="absolute rounded-full pointer-events-none" style={{
+          <div className="absolute pointer-events-none" style={{
             left: brush!.x, top: brush!.y, transform: "translate(-50%, -50%)",
-            width: Math.max(6, penSize * 3), height: Math.max(6, penSize * 3),
+            width: brush!.w, height: brush!.h, borderRadius: 2,
             border: `1.5px solid ${PEN_COLOR[penLabel] ?? "#fff"}`, boxShadow: "0 0 0 1px rgba(0,0,0,0.5)",
             background: penLabel === 0 ? "transparent" : `${PEN_COLOR[penLabel]}22`,
           }} />

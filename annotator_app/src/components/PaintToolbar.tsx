@@ -9,6 +9,7 @@ import { tr, type TKey } from "../i18n";
 const PENS: { value: Pen; key: TKey; color: string }[] = [
   { value: 1, key: "pen.cornea", color: "#1ab2ff" },
   { value: 2, key: "pen.scar", color: "#ff453a" },
+  { value: 3, key: "pen.background", color: "#9aa0aa" }, // seed "not cornea" for Smart fill
   { value: 0, key: "pen.erase", color: "#c7c7cc" },
 ];
 
@@ -52,7 +53,7 @@ export function PaintToolbar() {
       <Tooltip title={tr(lang, "tb.sizeTip")} arrow>
         <div className="flex items-center gap-2" style={{ width: 132 }}>
           <Label>{tr(lang, "tb.size")}</Label>
-          <Slider size="small" min={1} max={15} step={1} value={penSize} valueLabelDisplay="auto"
+          <Slider size="small" min={1} max={40} step={1} value={penSize} valueLabelDisplay="auto"
             disabled={off} onChange={(_, v) => setPenSize(v as number)} />
           <span style={{ fontSize: 11, width: 16, textAlign: "right", color: "var(--c-text-dim)" }}>{penSize}</span>
         </div>

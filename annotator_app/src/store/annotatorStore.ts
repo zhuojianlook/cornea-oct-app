@@ -5,8 +5,8 @@ import * as nv from "../niivue/nvController";
 import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
-export type Pen = 0 | 1 | 2; // 0 erase, 1 cornea, 2 scar
-export const APP_VERSION = "0.1.10";
+export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
+export const APP_VERSION = "0.1.11";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {
@@ -179,7 +179,7 @@ export const useStore = create<State>((set, get) => ({
   setPenLabel: (p) => { nv.setPen(p, get().penFilled); set({ penLabel: p }); },
   setPenSize: (n) => { nv.setPenSize(n); set({ penSize: n }); },
   setPenFilled: (f) => { nv.setPen(get().penLabel, f); set({ penFilled: f }); },
-  setPaintMode: (on) => { if (on) nv.setPen(get().penLabel, get().penFilled); nv.setDrawingEnabled(on); set({ paintMode: on }); },
+  setPaintMode: (on) => { if (on) { nv.setPen(get().penLabel, get().penFilled); nv.lockCrosshair(); } nv.setDrawingEnabled(on); set({ paintMode: on }); },
   setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
   smartFill: () => nv.smartFill(),
   undo: () => nv.undoDrawing(),
