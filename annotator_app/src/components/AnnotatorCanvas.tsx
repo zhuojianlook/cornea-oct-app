@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -39,8 +39,17 @@ export function AnnotatorCanvas() {
     if (canvasRef.current) { attach(canvasRef.current); setNoWebgl(webglFailure()); }
   }, []);
 
+  // Defensive repaint once the layout has settled after a volume loads / the view changes — recovers
+  // WebKitGTK if it left the GL canvas black after a resize. (#2)
+  useEffect(() => {
+    if (!loaded) return;
+    const id = requestAnimationFrame(() => redraw());
+    return () => cancelAnimationFrame(id);
+  }, [loaded, view]);
+
   const painting = loaded && paintMode && view !== "render";
   const showBrush = painting && brush;
+  const showStrip = loaded && view !== "render" && !!dims;
 
   if (noWebgl) {
     return (
@@ -121,27 +130,28 @@ export function AnnotatorCanvas() {
         )}
       </div>
 
-      {/* Per-view slice scrollbars (#1): scrub a specific slice in each plane (one per single view,
-          all three in Multi). Stays in sync with scroll-wheel navigation via onLocationChange. */}
-      {loaded && view !== "render" && dims && (
-        <div className="flex items-center gap-5 px-4 border-t flex-none overflow-x-auto"
-          style={{ minHeight: 40, borderColor: "var(--c-border)", backgroundColor: "var(--c-surface)" }}>
-          {VIEW_AXIS.filter((a) => view === "multi" || view === a.plane).map((a) => {
-            const n = dims[a.axis];
-            const cur = Math.min(Math.max(0, vox[a.axis]), Math.max(0, n - 1));
-            return (
-              <div key={a.plane} className="flex items-center gap-2" style={{ flex: 1, minWidth: 150 }}>
-                <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em",
-                               color: "var(--c-text-dim)", whiteSpace: "nowrap" }}>{tr(lang, a.key)}</span>
-                <Slider size="small" min={0} max={Math.max(0, n - 1)} step={1} value={cur} valueLabelDisplay="auto"
-                  disabled={n <= 1} onChange={(_, v) => setSliceAxis(a.axis, v as number)} />
-                <span style={{ fontSize: 11, width: 58, textAlign: "right", color: "var(--c-text-dim)",
-                               whiteSpace: "nowrap" }}>{cur + 1}/{n}</span>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      {/* Per-view slice scrollbars (#1): one per single view, all three in Multi; synced to scroll-wheel
+          via onLocationChange. The bar's height is ALWAYS reserved (even with no volume / in 3D) so that
+          loading a volume never RESIZES the niivue canvas — WebKitGTK can render a freshly-loaded volume
+          black if its GL drawing buffer is reallocated by a resize right after the first draw. (#2) */}
+      <div className="flex items-center gap-5 px-4 flex-none overflow-x-auto"
+        style={{ height: 40, borderTop: showStrip ? "1px solid var(--c-border)" : "none",
+                 backgroundColor: showStrip ? "var(--c-surface)" : "transparent" }}>
+        {showStrip && VIEW_AXIS.filter((a) => view === "multi" || view === a.plane).map((a) => {
+          const n = dims![a.axis];
+          const cur = Math.min(Math.max(0, vox[a.axis]), Math.max(0, n - 1));
+          return (
+            <div key={a.plane} className="flex items-center gap-2" style={{ flex: 1, minWidth: 150 }}>
+              <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em",
+                             color: "var(--c-text-dim)", whiteSpace: "nowrap" }}>{tr(lang, a.key)}</span>
+              <Slider size="small" min={0} max={Math.max(0, n - 1)} step={1} value={cur} valueLabelDisplay="auto"
+                disabled={n <= 1} onChange={(_, v) => setSliceAxis(a.axis, v as number)} />
+              <span style={{ fontSize: 11, width: 58, textAlign: "right", color: "var(--c-text-dim)",
+                             whiteSpace: "nowrap" }}>{cur + 1}/{n}</span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

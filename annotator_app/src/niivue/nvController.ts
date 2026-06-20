@@ -81,6 +81,9 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
 
 export function hasVolume(): boolean { return !!nv && nv.volumes.length > 0; }
 export function setView(v: ViewName): void { if (nv) nv.setSliceType(SLICE[v]); }
+/** Force a repaint. Defensive: WebKitGTK can leave a freshly-loaded volume black if the canvas was
+    resized right after the first draw — re-issuing drawScene once the layout has settled recovers it. */
+export function redraw(): void { if (nv) { try { nv.drawScene(); } catch { /* nothing */ } } }
 
 // ── Pen / brush ────────────────────────────────────────────────────────────
 export function setPen(label: number, filled = false): void {
