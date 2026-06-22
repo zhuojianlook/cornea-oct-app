@@ -56,7 +56,11 @@ jobs:
       - name: Build app + (on tag) publish Release
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use a user PAT (RELEASE_PAT secret), NOT the default GITHUB_TOKEN: the GitHub-App-issued
+          # GITHUB_TOKEN 403s on create-a-release here ("Resource not accessible by integration") even
+          # with contents:write — a user token isn't "an integration", so it publishes cleanly.
+          # RELEASE_PAT = a fine-grained PAT scoped to this repo with Contents: read+write.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
           # Distinct signing key from the annotator so the two apps' updaters stay independent.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CORNEA_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CORNEA_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -98,7 +102,7 @@ jobs:
     steps:
       - name: Mirror updater manifest to the cornea-updater release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}   # same PAT — GITHUB_TOKEN 403s on release writes here
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
