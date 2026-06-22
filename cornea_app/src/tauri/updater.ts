@@ -35,6 +35,14 @@ export async function installAndRelaunch(update: Update, onProgress?: (pct: numb
       onProgress?.(100);
     }
   });
-  const { relaunch } = await import("@tauri-apps/plugin-process");
-  await relaunch();
+  // Restart via our own Rust command (kills the sidecar + execs $APPIMAGE on Linux) — Tauri's
+  // relaunch() can silently no-op on AppImages, and we must free port 8765 so the updated sidecar
+  // respawns. Falls back to relaunch() if the command isn't available.
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("restart_app");
+  } catch {
+    const { relaunch } = await import("@tauri-apps/plugin-process");
+    await relaunch();
+  }
 }

@@ -95,12 +95,41 @@ fn kill_sidecar(app: &tauri::AppHandle) {
     }
 }
 
+/// Restart after a self-update. Kill the sidecar first so port 8765 frees and the new instance can
+/// respawn the *updated* sidecar (otherwise the stale one keeps serving and the update is wasted).
+/// On Linux AppImages Tauri's relaunch() can silently no-op, so exec the (already-updated) $APPIMAGE
+/// directly — exec replaces this process, guaranteeing a restart into the new version. Falls back to
+/// Tauri's restart elsewhere / if exec fails.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    kill_sidecar(&app);
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(appimage) = std::env::var("APPIMAGE") {
+            use std::os::unix::process::CommandExt;
+            let err = Command::new(&appimage).exec(); // only returns on failure
+            log::error!("exec restart failed: {err}");
+        }
+    }
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Linux AppImage self-update: Tauri downloads the new AppImage to a temp dir and renames it over
+    // the running one, which fails if the temp dir is on a different mount (e.g. /tmp = tmpfs). Point
+    // the temp dir at the AppImage's own directory (always same mount + writable).
+    #[cfg(target_os = "linux")]
+    if let Ok(appimage) = std::env::var("APPIMAGE") {
+        if let Some(dir) = std::path::Path::new(&appimage).parent() {
+            std::env::set_var("TMPDIR", dir);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Sidecar(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![proxy_request, proxy_upload])
+        .invoke_handler(tauri::generate_handler![proxy_request, proxy_upload, restart_app])
         .setup(|app| {
             #[cfg(desktop)]
             {

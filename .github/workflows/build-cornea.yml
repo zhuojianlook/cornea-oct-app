@@ -83,3 +83,34 @@ jobs:
             cornea_app/src-tauri/target/**/release/bundle/**/*.msi
             cornea_app/src-tauri/target/**/release/bundle/**/*.exe
             cornea_app/src-tauri/target/**/release/bundle/**/*.sig
+
+  # After all platform builds upload their installers + the signed latest.json to the cornea-vX.Y.Z
+  # release, mirror that manifest onto a STABLE prerelease (cornea-updater) under the fixed filename
+  # the app's updater endpoint points at. Without this the in-app updater has nothing to read.
+  # (Kept as a prerelease so it never becomes the repo's "Latest" — that slot belongs to the annotator,
+  # whose updater uses releases/latest in this same repo.)
+  publish-manifest:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mirror updater manifest to the cornea-updater release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # tauri-action assembled the per-platform signed manifest as latest.json on the tag release.
+          gh release download "$TAG" --repo "$REPO" --pattern "latest.json" --dir . --clobber
+          mv latest.json cornea-latest.json
+          # Create the stable manifest release on first run (prerelease); reuse it thereafter.
+          if ! gh release view cornea-updater --repo "$REPO" >/dev/null 2>&1; then
+            gh release create cornea-updater --repo "$REPO" --prerelease \
+              --title "Cornea OCT — updater manifest" \
+              --notes "Auto-updated pointer to the latest Cornea OCT release. Do not delete: the in-app updater reads cornea-latest.json from here."
+          fi
+          gh release upload cornea-updater cornea-latest.json --repo "$REPO" --clobber
+          echo "Mirrored $TAG latest.json -> cornea-updater/cornea-latest.json"
