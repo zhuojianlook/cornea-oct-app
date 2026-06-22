@@ -3,7 +3,7 @@
    erase=0), smart-fill (GrowCut), and export the drawing as a 0/1/2 NIfTI labelmap co-registered to
    the volume. No backend. */
 
-import { Niivue, SLICE_TYPE } from "@niivue/niivue";
+import { Niivue, NVImage, SLICE_TYPE, DRAG_MODE } from "@niivue/niivue";
 
 export type ViewName = "multi" | "axial" | "coronal" | "sagittal" | "render";
 const SLICE: Record<ViewName, number> = {
@@ -18,15 +18,18 @@ const SLICE: Record<ViewName, number> = {
 // 3 = BACKGROUND seed (gray) — used only to seed Smart fill (GrowCut) like Slicer "Grow from
 // seeds"; it's mapped back to 0 (background) after growcut / on export, so it never ships.
 // Cornea semi-transparent so the opaque scar is visible WITHIN the cornea in the 3D render.
+// 4/5 = LIGHTER preview shades of cornea/scar — used only to display an unconfirmed smart-fill preview
+// (mapped back to 1/2 on Confirm and on export); seeds/committed use the solid 1/2.
 const DRAW_CMAP = {
-  R: [0, 70, 235, 150],
-  G: [0, 160, 95, 150],
-  B: [0, 235, 95, 165],
-  A: [0, 130, 255, 90],
-  I: [0, 1, 2, 3],
-  labels: ["", "cornea", "scar", "background"],
+  R: [0, 70, 235, 150, 120, 255],
+  G: [0, 160, 95, 150, 195, 160],
+  B: [0, 235, 95, 165, 255, 160],
+  A: [0, 130, 255, 90, 80, 80],
+  I: [0, 1, 2, 3, 4, 5],
+  labels: ["", "cornea", "scar", "background", "cornea-preview", "scar-preview"],
 };
 const BG_SEED = 3;
+const PREVIEW_CORNEA = 4, PREVIEW_SCAR = 5;
 
 let nv: Niivue | null = null;
 let webglError: string | null = null;
@@ -70,12 +73,19 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   nv.setDrawOpacity(drawOpacity);
   nv.setDrawingEnabled(false); // custom sphere brush owns painting; niivue navigation still sets crosshair
   nv.opts.penSize = 1;
+  // Pan/zoom: left-drag stays crosshair (NOT contrast); shift/ctrl+left, middle & right drag = pan.
+  (nv as unknown as { opts: { mouseEventConfig?: unknown } }).opts.mouseEventConfig = {
+    leftButton: { primary: DRAG_MODE.crosshair, withShift: DRAG_MODE.pan, withCtrl: DRAG_MODE.pan },
+    rightButton: DRAG_MODE.pan, centerButton: DRAG_MODE.pan,
+  };
+  try { nv.setPan2Dxyzmm([0, 0, 0, 1]); } catch { /* */ } // reset zoom/pan for the new volume
+  rasIntensity = null; // drop the previous volume's cached intensity
   // Three-layer drawing model (#smartfill-preview): seeds = the user's brushstrokes (the ONLY input to
   // smart fill), committed = confirmed segmentation, preview = last smart-fill result (recomputed each
   // run). The displayed drawBitmap is composed = seeds ▸ preview ▸ committed. Confirm bakes preview→committed.
   if (nv.drawBitmap) { const n = nv.drawBitmap.length;
     seedBmp = new Uint8Array(n); committedBmp = new Uint8Array(n); previewBmp = new Uint8Array(n);
-    previewing = false; undoStack = []; }
+    previewing = false; undoStack = []; redoStack = []; }
   // Keep the per-view slice scrollbars (#1) in sync when the user scroll-wheels through slices.
   // Ignore the location changes niivue fires from its OWN paint mousedown/drag: its native canvas
   // listener runs before React's onMouseDown sets strokeActive, so also gate on uiData.mousedown
@@ -257,6 +267,21 @@ export function tileAtScreen(xCss: number, yCss: number): number {
   return -1;
 }
 
+/** The voxel [x,y,z] under a canvas-relative point (for the hover intensity readout), or null if not
+    over a 2-D pane. Uses niivue's exact screen→texture transform. */
+export function voxAtScreen(xCss: number, yCss: number): [number, number, number] | null {
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => ArrayLike<number> }).screenXY2TextureFrac;
+  if (!nv || !dr || typeof f2f !== "function") return null;
+  const tile = tileAtScreen(xCss, yCss);
+  if (tile < 0) return null;
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const f = f2f.call(nv, xCss * dpr, yCss * dpr, tile);
+  if (!f || f[0] < 0) return null;
+  const ix = (a: number) => Math.max(0, Math.min(dr[a + 1] - 1, Math.round(f[a] * dr[a + 1] - 0.5)));
+  return [ix(0), ix(1), ix(2)];
+}
+
 // ── Layered drawing: seeds (brushstrokes) ▸ preview (last smart fill) ▸ committed (confirmed) ────────
 // Smart fill must grow ONLY from the user's brushstrokes (seeds), never from its own output — so the
 // fill is a recomputable PREVIEW. "Confirm" bakes the preview into the committed segmentation. The
@@ -265,25 +290,41 @@ let seedBmp: Uint8Array | null = null;
 let committedBmp: Uint8Array | null = null;
 let previewBmp: Uint8Array | null = null;
 let previewing = false;
-let undoStack: Array<{ s: Uint8Array; c: Uint8Array }> = [];
+let rasIntensity: ArrayLike<number> | null = null; // RAS-ordered intensity (cached for wand + readout)
+type Snap = { s: Uint8Array; c: Uint8Array };
+let undoStack: Snap[] = [];
+let redoStack: Snap[] = [];
 const UNDO_CAP = 4;
 
 export function isPreviewing(): boolean { return previewing; }
+export function canUndo(): boolean { return undoStack.length > 0; }
+export function canRedo(): boolean { return redoStack.length > 0; }
 
-/** Recompose the displayed/exported drawBitmap from the three layers and push it to the GPU. */
+/** Recompose the displayed drawBitmap from the three layers (seeds ▸ preview ▸ committed). Seeds and
+    committed show in solid colours; the unconfirmed preview shows in a LIGHTER shade (1→4, 2→5). */
 function compose(): void {
   if (!nv?.drawBitmap || !seedBmp || !committedBmp || !previewBmp) return;
   const d = nv.drawBitmap, s = seedBmp, p = previewBmp, c = committedBmp;
-  for (let i = 0; i < d.length; i++) { const sv = s[i]; d[i] = sv !== 0 ? sv : (p[i] !== 0 ? p[i] : c[i]); }
+  for (let i = 0; i < d.length; i++) {
+    const sv = s[i];
+    if (sv !== 0) d[i] = sv;
+    else { const pv = p[i]; d[i] = pv !== 0 ? (pv === 1 ? PREVIEW_CORNEA : pv === 2 ? PREVIEW_SCAR : pv) : c[i]; }
+  }
   try { nv.refreshDrawing(true); } catch { /* */ }
   nv.drawScene();
 }
 
-/** Snapshot seeds+committed for undo — call BEFORE a mutating action (stroke, smart fill, confirm, clear). */
+const snapshot = (): Snap => ({ s: seedBmp!.slice(), c: committedBmp!.slice() });
+function restoreSnap(e: Snap): void {
+  seedBmp!.set(e.s); committedBmp!.set(e.c); previewBmp!.fill(0); previewing = false; compose();
+}
+/** Snapshot seeds+committed for undo — call BEFORE a mutating action (stroke, smart fill, confirm, clear).
+    A new action invalidates the redo stack. */
 function pushUndo(): void {
   if (!seedBmp || !committedBmp) return;
-  undoStack.push({ s: seedBmp.slice(), c: committedBmp.slice() });
+  undoStack.push(snapshot());
   if (undoStack.length > UNDO_CAP) undoStack.shift();
+  redoStack = [];
 }
 /** Begin a brush stroke: snapshot for undo. */
 export function beginStroke(): void { pushUndo(); }
@@ -398,11 +439,115 @@ export function confirmFill(): boolean {
 }
 
 export function undoDrawing(): void {
-  const e = undoStack.pop();
-  if (!e || !seedBmp || !committedBmp || !previewBmp) return;
-  seedBmp.set(e.s); committedBmp.set(e.c); previewBmp.fill(0); previewing = false;
-  compose();
+  if (!undoStack.length || !seedBmp || !committedBmp || !previewBmp) return;
+  redoStack.push(snapshot());
+  restoreSnap(undoStack.pop()!);
 }
+export function redoDrawing(): void {
+  if (!redoStack.length || !seedBmp || !committedBmp || !previewBmp) return;
+  undoStack.push(snapshot());
+  restoreSnap(redoStack.pop()!);
+}
+
+// ── Intensity (RAS) cache — for the threshold wand + cursor readout ───────────
+function getRasIntensity(): ArrayLike<number> | null {
+  if (rasIntensity) return rasIntensity;
+  const vol = nv?.volumes[0] as unknown as { img2RAS?: () => ArrayLike<number> } | undefined;
+  if (!vol?.img2RAS) return null;
+  rasIntensity = vol.img2RAS(); // read-only use; one allocation per volume
+  return rasIntensity;
+}
+/** Raw image intensity at a RAS voxel, or null. */
+export function intensityAt(x: number, y: number, z: number): number | null {
+  const ras = getRasIntensity();
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  if (!ras || !dr) return null;
+  const nx = dr[1], ny = dr[2], nz = dr[3];
+  if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return null;
+  return ras[z * nx * ny + y * nx + x];
+}
+/** Volume intensity range [min,max] (for mapping the wand's 0..1 threshold to absolute intensity). */
+export function intensityRange(): [number, number] | null {
+  const vol = nv?.volumes[0] as unknown as { global_min?: number; global_max?: number } | undefined;
+  if (vol && vol.global_min != null && vol.global_max != null && vol.global_max > vol.global_min) return [vol.global_min, vol.global_max];
+  const ras = getRasIntensity();
+  if (!ras) return null;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < ras.length; i++) { const v = ras[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+  return hi > lo ? [lo, hi] : null;
+}
+
+// ── Threshold-assisted scar wand ─────────────────────────────────────────────
+/** Flood-fill SCAR (committed=2) from a clicked voxel through 6-connected voxels with intensity ≥ a
+    threshold (0..1 of the volume range). If any cornea is committed, the flood is confined to the cornea
+    (scar is a sub-region of cornea). Respects label locks + supports undo. */
+export function wandFill(x: number, y: number, z: number, threshold01: number): { ok: boolean; reason?: string; count?: number } {
+  const ras = getRasIntensity();
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  if (!nv || !ras || !committedBmp || !dr) return { ok: false, reason: "no-volume" };
+  const range = intensityRange();
+  if (!range) return { ok: false, reason: "no-volume" };
+  const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny, N = nx * ny * nz;
+  if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return { ok: false, reason: "out-of-bounds" };
+  const thr = range[0] + threshold01 * (range[1] - range[0]);
+  let hasCornea = false;
+  for (let i = 0; i < N; i++) { if (committedBmp[i] === 1) { hasCornea = true; break; } }
+  const c = committedBmp;
+  const inMask = (i: number) => ras[i] >= thr && (!hasCornea || c[i] === 1 || c[i] === 2);
+  const seed = z * nxny + y * nx + x;
+  if (!inMask(seed)) return { ok: false, reason: hasCornea ? "outside-cornea" : "below-threshold" };
+  pushUndo();
+  const hasLocks = lockedLabels.size > 0;
+  const visited = new Uint8Array(N);
+  let stack = new Int32Array(4096), sp = 0;
+  const push = (i: number) => { if (sp === stack.length) { const n = new Int32Array(stack.length * 2); n.set(stack); stack = n; } stack[sp++] = i; };
+  push(seed); visited[seed] = 1;
+  let count = 0;
+  while (sp > 0) {
+    const i = stack[--sp];
+    if (!(hasLocks && lockedLabels.has(c[i]))) { c[i] = 2; count++; }
+    const z2 = (i / nxny) | 0, r = i - z2 * nxny, y2 = (r / nx) | 0, x2 = r - y2 * nx;
+    if (x2 > 0 && !visited[i - 1] && inMask(i - 1)) { visited[i - 1] = 1; push(i - 1); }
+    if (x2 < nx - 1 && !visited[i + 1] && inMask(i + 1)) { visited[i + 1] = 1; push(i + 1); }
+    if (y2 > 0 && !visited[i - nx] && inMask(i - nx)) { visited[i - nx] = 1; push(i - nx); }
+    if (y2 < ny - 1 && !visited[i + nx] && inMask(i + nx)) { visited[i + nx] = 1; push(i + nx); }
+    if (z2 > 0 && !visited[i - nxny] && inMask(i - nxny)) { visited[i - nxny] = 1; push(i - nxny); }
+    if (z2 < nz - 1 && !visited[i + nxny] && inMask(i + nxny)) { visited[i + nxny] = 1; push(i + nxny); }
+  }
+  compose();
+  return { ok: true, count };
+}
+
+// ── Load an existing segmentation (open a prior .nii.gz / session GT) into the committed layer ────────
+export async function loadSegmentationBytes(bytes: Uint8Array, name: string): Promise<{ ok: boolean; reason?: string }> {
+  if (!nv || !nv.drawBitmap || !committedBmp || !seedBmp || !previewBmp) return { ok: false, reason: "no-volume" };
+  const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart]));
+  try {
+    const img = await NVImage.loadFromUrl({ url, name });
+    const ok = nv.loadDrawing(img); // aligns the labelmap to the background; populates nv.drawBitmap
+    if (!ok) return { ok: false, reason: "dims-mismatch" };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : "load-failed" };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  pushUndo();
+  // niivue put the loaded labelmap in drawBitmap → adopt it as the committed segmentation
+  const d = nv.drawBitmap;
+  for (let i = 0; i < committedBmp.length; i++) { const v = d[i]; committedBmp[i] = v === 1 || v === 2 ? v : 0; }
+  seedBmp.fill(0); previewBmp.fill(0); previewing = false;
+  compose();
+  return { ok: true };
+}
+
+// ── 2-D zoom / pan ────────────────────────────────────────────────────────────
+export function zoomBy(factor: number): void {
+  if (!nv) return;
+  const p = nv.scene.pan2Dxyzmm as unknown as number[];
+  const z = Math.max(1, Math.min(8, (p[3] || 1) * factor));
+  try { nv.setPan2Dxyzmm([p[0], p[1], p[2], z]); } catch { /* */ }
+}
+export function resetView(): void { if (nv) { try { nv.setPan2Dxyzmm([0, 0, 0, 1]); } catch { /* */ } } }
 
 /** Reset to a blank drawing (discard all paint on the current volume). */
 export function clearDrawing(): void {
@@ -417,10 +562,13 @@ export function clearDrawing(): void {
     segmentation (committed + preview + seeds); background seeds (3) are stripped. */
 export async function exportLabelmapBytes(): Promise<Uint8Array | null> {
   if (!nv?.drawBitmap) return null;
-  remapLabel(BG_SEED, 0); // strip background seeds from the saved GT (display is re-composed afterwards)
+  // the saved GT is strictly 0/1/2: background seeds → 0, preview shades → their real label
+  remapLabel(BG_SEED, 0);
+  remapLabel(PREVIEW_CORNEA, 1);
+  remapLabel(PREVIEW_SCAR, 2);
   try { nv.refreshDrawing(true); } catch { /* best-effort */ }
   const r = await nv.saveImage({ filename: "", isSaveDrawing: true, volumeByIndex: 0 });
-  compose(); // restore the on-screen display (re-adds bg seeds + layer ordering)
+  compose(); // restore the on-screen display (re-adds bg seeds + preview shading)
   return r instanceof Uint8Array ? r : null;
 }
 
@@ -429,7 +577,7 @@ export function drawStats(): { cornea: number; scar: number; mm3: number; spacin
   const out = { cornea: 0, scar: 0, mm3: 0, spacing: [0, 0, 0] as [number, number, number] };
   if (!nv || !nv.drawBitmap) return out;
   const b = nv.drawBitmap;
-  for (let i = 0; i < b.length; i++) { if (b[i] === 1) out.cornea++; else if (b[i] === 2) out.scar++; }
+  for (let i = 0; i < b.length; i++) { const v = b[i]; if (v === 1 || v === PREVIEW_CORNEA) out.cornea++; else if (v === 2 || v === PREVIEW_SCAR) out.scar++; }
   const pd = nv.volumes[0]?.hdr?.pixDims;
   if (pd && pd.length >= 4) {
     out.spacing = [pd[1], pd[2], pd[3]];

@@ -2,7 +2,7 @@
    Disabled until a volume is loaded. */
 
 import type { ReactNode } from "react";
-import { Button, CircularProgress, LinearProgress, Slider, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
+import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, LinearProgress, Slider, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
 import { useStore, type Pen } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -21,12 +21,13 @@ const Sep = () => <div style={{ width: 1, height: 24, background: "var(--c-borde
 const tbSx = { py: 0.4, px: 1.1, fontSize: 12, textTransform: "none" as const, lineHeight: 1.4 };
 
 export function PaintToolbar() {
-  const { loaded, penLabel, penSize, penFilled, paintMode, drawOpacity, lang, busy, smartPct, canConfirm,
-          brightness, contrast, locked,
-          setPenLabel, setPenSize, setPenFilled, setPaintMode, setDrawOpacity, smartFill, confirmFill, undo, clearDrawing,
-          setBrightness, setContrast, resetWindow, toggleLock } = useStore();
+  const { loaded, penLabel, penSize, penFilled, tool, drawOpacity, wandThreshold, lang, busy, smartPct, canConfirm,
+          canUndo, canRedo, brightness, contrast, locked, confirmClear,
+          setPenLabel, setPenSize, setPenFilled, setTool, setWandThreshold, setDrawOpacity, smartFill, confirmFill,
+          undo, redo, requestClear, cancelClear, clearDrawing, setBrightness, setContrast, resetWindow, toggleLock } = useStore();
   const off = !loaded || busy;            // lock controls while smart fill computes
   const filling = busy && smartPct !== null;
+  const paint = tool === "paint";
 
   return (
     <div className="flex items-center gap-3 px-4 border-b overflow-x-auto [&>*]:flex-none"
@@ -36,18 +37,29 @@ export function PaintToolbar() {
           sx={{ position: "absolute", left: 0, right: 0, bottom: 0, height: 3 }} />
       )}
 
-      {/* Mode */}
-      <ToggleButtonGroup size="small" exclusive disabled={off} value={paintMode ? "paint" : "nav"}
-        onChange={(_, v) => v !== null && setPaintMode(v === "paint")}>
+      {/* Tool */}
+      <ToggleButtonGroup size="small" exclusive disabled={off} value={tool}
+        onChange={(_, v) => v !== null && setTool(v)}>
         <ToggleButton value="paint" sx={tbSx}>✏ {tr(lang, "tb.paint")}</ToggleButton>
-        <ToggleButton value="nav" sx={tbSx}>✋ {tr(lang, "tb.navigate")}</ToggleButton>
+        <Tooltip title={tr(lang, "tb.wandTip")} arrow><ToggleButton value="wand" sx={tbSx}>✨ {tr(lang, "tb.wand")}</ToggleButton></Tooltip>
+        <ToggleButton value="navigate" sx={tbSx}>✋ {tr(lang, "tb.navigate")}</ToggleButton>
       </ToggleButtonGroup>
+
+      {tool === "wand" && (
+        <Tooltip title={tr(lang, "tb.wandThreshTip")} arrow>
+          <div className="flex items-center gap-2" style={{ width: 150 }}>
+            <Label>{tr(lang, "tb.threshold")}</Label>
+            <Slider size="small" min={0} max={1} step={0.01} value={wandThreshold} valueLabelDisplay="auto"
+              valueLabelFormat={(v) => `${Math.round(v * 100)}%`} disabled={off} onChange={(_, v) => setWandThreshold(v as number)} />
+          </div>
+        </Tooltip>
+      )}
 
       <Sep />
 
       {/* Pen */}
       <Label>{tr(lang, "tb.pen")}</Label>
-      <ToggleButtonGroup size="small" exclusive disabled={off || !paintMode} value={penLabel} onChange={(_, v) => v !== null && setPenLabel(v)}>
+      <ToggleButtonGroup size="small" exclusive disabled={off || !paint} value={penLabel} onChange={(_, v) => v !== null && setPenLabel(v)}>
         {PENS.map((p) => (
           <ToggleButton key={p.value} value={p.value} sx={tbSx}>
             <span style={{ width: 10, height: 10, borderRadius: "50%", background: p.color, marginRight: 7,
@@ -67,7 +79,7 @@ export function PaintToolbar() {
       </Tooltip>
 
       <Tooltip title={tr(lang, "tb.fillTip")} arrow>
-        <ToggleButton size="small" value="filled" selected={penFilled} disabled={off || !paintMode}
+        <ToggleButton size="small" value="filled" selected={penFilled} disabled={off || !paint}
           onChange={() => setPenFilled(!penFilled)} sx={tbSx}>▣ {tr(lang, "tb.fill")}</ToggleButton>
       </Tooltip>
 
@@ -88,8 +100,9 @@ export function PaintToolbar() {
             onClick={() => confirmFill()} sx={tbSx}>✓ {tr(lang, "tb.confirmFill")}</Button>
         </span>
       </Tooltip>
-      <Button size="small" variant="outlined" disabled={off} onClick={() => undo()} sx={tbSx}>↶ {tr(lang, "tb.undo")}</Button>
-      <Button size="small" variant="outlined" color="inherit" disabled={off} onClick={() => clearDrawing()} sx={tbSx}>{tr(lang, "tb.clear")}</Button>
+      <Button size="small" variant="outlined" disabled={off || !canUndo} onClick={() => undo()} sx={tbSx}>↶ {tr(lang, "tb.undo")}</Button>
+      <Button size="small" variant="outlined" disabled={off || !canRedo} onClick={() => redo()} sx={tbSx}>↷ {tr(lang, "tb.redo")}</Button>
+      <Button size="small" variant="outlined" color="inherit" disabled={off} onClick={() => requestClear()} sx={tbSx}>{tr(lang, "tb.clear")}</Button>
 
       <Sep />
 
@@ -137,6 +150,16 @@ export function PaintToolbar() {
           ))}
         </span>
       </Tooltip>
+
+      {/* Clear confirmation */}
+      <Dialog open={confirmClear} onClose={() => cancelClear()}>
+        <DialogTitle>{tr(lang, "tb.clearTitle")}</DialogTitle>
+        <DialogContent><DialogContentText>{tr(lang, "tb.clearBody")}</DialogContentText></DialogContent>
+        <DialogActions>
+          <Button onClick={() => cancelClear()}>{tr(lang, "save.cancel")}</Button>
+          <Button variant="contained" color="error" disableElevation onClick={() => clearDrawing()}>{tr(lang, "tb.clear")}</Button>
+        </DialogActions>
+      </Dialog>
     </div>
   );
 }

@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.14";
+export const APP_VERSION = "0.1.15";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {
@@ -24,22 +24,29 @@ interface State {
   volumeStartMs: number;
   dims: [number, number, number] | null;   // [nx, ny, nz] of the loaded volume
   vox: [number, number, number];           // current crosshair slice indices [x, y, z]
-  // pen
+  // pen / tool
   penLabel: Pen;
   penSize: number;
   penFilled: boolean;
-  paintMode: boolean;
+  tool: "paint" | "navigate" | "wand";   // active interaction tool
   drawOpacity: number;
+  wandThreshold: number;     // threshold scar wand, 0..1 of the intensity range
   // ui
   busy: boolean;
   status: string;
   lang: Lang;
   smartPct: number | null;   // smart-fill progress 0–100 while computing, else null
   canConfirm: boolean;       // a smart-fill preview is active and can be confirmed
+  canUndo: boolean;
+  canRedo: boolean;
+  corneaVox: number;         // live voxel counts
+  scarVox: number;
+  cursorIntensity: number | null; // raw intensity under the cursor (for the wand)
   brightness: number;        // display window brightness, −1..1 (#3)
   contrast: number;          // display window contrast, −1..1 (#3)
   locked: number[];          // labels protected from brush/erase/smart-fill (#4)
   confirmOverwrite: boolean; // overwrite-confirmation dialog visible (#1)
+  confirmClear: boolean;     // clear-confirmation dialog visible
   pendingVolume: string | null; // last volume to auto-reopen after login (#2)
   // self-update
   update: Update | null;
@@ -53,21 +60,34 @@ interface State {
   installUpdate: () => Promise<void>;
   dismissUpdate: () => void;
   addUser: (name: string) => Promise<void>;
+  deleteUser: (name: string) => Promise<void>;
   selectUser: (name: string) => Promise<void>;
   pickFolder: () => Promise<void>;
   openVolume: (v: io.VolumeEntry) => Promise<void>;
+  nextUnannotated: () => void;
+  loadSegmentation: () => Promise<void>;
   chooseOutputDir: () => Promise<void>;
   setPenLabel: (p: Pen) => void;
   setPenSize: (n: number) => void;
   setPenFilled: (f: boolean) => void;
-  setPaintMode: (on: boolean) => void;
+  setTool: (t: "paint" | "navigate" | "wand") => void;
+  setWandThreshold: (t: number) => void;
+  wandAt: (x: number, y: number, z: number) => void;
+  setCursorIntensity: (x: number, y: number, z: number) => void;
   setDrawOpacity: (o: number) => void;
   setSliceAxis: (axis: 0 | 1 | 2, s: number) => void;
   syncVox: () => void;
+  refreshStats: () => void;
   smartFill: () => Promise<void>;
   confirmFill: () => void;
   undo: () => void;
+  redo: () => void;
+  requestClear: () => void;
+  cancelClear: () => void;
   clearDrawing: () => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  resetView: () => void;
   save: (force?: boolean) => Promise<void>;
   cancelOverwrite: () => void;
   setBrightness: (b: number) => void;
@@ -94,17 +114,24 @@ export const useStore = create<State>((set, get) => ({
   penLabel: 2,
   penSize: 8,
   penFilled: false,
-  paintMode: true,
+  tool: "paint",
   drawOpacity: 0.6,
+  wandThreshold: 0.55,
   busy: false,
   status: "Select or add a user to begin.",
   lang: "en",
   smartPct: null,
   canConfirm: false,
+  canUndo: false,
+  canRedo: false,
+  corneaVox: 0,
+  scarVox: 0,
+  cursorIntensity: null,
   brightness: 0,
   contrast: 0,
   locked: [],
   confirmOverwrite: false,
+  confirmClear: false,
   pendingVolume: null,
   update: null,
   updateBusy: false,
@@ -179,6 +206,13 @@ export const useStore = create<State>((set, get) => ({
     await get().selectUser(u);
   },
 
+  deleteUser: async (name) => {
+    const users = get().users.filter((u) => u !== name);
+    const activeUser = get().activeUser === name ? null : get().activeUser;
+    set({ users, activeUser });
+    get().persistConfig();
+  },
+
   selectUser: async (name) => {
     set({ activeUser: name, status: `Annotating as “${name}”. Pick a folder of NIfTI volumes.` });
     const done = await io.annotatedStems(get().outputDir, name);
@@ -209,13 +243,43 @@ export const useStore = create<State>((set, get) => ({
       nv.setPen(get().penLabel, get().penFilled);
       nv.setSliceListener((vx) => set({ vox: vx })); // keep slice scrollbars synced to scroll-wheel nav
       nv.setLockedLabels(get().locked);              // re-apply label locks for the new volume (#4)
-      set({ activeVolume: v, loaded: true, paintMode: true, volumeStartMs: Date.now(), canConfirm: false,
-            dims: nv.getDims(), vox: nv.currentVox() ?? [0, 0, 0],
+      set({ activeVolume: v, loaded: true, tool: "paint", volumeStartMs: Date.now(), canConfirm: false,
+            dims: nv.getDims(), vox: nv.currentVox() ?? [0, 0, 0], brightness: 0, contrast: 0,
             status: `Annotating ${v.name}. Paint cornea/scar; Smart fill helps; then Save.` });
-      nv.setWindow(get().brightness, get().contrast);  // re-apply brightness/contrast (#3)
-      get().persistConfig();                           // remember this as the last volume (#2)
+      nv.setWindow(0, 0);     // new volume → reset display window + counts
+      get().refreshStats();
+      get().persistConfig();  // remember this as the last volume (#2)
     } catch (e) {
       set({ status: `Failed to load volume: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  nextUnannotated: () => {
+    const { volumes, annotated, activeVolume } = get();
+    if (!volumes.length) return;
+    const startIdx = activeVolume ? volumes.findIndex((v) => v.path === activeVolume.path) : -1;
+    for (let k = 1; k <= volumes.length; k++) {
+      const v = volumes[(startIdx + k + volumes.length) % volumes.length];
+      if (!annotated.has(v.name.replace(/\.nii(\.gz)?$/i, ""))) { void get().openVolume(v); return; }
+    }
+    set({ status: "All volumes in this folder are annotated." });
+  },
+
+  loadSegmentation: async () => {
+    if (!get().loaded) { set({ status: "Open a volume first, then load a segmentation to correct." }); return; }
+    const path = await io.pickFile("Choose a ground-truth labelmap (.nii.gz) to load");
+    if (!path) return;
+    set({ busy: true, status: "Loading segmentation…" });
+    try {
+      const name = await io.stem(path);
+      const bytes = await io.readVolume(path);
+      const r = await nv.loadSegmentationBytes(bytes, name.endsWith(".nii.gz") ? name : `${name}.nii.gz`);
+      if (!r.ok) set({ status: r.reason === "dims-mismatch" ? "That labelmap doesn't match this volume's dimensions." : `Could not load segmentation: ${r.reason}` });
+      else { get().refreshStats(); set({ canConfirm: false, status: "Segmentation loaded — edit/correct, then Save." }); }
+    } catch (e) {
+      set({ status: `Could not load segmentation: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
       set({ busy: false });
     }
@@ -232,8 +296,21 @@ export const useStore = create<State>((set, get) => ({
   setPenLabel: (p) => { nv.setPen(p, get().penFilled); set({ penLabel: p }); },
   setPenSize: (n) => { nv.setPenSize(n); set({ penSize: n }); },
   setPenFilled: (f) => { nv.setPen(get().penLabel, f); set({ penFilled: f }); },
-  setPaintMode: (on) => { if (on) nv.lockCrosshair(); nv.setDrawingEnabled(false); set({ paintMode: on }); },
+  setTool: (t) => { if (t === "paint") nv.lockCrosshair(); nv.setDrawingEnabled(false); set({ tool: t }); },
+  setWandThreshold: (t) => set({ wandThreshold: Math.max(0, Math.min(1, t)) }),
+  wandAt: (x, y, z) => {
+    const r = nv.wandFill(x, y, z, get().wandThreshold);
+    if (!r.ok) {
+      set({ status: r.reason === "below-threshold" ? "Wand: that spot is below the threshold — lower it or click a brighter area."
+        : r.reason === "outside-cornea" ? "Wand: click inside the cornea (scar grows within it)." : "Wand: nothing to fill here." });
+    } else { get().refreshStats(); set({ status: `Wand: filled ${r.count} scar voxels. Adjust the threshold or Undo if needed.` }); }
+  },
+  setCursorIntensity: (x, y, z) => { set({ cursorIntensity: nv.intensityAt(x, y, z) }); },
   setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
+  refreshStats: () => { const st = nv.drawStats(); set({ corneaVox: st.cornea, scarVox: st.scar, canUndo: nv.canUndo(), canRedo: nv.canRedo() }); },
+  zoomIn: () => nv.zoomBy(1.25),
+  zoomOut: () => nv.zoomBy(1 / 1.25),
+  resetView: () => nv.resetView(),
   cancelOverwrite: () => set({ confirmOverwrite: false }),
   setBrightness: (b) => { nv.setWindow(b, get().contrast); set({ brightness: b }); },
   setContrast: (c) => { nv.setWindow(get().brightness, c); set({ contrast: c }); },
@@ -260,6 +337,7 @@ export const useStore = create<State>((set, get) => ({
           ? "Smart fill needs seeds — scribble a little Cornea and Background (and Scar), then Smart fill."
           : "Load a volume first." });
       } else {
+        get().refreshStats();
         set({ canConfirm: true,
           status: "Smart-fill PREVIEW — refine your brushstrokes and Smart fill again, or Confirm to keep it." });
       }
@@ -270,10 +348,13 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   confirmFill: () => {
-    if (nv.confirmFill()) set({ canConfirm: false, status: "Smart fill confirmed — added to the segmentation." });
+    if (nv.confirmFill()) { get().refreshStats(); set({ canConfirm: false, status: "Smart fill confirmed — added to the segmentation." }); }
   },
-  undo: () => { nv.undoDrawing(); set({ canConfirm: nv.isPreviewing() }); },
-  clearDrawing: () => { nv.clearDrawing(); set({ canConfirm: false, status: "Cleared — blank drawing." }); },
+  undo: () => { nv.undoDrawing(); get().refreshStats(); set({ canConfirm: nv.isPreviewing() }); },
+  redo: () => { nv.redoDrawing(); get().refreshStats(); set({ canConfirm: nv.isPreviewing() }); },
+  requestClear: () => set({ confirmClear: true }),
+  cancelClear: () => set({ confirmClear: false }),
+  clearDrawing: () => { nv.clearDrawing(); get().refreshStats(); set({ canConfirm: false, confirmClear: false, status: "Cleared — blank drawing." }); },
 
   save: async (force = false) => {
     const { activeUser, activeVolume, outputDir, sessionId: sid } = get();

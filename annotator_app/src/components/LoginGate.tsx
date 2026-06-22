@@ -12,6 +12,7 @@ const label = { fontSize: 10, textTransform: "uppercase" as const, letterSpacing
 export function LoginGate() {
   const users = useStore((s) => s.users);
   const addUser = useStore((s) => s.addUser);
+  const deleteUser = useStore((s) => s.deleteUser);
   const selectUser = useStore((s) => s.selectUser);
   const lang = useStore((s) => s.lang);
   const setLang = useStore((s) => s.setLang);
@@ -48,6 +49,8 @@ export function LoginGate() {
                 {users.map((u) => <MenuItem key={u} value={u} sx={{ fontSize: 14 }}>{u}</MenuItem>)}
               </Select>
               <Button variant="contained" disableElevation disabled={!pick} onClick={() => selectUser(pick)} sx={{ flex: "none", px: 2 }}>{tr(lang, "login.enter")}</Button>
+              <Button variant="text" color="error" disabled={!pick} title={tr(lang, "login.delete")}
+                onClick={() => { deleteUser(pick); setPick(""); }} sx={{ flex: "none", minWidth: 0, px: 1 }}>🗑</Button>
             </div>
           </div>
         )}

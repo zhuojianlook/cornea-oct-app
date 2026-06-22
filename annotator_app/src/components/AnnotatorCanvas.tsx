@@ -2,10 +2,26 @@
    paint/navigate, sized brush cursor coloured by pen, hidden in 3D / navigate). */
 
 import { useEffect, useRef, useState } from "react";
-import { CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, currentVox, paintBrush, beginStroke, tileAtScreen, type ViewName } from "../niivue/nvController";
+import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, currentVox, paintBrush, beginStroke, tileAtScreen, voxAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
+
+/** Live voxel counts + cursor intensity — isolated so per-move intensity updates don't re-render the canvas. */
+function Readout() {
+  const lang = useStore((s) => s.lang);
+  const cornea = useStore((s) => s.corneaVox);
+  const scar = useStore((s) => s.scarVox);
+  const tool = useStore((s) => s.tool);
+  const intensity = useStore((s) => s.cursorIntensity);
+  return (
+    <span className="flex items-center gap-3 flex-none" style={{ fontSize: 11, color: "var(--c-text-dim)" }}>
+      <span><b style={{ color: "#1ab2ff" }}>{cornea.toLocaleString()}</b> {tr(lang, "pen.cornea")}</span>
+      <span><b style={{ color: "#ff453a" }}>{scar.toLocaleString()}</b> {tr(lang, "pen.scar")}</span>
+      {tool === "wand" && intensity != null && <span>I: <b style={{ color: "var(--c-text)" }}>{Math.round(intensity)}</b></span>}
+    </span>
+  );
+}
 
 const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff453a", 3: "#9aa0aa" };
 const PEN_KEY = { 0: "pen.erase", 1: "pen.cornea", 2: "pen.scar", 3: "pen.background" } as const;
@@ -27,7 +43,7 @@ export function AnnotatorCanvas() {
   const [brush, setBrush] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const loaded = useStore((s) => s.loaded);
   const busy = useStore((s) => s.busy);
-  const paintMode = useStore((s) => s.paintMode);
+  const tool = useStore((s) => s.tool);
   const penLabel = useStore((s) => s.penLabel);
   const penSize = useStore((s) => s.penSize);
   const volName = useStore((s) => s.activeVolume?.name);
@@ -36,6 +52,12 @@ export function AnnotatorCanvas() {
   const vox = useStore((s) => s.vox);
   const setSliceAxis = useStore((s) => s.setSliceAxis);
   const syncVox = useStore((s) => s.syncVox);
+  const wandAt = useStore((s) => s.wandAt);
+  const setCursorIntensity = useStore((s) => s.setCursorIntensity);
+  const refreshStats = useStore((s) => s.refreshStats);
+  const zoomIn = useStore((s) => s.zoomIn);
+  const zoomOut = useStore((s) => s.zoomOut);
+  const resetView = useStore((s) => s.resetView);
 
   useEffect(() => {
     if (canvasRef.current) {
@@ -54,7 +76,8 @@ export function AnnotatorCanvas() {
     return () => cancelAnimationFrame(id);
   }, [loaded, view]);
 
-  const painting = loaded && paintMode && view !== "render";
+  const painting = loaded && tool === "paint" && view !== "render";
+  const wandActive = loaded && tool === "wand" && view !== "render";
   const showBrush = painting && brush;
   const showStrip = loaded && view !== "render" && !!dims;
 
@@ -77,15 +100,23 @@ export function AnnotatorCanvas() {
             </ToggleButton>
           ))}
         </ToggleButtonGroup>
+        {loaded && view !== "render" && (
+          <span className="flex items-center gap-0.5 flex-none" title={tr(lang, "view.zoomTip")}>
+            <Button size="small" onClick={() => zoomOut()} sx={{ minWidth: 24, px: 0, fontSize: 16, lineHeight: 1, color: "var(--c-text-dim)" }}>−</Button>
+            <Button size="small" onClick={() => resetView()} sx={{ minWidth: 24, px: 0, fontSize: 13, lineHeight: 1, color: "var(--c-text-dim)" }}>⤢</Button>
+            <Button size="small" onClick={() => zoomIn()} sx={{ minWidth: 24, px: 0, fontSize: 16, lineHeight: 1, color: "var(--c-text-dim)" }}>+</Button>
+          </span>
+        )}
         <span className="flex-1" />
-        {loaded && paintMode && view !== "render" && (
-          <span className="flex items-center gap-1.5" style={{ fontSize: 11, color: "var(--c-text-dim)" }}>
+        {loaded && <Readout />}
+        {loaded && tool === "paint" && view !== "render" && (
+          <span className="flex items-center gap-1.5 flex-none" style={{ fontSize: 11, color: "var(--c-text-dim)" }}>
             <span style={{ width: 9, height: 9, borderRadius: "50%", background: PEN_COLOR[penLabel],
                            display: "inline-block", boxShadow: "0 0 0 1px rgba(0,0,0,0.35)" }} />
             {tr(lang, PEN_KEY[penLabel])} · {penSize}px
           </span>
         )}
-        <span className="truncate flex-none" style={{ fontSize: 12, maxWidth: 240, color: loaded ? "var(--c-text)" : "var(--c-text-dim)" }}
+        <span className="truncate flex-none" style={{ fontSize: 12, maxWidth: 180, color: loaded ? "var(--c-text)" : "var(--c-text-dim)" }}
           title={volName ?? ""}>{volName ?? tr(lang, "canvas.noVol")}</span>
       </div>
 
@@ -94,40 +125,47 @@ export function AnnotatorCanvas() {
         className="relative flex-1 min-h-0 min-w-0"
         onMouseDownCapture={() => { if (painting) setStroke(true); }}
         onMouseDown={(e) => {
-          if (!painting) return;
-          const r = e.currentTarget.getBoundingClientRect();
-          strokeTile.current = tileAtScreen(e.clientX - r.left, e.clientY - r.top);
-          if (strokeTile.current < 0) return;                      // started off any 2-D pane → ignore
-          beginStroke();                                           // snapshot for undo (start of stroke)
-          const v = currentVox();                                  // voxel niivue just set from the click
-          if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel); lastVox.current = v; }
-          restoreCrosshair();
-        }}
-        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); } }}
-        onMouseMove={(e) => {
-          // #2 — paint a 3-D SPHERE at the cursor voxel (round in every view); read the voxel before the
-          // crosshair-lock restores it. Painting must not drag the crosshair (other views stay put); on
-          // hover/navigate remember the current crosshair so a stroke can snap back to it.
+          if (e.shiftKey || e.ctrlKey) return;                     // shift/ctrl+drag = pan (niivue handles it)
           const r = e.currentTarget.getBoundingClientRect();
           const x = e.clientX - r.left, y = e.clientY - r.top;
-          const tile = painting ? tileAtScreen(x, y) : -1;
-          if (painting && (e.buttons & 1)) {
-            if (tile >= 0 && tile === strokeTile.current) {        // only paint within the stroke's own pane
+          if (painting) {
+            strokeTile.current = tileAtScreen(x, y);
+            if (strokeTile.current < 0) return;                    // started off any 2-D pane → ignore
+            beginStroke();                                         // snapshot for undo (start of stroke)
+            const v = currentVox();                                // voxel niivue just set from the click
+            if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel); lastVox.current = v; }
+            restoreCrosshair();
+          } else if (wandActive) {
+            if (tileAtScreen(x, y) < 0) return;
+            const v = currentVox();
+            if (v) wandAt(v[0], v[1], v[2]);                       // threshold-grow scar from the click
+          }
+        }}
+        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); } }}
+        onMouseMove={(e) => {
+          const r = e.currentTarget.getBoundingClientRect();
+          const x = e.clientX - r.left, y = e.clientY - r.top;
+          const modPan = e.shiftKey || e.ctrlKey;
+          const tile = (painting || wandActive) ? tileAtScreen(x, y) : -1;
+          // paint a 3-D sphere at the cursor voxel, confined to the stroke's pane; crosshair stays put.
+          if (painting && !modPan && (e.buttons & 1)) {
+            if (tile >= 0 && tile === strokeTile.current) {
               const v = currentVox();
               if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel); lastVox.current = v; }
-            } else {
-              lastVox.current = null;                              // outside the pane → no paint, break the stroke
-            }
+            } else lastVox.current = null;
             restoreCrosshair();
-          } else lockCrosshair();
-          if (!painting || tile < 0) { if (brush) setBrush(null); return; } // hide cursor off a 2-D pane
-          const sz = brushScreenSize(x, y);                        // circle diameter matching the sphere
-          const d = sz ? Math.max(4, sz.w) : Math.max(4, penSize);
-          setBrush({ x, y, w: d, h: d });
+          } else if (painting && !modPan) lockCrosshair();
+          // wand: show the intensity under the cursor (helps choose the threshold)
+          if (wandActive && tile >= 0) { const vx = voxAtScreen(x, y); if (vx) setCursorIntensity(vx[0], vx[1], vx[2]); }
+          // brush cursor (paint only)
+          if (painting && !modPan && tile >= 0) {
+            const sz = brushScreenSize(x, y);
+            setBrush({ x, y, w: sz ? Math.max(4, sz.w) : Math.max(4, penSize), h: sz ? Math.max(4, sz.h) : Math.max(4, penSize) });
+          } else if (brush) setBrush(null);
         }}
-        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); } setBrush(null); }}
+        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); } setBrush(null); }}
       >
-        <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting ? "crosshair" : "default" }} />
+        <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting || wandActive ? "crosshair" : "default" }} />
         {showBrush && (
           <div className="absolute pointer-events-none" style={{
             left: brush!.x, top: brush!.y, transform: "translate(-50%, -50%)",

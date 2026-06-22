@@ -9,7 +9,7 @@ import { tr } from "../i18n";
 import { AboutDialog } from "./AboutDialog";
 
 export function SaveBar() {
-  const { activeUser, outputDir, loaded, busy, save, chooseOutputDir, lang, setLang } = useStore();
+  const { activeUser, outputDir, loaded, busy, save, chooseOutputDir, lang, setLang, loadSegmentation } = useStore();
   const confirmOverwrite = useStore((s) => s.confirmOverwrite);
   const cancelOverwrite = useStore((s) => s.cancelOverwrite);
   const activeVolume = useStore((s) => s.activeVolume);
@@ -51,6 +51,15 @@ export function SaveBar() {
         <Button variant="outlined" onClick={() => chooseOutputDir()} sx={{ fontSize: 11, maxWidth: 220 }}>
           <span className="truncate">{outName ? `📁 ${outName}` : tr(lang, "save.setOutput")}</span>
         </Button>
+      </Tooltip>
+
+      {/* Load an existing segmentation to correct */}
+      <Tooltip title={tr(lang, "save.loadTip")} arrow>
+        <span>
+          <Button variant="outlined" disabled={!loaded || busy} onClick={() => loadSegmentation()} sx={{ fontSize: 11 }}>
+            {tr(lang, "save.load")}
+          </Button>
+        </span>
       </Tooltip>
 
       {/* Save */}

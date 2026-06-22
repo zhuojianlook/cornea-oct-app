@@ -6,7 +6,7 @@ import { useStore } from "../store/annotatorStore";
 import { tr } from "../i18n";
 
 export function VolumeBrowser() {
-  const { folder, volumes, activeVolume, annotated, busy, pickFolder, openVolume, lang } = useStore();
+  const { folder, volumes, activeVolume, annotated, busy, pickFolder, openVolume, nextUnannotated, lang } = useStore();
   const folderName = folder ? folder.split(/[/\\]/).filter(Boolean).pop() : null;
   const nDone = volumes.filter((v) => annotated.has(v.name.replace(/\.nii(\.gz)?$/i, ""))).length;
 
@@ -27,6 +27,12 @@ export function VolumeBrowser() {
         <Button variant="outlined" size="small" fullWidth disabled={busy} onClick={() => pickFolder()}>
           {folder ? tr(lang, "vol.change") : tr(lang, "vol.pick")}
         </Button>
+        {volumes.length > 0 && (
+          <Button variant="contained" size="small" fullWidth disableElevation disabled={busy}
+            onClick={() => nextUnannotated()} title={tr(lang, "vol.nextTip")}>
+            {tr(lang, "vol.next")}
+          </Button>
+        )}
         {folderName && (
           <div className="flex items-center gap-1.5 rounded px-2 py-1 truncate" title={folder ?? ""}
             style={{ fontSize: 10, color: "var(--c-text-dim)", background: "var(--c-surface2)", border: "1px solid var(--c-border)" }}>

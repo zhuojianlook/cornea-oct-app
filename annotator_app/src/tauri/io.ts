@@ -31,6 +31,13 @@ export async function pickFolder(title = "Choose a folder of NIfTI volumes"): Pr
   return typeof r === "string" ? r : null;
 }
 
+/** Pick a single NIfTI file (e.g. a prior ground-truth labelmap to load & correct). */
+export async function pickFile(title = "Choose a NIfTI labelmap"): Promise<string | null> {
+  if (!inTauri()) return null;
+  const r = await open({ directory: false, multiple: false, title, filters: [{ name: "NIfTI", extensions: ["nii", "gz"] }] });
+  return typeof r === "string" ? r : null;
+}
+
 export async function listNifti(folder: string): Promise<VolumeEntry[]> {
   const entries = await readDir(folder);
   const out: VolumeEntry[] = [];
