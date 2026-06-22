@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, currentVox, paintBrush, beginStroke, tileAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -20,6 +20,8 @@ const VIEW_AXIS: { plane: "axial" | "coronal" | "sagittal"; axis: 0 | 1 | 2; key
 
 export function AnnotatorCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastVox = useRef<[number, number, number] | null>(null); // previous painted voxel (stroke continuity)
+  const strokeTile = useRef<number>(-1);                          // pane the current stroke started on
   const [view, setV] = useState<ViewName>("multi");
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
   const [brush, setBrush] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
@@ -36,7 +38,12 @@ export function AnnotatorCanvas() {
   const syncVox = useStore((s) => s.syncVox);
 
   useEffect(() => {
-    if (canvasRef.current) { attach(canvasRef.current); setNoWebgl(webglFailure()); }
+    if (canvasRef.current) {
+      attach(canvasRef.current);
+      const err = webglFailure();
+      setNoWebgl(err);
+      if (!err) useStore.getState().resumePending(); // #2 reopen last session's volume once attached
+    }
   }, []);
 
   // Defensive repaint once the layout has settled after a volume loads / the view changes — recovers
@@ -86,26 +93,45 @@ export function AnnotatorCanvas() {
       <div
         className="relative flex-1 min-h-0 min-w-0"
         onMouseDownCapture={() => { if (painting) setStroke(true); }}
-        onMouseDown={() => { if (painting) restoreCrosshair(); }}
-        onMouseUp={() => { if (painting) { restoreCrosshair(); setStroke(false); syncVox(); } }}
+        onMouseDown={(e) => {
+          if (!painting) return;
+          const r = e.currentTarget.getBoundingClientRect();
+          strokeTile.current = tileAtScreen(e.clientX - r.left, e.clientY - r.top);
+          if (strokeTile.current < 0) return;                      // started off any 2-D pane → ignore
+          beginStroke();                                           // snapshot for undo (start of stroke)
+          const v = currentVox();                                  // voxel niivue just set from the click
+          if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel); lastVox.current = v; }
+          restoreCrosshair();
+        }}
+        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); } }}
         onMouseMove={(e) => {
-          // #2 — painting must not drag the crosshair (other views stay on the chosen slice). While a
-          // paint stroke is active (left button down) restore the crosshair niivue just moved; otherwise
-          // (hover / navigate) remember the current crosshair so a stroke can snap back to it.
-          if (painting && (e.buttons & 1)) restoreCrosshair(); else lockCrosshair();
-          if (!painting) { if (brush) setBrush(null); return; }
+          // #2 — paint a 3-D SPHERE at the cursor voxel (round in every view); read the voxel before the
+          // crosshair-lock restores it. Painting must not drag the crosshair (other views stay put); on
+          // hover/navigate remember the current crosshair so a stroke can snap back to it.
           const r = e.currentTarget.getBoundingClientRect();
           const x = e.clientX - r.left, y = e.clientY - r.top;
-          const sz = brushScreenSize(x, y); // accurate voxel→screen size; fall back to a rough estimate
-          setBrush({ x, y, w: sz ? Math.max(3, sz.w) : penSize * 3, h: sz ? Math.max(3, sz.h) : penSize * 3 });
+          const tile = painting ? tileAtScreen(x, y) : -1;
+          if (painting && (e.buttons & 1)) {
+            if (tile >= 0 && tile === strokeTile.current) {        // only paint within the stroke's own pane
+              const v = currentVox();
+              if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel); lastVox.current = v; }
+            } else {
+              lastVox.current = null;                              // outside the pane → no paint, break the stroke
+            }
+            restoreCrosshair();
+          } else lockCrosshair();
+          if (!painting || tile < 0) { if (brush) setBrush(null); return; } // hide cursor off a 2-D pane
+          const sz = brushScreenSize(x, y);                        // circle diameter matching the sphere
+          const d = sz ? Math.max(4, sz.w) : Math.max(4, penSize);
+          setBrush({ x, y, w: d, h: d });
         }}
-        onMouseLeave={() => { if (painting) { restoreCrosshair(); setStroke(false); syncVox(); } setBrush(null); }}
+        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); } setBrush(null); }}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting ? "crosshair" : "default" }} />
         {showBrush && (
           <div className="absolute pointer-events-none" style={{
             left: brush!.x, top: brush!.y, transform: "translate(-50%, -50%)",
-            width: brush!.w, height: brush!.h, borderRadius: 2,
+            width: brush!.w, height: brush!.h, borderRadius: "50%",
             border: `1.5px solid ${PEN_COLOR[penLabel] ?? "#fff"}`, boxShadow: "0 0 0 1px rgba(0,0,0,0.5)",
             background: penLabel === 0 ? "transparent" : `${PEN_COLOR[penLabel]}22`,
           }} />

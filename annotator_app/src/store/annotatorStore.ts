@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.13";
+export const APP_VERSION = "0.1.14";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 interface State {
@@ -34,6 +34,13 @@ interface State {
   busy: boolean;
   status: string;
   lang: Lang;
+  smartPct: number | null;   // smart-fill progress 0–100 while computing, else null
+  canConfirm: boolean;       // a smart-fill preview is active and can be confirmed
+  brightness: number;        // display window brightness, −1..1 (#3)
+  contrast: number;          // display window contrast, −1..1 (#3)
+  locked: number[];          // labels protected from brush/erase/smart-fill (#4)
+  confirmOverwrite: boolean; // overwrite-confirmation dialog visible (#1)
+  pendingVolume: string | null; // last volume to auto-reopen after login (#2)
   // self-update
   update: Update | null;
   updateBusy: boolean;
@@ -57,10 +64,18 @@ interface State {
   setDrawOpacity: (o: number) => void;
   setSliceAxis: (axis: 0 | 1 | 2, s: number) => void;
   syncVox: () => void;
-  smartFill: () => void;
+  smartFill: () => Promise<void>;
+  confirmFill: () => void;
   undo: () => void;
   clearDrawing: () => void;
-  save: () => Promise<void>;
+  save: (force?: boolean) => Promise<void>;
+  cancelOverwrite: () => void;
+  setBrightness: (b: number) => void;
+  setContrast: (c: number) => void;
+  resetWindow: () => void;
+  toggleLock: (label: number) => void;
+  persistConfig: () => void;
+  resumePending: () => void;
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -77,13 +92,20 @@ export const useStore = create<State>((set, get) => ({
   dims: null,
   vox: [0, 0, 0],
   penLabel: 2,
-  penSize: 3,
+  penSize: 8,
   penFilled: false,
   paintMode: true,
   drawOpacity: 0.6,
   busy: false,
   status: "Select or add a user to begin.",
   lang: "en",
+  smartPct: null,
+  canConfirm: false,
+  brightness: 0,
+  contrast: 0,
+  locked: [],
+  confirmOverwrite: false,
+  pendingVolume: null,
   update: null,
   updateBusy: false,
   updatePct: null,
@@ -91,13 +113,33 @@ export const useStore = create<State>((set, get) => ({
 
   init: async () => {
     const cfg = await io.loadConfig();
-    set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder, lang: cfg.lang });
+    set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder, lang: cfg.lang, pendingVolume: cfg.lastVolume ?? null });
+    // A2: auto-restore the last folder's volume list so the user need not re-pick the folder. The last
+    // volume is reopened (resumePending) once a user logs in and the canvas has attached.
+    if (cfg.lastFolder) {
+      try {
+        const volumes = await io.listNifti(cfg.lastFolder);
+        set({ volumes });
+      } catch { set({ folder: null, pendingVolume: null }); } // folder moved/deleted
+    }
   },
 
-  setLang: (l) => {
-    set({ lang: l });
-    void io.saveConfig({ users: get().users, outputDir: get().outputDir, lastFolder: get().folder, lang: l });
+  // Persist the full config (users, output dir, last folder + volume, language) — best-effort.
+  persistConfig: () => {
+    const s = get();
+    void io.saveConfig({ users: s.users, outputDir: s.outputDir, lastFolder: s.folder, lang: s.lang, lastVolume: s.activeVolume?.path ?? null });
   },
+
+  // After login + canvas attach, reopen the volume from the previous session (#2).
+  resumePending: () => {
+    const s = get();
+    if (!s.activeUser || s.activeVolume || s.loaded || !s.pendingVolume) return;
+    const v = s.volumes.find((x) => x.path === s.pendingVolume);
+    set({ pendingVolume: null });
+    if (v) void get().openVolume(v);
+  },
+
+  setLang: (l) => { set({ lang: l }); get().persistConfig(); },
 
   // Check the GitHub release feed. `manual` surfaces "up to date"/error feedback; the silent
   // launch check only speaks up when an update actually exists (shows the banner).
@@ -133,7 +175,7 @@ export const useStore = create<State>((set, get) => ({
     if (!u) return;
     const users = Array.from(new Set([...get().users, u])).sort();
     set({ users });
-    await io.saveConfig({ users, outputDir: get().outputDir, lastFolder: get().folder, lang: get().lang });
+    get().persistConfig();
     await get().selectUser(u);
   },
 
@@ -150,7 +192,7 @@ export const useStore = create<State>((set, get) => ({
     try {
       const volumes = await io.listNifti(folder);
       set({ folder, volumes, status: `${volumes.length} volume(s) found. Select one to annotate.` });
-      await io.saveConfig({ users: get().users, outputDir: get().outputDir, lastFolder: folder, lang: get().lang });
+      get().persistConfig();
     } catch (e) {
       set({ status: `Could not list folder: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
@@ -166,9 +208,12 @@ export const useStore = create<State>((set, get) => ({
       nv.setPenSize(get().penSize);
       nv.setPen(get().penLabel, get().penFilled);
       nv.setSliceListener((vx) => set({ vox: vx })); // keep slice scrollbars synced to scroll-wheel nav
-      set({ activeVolume: v, loaded: true, paintMode: true, volumeStartMs: Date.now(),
+      nv.setLockedLabels(get().locked);              // re-apply label locks for the new volume (#4)
+      set({ activeVolume: v, loaded: true, paintMode: true, volumeStartMs: Date.now(), canConfirm: false,
             dims: nv.getDims(), vox: nv.currentVox() ?? [0, 0, 0],
             status: `Annotating ${v.name}. Paint cornea/scar; Smart fill helps; then Save.` });
+      nv.setWindow(get().brightness, get().contrast);  // re-apply brightness/contrast (#3)
+      get().persistConfig();                           // remember this as the last volume (#2)
     } catch (e) {
       set({ status: `Failed to load volume: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
@@ -180,15 +225,24 @@ export const useStore = create<State>((set, get) => ({
     const dir = await io.pickFolder("Choose where to save ground-truth output");
     if (!dir) return;
     set({ outputDir: dir });
-    await io.saveConfig({ users: get().users, outputDir: dir, lastFolder: get().folder, lang: get().lang });
+    get().persistConfig();
     if (get().activeUser) set({ annotated: await io.annotatedStems(dir, get().activeUser!) });
   },
 
   setPenLabel: (p) => { nv.setPen(p, get().penFilled); set({ penLabel: p }); },
   setPenSize: (n) => { nv.setPenSize(n); set({ penSize: n }); },
   setPenFilled: (f) => { nv.setPen(get().penLabel, f); set({ penFilled: f }); },
-  setPaintMode: (on) => { if (on) { nv.setPen(get().penLabel, get().penFilled); nv.lockCrosshair(); } nv.setDrawingEnabled(on); set({ paintMode: on }); },
+  setPaintMode: (on) => { if (on) nv.lockCrosshair(); nv.setDrawingEnabled(false); set({ paintMode: on }); },
   setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
+  cancelOverwrite: () => set({ confirmOverwrite: false }),
+  setBrightness: (b) => { nv.setWindow(b, get().contrast); set({ brightness: b }); },
+  setContrast: (c) => { nv.setWindow(get().brightness, c); set({ contrast: c }); },
+  resetWindow: () => { nv.setWindow(0, 0); set({ brightness: 0, contrast: 0 }); },
+  toggleLock: (label) => {
+    const locked = get().locked.includes(label) ? get().locked.filter((l) => l !== label) : [...get().locked, label];
+    nv.setLockedLabels(locked);
+    set({ locked });
+  },
   setSliceAxis: (axis, s) => {
     nv.setVoxAxis(axis, s);
     const vox = [...get().vox] as [number, number, number];
@@ -196,22 +250,38 @@ export const useStore = create<State>((set, get) => ({
     set({ vox });
   },
   syncVox: () => { const v = nv.currentVox(); if (v) set({ vox: v }); },
-  smartFill: () => {
-    const r = nv.smartFill();
-    if (!r.ok) {
-      set({ status: r.reason === "no-seeds"
-        ? "Smart fill needs seeds — scribble a little Cornea and Background (and Scar), then Smart fill."
-        : "Load a volume first." });
-      return;
+  smartFill: async () => {
+    if (get().busy) return;
+    set({ busy: true, smartPct: 0, status: "Smart fill: growing from seeds…" });
+    try {
+      const r = await nv.smartFill((pct) => set({ smartPct: pct }));
+      if (!r.ok) {
+        set({ status: r.reason === "no-seeds"
+          ? "Smart fill needs seeds — scribble a little Cornea and Background (and Scar), then Smart fill."
+          : "Load a volume first." });
+      } else {
+        set({ canConfirm: true,
+          status: "Smart-fill PREVIEW — refine your brushstrokes and Smart fill again, or Confirm to keep it." });
+      }
+    } catch (e) {
+      set({ status: `Smart fill failed: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      set({ busy: false, smartPct: null });
     }
-    set({ status: "Smart fill done. If the cornea over-grew, add Background seeds around it and Smart fill again." });
   },
-  undo: () => nv.undoDrawing(),
-  clearDrawing: () => { nv.clearDrawing(); set({ status: "Cleared — blank drawing." }); },
+  confirmFill: () => {
+    if (nv.confirmFill()) set({ canConfirm: false, status: "Smart fill confirmed — added to the segmentation." });
+  },
+  undo: () => { nv.undoDrawing(); set({ canConfirm: nv.isPreviewing() }); },
+  clearDrawing: () => { nv.clearDrawing(); set({ canConfirm: false, status: "Cleared — blank drawing." }); },
 
-  save: async () => {
+  save: async (force = false) => {
     const { activeUser, activeVolume, outputDir, sessionId: sid } = get();
     if (!activeUser || !activeVolume) return;
+    const vstem = await io.stem(activeVolume.path);
+    // A1: if this scan already has a saved ground truth, confirm before overwriting.
+    if (!force && get().annotated.has(vstem)) { set({ confirmOverwrite: true }); return; }
+    set({ confirmOverwrite: false });
     if (!outputDir) { await get().chooseOutputDir(); if (!get().outputDir) return; }
     set({ busy: true, status: "Saving ground truth…" });
     try {
@@ -219,7 +289,6 @@ export const useStore = create<State>((set, get) => ({
       if (!bytes) throw new Error("Nothing to export.");
       const st = nv.drawStats();
       const out = get().outputDir!;
-      const vstem = await io.stem(activeVolume.path);
       const file = await io.writeLabelmap(out, vstem, activeUser, sid, bytes);
       await io.appendManifest(out, {
         username: activeUser, volume_stem: vstem, volume_path: activeVolume.path,

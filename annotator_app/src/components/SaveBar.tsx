@@ -3,13 +3,16 @@
    live in the bottom StatusBar. */
 
 import { useState } from "react";
-import { Button, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
+import { Button, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
 import { useStore } from "../store/annotatorStore";
 import { tr } from "../i18n";
 import { AboutDialog } from "./AboutDialog";
 
 export function SaveBar() {
   const { activeUser, outputDir, loaded, busy, save, chooseOutputDir, lang, setLang } = useStore();
+  const confirmOverwrite = useStore((s) => s.confirmOverwrite);
+  const cancelOverwrite = useStore((s) => s.cancelOverwrite);
+  const activeVolume = useStore((s) => s.activeVolume);
   const checkUpdates = useStore((s) => s.checkUpdates);
   const updateBusy = useStore((s) => s.updateBusy);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -79,6 +82,20 @@ export function SaveBar() {
       </ToggleButtonGroup>
 
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
+
+      {/* Overwrite confirmation (#1) */}
+      <Dialog open={confirmOverwrite} onClose={() => cancelOverwrite()}>
+        <DialogTitle>{tr(lang, "save.overwriteTitle")}</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {tr(lang, "save.overwriteBody")}{activeVolume ? `\n\n${activeVolume.name}` : ""}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => cancelOverwrite()}>{tr(lang, "save.cancel")}</Button>
+          <Button variant="contained" color="success" disableElevation onClick={() => save(true)}>{tr(lang, "save.overwrite")}</Button>
+        </DialogActions>
+      </Dialog>
     </header>
   );
 }
