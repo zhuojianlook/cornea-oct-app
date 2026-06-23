@@ -1619,6 +1619,30 @@ def set_case_classification(case_id: str, req: ClassificationRequest) -> dict:
             "scar_range": m.get("scar_range")}
 
 
+class ObserverAnalysisRequest(BaseModel):
+    root: str   # the annotator's ground-truth OUTPUT folder (contains manifest.json + <stem>/ labelmaps)
+
+
+@app.post("/api/observer-analysis")
+def observer_analysis(req: ObserverAnalysisRequest) -> dict:
+    """#4: derive INTER-/INTRA-observer reproducibility from a folder of companion-annotator ground
+    truth. Computes pairwise scar/cornea Dice (intra = same user across replicates; inter = same scan
+    across users) + scar-volume CV, writes observer_{intra,inter,volume}.csv + observer_summary.json
+    into the folder, and returns the summary + tables."""
+    root = Path(req.root).expanduser()
+    if not root.exists():
+        raise HTTPException(status_code=400, detail=f"Folder not found: {root}")
+    import observer_analysis as _oa
+    res = _oa.analyze(root)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "analysis failed"))
+    try:
+        res["written"] = _oa.write_csvs(res, root)
+    except Exception:  # noqa: BLE001
+        res["written"] = []
+    return res
+
+
 @app.post("/api/case/{case_id}/oct-preprocess-steps")
 def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
     """Render EVERY preprocessing step for the central sagittal slice (original → hist-eq →

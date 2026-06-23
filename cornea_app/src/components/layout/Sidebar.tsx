@@ -77,6 +77,49 @@ function NormalBaselinePanel() {
   );
 }
 
+// #4: inter-/intra-observer reproducibility from the companion annotator's ground-truth output folder.
+function ObserverPanel() {
+  const [root, setRoot] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [sum, setSum] = useState<Record<string, unknown> | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const run = async () => {
+    if (!root.trim()) { setMsg("Enter the annotator's output folder path."); return; }
+    setBusy(true); setMsg(null); setSum(null);
+    try {
+      const r = await api.json<{ summary: Record<string, unknown>; written?: string[] }>(
+        "/api/observer-analysis", "POST", JSON.stringify({ root: root.trim() }));
+      setSum(r.summary); setMsg(`Wrote observer_*.csv + summary to the folder (${r.written?.length ?? 0} files).`);
+    } catch (e) { setMsg(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const row = (k: string, v: unknown) => v == null ? null : (
+    <div key={k} className="flex justify-between text-xs"><span style={{ color: "var(--c-text-dim)" }}>{k}</span><span>{String(v)}</span></div>);
+  return (
+    <div className="flex flex-col gap-2">
+      <Typography variant="caption" sx={{ color: "var(--c-text-dim)" }}>
+        Point at the companion annotator's <b>output folder</b> (has manifest.json + per-scan labelmaps).
+        Computes pairwise Dice — <b>intra</b>-observer (same rater, rep 1 vs 2) and <b>inter</b>-observer
+        (different raters, same scan) — plus scar-volume CV, and writes CSVs there.
+      </Typography>
+      <TextField size="small" placeholder="/path/to/annotator/output" value={root}
+        onChange={(e) => setRoot(e.target.value)} InputProps={{ sx: { fontSize: 12 } }} />
+      <Button variant="outlined" size="small" disabled={busy} onClick={run}>
+        {busy ? "Computing…" : "Compute observer reproducibility"}
+      </Button>
+      {sum && (
+        <div className="rounded p-2 flex flex-col gap-0.5" style={{ background: "var(--c-surface2)", border: "1px solid var(--c-border)" }}>
+          {row("scans", sum.scans)}{row("annotations", sum.n_annotations)}
+          {row("intra Dice (scar)", sum.intra_dice_scar_mean)}{row("intra Dice (cornea)", sum.intra_dice_cornea_mean)}
+          {row("inter Dice (scar)", sum.inter_dice_scar_mean)}{row("inter Dice (cornea)", sum.inter_dice_cornea_mean)}
+          {row("scar volume CV", sum.scar_volume_cv_mean)}
+        </div>
+      )}
+      {msg && <Typography variant="caption" sx={{ color: "var(--c-text-dim)", wordBreak: "break-word" }}>{msg}</Typography>}
+    </div>
+  );
+}
+
 export function Sidebar() {
   return (
     <div className="flex flex-col">
@@ -100,6 +143,12 @@ export function Sidebar() {
 
       <Section title="Manual ground truth (compare)">
         <ManualGtPanel />
+      </Section>
+
+      <Divider sx={{ borderColor: "var(--c-border)" }} />
+
+      <Section title="Observer reproducibility (inter / intra)">
+        <ObserverPanel />
       </Section>
 
       <Divider sx={{ borderColor: "var(--c-border)" }} />
