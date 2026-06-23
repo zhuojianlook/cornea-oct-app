@@ -250,6 +250,7 @@ export function SliceGallery() {
     try {
       await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify({
         force_columns: [...badCols], good_columns: [], // every non-bad column is a good anchor
+        max_iterations: 1, // targeted column fix is a single pass (not iterative refinement)
       }));
       setColSel(false);
       setBadCols(new Set());

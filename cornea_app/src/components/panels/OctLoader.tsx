@@ -157,6 +157,9 @@ export function OctLoader() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParams] = useState<Record<string, number>>(defaultParams());
   const [paramsOpen, setParamsOpen] = useState(false);
+  // Iterative refinement: re-apply the correction until the boundary stops improving (auto-stops
+  // before it worsens). Default 5 (auto-converge); 1 = the single faithful pass.
+  const [maxPasses, setMaxPasses] = useState(5);
   const [report, setReport] = useState<ConsensusReport | null>(null);
   const [reportLabel, setReportLabel] = useState("");
   const [casesCount, setCasesCount] = useState<number | null>(null);
@@ -448,22 +451,26 @@ export function OctLoader() {
     setBusy(true);
     setReport(null);
     let failed = 0;
+    let lastIter: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } | null = null;
     try {
       for (let k = 0; k < sel.length; k++) {
         const s = sel[k];
         const g = groups.find((gg) => gg.id === s.groupId);
         const cls = g?.condition ?? null;
         const edited = g && isEdited(g);
-        setStep(`Preprocessing ${k + 1}/${sel.length} — ${s.filename} (OCT→correct, up to ~20 min if the backend is busy)`);
+        setStep(`Preprocessing ${k + 1}/${sel.length} — ${s.filename}${maxPasses > 1 ? ` (iterative ≤${maxPasses} passes)` : ""} (OCT→correct, up to ~20 min if the backend is busy)`);
         patchScan(s.id, { status: "preprocessing" });
         try {
-          await api.json(`/api/case/${s.caseId}/oct-preprocess`, "POST", JSON.stringify({
-            params,
-            classification: cls,
-            scar_range: cls === "scar" ? s.scarRange : null,
-            // Persist a user-corrected identity so the rename reaches consensus/export.
-            ...(edited ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
-          }));
+          const r = await api.json<{ oct_iter?: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } }>(
+            `/api/case/${s.caseId}/oct-preprocess`, "POST", JSON.stringify({
+              params,
+              classification: cls,
+              scar_range: cls === "scar" ? s.scarRange : null,
+              max_iterations: maxPasses,
+              // Persist a user-corrected identity so the rename reaches consensus/export.
+              ...(edited ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
+            }));
+          lastIter = r.oct_iter ?? null;
           patchScan(s.id, { status: "done" });
           // Show the freshly-corrected scan in the viewer (switch to it even if another was on
           // screen) so the user immediately sees the preprocessed result. openCase loads the
@@ -477,10 +484,19 @@ export function OctLoader() {
           failed++;
         }
       }
+      // Convergence summary (single scan, iterative): show every pass's boundary deviation (raw +
+      // each pass) and WHICH pass was kept (the least-deviant) — so a pass that worsened the boundary
+      // is visible and was NOT kept. Step through them in ⇆ Before/after.
+      let conv = "";
+      if (sel.length === 1 && lastIter && (lastIter.passes ?? 1) > 1) {
+        const ms = (lastIter.metrics ?? []).map((x) => x.toFixed(2)).join(" → ");
+        const best = lastIter.best_pass ?? lastIter.passes;
+        conv = ` Refined ${lastIter.passes} passes — kept pass ${best} (boundary deviation raw→passes: ${ms} px; lower=flatter${lastIter.stopped ? `, stopped: ${lastIter.stopped}` : ""}). Step through them in ⇆ Before/after.`;
+      }
       // Don't claim success when some scans failed — surface the partial result.
       setStep(failed
         ? `Preprocessing finished: ${sel.length - failed}/${sel.length} OK, ${failed} failed (see the red rows).`
-        : "Preprocessing complete. Now Run SAM2 + consensus on the corrected scans.");
+        : `Preprocessing complete.${conv} Now Run SAM2 + consensus on the corrected scans.`);
     } catch (e) {
       setStep(`Preprocessing failed: ${msg(e)}`);
     } finally {
@@ -788,6 +804,18 @@ export function OctLoader() {
               ))}
             </div>
           </Collapse>
+
+          <div className="flex items-center gap-2 px-1" title="Re-applies the correction until the corneal boundary stops improving toward its curve fit (auto-stops just before it worsens). 1 = a single pass (faithful method).">
+            <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Refine passes</span>
+            <Slider size="small" min={1} max={8} step={1} value={maxPasses} disabled={busy}
+              onChange={(_, v) => setMaxPasses(v as number)} />
+            <span className="text-[10px]" style={{ width: 28, textAlign: "right" }}>
+              {maxPasses === 1 ? "1" : `≤${maxPasses}`}
+            </span>
+          </div>
+          <span className="text-[10px] px-1" style={{ color: "var(--c-text-dim)", opacity: 0.8 }}>
+            {maxPasses === 1 ? "Single pass (faithful method)." : "Iterative — auto-stops at convergence; step through passes in ⇆ Before/after."}
+          </span>
 
           <Button variant="contained" size="small" onClick={runPreprocess} disabled={busy || nToRun < 1 || untaggedGroups.length > 0}>
             Preprocess selected ({nToRun})

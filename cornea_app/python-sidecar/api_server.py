@@ -412,6 +412,27 @@ def _preview_group_dir(case_id: str, group: str) -> Path:
     return orch.case_root(case_id) / "previews" / orch.safe_case_id(group)
 
 
+def _clear_iter_preview_groups(case_id: str) -> None:
+    """Remove the per-pass iterative-refinement preview groups (previews/context_iter*). They are
+    re-rendered by each preprocess and are stale after a re-run or a raw re-scrub."""
+    import shutil as _sh
+    previews = orch.case_root(case_id) / "previews"
+    if previews.exists():
+        for d in previews.glob("context_iter*"):
+            _sh.rmtree(d, ignore_errors=True)
+
+
+def _parse_iter_info(worker_stdout: str) -> dict:
+    """Parse the `ITER {json}` line the oct_preprocess worker prints (per-pass convergence)."""
+    for line in (worker_stdout or "").splitlines():
+        if line.startswith("ITER "):
+            try:
+                return json.loads(line[5:])
+            except Exception:  # noqa: BLE001
+                break
+    return {"passes": 1, "metrics": [], "applied": [True], "stopped": "single"}
+
+
 @app.get("/api/case/{case_id}/previews/{group}")
 def list_previews(case_id: str, group: str) -> dict:
     # Lazy `src` URLs (not inline base64): the gallery loads only the slice on screen, so a
@@ -1192,6 +1213,7 @@ class OctPreprocessRequest(BaseModel):
     force_columns: List[int] | None = None  # BAD frame indices to re-correct ("re-run preprocessing")
     good_columns: List[int] | None = None    # GOOD/anchor frame indices guiding the re-correction
                                              # (all reuse the scan's persisted settings)
+    max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1214,7 +1236,7 @@ def _nifti_frames(path: Path) -> int:
 
 
 def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int,
-                    companion: str | None = None, extra: list | None = None) -> None:
+                    companion: str | None = None, extra: list | None = None) -> str:
     """Run the oct_preprocess CLI in an isolated subprocess (keeps its fork-based
     parallelism away from the sidecar's CUDA/torch state). New session so a timeout can
     reap the whole fork-pool process group. `companion` = the .txt filespec whose
@@ -1230,7 +1252,7 @@ def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int,
         cmd += [str(x) for x in extra]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        _, err = proc.communicate(timeout=1200)
+        stdout_text, err = proc.communicate(timeout=1200)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1240,6 +1262,7 @@ def _run_oct_worker(mode: str, src: str, out: Path, params: dict, vi: int,
         raise HTTPException(504, f"OCT {mode} timed out (>1200s).")
     if proc.returncode != 0 or not Path(out).exists():
         raise HTTPException(500, f"OCT {mode} failed: {(err or '')[-800:]}")
+    return stdout_text or ""
 
 
 def _previews_fresh(out_dir: Path, base: Path) -> bool:
@@ -1314,6 +1337,7 @@ def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict
         # Drop the before/after 3rd-panel overlays too — they belong to the dropped segmentation.
         for grp in ("context_seg", "context_cons"):
             shutil.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
+        _clear_iter_preview_groups(case_id)   # stale per-pass refinement previews
         labels.corrected_path(case_id).unlink(missing_ok=True)
         orch.case_qa_json(case_id).unlink(missing_ok=True)
         orch.write_manifest_value(case_id, {"scar_metrics": None})
@@ -1467,10 +1491,21 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
     cls = req.classification or m.get("scar_classification")
     sr = req.scar_range or m.get("scar_range")
-    _run_oct_worker("preprocess", src, work, eff_params, vi, companion=m.get("companion_txt"))
+    # Iterative refinement: auto-converge by default (cap 8). Persisted as oct_max_iterations so a
+    # later viewer re-run reuses the user's setting. Each pass re-flattens the boundary toward its
+    # fit; the worker auto-stops when the correction stops shrinking (see iterate_smooth_volume).
+    max_it = req.max_iterations if req.max_iterations is not None else int(m.get("oct_max_iterations", 5))
+    max_it = max(1, min(8, int(max_it)))
+    import shutil as _sh
+    iter_dir = orch.case_root(case_id) / "input" / "_iter"
+    _sh.rmtree(iter_dir, ignore_errors=True)        # clear stale intermediate pass NIfTIs
+    _clear_iter_preview_groups(case_id)             # clear stale per-pass preview groups
+    worker_out = _run_oct_worker("preprocess", src, work, eff_params, vi,
+                                 companion=m.get("companion_txt"),
+                                 extra=["--max-iter", str(max_it), "--iter-dir", str(iter_dir)])
+    iter_info = _parse_iter_info(worker_out)
     # The corrected volume just changed → drop any segmentation built on the OLD correction so a
     # stale overlay can't show on the re-corrected volume (the user re-runs SAM2 next).
-    import shutil as _sh
     seg_dir = orch.segmentation_preview_dir(case_id)
     if seg_dir.exists():
         _sh.rmtree(seg_dir, ignore_errors=True)
@@ -1478,7 +1513,8 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         _sh.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
     labels.corrected_path(case_id).unlink(missing_ok=True)
     orch.case_qa_json(case_id).unlink(missing_ok=True)
-    extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None}
+    extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None,
+             "oct_max_iterations": max_it, "oct_iter": iter_info}
     if cls:
         extra["scar_classification"] = cls
     if sr:
@@ -1496,8 +1532,25 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         if eye in ("OD", "OS"):
             extra["eye"] = eye
     out = _oct_render_volume(case_id, work, preprocessed=True, extra=extra)
+    # Render EVERY corrected pass (V1..Vm) so the user can step through all of them in the before/
+    # after viewer and SEE which is best: pass 0 = context_raw, pass k = context_iter{k}; the chosen
+    # best (oct_iter.best_pass) is the working "context"/volume. Best-effort — a render failure never
+    # fails the preprocess (the final result is already in).
+    try:
+        passes = int(iter_info.get("passes", 1))
+        for k in range(1, passes + 1):
+            pv = iter_dir / f"pass_{k}.nii.gz"
+            if pv.exists():
+                grp_dir = _preview_group_dir(case_id, f"context_iter{k}")
+                postprocess.render_context_previews(pv, grp_dir)
+                (grp_dir / ".rev3").write_text("")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[oct-preprocess] per-pass preview render skipped: {exc}", file=sys.stderr)
+    finally:
+        _sh.rmtree(iter_dir, ignore_errors=True)
     out["preprocessed"] = True
     out["n_frames"] = _nifti_frames(work)
+    out["oct_iter"] = iter_info
     return out
 
 

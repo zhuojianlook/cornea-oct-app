@@ -487,7 +487,11 @@ def _warp_worker(packed):
     quad = _fit_quadratic_ransac(active_edge, residual)
     disp = (quad - active_edge) * corr_factor
     disp = _interp_bad_displacement(disp, bad_cols, good_cols)
-    return _warp_by_displacement(sl, disp)
+    # Also report this slice's mean applied displacement (pixels). It is exactly the boundary's
+    # deviation from its quadratic fit (×corr_factor) — the signal iterative refinement watches:
+    # it shrinks each pass and stops shrinking once the cornea is flattened. The warped output is
+    # unchanged, so the single-pass path stays byte-identical to DICOMSmootherSteps.
+    return _warp_by_displacement(sl, disp), float(np.mean(np.abs(disp)))
 
 
 def _map_slices(worker, items, progress, lo, hi, workers):
@@ -517,13 +521,17 @@ def _map_slices(worker, items, progress, lo, hi, workers):
 
 
 def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
-                  workers: int | None = None) -> np.ndarray:
+                  workers: int | None = None, return_metric: bool = False):
     """Apply the corneal-edge + column correction with 3D active correction to a
     (frames, H, W) volume; returns the corrected volume (same shape/dtype).
 
     Equivalent to DICOMSmootherSteps' process_slice_with_3d_active over every sagittal
     slice, but each slice's edge is computed once (O(N), not O(3N)) and the two
-    independent per-slice phases are parallelised across CPU cores."""
+    independent per-slice phases are parallelised across CPU cores.
+
+    return_metric=True → also return the mean per-column correction magnitude (pixels) applied
+    this pass (the boundary's mean deviation from its fit) — the iterative-refinement signal. The
+    corrected array is identical either way (single-pass path stays byte-identical)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     sag = reformat_to_sagittal(volume)             # (sag_slices, H, W)
     n = sag.shape[0]
@@ -554,8 +562,78 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     bad_cols = [int(c) for c in (p.get("force_columns") or [])]
     good_cols = [int(c) for c in (p.get("good_columns") or [])]
     items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols) for i in range(n)]
-    warped = _map_slices(_warp_worker, items, progress, 0.5, 1.0, workers)
-    return revert_sagittal(np.array(warped))
+    results = _map_slices(_warp_worker, items, progress, 0.5, 1.0, workers)
+    warped = [r[0] for r in results]
+    corrected = revert_sagittal(np.array(warped))
+    if return_metric:
+        disp_means = [float(r[1]) for r in results]
+        return corrected, float(np.mean(disp_means)) if disp_means else 0.0
+    return corrected
+
+
+def _boundary_deviation(volume: np.ndarray, params: dict | None = None,
+                        workers: int | None = None) -> float:
+    """Mean (over sagittal slices/columns) absolute deviation of the DETECTED corneal boundary
+    from its own quadratic fit, in pixels — i.e. how jagged/non-smooth the boundary is. This is
+    the SAME quantity smooth_volume's per-pass metric reports for its input; computing it directly
+    (no warp) lets the iterator score a candidate volume's quality on its own terms. Lower = flatter
+    + smoother + less extreme."""
+    _, m = smooth_volume(volume, params, workers=workers, return_metric=True)
+    return float(m)
+
+
+def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
+                          max_iter: int = 5, min_improvement: float = 0.15,
+                          abs_floor: float = 0.3, progress=None, workers: int | None = None):
+    """Iteratively re-apply smooth_volume to its own output, then KEEP THE BEST pass — the one whose
+    detected corneal boundary deviates LEAST from a smooth fit (lowest "boundary deviation", px).
+
+    Why keep-the-best rather than keep-the-last: each pass warps the boundary toward its quadratic
+    fit, so the deviation usually SHRINKS pass over pass — but a pass can OVERSHOOT and produce a
+    MORE deviant (worse) boundary than an earlier pass or even than the raw original (re-detection on
+    an over-warped volume picks up a jagged edge). So we score EVERY candidate volume's deviation and
+    select the minimum: a worse pass is never kept, and the result can never be more deviant than the
+    raw input (raw is in the candidate set). This is the user's "compare so the subsequent border is
+    not a more extreme deviation than the original".
+
+    The search stops early (no more passes) once the deviation stops improving — it GREW vs the prior
+    pass (overshoot), improved by < min_improvement (diminishing), fell below abs_floor (converged),
+    or hit max_iter. But the FINAL choice is always argmin over all measured candidates.
+
+    Returns (chain, best_idx, info): chain = [V0(raw), V1, …, Vm] every measured volume (for the UI
+    pass-stepper); best_idx = index of the kept volume; info = {passes (corrected passes produced =
+    len(chain)-1), best_pass, metrics (deviation px of each chain volume), stopped}."""
+    max_iter = max(1, int(max_iter))
+    chain: list = [volume]       # V0 = raw, then each accepted pass
+    rough: list = []             # rough[i] = boundary deviation of chain[i]
+    stopped = "max_iter"
+    for k in range(max_iter):
+        lo = k / max_iter
+        hi = (k + 1) / max_iter
+        nxt, r = smooth_volume(chain[k], params, progress=(
+            (lambda f, lo=lo, hi=hi: progress(lo + (hi - lo) * f)) if progress else None),
+            workers=workers, return_metric=True)   # r = deviation of chain[k]; nxt = its correction
+        rough.append(float(r))
+        # Stop producing more passes once the boundary stops getting smoother (but we've still
+        # MEASURED chain[k], so it stays a candidate for the argmin below).
+        if k >= 1:
+            if r >= rough[k - 1]:
+                stopped = "grew"; break          # chain[k] is MORE deviant than chain[k-1]
+            if (rough[k - 1] - r) / max(rough[k - 1], 1e-9) < min_improvement:
+                stopped = "diminishing"; break
+        if r < abs_floor:
+            stopped = "converged"
+            chain.append(nxt)                    # a final tiny refinement is safe; keep + measure it
+            break
+        chain.append(nxt)                        # accept the next pass into the chain
+    # Make sure EVERY chain volume has a measured deviation so it can compete in the argmin (the last
+    # accepted pass is otherwise unmeasured when we stop by max_iter / converged).
+    while len(rough) < len(chain):
+        rough.append(_boundary_deviation(chain[len(rough)], params, workers=workers))
+    best_idx = min(range(len(chain)), key=lambda i: rough[i])
+    info = {"passes": len(chain) - 1, "best_pass": best_idx,
+            "metrics": [float(x) for x in rough], "stopped": stopped}
+    return chain, best_idx, info
 
 
 # ── NIfTI output (correct Avanti geometry, matching the app's existing volumes) ──
@@ -613,12 +691,36 @@ def raw_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
 
 def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             params: dict | None = None, volume_index: int = 0,
-                            progress=None, companion_txt: str | Path | None = None) -> str:
-    """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry."""
+                            progress=None, companion_txt: str | Path | None = None,
+                            max_iterations: int = 1, min_improvement: float = 0.15,
+                            abs_floor: float = 0.3, iter_dir: str | Path | None = None) -> dict:
+    """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry.
+
+    max_iterations<=1 → the faithful single pass (unchanged). max_iterations>1 → iterative
+    refinement (iterate_smooth_volume), auto-stopping when the boundary correction stops
+    shrinking. When iter_dir is given, each INTERMEDIATE pass volume (V1..V(n-1)) is written
+    there as pass_{k}.nii.gz so the UI can step through every pass; the final pass is out_nifti.
+    Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
-    corrected = smooth_volume(vol, params, progress=progress)
-    return write_volume_nifti(corrected, out_nifti, sp)
+    if max_iterations and int(max_iterations) > 1:
+        chain, best_idx, info = iterate_smooth_volume(
+            vol, params, max_iter=int(max_iterations),
+            min_improvement=min_improvement, abs_floor=abs_floor, progress=progress)
+        corrected = chain[best_idx]                 # the BEST pass (least-deviant boundary)
+        # Write EVERY corrected pass (V1..Vm) so the UI can step through them all and SEE why the
+        # best was chosen (a worse pass is visibly more deviant). chain[0] = raw = context_raw.
+        if iter_dir is not None and len(chain) > 1:
+            idir = Path(iter_dir)
+            idir.mkdir(parents=True, exist_ok=True)
+            for k, pv in enumerate(chain[1:], start=1):
+                write_volume_nifti(pv, idir / f"pass_{k}.nii.gz", sp)
+    else:
+        corrected, m = smooth_volume(vol, params, progress=progress, return_metric=True)
+        info = {"passes": 1, "best_pass": 1, "metrics": [float(m)], "stopped": "single"}
+    write_volume_nifti(corrected, out_nifti, sp)
+    info["out"] = str(out_nifti)
+    return info
 
 
 # ── Diagnostic: render EVERY processing step for the central sagittal slice ──
@@ -737,6 +839,10 @@ if __name__ == "__main__":
     ap.add_argument("--volume-index", type=int, default=0)
     ap.add_argument("--companion-txt", default="")
     ap.add_argument("--bad-cols", default="[]")
+    ap.add_argument("--max-iter", type=int, default=1)        # >1 = iterative refinement
+    ap.add_argument("--min-improvement", type=float, default=0.15)
+    ap.add_argument("--abs-floor", type=float, default=0.3)
+    ap.add_argument("--iter-dir", default="")                 # where to write intermediate pass NIfTIs
     a = ap.parse_args()
     _p = _json.loads(a.params)
     _comp = a.companion_txt or None
@@ -756,5 +862,10 @@ if __name__ == "__main__":
             _labels.append({"label": _label, "file": _fn})
         (_outdir / "labels.json").write_text(_json.dumps(_labels))
     else:
-        preprocess_oct_to_nifti(a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp)
+        _info = preprocess_oct_to_nifti(
+            a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp,
+            max_iterations=a.max_iter, min_improvement=a.min_improvement, abs_floor=a.abs_floor,
+            iter_dir=(a.iter_dir or None))
+        # Single machine-readable line the sidecar parses for the per-pass convergence report.
+        print("ITER " + _json.dumps(_info))
     print("OK " + str(a.out_nifti))
