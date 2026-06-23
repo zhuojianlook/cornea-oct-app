@@ -49,6 +49,11 @@ DEFAULT_PARAMS: dict = {
     # boundary deviates < ~17px from its fit), so this is a no-op on well-detected columns — clean scans
     # are unchanged; only the pathological lateral runaway is tamed.
     "max_displacement": 40.0,
+    # ── ping-pong axial refine (#2) ── After the sagittal correction, run the SAME correction in the
+    # axial domain (flatten along lateral, per frame) and keep it per-frame where it makes the en-face
+    # boundary smoother — cleans the 'hairy' axial boundary the sagittal pass leaves at noisy slice ends.
+    # Confirmed on real scans to give the smoothest 3-D surface; a global guard makes it never worse.
+    "axial_refine": True,
     # ── axial consistency (#3) ── Sagittal slices are corrected independently, so neighbouring slices
     # can shift inconsistently → the en-face/axial corneal boundary turns jagged ("hairier"). Smoothing
     # the per-column displacement FIELD across the slice (lateral) axis with this Gaussian sigma (px,
@@ -769,6 +774,68 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     return chain, best_idx, info
 
 
+# ── Ping-pong: axial correction after sagittal, for the hairy frames only (#2) ──────────────────────
+# The sagittal correction flattens the boundary ALONG FRAMES (independently per lateral slice), so it
+# leaves roughness ACROSS LATERAL — the en-face/"axial" boundary can look hairy where the sagittal slice
+# was noisy at its ends. Running the SAME correction in the axial domain (flatten ALONG LATERAL, per
+# frame) cleans those up. Empirically (real Avanti scans) a SINGLE axial pass after the sagittal one is
+# the smoothest 3D surface; more ping-pong passes over-correct. Applying the axial result PER FRAME only
+# where it actually reduces that frame's lateral roughness ("hairy frames only") is best + can't regress.
+_FRAME_LATERAL_SWAP = (2, 1, 0)  # frames<->lateral (depth stays axis 1); makes axial slices the warp slices
+
+
+def _axial_smooth_volume(volume: np.ndarray, params: dict | None, workers: int | None) -> np.ndarray:
+    """Run smooth_volume in the AXIAL domain (flatten the boundary along the LATERAL axis, per frame) by
+    swapping frames<->lateral, correcting, swapping back. Detects on a black-band-filled copy so the
+    prior sagittal warp's padding can't fool the detector."""
+    vt = np.ascontiguousarray(volume.transpose(*_FRAME_LATERAL_SWAP))
+    out = smooth_volume(vt, params, workers=workers, detect_volume=_fill_black_bands(vt))
+    return np.ascontiguousarray(out.transpose(*_FRAME_LATERAL_SWAP))
+
+
+def _frame_boundary_surface(volume: np.ndarray, params: dict, workers: int | None) -> np.ndarray:
+    """The corneal boundary B(frame, lateral) detected per FRAME (axial B-scan = depth×lateral) on a
+    black-band-filled copy (so the warp padding can't fool detection). Shape (n_frames, n_lateral)."""
+    vf = _fill_black_bands(volume)
+    res = _map_slices(_edge_worker, [(vf[f], params) for f in range(vf.shape[0])], None, 0.0, 1.0, workers)
+    return np.array([(r[0] if isinstance(r, tuple) else r) for r in res])
+
+
+def _surface_rms(B: np.ndarray) -> float:
+    """RMS deviation of the boundary surface from a smooth 2-D quadratic fit (3-D smoothness; lower=better)."""
+    if B.ndim != 2 or B.size < 6:
+        return 0.0
+    ff, ll = np.mgrid[0:B.shape[0], 0:B.shape[1]].astype(float)
+    A = np.c_[np.ones(B.size), ff.ravel(), ll.ravel(), ff.ravel() ** 2, ll.ravel() ** 2, (ff * ll).ravel()]
+    coef, *_ = np.linalg.lstsq(A, B.ravel(), rcond=None)
+    return float(np.sqrt(np.mean((B.ravel() - A @ coef) ** 2)))
+
+
+def axial_refine_volume(v_sag: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """#2 ping-pong refine: after the sagittal correction, run an axial pass and KEEP it PER FRAME only
+    where it reduces that frame's lateral boundary roughness (the user's 'axial correction for hairy
+    axial slices'). A global guard then accepts the blend only if the whole 3-D surface got smoother — so
+    this can never produce a worse surface than sagittal-only. Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = max(1, min(16, (os.cpu_count() or 2) - 2))
+    v_ax = _axial_smooth_volume(v_sag, p, workers)
+    B_sag = _frame_boundary_surface(v_sag, p, workers)
+    B_ax = _frame_boundary_surface(v_ax, p, workers)
+    tvl_sag = np.mean(np.abs(np.diff(B_sag, axis=1)), axis=1)   # per-frame lateral roughness (sagittal)
+    tvl_ax = np.mean(np.abs(np.diff(B_ax, axis=1)), axis=1)     # per-frame lateral roughness (axial)
+    use = tvl_ax < tvl_sag                                       # frames the axial pass actually improved
+    out = v_sag.copy()
+    out[use] = v_ax[use]
+    B_out = np.where(use[:, None], B_ax, B_sag)                  # blended surface (no re-detect needed)
+    rms_before, rms_after = _surface_rms(B_sag), _surface_rms(B_out)
+    if use.any() and rms_after <= rms_before:                    # global guard: only accept a smoother surface
+        return out, {"frames_refined": int(use.sum()), "n_frames": int(B_sag.shape[0]),
+                     "surf_rms_before": rms_before, "surf_rms_after": rms_after, "applied": True}
+    return v_sag, {"frames_refined": 0, "n_frames": int(B_sag.shape[0]),
+                   "surf_rms_before": rms_before, "surf_rms_after": rms_before, "applied": False}
+
+
 # ── NIfTI output (correct Avanti geometry, matching the app's existing volumes) ──
 def write_volume_nifti(vol_zyx: np.ndarray, out_path: str | Path,
                        spacing_xyz=NIFTI_SPACING, direction=NIFTI_DIRECTION) -> str:
@@ -834,8 +901,11 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     auto-stopping when the boundary correction stops shrinking, then keeping the BEST pass (lowest
     in-plane deviation + axial roughness, #3). Both paths apply the over-correction guard (#2) +
     inter-slice smoothing (#3) — see smooth_volume (no longer byte-identical to DICOMSmootherSteps by
-    design). When iter_dir is given, each INTERMEDIATE pass volume (V1..V(n-1)) is written there as
-    pass_{k}.nii.gz so the UI can step through every pass; the final pass is out_nifti.
+    design). FINALLY (#2 ping-pong) the chosen volume is AXIAL-refined: an axial correction pass kept
+    per-frame where it makes the en-face boundary smoother (axial_refine param, default on; a global
+    guard makes it never worse). When iter_dir is given, each INTERMEDIATE sagittal pass volume
+    (V1..V(n-1)) is written there as pass_{k}.nii.gz so the UI can step through them; out_nifti is the
+    axial-refined best (so the delivered volume can be slightly smoother than the last stepped pass).
     Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
@@ -855,6 +925,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     else:
         corrected, m, ax = smooth_volume(vol, params, progress=progress, return_metric=True)
         info = {"passes": 1, "best_pass": 1, "metrics": [float(m)], "axial_metrics": [float(ax)], "stopped": "single"}
+    # #2 ping-pong: refine the sagittally-corrected volume with an AXIAL pass, kept per-frame only where
+    # it makes the en-face boundary smoother (and only if the whole 3-D surface improves). Confirmed on
+    # real scans to give the smoothest 3-D corneal surface; never worse than sagittal-only.
+    p_all = {**DEFAULT_PARAMS, **(params or {})}
+    if p_all.get("axial_refine", True):
+        corrected, ref = axial_refine_volume(corrected, params)
+        info["axial_refine"] = ref
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     return info
