@@ -91,12 +91,24 @@ export function AnnotatorCanvas() {
     return () => window.removeEventListener("beforeunload", flush);
   }, []);
 
-  // Defensive repaint once the layout has settled after a volume loads / the view changes — recovers
-  // WebKitGTK if it left the GL canvas black after a resize. (#2)
+  // Defensive repaint once the layout has SETTLED after a volume loads / the view changes. WebKitGTK
+  // (the desktop webview) leaves the GL canvas BLACK if its drawing buffer is reallocated by a resize
+  // after the first draw — and a single requestAnimationFrame can fire BEFORE the layout has settled
+  // (the extra on-load work in #5 made this worse: panes stayed black). So redraw on a few escalating
+  // delays AND whenever the canvas container actually RESIZES (a ResizeObserver is the reliable signal
+  // that WebKitGTK has reallocated the buffer — re-issuing drawScene then recovers it). Chromium is
+  // unaffected; these extra drawScene() calls are cheap and harmless. (#2 / v0.1.21)
   useEffect(() => {
     if (!loaded) return;
-    const id = requestAnimationFrame(() => redraw());
-    return () => cancelAnimationFrame(id);
+    const raf = requestAnimationFrame(() => redraw());
+    const timers = [60, 180, 400, 800].map((d) => setTimeout(() => redraw(), d));
+    const host = canvasRef.current?.parentElement;
+    let ro: ResizeObserver | undefined;
+    if (host && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(() => requestAnimationFrame(() => redraw()));
+      ro.observe(host);
+    }
+    return () => { cancelAnimationFrame(raf); timers.forEach(clearTimeout); ro?.disconnect(); };
   }, [loaded, view]);
 
   const painting = loaded && tool === "paint" && view !== "render";
