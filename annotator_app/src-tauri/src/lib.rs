@@ -32,6 +32,9 @@ pub fn run() {
     .plugin(tauri_plugin_fs::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_process::init())
+    // Remember the window's size + position across restarts AND updates (state file lives in the OS
+    // app-config dir, keyed by the stable identifier, so a new version restores the old window).
+    .plugin(tauri_plugin_window_state::Builder::default().build())
     .invoke_handler(tauri::generate_handler![restart_app])
     .setup(|app| {
       // Self-update (desktop only; the updater crate isn't built for mobile targets).
