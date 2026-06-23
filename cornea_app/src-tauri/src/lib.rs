@@ -128,6 +128,9 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Remember the window's size + position across restarts AND updates (state file lives in the
+        // OS app-config dir, keyed by the stable identifier, so a new version restores the old window).
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Sidecar(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![proxy_request, proxy_upload, restart_app])
         .setup(|app| {

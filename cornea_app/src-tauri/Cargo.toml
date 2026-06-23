@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.0.4"
+version = "0.0.5"
 description = "Cornea OCT"
 authors = ["you"]
 license = ""
@@ -22,6 +22,7 @@ log = "0.4"
 tauri = { version = "2.11.2" }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls", "charset", "http2"] }
 
