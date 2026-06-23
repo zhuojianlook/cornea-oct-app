@@ -98,6 +98,12 @@ fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Option<Child> {
         .arg("--port")
         .arg(port.to_string())
         .current_dir(&sidecar_dir);
+    // The AppImage runtime exports PYTHONHOME/PYTHONPATH pointing into its OWN mount; inherited by the
+    // child these make the system python3 fail to load its stdlib ("No module named 'encodings'") and
+    // crash on startup. Strip them so the sidecar interpreter uses its own stdlib + the user's
+    // site-packages, exactly as in a normal shell. (Same reason the bundled sidecar never started.)
+    cmd.env_remove("PYTHONHOME");
+    cmd.env_remove("PYTHONPATH");
     // Stamp the sidecar with this shell's version so /api/health can confirm the right one is up.
     cmd.env("CORNEA_SHELL_VERSION", app.package_info().version.to_string());
     // Installed app: write cases/state to the OS app-data dir (not the read-only bundle), and tee the
