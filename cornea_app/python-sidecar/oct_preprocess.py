@@ -836,6 +836,42 @@ def axial_refine_volume(v_sag: np.ndarray, params: dict | None = None, workers: 
                    "surf_rms_before": rms_before, "surf_rms_after": rms_before, "applied": False}
 
 
+def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
+    """#2 fix-columns drag-to-correct: shift a specific frame (B-scan) UP/DOWN in DEPTH by an explicit
+    pixel offset the annotator dragged in the fix-columns view — a per-frame manual ground-truth nudge
+    applied ON TOP of the automatic boundary correction (so the user can fix any frame the auto-detect
+    still placed wrong, especially the last few sagittal slices). `shifts` maps frame_index ->
+    depth_pixels (positive = DOWN / deeper, matching the on-screen drag down); accepts a dict
+    {frame: px} or a list of [frame, px] pairs. Vacated rows are zero-filled. Returns (volume,
+    n_frames_shifted)."""
+    pairs = []
+    if isinstance(shifts, dict):
+        pairs = list(shifts.items())
+    elif isinstance(shifts, (list, tuple)):
+        for item in shifts:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                pairs.append((item[0], item[1]))
+    nz, depth = volume.shape[0], volume.shape[1]
+    out = volume.copy()
+    n = 0
+    for f, px in pairs:
+        try:
+            fi, s = int(f), int(round(float(px)))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= fi < nz) or s == 0:
+            continue
+        b = out[fi]                      # (depth, lateral)
+        shifted = np.zeros_like(b)       # vacated rows stay 0 (background)
+        if s > 0 and s < depth:          # move pixels DOWN (toward larger depth index)
+            shifted[s:, :] = b[:depth - s, :]
+        elif s < 0 and -s < depth:       # move pixels UP
+            shifted[:depth + s, :] = b[-s:, :]
+        out[fi] = shifted
+        n += 1
+    return out, n
+
+
 # ── NIfTI output (correct Avanti geometry, matching the app's existing volumes) ──
 def write_volume_nifti(vol_zyx: np.ndarray, out_path: str | Path,
                        spacing_xyz=NIFTI_SPACING, direction=NIFTI_DIRECTION) -> str:
@@ -932,6 +968,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("axial_refine", True):
         corrected, ref = axial_refine_volume(corrected, params)
         info["axial_refine"] = ref
+    # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
+    # so they override whatever the auto-correction left for those frames (manual ground truth wins).
+    ms = p_all.get("manual_shifts")
+    if ms:
+        corrected, n_ms = apply_manual_shifts(corrected, ms)
+        info["manual_shifts"] = {"n_frames": int(n_ms)}
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     return info

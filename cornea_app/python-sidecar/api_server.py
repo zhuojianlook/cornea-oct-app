@@ -1234,6 +1234,8 @@ class OctPreprocessRequest(BaseModel):
                                              # (all reuse the scan's persisted settings)
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
+    manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
+                                             # depth nudges (positive = DOWN), applied LAST as manual ground truth
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1518,6 +1520,17 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         eff_params.pop("good_columns", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
+    # #2 drag-to-correct: explicit per-frame manual depth nudges. When provided, override (an empty {}
+    # clears them); when omitted, the persisted nudges from oct_params carry through so manual ground
+    # truth stays applied on every later re-run. Flows to the worker inside eff_params (--params JSON).
+    if req.manual_shifts is not None:
+        ms: dict = {}
+        for k, v in (req.manual_shifts or {}).items():
+            try:
+                ms[str(int(k))] = int(round(float(v)))
+            except (TypeError, ValueError):
+                pass
+        eff_params["manual_shifts"] = ms
     cls = req.classification or m.get("scar_classification")
     sr = req.scar_range or m.get("scar_range")
     # Iterative refinement: auto-converge by default (cap 8). Persisted as oct_max_iterations so a

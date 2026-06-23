@@ -36,6 +36,22 @@ export function SliceGallery() {
   useEffect(() => {
     if (fixPass != null && fixPass > passCount) setFixPass(passCount > 1 ? passCount : null);
   }, [passCount, fixPass]);
+  // #2: the manual depth nudges already baked into the current corrected volume (persisted on the case).
+  // A stable JSON signature drives a re-seed only when they actually change (case load / after a re-run),
+  // never mid-drag.
+  const persistedSig = JSON.stringify(
+    ((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.manual_shifts ?? {});
+  const persistedShifts = useMemo(() => {
+    const m = new Map<number, number>();
+    try {
+      for (const [k, v] of Object.entries(JSON.parse(persistedSig) as Record<string, number>)) {
+        const f = Number(k), px = Number(v);
+        if (Number.isFinite(f) && Number.isFinite(px) && px) m.set(f, Math.round(px));
+      }
+    } catch { /* none */ }
+    return m;
+  }, [persistedSig]);
   // Re-fetch when the segmentation changes (SAM2/correct/scar re-render previews).
   const segSig = useWorkflowStore((s) => s.segVersion);
   const hintMode = useWorkflowStore((s) => s.hintMode);
@@ -74,6 +90,23 @@ export function SliceGallery() {
   const colPaintingRef = useRef(false);
   const colDragModeRef = useRef<"add" | "remove">("add"); // a drag adds or removes (set on press)
   const lastCaseRef = useRef<string | null>(null); // reset slice position only when the case changes
+  // #2 drag-to-correct: within Fix-columns, "shift" mode lets the user grab a frame in the SAGITTAL
+  // view and drag it UP/DOWN to its correct depth — a manual ground-truth nudge (in depth VOXELS,
+  // applied LAST in preprocessing). manualShifts holds the ABSOLUTE per-frame depth offset to send;
+  // it is seeded from the persisted oct_params.manual_shifts so earlier nudges are never lost.
+  const [colMode, setColMode] = useState<"mark" | "shift">("mark");
+  const [manualShifts, setManualShifts] = useState<Map<number, number>>(new Map());
+  const [dragGhost, setDragGhost] = useState<{ lo: number; hiEnd: number; dy: number } | null>(null);
+  const shiftDragRef = useRef<{ startY: number; frames: number[]; baseAbs: Map<number, number>; depthVox: number; rectH: number; lo: number; hiEnd: number; dy: number } | null>(null);
+  // Re-seed the editable shifts from the persisted set whenever it changes (clears pending after a re-run).
+  useEffect(() => { setManualShifts(new Map(persistedShifts)); }, [persistedShifts]);
+  // Pending = differs from what's already baked into the displayed volume (drives chips + the re-run enable).
+  const pendingFrames = useMemo(() => {
+    const s = new Set<number>();
+    manualShifts.forEach((v, k) => { if ((persistedShifts.get(k) ?? 0) !== v) s.add(k); });
+    return s;
+  }, [manualShifts, persistedShifts]);
+  const shiftsDirty = pendingFrames.size > 0;
   // Display-only image enhancement (does NOT change the data) to aid seeing the corneal border.
   const [enhContrast, setEnhContrast] = useState(false);
   const [enhBlur, setEnhBlur] = useState(false);
@@ -221,6 +254,9 @@ export function SliceGallery() {
   // sagittal preview, so the button is discoverable on ANY view (Slices OR Segmentation); clicking
   // it switches to the corrected sagittal view where the column band is shown.
   const nFrames = rawImages.find((i) => i.orientation === "sagittal")?.source_height ?? 0;
+  // Depth voxel count = the sagittal preview's SOURCE width (rgb is frames×depth pre-rotation), used to
+  // convert a vertical screen drag → a depth-voxel shift for #2 drag-to-correct.
+  const depthVox = rawImages.find((i) => i.orientation === "sagittal")?.source_width ?? 0;
   const canMarkColumns = !previewGroup && rawImages.length > 0 && nFrames > 1 && !showBeforeAfter;
 
   // Map a pointer position to a FRAME index. The same frame is a vertical COLUMN in the sagittal
@@ -258,15 +294,23 @@ export function SliceGallery() {
   };
 
   const rerunColumns = async () => {
-    if (!caseId || badCols.size === 0) return;
+    const hasMarks = badCols.size > 0;
+    if (!caseId || (!hasMarks && !shiftsDirty)) return;
     setRerunBusy(true);
     try {
+      // #2: send the COMPLETE manual depth-nudge set (absolute voxels) so every nudged frame keeps its
+      // correction; an empty {} would clear them. Rides along with whatever column-fix mode is active.
+      const manual_shifts: Record<string, number> = {};
+      manualShifts.forEach((v, k) => { if (v) manual_shifts[String(k)] = Math.round(v); });
       // Iterative scan (passCount>1): inject the column fix at the chosen pass ONLY and let the
-      // iteration re-converge from there (the user's "fix columns for a particular iteration").
-      // Single-pass scan: the legacy targeted re-run (one pass with the fix).
-      const body = (passCount > 1 && fixPass)
-        ? { inject_pass: fixPass, force_columns: [...badCols], good_columns: [] }
-        : { force_columns: [...badCols], good_columns: [], max_iterations: 1 };
+      // iteration re-converge from there. Single-pass scan: the legacy targeted re-run (one pass).
+      // Nudges-only (no marked frames): keep the persisted pipeline so the nudge lands relative to the
+      // result the user dragged against, and clear any stale forced columns.
+      const body = (passCount > 1 && fixPass && hasMarks)
+        ? { inject_pass: fixPass, force_columns: [...badCols], good_columns: [], manual_shifts }
+        : hasMarks
+          ? { force_columns: [...badCols], good_columns: [], max_iterations: 1, manual_shifts }
+          : { force_columns: [], good_columns: [], manual_shifts };
       await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify(body));
       setColSel(false);
       setBadCols(new Set());
@@ -379,6 +423,22 @@ export function SliceGallery() {
     }
   };
   const onPointerDown = (e: React.PointerEvent) => {
+    if (colSel && colMode === "shift" && orient === "sagittal") {  // #2: grab a frame and drag its depth
+      e.preventDefault();
+      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+      const f = frameAt(e.clientX, e.clientY);
+      const img = imgRef.current;
+      if (f == null || !img || depthVox < 2) return;
+      const rect = img.getBoundingClientRect();
+      const frames: number[] = [];
+      for (let k = Math.max(0, f - 1); k <= Math.min(nFrames - 1, f + 1); k++) frames.push(k); // ±1 frame, like the mark brush
+      const baseAbs = new Map<number, number>();
+      frames.forEach((k) => baseAbs.set(k, manualShifts.get(k) ?? 0));
+      shiftDragRef.current = { startY: e.clientY, frames, baseAbs, depthVox, rectH: rect.height,
+        lo: frames[0] / nFrames, hiEnd: (frames[frames.length - 1] + 1) / nFrames, dy: 0 };
+      setDragGhost({ lo: shiftDragRef.current.lo, hiEnd: shiftDragRef.current.hiEnd, dy: 0 });
+      return;
+    }
     if (colSel) {   // Fix-columns: toggle frame-columns instead of painting scar
       e.preventDefault();
       (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
@@ -397,6 +457,14 @@ export function SliceGallery() {
     paintAt(e);
   };
   const onPointerMove = (e: React.PointerEvent) => {
+    if (colSel && colMode === "shift" && orient === "sagittal") {
+      const d = shiftDragRef.current;
+      if (!d) return;
+      const dy = Math.max(-d.rectH, Math.min(d.rectH, e.clientY - d.startY)); // clamp to one image height
+      d.dy = dy;
+      setDragGhost({ lo: d.lo, hiEnd: d.hiEnd, dy });
+      return;
+    }
     if (colSel) {
       if (colPaintingRef.current) paintColAt(e.clientX, e.clientY);
       return;
@@ -404,6 +472,23 @@ export function SliceGallery() {
     if (editing && paintingRef.current) paintAt(e);
   };
   const onPointerUp = async () => {
+    if (colSel && colMode === "shift" && orient === "sagittal") {  // #2: commit the dragged depth shift
+      const d = shiftDragRef.current;
+      shiftDragRef.current = null;
+      setDragGhost(null);
+      if (d) {
+        const deltaVox = Math.round((d.dy / d.rectH) * d.depthVox); // screen px → depth voxels (down = +)
+        if (deltaVox !== 0) setManualShifts((prev) => {
+          const next = new Map(prev);
+          d.frames.forEach((k) => {
+            const abs = (d.baseAbs.get(k) ?? 0) + deltaVox;
+            if (abs) next.set(k, abs); else next.delete(k); // keep the map zero-free (matches persisted)
+          });
+          return next;
+        });
+      }
+      return;
+    }
     if (colSel) { colPaintingRef.current = false; return; }
     if (!editing || !paintingRef.current) return;
     paintingRef.current = false;
@@ -484,8 +569,26 @@ export function SliceGallery() {
         )}
         {colSel && canMarkColumns && (
           <>
-            <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
-            <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>mark in sagittal (columns) or coronal (rows) · click again to unmark · the rest are anchors</span>
+            <ToggleButtonGroup size="small" exclusive value={orient === "sagittal" ? colMode : "mark"}
+              onChange={(_, v) => { if (v) setColMode(v); }}>
+              <ToggleButton value="mark" sx={{ py: 0.1, px: 0.8, fontSize: 10, textTransform: "none" }}
+                title="Click/drag to mark BAD frames; preprocessing re-interpolates them from good neighbours">
+                Mark bad
+              </ToggleButton>
+              <ToggleButton value="shift" disabled={orient !== "sagittal" || depthVox < 2}
+                sx={{ py: 0.1, px: 0.8, fontSize: 10, textTransform: "none" }}
+                title="Sagittal only: drag a frame UP/DOWN to its correct depth (manual ground-truth nudge)">
+                ↕ Drag-fix
+              </ToggleButton>
+            </ToggleButtonGroup>
+            {(orient === "sagittal" ? colMode : "mark") === "shift" ? (
+              <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>drag a frame up/down to set its depth · shifted: {pendingFrames.size}</span>
+            ) : (
+              <>
+                <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
+                <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>mark in sagittal (columns) or coronal (rows) · click again to unmark · the rest are anchors</span>
+              </>
+            )}
             {passCount > 1 && (
               <span className="flex items-center gap-1" title="Apply this fix at ONLY this iteration pass, then re-converge the later passes from it. Earlier passes are unchanged.">
                 <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>fix at pass</span>
@@ -498,16 +601,21 @@ export function SliceGallery() {
                 </Select>
               </span>
             )}
-            {badCols.size > 0 && (
-              <button onClick={() => setBadCols(new Set())} disabled={rerunBusy}
+            {(badCols.size > 0 || shiftsDirty) && (
+              <button onClick={() => { setBadCols(new Set()); setManualShifts(new Map(persistedShifts)); }} disabled={rerunBusy}
                 style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
                 Clear
               </button>
             )}
-            <button onClick={rerunColumns} disabled={rerunBusy || badCols.size === 0}
-              style={{ background: badCols.size ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !badCols.size ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !badCols.size ? 0.6 : 1 }}>
-              {rerunBusy ? "Re-running…" : (passCount > 1 && fixPass ? `Re-run (fix at pass ${fixPass})` : "Re-run preprocessing")}
-            </button>
+            {(() => {
+              const ready = badCols.size > 0 || shiftsDirty;
+              return (
+                <button onClick={rerunColumns} disabled={rerunBusy || !ready}
+                  style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !ready ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !ready ? 0.6 : 1 }}>
+                  {rerunBusy ? "Re-running…" : (passCount > 1 && fixPass && badCols.size > 0 ? `Re-run (fix at pass ${fixPass})` : "Re-run preprocessing")}
+                </button>
+              );
+            })()}
           </>
         )}
 
@@ -649,7 +757,8 @@ export function SliceGallery() {
                 maxWidth: "100%",
                 imageRendering: "pixelated",
                 touchAction: editing || colSel ? "none" : undefined,
-                cursor: editing || hintMode || colSel ? "crosshair" : "zoom-in",
+                cursor: colSel && colMode === "shift" && orient === "sagittal" ? "ns-resize"
+                  : editing || hintMode || colSel ? "crosshair" : "zoom-in",
                 filter: effectiveGroup === "context" ? enhanceFilter : undefined,
               }}
             />
@@ -668,6 +777,26 @@ export function SliceGallery() {
                   : { top: `${Math.max(0, 1 - hiEnd) * 100}%`, height: `${(hiEnd - lo) * 100}%`, left: 0, right: 0 };
                 return <div key={`b${i}`} style={{ position: "absolute", ...pos, background: "rgba(255,70,70,0.32)", pointerEvents: "none" }} />;
               })}
+            {/* #2: committed (un-re-run) depth nudges — a blue band + the pixel offset chip per frame run. */}
+            {colSel && orient === "sagittal" && nFrames > 1 &&
+              colRuns(pendingFrames).map(([a, b], i) => {
+                const lo = a / nFrames, hiEnd = (b + 1) / nFrames;
+                const delta = (manualShifts.get(a) ?? 0) - (persistedShifts.get(a) ?? 0);
+                return (
+                  <div key={`s${i}`} style={{ position: "absolute", left: `${lo * 100}%`, width: `${(hiEnd - lo) * 100}%`, top: 0, bottom: 0, background: "rgba(93,176,255,0.18)", borderLeft: "1px solid rgba(93,176,255,0.7)", borderRight: "1px solid rgba(93,176,255,0.7)", pointerEvents: "none", display: "flex", justifyContent: "center" }}>
+                    <span style={{ height: "fit-content", marginTop: 2, background: "rgba(30,80,150,0.92)", color: "#fff", fontSize: 10, lineHeight: 1.3, padding: "1px 4px", borderRadius: 3, whiteSpace: "nowrap" }}>
+                      {delta > 0 ? `↓${delta}` : `↑${-delta}`}px
+                    </span>
+                  </div>
+                );
+              })}
+            {/* #2: live drag preview — the grabbed frame strip's content slides with the cursor. */}
+            {dragGhost && cur && (
+              <div style={{ position: "absolute", top: 0, bottom: 0, left: `${dragGhost.lo * 100}%`, width: `${(dragGhost.hiEnd - dragGhost.lo) * 100}%`, overflow: "hidden", pointerEvents: "none", outline: "1px solid #5db0ff", outlineOffset: -1 }}>
+                <img src={imgSrc(cur)} alt="" draggable={false}
+                  style={{ position: "absolute", top: 0, left: `${-(dragGhost.lo / (dragGhost.hiEnd - dragGhost.lo)) * 100}%`, width: `${100 / (dragGhost.hiEnd - dragGhost.lo)}%`, height: "100%", transform: `translateY(${dragGhost.dy}px)`, imageRendering: "pixelated", opacity: 0.9, filter: effectiveGroup === "context" ? enhanceFilter : undefined }} />
+              </div>
+            )}
             {hintsHere.map((h, i) => (
               <span
                 key={i}
