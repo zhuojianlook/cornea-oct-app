@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.21";
+export const APP_VERSION = "0.1.22";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 // ── Annotation persistence (#5) — never lose work on volume swap OR app close/restart ─────────────
@@ -385,6 +385,8 @@ export const useStore = create<State>((set, get) => ({
   setPenSize: (n) => { nv.setPenSize(n); set({ penSize: n }); },
   setPenFilled: (f) => { nv.setPen(get().penLabel, f); set({ penFilled: f }); },
   setTool: (t) => { if (t === "paint") nv.lockCrosshair(); nv.setDrawingEnabled(false);
+    // #2: left-click never moves the crosshair (niivue leftButton=none); Navigate sets it explicitly
+    // (AnnotatorCanvas → setCrosshairAtScreen). So Paint/Wand clicks can't jump the crosshair.
     set(t === "wand" ? { tool: t } : { tool: t, wandSeed: null, wandSeedAxis: null }); },
   // Recompute the live wand preview from the current seed + params (after a param change). Debounced so
   // dragging a slider stays smooth. Clears the seed if a recompute no longer floods anything.
@@ -399,8 +401,8 @@ export const useStore = create<State>((set, get) => ({
       const [x, y, z] = st.wandSeed;
       const r = nv.wandPreview(x, y, z, { mode: st.wandMode, threshold01: st.wandThreshold, tolerance01: st.wandTolerance,
         scope: st.wandScope, throughAxis: st.wandSeedAxis, target: st.wandTarget });
-      if (r.ok) { get().refreshStats(); set({ canConfirm: true, status: `Wand preview: ${r.count} voxels — adjust, then Confirm (or click a new spot).` }); }
-      else { nv.clearPreview(); get().refreshStats(); set({ canConfirm: false }); }
+      if (r.ok) { get().refreshStats(); nv.forceDrawAll(); set({ canConfirm: true, status: `Wand preview: ${r.count} voxels — adjust, then Confirm (or click a new spot).` }); }
+      else { nv.clearPreview(); nv.forceDrawAll(); get().refreshStats(); set({ canConfirm: false }); }
     }, 110);
   },
   setWandThreshold: (t) => { set({ wandThreshold: Math.max(0, Math.min(1, t)) }); if (get().wandMode === "threshold") get().wandRecompute(); },
@@ -420,6 +422,7 @@ export const useStore = create<State>((set, get) => ({
           : r.reason === "outside-cornea" ? "Wand: click inside the cornea (scar grows within it)." : "Wand: nothing to fill here." });
     } else {
       get().refreshStats();
+      nv.forceDrawAll();   // #1/#2: ensure every tile (incl. coronal) shows the preview on WebKitGTK
       set({ wandSeed: [x, y, z], wandSeedAxis: throughAxis, canConfirm: true,
         status: `Wand preview: ${r.count} voxels — adjust ${s.wandMode === "threshold" ? "threshold" : "tolerance"}, then Confirm (or click a new spot).` });
     }
@@ -474,7 +477,7 @@ export const useStore = create<State>((set, get) => ({
   redo: () => { nv.redoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing(), wandSeed: null, wandSeedAxis: null }); },
   requestClear: () => set({ confirmClear: true }),
   cancelClear: () => set({ confirmClear: false }),
-  clearDrawing: () => { nv.clearDrawing(); get().refreshStats(); void get().flushAutosave(); set({ canConfirm: false, confirmClear: false, wandSeed: null, wandSeedAxis: null, status: "Cleared — blank drawing." }); },
+  clearDrawing: () => { nv.clearDrawing(); nv.centerView(); get().refreshStats(); void get().flushAutosave(); set({ canConfirm: false, confirmClear: false, wandSeed: null, wandSeedAxis: null, status: "Cleared — blank drawing; view recentred." }); },
 
   save: async (force = false) => {
     const { activeUser, activeVolume, outputDir, sessionId: sid } = get();

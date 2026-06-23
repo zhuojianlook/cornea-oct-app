@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, forceDrawAll, setCrosshairAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -178,9 +178,11 @@ export function AnnotatorCanvas() {
             if (t < 0) return;
             const v = voxAtScreen(x, y);
             if (v) wandAt(v[0], v[1], v[2], tileThroughAxis(t));   // seed the wand → live preview (Confirm bakes it)
+          } else if (loaded && tool === "navigate") {
+            setCrosshairAtScreen(x, y);                            // #2: ONLY Navigate moves the crosshair (shift/ctrl already returned = pan)
           }
         }}
-        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); autosaveDraw(); } }}
+        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); forceDrawAll(); autosaveDraw(); } }}
         onMouseMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           const x = e.clientX - r.left, y = e.clientY - r.top;
@@ -196,6 +198,7 @@ export function AnnotatorCanvas() {
             else lastVox.current = null;
             restoreCrosshair();
           } else if (painting && !modPan) lockCrosshair();
+          else if (loaded && tool === "navigate" && !modPan && (e.buttons & 1)) setCrosshairAtScreen(x, y); // #2: drag scrubs crosshair in Navigate
           // wand: show the intensity under the cursor (helps choose the threshold)
           if (wandActive && tile >= 0) { const vx = voxAtScreen(x, y); if (vx) setCursorIntensity(vx[0], vx[1], vx[2]); }
           // brush cursor (paint only)
@@ -204,7 +207,7 @@ export function AnnotatorCanvas() {
             setBrush({ x, y, w: sz ? Math.max(4, sz.w) : Math.max(4, penSize), h: sz ? Math.max(4, sz.h) : Math.max(4, penSize) });
           } else if (brush) setBrush(null);
         }}
-        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); autosaveDraw(); } setBrush(null); }}
+        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); forceDrawAll(); autosaveDraw(); } setBrush(null); }}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting || wandActive ? "crosshair" : "default" }} />
         {showBrush && (

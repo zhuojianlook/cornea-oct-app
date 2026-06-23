@@ -75,7 +75,9 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   nv.opts.penSize = 1;
   // Pan/zoom: left-drag stays crosshair (NOT contrast); shift/ctrl+left, middle & right drag = pan.
   (nv as unknown as { opts: { mouseEventConfig?: unknown } }).opts.mouseEventConfig = {
-    leftButton: { primary: DRAG_MODE.crosshair, withShift: DRAG_MODE.pan, withCtrl: DRAG_MODE.pan },
+    // default tool is Paint → left-click must NOT move the crosshair (#2); setTool flips this to
+    // DRAG_MODE.crosshair only in Navigate mode. Shift/Ctrl+drag stays pan everywhere.
+    leftButton: { primary: DRAG_MODE.none, withShift: DRAG_MODE.pan, withCtrl: DRAG_MODE.pan },
     rightButton: DRAG_MODE.pan, centerButton: DRAG_MODE.pan,
   };
   try { nv.setPan2Dxyzmm([0, 0, 0, 1]); } catch { /* */ } // reset zoom/pan for the new volume
@@ -158,6 +160,46 @@ export function restoreCrosshair(): void {
   if (!nv || !savedCrosshair) return;
   (nv.scene as unknown as { crosshairPos: Float32Array }).crosshairPos = savedCrosshair.slice();
   nv.drawScene();
+}
+
+/** Move the crosshair to the voxel under a canvas-relative point — used ONLY by Navigate mode (#2). The
+    left button is inert at the niivue level (DRAG_MODE.none) in every mode, so a Paint/Wand click never
+    jumps the crosshair; Navigate calls this explicitly so click/drag still scrubs the crosshair. */
+export function setCrosshairAtScreen(xCss: number, yCss: number): void {
+  if (!nv) return;
+  const tile = tileAtScreen(xCss, yCss);
+  if (tile < 0) return;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => ArrayLike<number> }).screenXY2TextureFrac;
+  if (typeof f2f !== "function") return;
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const f = f2f.call(nv, xCss * dpr, yCss * dpr, tile);
+  if (!f || f[0] < 0) return;
+  const cl = (v: number) => Math.max(0, Math.min(1, v));
+  (nv.scene as unknown as { crosshairPos: Float32Array }).crosshairPos = new Float32Array([cl(f[0]), cl(f[1]), cl(f[2])]);
+  try { nv.drawScene(); } catch { /* */ }
+  const v = currentVox();
+  if (v && sliceListener) sliceListener(v);
+}
+
+/** Reset the 2-D pan/zoom AND recentre the crosshair to the middle of every slice (#3, used by Clear). */
+export function centerView(): void {
+  if (!nv) return;
+  try { nv.setPan2Dxyzmm([0, 0, 0, 1]); } catch { /* */ }
+  try { (nv.scene as unknown as { crosshairPos: Float32Array }).crosshairPos = new Float32Array([0.5, 0.5, 0.5]); } catch { /* */ }
+  savedCrosshair = null;
+  forceDrawAll();
+}
+
+/** Force a COMPLETE redraw of every tile now + after the layout settles. WebKitGTK (desktop) can leave a
+    pane (often the coronal one) showing a stale drawing after a paint/wand edit because the throttled
+    single drawScene lands before the tile repaints — so re-issue refreshDrawing+drawScene on a couple of
+    delays. Cheap; Chromium is unaffected. (#1) */
+export function forceDrawAll(): void {
+  if (!nv) return;
+  const go = () => { if (!nv) return; try { nv.refreshDrawing(true); } catch { /* */ } try { nv.drawScene(); } catch { /* */ } };
+  go();
+  requestAnimationFrame(go);
+  setTimeout(go, 60);
 }
 
 // ── Slice navigation (per-view scrollbars, #1) ───────────────────────────────
