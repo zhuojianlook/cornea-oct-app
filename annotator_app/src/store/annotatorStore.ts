@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.23";
+export const APP_VERSION = "0.1.24";
 
 // #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
 // (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
@@ -348,7 +348,12 @@ export const useStore = create<State>((set, get) => ({
       if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
       await snapshotVolume(get().activeUser, aKey(get().activeVolume));
       const bytes = await io.readVolume(v.path);                       // v.path = the REAL file
-      await nv.loadVolumeBytes(bytes, v.name, get().drawOpacity);
+      // niivue picks its decoder from the NAME's extension (regex on the last '.'), so it MUST end in
+      // .nii/.nii.gz. v.name is the BLINDED label ("Scan A · rep 1") with no '.' → niivue crashed
+      // (undefined.toUpperCase). Feed it a neutral name carrying the real file's extension instead.
+      const ext = v.path.match(/\.nii(\.gz)?$/i)?.[0] ?? ".nii.gz";
+      const niiName = `volume${ext}`;
+      await nv.loadVolumeBytes(bytes, niiName, get().drawOpacity);
       nv.setPenSize(get().penSize);
       nv.setPen(get().penLabel, get().penFilled);
       nv.setSliceListener((vx) => set({ vox: vx })); // keep slice scrollbars synced to scroll-wheel nav
@@ -363,7 +368,7 @@ export const useStore = create<State>((set, get) => ({
       } else {
         try {
           const ab = await io.readAutosave(get().activeUser ?? "", key);
-          if (ab) await nv.loadSegmentationBytes(ab, `${v.name}__autosave`);
+          if (ab) await nv.loadSegmentationBytes(ab, `autosave${ext}`); // .nii.gz name (niivue needs the ext)
         } catch { /* no autosave / unreadable — start blank */ }
       }
       set({ activeVolume: v, loaded: true, tool: "paint", volumeStartMs: Date.now(), canConfirm: restoredPreviewing,
@@ -542,6 +547,9 @@ export const useStore = create<State>((set, get) => ({
       const st = nv.drawStats();
       const out = get().outputDir!;
       const file = await io.writeLabelmap(out, vstem, activeUser, sid, bytes, rep);
+      // #1: persist the SAVED state as this entry's autosave so closing+reopening restores the segmentation
+      // (the debounced autosave may not have fired before Save; this is the authoritative copy).
+      try { const ak = aKey(activeVolume); if (ak) await io.writeAutosave(activeUser, ak, bytes); } catch { /* best-effort */ }
       await io.appendManifest(out, {
         username: activeUser, volume_stem: vstem, volume_path: activeVolume.path,
         session_id: sid, replicate: rep, blind_label: activeVolume.blindLabel, saved_at: new Date().toISOString(),
