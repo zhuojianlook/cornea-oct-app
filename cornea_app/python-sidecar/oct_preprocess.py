@@ -444,6 +444,39 @@ def _warp_by_displacement(img: np.ndarray, displacement: np.ndarray) -> np.ndarr
     return warped
 
 
+def _fill_cols_along_rows(img: np.ndarray) -> np.ndarray:
+    """In a sagittal slice (rows=depth, cols=frames), replace each column's LEADING/TRAILING zero run
+    (the black padding a prior column-warp left) with the nearest real pixel. Used between iterative
+    passes so the edge detector can't lock onto the black-band→tissue edge (which caused 100–360px
+    runaway shifts on pass 2+). Pure edge-replication; only touches padding, never real tissue."""
+    H, W = img.shape
+    out = img.copy()
+    nz = img != 0
+    has = nz.any(axis=0)
+    firstnz = np.argmax(nz, axis=0)
+    lastnz = H - 1 - np.argmax(nz[::-1], axis=0)
+    for x in range(W):
+        if not has[x]:
+            continue
+        f, l = int(firstnz[x]), int(lastnz[x])
+        if f > 0:
+            out[:f, x] = img[f, x]
+        if l < H - 1:
+            out[l + 1:, x] = img[l, x]
+    return out
+
+
+def _fill_black_bands(volume: np.ndarray) -> np.ndarray:
+    """Fill the warp's black padding throughout a (frames, depth, lateral) volume, in the SAME
+    sagittal domain the warp operates on, so a re-fed (already-corrected) volume detects cleanly.
+    Operates on a COPY — reformat_to_sagittal is a transpose VIEW, so writing through it would mutate
+    the caller's stored chain volume (corrupting the kept pass + its previews)."""
+    sag = reformat_to_sagittal(volume).copy()
+    for i in range(sag.shape[0]):
+        sag[i] = _fill_cols_along_rows(sag[i])
+    return np.ascontiguousarray(revert_sagittal(sag))
+
+
 def _merged_side_edge(slice_img: np.ndarray, p: dict) -> np.ndarray:
     """The per-slice corrected boundary (process_slice_single_stage → 'Merged Side Edge'),
     choosing the lower-error edge of {hist-eq, raw} advanced-filtered detections."""
@@ -521,7 +554,8 @@ def _map_slices(worker, items, progress, lo, hi, workers):
 
 
 def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
-                  workers: int | None = None, return_metric: bool = False):
+                  workers: int | None = None, return_metric: bool = False,
+                  detect_volume: np.ndarray | None = None):
     """Apply the corneal-edge + column correction with 3D active correction to a
     (frames, H, W) volume; returns the corrected volume (same shape/dtype).
 
@@ -531,17 +565,25 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
 
     return_metric=True → also return the mean per-column correction magnitude (pixels) applied
     this pass (the boundary's mean deviation from its fit) — the iterative-refinement signal. The
-    corrected array is identical either way (single-pass path stays byte-identical)."""
+    corrected array is identical either way (single-pass path stays byte-identical).
+
+    detect_volume: if given, the corneal edge is DETECTED on this volume (e.g. a black-band-filled
+    copy, so re-detection on a warped input isn't fooled by the warp's zero padding) while the warp is
+    applied to `volume` itself — so the OUTPUT never contains the filled (fake-tissue) pixels, only the
+    real data + honest zero padding. The cornea sits at the same row in both (filling only touches
+    padding), so the detected displacement aligns `volume`'s cornea correctly."""
     p = {**DEFAULT_PARAMS, **(params or {})}
-    sag = reformat_to_sagittal(volume)             # (sag_slices, H, W)
+    sag = reformat_to_sagittal(volume)             # the volume to WARP (real data, never filled)
+    det = reformat_to_sagittal(detect_volume) if detect_volume is not None else sag  # detect on this
     n = sag.shape[0]
     corr_factor = float(p.get("corr_factor", 1.0))
     active_threshold = float(p.get("active_threshold", 5.0))
     if workers is None:
         workers = max(1, min(16, (os.cpu_count() or 2) - 2))
 
-    # 1) per-slice corrected boundary (the expensive bilateral+edge+RANSAC) — parallel.
-    edges = np.array(_map_slices(_edge_worker, [(sag[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
+    # 1) per-slice corrected boundary (the expensive bilateral+edge+RANSAC) — parallel. Detected on
+    #    `det` (the filled copy when iterating) so the warp's black padding can't fool the detector.
+    edges = np.array(_map_slices(_edge_worker, [(det[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
 
     # 2) 3D active correction — faithful to DICOMSmootherSteps.process_slice_with_3d_active: snap
     #    each slice's edge toward the median of ITSELF + its available neighbours (boundaries
@@ -572,13 +614,13 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
 
 
 def _boundary_deviation(volume: np.ndarray, params: dict | None = None,
-                        workers: int | None = None) -> float:
+                        workers: int | None = None, detect_volume: np.ndarray | None = None) -> float:
     """Mean (over sagittal slices/columns) absolute deviation of the DETECTED corneal boundary
     from its own quadratic fit, in pixels — i.e. how jagged/non-smooth the boundary is. This is
     the SAME quantity smooth_volume's per-pass metric reports for its input; computing it directly
     (no warp) lets the iterator score a candidate volume's quality on its own terms. Lower = flatter
     + smoother + less extreme."""
-    _, m = smooth_volume(volume, params, workers=workers, return_metric=True)
+    _, m = smooth_volume(volume, params, workers=workers, return_metric=True, detect_volume=detect_volume)
     return float(m)
 
 
@@ -610,9 +652,14 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     for k in range(max_iter):
         lo = k / max_iter
         hi = (k + 1) / max_iter
+        # A re-fed pass (k>=1) runs on the PREVIOUS pass's warped output, whose black padding would
+        # fool the edge detector into 100-360px runaway shifts — DETECT on a filled copy. But WARP the
+        # real (unfilled) chain[k], so the output never carries the fill's fake pixels (only honest
+        # zero padding). Pass 1 runs on raw with no fill → byte-identical to the faithful single pass.
+        det = None if k == 0 else _fill_black_bands(chain[k])
         nxt, r = smooth_volume(chain[k], params, progress=(
             (lambda f, lo=lo, hi=hi: progress(lo + (hi - lo) * f)) if progress else None),
-            workers=workers, return_metric=True)   # r = deviation of chain[k]; nxt = its correction
+            workers=workers, return_metric=True, detect_volume=det)   # r = deviation of chain[k]
         rough.append(float(r))
         # Stop producing more passes once the boundary stops getting smoother (but we've still
         # MEASURED chain[k], so it stays a candidate for the argmin below).
@@ -629,7 +676,9 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     # Make sure EVERY chain volume has a measured deviation so it can compete in the argmin (the last
     # accepted pass is otherwise unmeasured when we stop by max_iter / converged).
     while len(rough) < len(chain):
-        rough.append(_boundary_deviation(chain[len(rough)], params, workers=workers))
+        idx = len(rough)
+        det = None if idx == 0 else _fill_black_bands(chain[idx])
+        rough.append(_boundary_deviation(chain[idx], params, workers=workers, detect_volume=det))
     best_idx = min(range(len(chain)), key=lambda i: rough[i])
     info = {"passes": len(chain) - 1, "best_pass": best_idx,
             "metrics": [float(x) for x in rough], "stopped": stopped}

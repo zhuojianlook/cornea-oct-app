@@ -36,6 +36,9 @@ export function VolumeCanvas() {
   // been preprocessed — i.e. its raw snapshot (context_raw previews) was captured.
   const [hasRaw, setHasRaw] = useState(false);
   const [compareView, setCompareView] = useState(false);
+  // Manual "Fix columns" correction (mark bad B-scan frames → re-run preprocessing) lives in the 2D
+  // SliceGallery; on the WebGL/3D desktop path it was otherwise unreachable. This opens it.
+  const [fixColsView, setFixColsView] = useState(false);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
   const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
   const painting = correcting && paintMode && view !== "render";
@@ -112,8 +115,8 @@ export function VolumeCanvas() {
     return () => { cancelled = true; };
   }, [caseInfo?.case_id, volumeUrl]);
 
-  // Leave the comparison when switching to a different case.
-  useEffect(() => { setCompareView(false); }, [caseInfo?.case_id]);
+  // Leave the comparison / fix-columns views when switching to a different case.
+  useEffect(() => { setCompareView(false); setFixColsView(false); }, [caseInfo?.case_id]);
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -175,6 +178,27 @@ export function VolumeCanvas() {
     );
   }
 
+  // Manual "Fix columns" correction: the 2D SliceGallery owns the mark-bad-frames + re-run UI. On
+  // return, reload the case so the 3D viewer reflects any re-run correction.
+  if (fixColsView && volumeUrl) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
+        {backBanner}
+        <div className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
+          style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}>
+          <button onClick={async () => { setFixColsView(false); await openCase(); }}
+            style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-accent)", cursor: "pointer", fontSize: 12, padding: "2px 8px" }}>
+            ← 3D view
+          </button>
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+            Click <b>▥ Fix columns</b>, mark bad B-scan frames on a sagittal/coronal slice, then <b>Re-run preprocessing</b>.
+          </span>
+        </div>
+        <div className="flex-1 min-h-0"><SliceGallery /></div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
       {backBanner}
@@ -199,6 +223,18 @@ export function VolumeCanvas() {
             title="Compare the original (raw) scan with the preprocessed result, side by side"
           >
             ⇆ Before/after
+          </ToggleButton>
+        )}
+        {hasRaw && (
+          <ToggleButton
+            size="small"
+            value="fix"
+            selected={fixColsView}
+            onChange={() => setFixColsView((v) => !v)}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Manually fix mis-aligned B-scan frames: mark bad frames on a slice, then re-run preprocessing on them"
+          >
+            ▥ Fix columns
           </ToggleButton>
         )}
         <div className="flex-1" />

@@ -176,6 +176,17 @@ def _working_volume(case_id: str) -> Path:
     return base
 
 
+def _pass_volume_path(case_id: str, pass_num: int | None) -> Path:
+    """Resolve the NIfTI to download for a specific iterative-refinement pass (1-based), or the
+    working/best volume when pass_num is None. Each pass Vk is persisted at passes/pass_{k}.nii.gz by
+    oct_preprocess_case; falls back to the working (best) volume if that pass wasn't persisted (e.g. a
+    single-pass scan, or pass_num out of range)."""
+    if pass_num is None:
+        return _working_volume(case_id)
+    p = orch.case_root(case_id) / "passes" / f"pass_{int(pass_num)}.nii.gz"
+    return p if p.exists() else _working_volume(case_id)
+
+
 @app.get("/api/case/{case_id}/volume.nii.gz")
 def get_volume_nifti(case_id: str) -> FileResponse:
     dst = _working_volume(case_id)
@@ -201,7 +212,7 @@ def _scan_filename_stem(case_id: str) -> str:
 
 
 @app.get("/api/case/{case_id}/preprocessed.nii.gz")
-def download_preprocessed_nifti(case_id: str) -> FileResponse:
+def download_preprocessed_nifti(case_id: str, pass_num: int | None = None) -> FileResponse:
     """Download ONE preprocessed (corrected) scan as a NIfTI, named ``<case_id>.nii.gz``.
 
     Same bytes as the working volume the viewer/pipeline use, but with a per-scan
@@ -212,18 +223,22 @@ def download_preprocessed_nifti(case_id: str) -> FileResponse:
     if not orch.case_root(cid).exists():
         raise HTTPException(404, f"No such case: {case_id}")
     try:
-        dst = _working_volume(cid)
+        dst = _pass_volume_path(cid, pass_num)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(404, f"No preprocessed volume for {case_id}: {exc}")
     if not Path(dst).exists():
         raise HTTPException(404, f"No preprocessed volume for {case_id}. Preprocess the scan first.")
-    return FileResponse(str(dst), media_type="application/gzip", filename=f"{_scan_filename_stem(cid)}.nii.gz")
+    # Only tag the filename with the pass when that pass actually exists (else _pass_volume_path fell
+    # back to the working/best volume — don't mislabel it as the requested pass).
+    pass_exists = bool(pass_num) and (orch.case_root(cid) / "passes" / f"pass_{int(pass_num)}.nii.gz").exists()
+    suffix = f"_pass{int(pass_num)}" if pass_exists else ""
+    return FileResponse(str(dst), media_type="application/gzip", filename=f"{_scan_filename_stem(cid)}{suffix}.nii.gz")
 
 
 @app.get("/api/preprocessed-zip")
-def download_preprocessed_zip(cases: str = "") -> FileResponse:
+def download_preprocessed_zip(cases: str = "", pass_num: int | None = None) -> FileResponse:
     """Bundle several preprocessed scans into one ``.zip`` — a folder-ready SET for
     manual ground-truth segmentation. Each entry is ``<case_id>.nii.gz`` (the working
     volume), so unzipping gives a directory the annotator app can open directly.
@@ -252,7 +267,7 @@ def download_preprocessed_zip(cases: str = "") -> FileResponse:
                     missing.append(raw)
                     continue
                 try:
-                    src = _working_volume(cid)
+                    src = _pass_volume_path(cid, pass_num)
                 except Exception:  # noqa: BLE001 — skip a bad scan, keep the rest of the set
                     missing.append(raw)
                     continue
@@ -291,6 +306,7 @@ def download_preprocessed_zip(cases: str = "") -> FileResponse:
 
 class SavePreprocessedRequest(BaseModel):
     dest: str
+    pass_num: int | None = None   # 1-based iterative pass to export; None = working/best volume
 
 
 @app.post("/api/case/{case_id}/save-preprocessed")
@@ -301,7 +317,7 @@ def save_preprocessed(case_id: str, req: SavePreprocessedRequest) -> dict:
     if not orch.case_root(cid).exists():
         raise HTTPException(404, f"No such case: {case_id}")
     try:
-        src = _working_volume(cid)
+        src = _pass_volume_path(cid, req.pass_num)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -321,6 +337,7 @@ def save_preprocessed(case_id: str, req: SavePreprocessedRequest) -> dict:
 class SaveZipRequest(BaseModel):
     cases: List[str]
     dest: str
+    pass_num: int | None = None   # 1-based iterative pass to export for every scan; None = working/best
 
 
 @app.post("/api/preprocessed-zip-save")
@@ -348,7 +365,7 @@ def save_preprocessed_zip(req: SaveZipRequest) -> dict:
                     missing.append(raw)
                     continue
                 try:
-                    src = _working_volume(cid)
+                    src = _pass_volume_path(cid, req.pass_num)
                 except Exception:  # noqa: BLE001
                     missing.append(raw)
                     continue
@@ -413,13 +430,15 @@ def _preview_group_dir(case_id: str, group: str) -> Path:
 
 
 def _clear_iter_preview_groups(case_id: str) -> None:
-    """Remove the per-pass iterative-refinement preview groups (previews/context_iter*). They are
-    re-rendered by each preprocess and are stale after a re-run or a raw re-scrub."""
+    """Remove the per-pass iterative-refinement artifacts: the preview groups (previews/context_iter*)
+    AND the persisted per-pass NIfTIs (passes/). Re-created by each preprocess; stale after a re-run
+    or a raw re-scrub."""
     import shutil as _sh
     previews = orch.case_root(case_id) / "previews"
     if previews.exists():
         for d in previews.glob("context_iter*"):
             _sh.rmtree(d, ignore_errors=True)
+    _sh.rmtree(orch.case_root(case_id) / "passes", ignore_errors=True)
 
 
 def _parse_iter_info(worker_stdout: str) -> dict:
@@ -1547,7 +1566,17 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     except Exception as exc:  # noqa: BLE001
         print(f"[oct-preprocess] per-pass preview render skipped: {exc}", file=sys.stderr)
     finally:
-        _sh.rmtree(iter_dir, ignore_errors=True)
+        # Persist the per-pass NIfTIs (passes/pass_{k}.nii.gz) so the user can DOWNLOAD a specific
+        # pass, not just the best. Replace any stale set; if there are no intermediates, just clean up.
+        passes_dir = orch.case_root(case_id) / "passes"
+        _sh.rmtree(passes_dir, ignore_errors=True)
+        if iter_dir.exists() and any(iter_dir.iterdir()):
+            try:
+                _sh.move(str(iter_dir), str(passes_dir))
+            except Exception:  # noqa: BLE001
+                _sh.rmtree(iter_dir, ignore_errors=True)
+        else:
+            _sh.rmtree(iter_dir, ignore_errors=True)
     out["preprocessed"] = True
     out["n_frames"] = _nifti_frames(work)
     out["oct_iter"] = iter_info
@@ -1715,6 +1744,7 @@ def cases_list() -> dict:
             "eye": ((m.get("eye") or meta.get("eye") or "").strip() or None),
             "n_volumes": m.get("n_frames") or m.get("n_volumes"),
             "preprocessed": bool(m.get("oct_preprocessed")),
+            "passes": int((m.get("oct_iter") or {}).get("passes", 1)) if m.get("oct_iter") else 1,
         })
     return {"cases": out}
 

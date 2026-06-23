@@ -6,7 +6,7 @@
    scan to another / a new group. (SAM2 + consensus runs per group, downstream of this.) */
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Typography, TextField, LinearProgress, Slider, Checkbox, ToggleButton, ToggleButtonGroup, Collapse } from "@mui/material";
+import { Button, Typography, TextField, LinearProgress, Slider, Checkbox, ToggleButton, ToggleButtonGroup, Collapse, Select, MenuItem } from "@mui/material";
 import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
@@ -40,6 +40,7 @@ interface OctScan {
   // PER subgroup, not per eye. Assigned after preprocessing; "1" = the default single subgroup.
   subgroup: string;
   selected: boolean;
+  passes?: number;   // iterative-refinement passes produced (drives the download pass selector)
   error?: string;
 }
 
@@ -54,6 +55,7 @@ interface LoadedCase {
   eye?: string;
   n_volumes?: number;
   preprocessed?: boolean;
+  passes?: number;   // iterative-refinement passes produced (for the "download which pass" selector)
   error?: string;
 }
 
@@ -101,21 +103,24 @@ const triggerDownload = (href: string, name: string) => {
   a.click();
   a.remove();
 };
-async function downloadPreprocessed(cid: string, octName: string) {
-  const name = `${octName.replace(/\.oct$/i, "")}.nii.gz`;
+async function downloadPreprocessed(cid: string, octName: string, passNum?: number | null) {
+  const sfx = passNum ? `_pass${passNum}` : "";
+  const name = `${octName.replace(/\.oct$/i, "")}${sfx}.nii.gz`;
+  const q = passNum ? `?pass_num=${passNum}` : "";
   if (inTauri()) {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const dest = await save({ defaultPath: name });
       if (!dest) return; // user cancelled
-      await api.json(`/api/case/${encodeURIComponent(cid)}/save-preprocessed`, "POST", JSON.stringify({ dest }));
+      await api.json(`/api/case/${encodeURIComponent(cid)}/save-preprocessed`, "POST",
+        JSON.stringify({ dest, pass_num: passNum ?? null }));
     } catch (e) {
       alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     return;
   }
   // Browser: fetch bytes → blob URL so the saved filename matches the source scan.
-  const path = `/api/case/${encodeURIComponent(cid)}/preprocessed.nii.gz`;
+  const path = `/api/case/${encodeURIComponent(cid)}/preprocessed.nii.gz${q}`;
   try {
     const res = await fetch(resourceUrl(path));
     if (!res.ok) throw new Error(String(res.status));
@@ -126,22 +131,25 @@ async function downloadPreprocessed(cid: string, octName: string) {
     triggerDownload(resourceUrl(path), name);
   }
 }
-async function downloadPreprocessedZip(cids: string[]) {
+async function downloadPreprocessedZip(cids: string[], passNum?: number | null) {
   if (!cids.length) return;
+  const sfx = passNum ? `_pass${passNum}` : "";
   if (inTauri()) {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
-      const dest = await save({ defaultPath: "preprocessed_scans.zip" });
+      const dest = await save({ defaultPath: `preprocessed_scans${sfx}.zip` });
       if (!dest) return; // user cancelled
-      await api.json(`/api/preprocessed-zip-save`, "POST", JSON.stringify({ cases: cids, dest }));
+      await api.json(`/api/preprocessed-zip-save`, "POST",
+        JSON.stringify({ cases: cids, dest, pass_num: passNum ?? null }));
     } catch (e) {
       alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     return;
   }
+  const q = passNum ? `&pass_num=${passNum}` : "";
   triggerDownload(
-    resourceUrl(`/api/preprocessed-zip?cases=${cids.map(encodeURIComponent).join(",")}`),
-    "preprocessed_scans.zip",
+    resourceUrl(`/api/preprocessed-zip?cases=${cids.map(encodeURIComponent).join(",")}${q}`),
+    `preprocessed_scans${sfx}.zip`,
   );
 }
 
@@ -160,6 +168,8 @@ export function OctLoader() {
   // Iterative refinement: re-apply the correction until the boundary stops improving (auto-stops
   // before it worsens). Default 5 (auto-converge); 1 = the single faithful pass.
   const [maxPasses, setMaxPasses] = useState(5);
+  // Which refinement pass to EXPORT when downloading (null = the working/best volume).
+  const [downloadPass, setDownloadPass] = useState<number | null>(null);
   const [report, setReport] = useState<ConsensusReport | null>(null);
   const [reportLabel, setReportLabel] = useState("");
   const [casesCount, setCasesCount] = useState<number | null>(null);
@@ -170,6 +180,7 @@ export function OctLoader() {
   const openCase = useCaseStore((s) => s.openCase);
   const setStage = useWorkflowStore((s) => s.setStage);
   const initTabs = useWorkflowStore((s) => s.initTabs);
+  const segSig = useWorkflowStore((s) => s.segVersion); // bumps on a re-preprocess (incl. Fix-columns)
 
   // Background pre-warm bookkeeping (so clicking a scan to scrub is instant).
   const busyRef = useRef(false);
@@ -265,7 +276,7 @@ export function OctLoader() {
         id: uid("s"), groupId: g.id, filename: c.filename, caseId: c.case_id, nVolumes: c.n_volumes,
         // A scan already corrected in a prior session loads as "done" so it's coloured + skipped on re-run.
         nFrames: 101, status: c.error ? "error" : c.preprocessed ? "done" : "ready",
-        error: c.error, scarRange: [1, 101], subgroup: "1", selected: !c.error,
+        error: c.error, scarRange: [1, 101], subgroup: "1", selected: !c.error, passes: c.passes,
       });
     }
     setGroups(order);
@@ -290,6 +301,24 @@ export function OctLoader() {
     return () => { stop = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // A re-preprocess elsewhere (notably the viewer's Fix-columns "Re-run", which runs a SINGLE pass)
+  // changes a scan's pass count. Refresh passes from cases/list when segVersion bumps, so the
+  // "Download pass" selector never offers passes that no longer exist. Merge by caseId only.
+  useEffect(() => {
+    if (segSig === 0) return;
+    let stop = false;
+    (async () => {
+      try {
+        const r = await api.json<{ cases: LoadedCase[] }>("/api/cases/list");
+        if (stop || !r.cases) return;
+        const byId = new Map(r.cases.map((c) => [c.case_id, c.passes]));
+        setScans((cur) => cur.map((s) => (s.caseId && byId.has(s.caseId)) ? { ...s, passes: byId.get(s.caseId) ?? s.passes } : s));
+      } catch { /* best-effort */ }
+    })();
+    return () => { stop = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segSig]);
 
   // Keep only .OCT (+ companion .txt) from a file/dir selection.
   const pickFiles = (fs: File[]) => fs.filter((f) => /\.(oct|txt)$/i.test(f.name));
@@ -471,7 +500,7 @@ export function OctLoader() {
               ...(edited ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
             }));
           lastIter = r.oct_iter ?? null;
-          patchScan(s.id, { status: "done" });
+          patchScan(s.id, { status: "done", passes: r.oct_iter?.passes ?? 1 });
           // Show the freshly-corrected scan in the viewer (switch to it even if another was on
           // screen) so the user immediately sees the preprocessed result. openCase loads the
           // corrected working volume; initTabs refetches the corrected previews.
@@ -574,6 +603,8 @@ export function OctLoader() {
 
   const nDone = scans.filter((s) => s.status === "done" && s.selected).length;
   const nToRun = scans.filter((s) => s.selected && s.caseId && s.status !== "error" && s.status !== "done").length;
+  // Most refinement passes among the selected, done scans — bounds the "download which pass" selector.
+  const maxScanPasses = Math.max(1, ...scans.filter((s) => s.status === "done" && s.selected).map((s) => s.passes ?? 1));
   // Tagging is the point of this panel: don't let a scan in an untagged group preprocess
   // (it would be committed with no Scar/Control label, silently producing unlabeled data).
   const runnableInGroup = (gid: string) =>
@@ -666,7 +697,7 @@ export function OctLoader() {
                     </span>
                     {nDoneInGroup > 0 && (
                       <button title={`Download all ${nDoneInGroup} preprocessed scan(s) in this group as a .zip (a folder for manual segmentation)`}
-                        onClick={() => downloadPreprocessedZip(groupScans.filter((s) => s.status === "done" && s.caseId).map((s) => s.caseId!))}
+                        onClick={() => downloadPreprocessedZip(groupScans.filter((s) => s.status === "done" && s.caseId).map((s) => s.caseId!), downloadPass)}
                         style={{ background: "none", border: "none", color: "var(--c-accent)", cursor: "pointer", padding: 0, fontSize: 10, flex: "none" }}>
                         ⬇ zip
                       </button>
@@ -723,7 +754,7 @@ export function OctLoader() {
                           </span>
                           {done && s.caseId && (
                             <button title="Download this preprocessed scan (.nii.gz) for manual segmentation"
-                              onClick={(e) => { e.stopPropagation(); void downloadPreprocessed(s.caseId!, s.filename); }}
+                              onClick={(e) => { e.stopPropagation(); void downloadPreprocessed(s.caseId!, s.filename, downloadPass && downloadPass <= (s.passes ?? 1) ? downloadPass : null); }}
                               style={{ background: "none", border: "none", color: "var(--c-accent)", cursor: "pointer", padding: 0, fontSize: 13, lineHeight: 1, flex: "none", marginTop: 2 }}>
                               ⬇
                             </button>
@@ -825,11 +856,24 @@ export function OctLoader() {
               Tag {untaggedGroups.length} group{untaggedGroups.length === 1 ? "" : "s"} Scar/Control first: {untaggedGroups.map((g) => `${g.patient} ${g.eye}`.trim()).join(", ")}
             </Typography>
           )}
+          {nDone > 0 && maxScanPasses > 1 && (
+            <div className="flex items-center gap-2 px-1" title="Choose which refinement pass the ⬇ downloads export. 'Best' = the pass the app kept. A scan with fewer passes falls back to its best.">
+              <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Download pass</span>
+              <Select size="small" variant="standard" value={downloadPass ?? 0}
+                onChange={(e) => { const v = Number(e.target.value); setDownloadPass(v === 0 ? null : v); }}
+                sx={{ fontSize: 11, flex: 1 }}>
+                <MenuItem value={0} sx={{ fontSize: 11 }}>Best (recommended)</MenuItem>
+                {Array.from({ length: maxScanPasses }, (_, i) => i + 1).map((k) => (
+                  <MenuItem key={k} value={k} sx={{ fontSize: 11 }}>Pass {k}</MenuItem>
+                ))}
+              </Select>
+            </div>
+          )}
           {nDone > 0 && (
             <Button variant="outlined" size="small" disabled={busy}
-              onClick={() => downloadPreprocessedZip(scans.filter((s) => s.status === "done" && s.selected && s.caseId).map((s) => s.caseId!))}
+              onClick={() => downloadPreprocessedZip(scans.filter((s) => s.status === "done" && s.selected && s.caseId).map((s) => s.caseId!), downloadPass)}
               title="Download the selected corrected scans as one .zip (a folder of <case_id>.nii.gz) — open it in the annotator app for manual ground-truth segmentation">
-              ⬇ Download preprocessed (.zip) ({nDone})
+              ⬇ Download preprocessed (.zip){downloadPass ? ` — pass ${downloadPass}` : ""} ({nDone})
             </Button>
           )}
           {nDone > 0 && (
