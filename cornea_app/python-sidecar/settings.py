@@ -15,13 +15,31 @@ _DATA_DIR = os.environ.get("CORNEA_DATA_DIR")
 _STATE_FILE = (Path(_DATA_DIR) / ".sidecar_state.json") if _DATA_DIR else (Path(__file__).parent / ".sidecar_state.json")
 _PERSIST_KEYS = ("slicer_executable", "default_case_id")
 
+# Code location of this sidecar: dev = <repo>/cornea_app/python-sidecar; bundle = read-only resource dir.
+_SIDECAR_DIR = Path(__file__).resolve().parent
 # python-sidecar/ -> cornea_app/ -> Integration/ (dev); or CORNEA_DATA_DIR when packaged.
-WORKSPACE_ROOT = Path(_DATA_DIR) if _DATA_DIR else Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = Path(_DATA_DIR) if _DATA_DIR else _SIDECAR_DIR.parents[1]
 CASES_ROOT = WORKSPACE_ROOT / "cases"
-SLICER_BRIDGE_DIR = WORKSPACE_ROOT / "slicer_bridge"
 if _DATA_DIR:
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     CASES_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_slicer_bridge() -> Path:
+    """slicer_bridge (preview_io.py etc.) is shipped CODE, not data: it sits at the repo root in
+    dev and is bundled NEXT TO python-sidecar in the packaged app — NOT in CORNEA_DATA_DIR, which
+    holds only cases/output. Resolve to wherever preview_io.py actually exists."""
+    for cand in (
+        _SIDECAR_DIR.parents[1] / "slicer_bridge",   # dev: <repo>/slicer_bridge
+        _SIDECAR_DIR.parent / "slicer_bridge",        # bundle: <resource_dir>/slicer_bridge (sibling)
+        _SIDECAR_DIR / "slicer_bridge",               # nested fallback
+    ):
+        if (cand / "preview_io.py").exists():
+            return cand
+    return _SIDECAR_DIR.parents[1] / "slicer_bridge"
+
+
+SLICER_BRIDGE_DIR = _resolve_slicer_bridge()
 
 DEFAULT_SLICER_EXECUTABLE = os.environ.get(
     "SLICER_EXECUTABLE",
