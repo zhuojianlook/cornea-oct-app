@@ -11,6 +11,7 @@ import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
 import { GtCompareViewer } from "./GtCompareViewer";
 import { BeforeAfterViewer } from "./BeforeAfterViewer";
+import { StepsViewer } from "./StepsViewer";
 
 export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -39,6 +40,8 @@ export function VolumeCanvas() {
   // Manual "Fix columns" correction (mark bad B-scan frames → re-run preprocessing) lives in the 2D
   // SliceGallery; on the WebGL/3D desktop path it was otherwise unreachable. This opens it.
   const [fixColsView, setFixColsView] = useState(false);
+  // Preprocessing-steps filmstrip (per-stage diagnostic) — also otherwise unreachable on the 3D path.
+  const [stepsView, setStepsView] = useState(false);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
   const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
   const painting = correcting && paintMode && view !== "render";
@@ -115,8 +118,8 @@ export function VolumeCanvas() {
     return () => { cancelled = true; };
   }, [caseInfo?.case_id, volumeUrl]);
 
-  // Leave the comparison / fix-columns views when switching to a different case.
-  useEffect(() => { setCompareView(false); setFixColsView(false); }, [caseInfo?.case_id]);
+  // Leave the comparison / fix-columns / steps overlays when switching to a different case.
+  useEffect(() => { setCompareView(false); setFixColsView(false); setStepsView(false); }, [caseInfo?.case_id]);
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -168,39 +171,14 @@ export function VolumeCanvas() {
     );
   }
 
-  // Before/after comparison: raw vs preprocessed slices, side by side (its own 2D view).
-  if (compareView && volumeUrl) {
-    return (
-      <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
-        {backBanner}
-        <BeforeAfterViewer onClose={() => setCompareView(false)} />
-      </div>
-    );
-  }
-
-  // Manual "Fix columns" correction: the 2D SliceGallery owns the mark-bad-frames + re-run UI. On
-  // return, reload the case so the 3D viewer reflects any re-run correction.
-  if (fixColsView && volumeUrl) {
-    return (
-      <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
-        {backBanner}
-        <div className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
-          style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}>
-          <button onClick={async () => { setFixColsView(false); await openCase(); }}
-            style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-accent)", cursor: "pointer", fontSize: 12, padding: "2px 8px" }}>
-            ← 3D view
-          </button>
-          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-            Click <b>▥ Fix columns</b>, mark bad B-scan frames on a sagittal/coronal slice, then <b>Re-run preprocessing</b>.
-          </span>
-        </div>
-        <div className="flex-1 min-h-0"><SliceGallery /></div>
-      </div>
-    );
-  }
-
+  // NOTE: the before/after, fix-columns and steps views are rendered as ABSOLUTE OVERLAYS at the end
+  // of the main return — NOT early returns — so the niivue <canvas> never unmounts. niivue is a
+  // singleton bound to the first canvas it attaches to (attach() early-returns the existing instance),
+  // so unmounting/remounting the canvas left it bound to a dead element → a blank 3D view after
+  // toggling those views (the bug: "switching scans after before/after shows no image"). Keeping the
+  // canvas mounted under the overlay keeps niivue live, so scan switches reload + render correctly.
   return (
-    <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
+    <div className="relative flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
       {backBanner}
       <div
         className="flex items-center gap-2 px-3 border-b"
@@ -218,7 +196,7 @@ export function VolumeCanvas() {
             size="small"
             value="ba"
             selected={compareView}
-            onChange={() => setCompareView((v) => !v)}
+            onChange={() => { setCompareView((v) => !v); setFixColsView(false); setStepsView(false); }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title="Compare the original (raw) scan with the preprocessed result, side by side"
           >
@@ -230,11 +208,23 @@ export function VolumeCanvas() {
             size="small"
             value="fix"
             selected={fixColsView}
-            onChange={() => setFixColsView((v) => !v)}
+            onChange={() => { setFixColsView((v) => !v); setCompareView(false); setStepsView(false); }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title="Manually fix mis-aligned B-scan frames: mark bad frames on a slice, then re-run preprocessing on them"
           >
             ▥ Fix columns
+          </ToggleButton>
+        )}
+        {hasRaw && (
+          <ToggleButton
+            size="small"
+            value="steps"
+            selected={stepsView}
+            onChange={() => { setStepsView((v) => !v); setCompareView(false); setFixColsView(false); }}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Preview every preprocessing step (hist-eq → edge → quadratic fit → 3D active → warp) for the central slice"
+          >
+            ⚙ Steps
           </ToggleButton>
         )}
         <div className="flex-1" />
@@ -278,6 +268,33 @@ export function VolumeCanvas() {
           </div>
         )}
       </div>
+
+      {/* Overlays over the (still-mounted) canvas — see the note above the return. */}
+      {compareView && volumeUrl && (
+        <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+          <BeforeAfterViewer onClose={() => setCompareView(false)} />
+        </div>
+      )}
+      {fixColsView && volumeUrl && (
+        <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+          <div className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
+            style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}>
+            <button onClick={async () => { setFixColsView(false); await openCase(); }}
+              style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-accent)", cursor: "pointer", fontSize: 12, padding: "2px 8px" }}>
+              ← 3D view
+            </button>
+            <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+              Click <b>▥ Fix columns</b>, mark bad B-scan frames on a sagittal/coronal slice, then <b>Re-run preprocessing</b>.
+            </span>
+          </div>
+          <div className="flex-1 min-h-0"><SliceGallery /></div>
+        </div>
+      )}
+      {stepsView && volumeUrl && (
+        <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+          <StepsViewer onClose={() => setStepsView(false)} />
+        </div>
+      )}
     </div>
   );
 }
