@@ -76,14 +76,23 @@ export const useCaseStore = create<CaseState>()(
     },
 
     fetchConfig: async () => {
-      const ok = await checkHealth();
+      // The desktop shell spawns its OWN sidecar on launch; importing torch/SAM2 can take ~10–15s, so
+      // POLL the health check instead of failing on the first miss (a fresh start would otherwise look
+      // broken). Shows a transient "starting…" status; only errors out if it never comes up.
+      let ok = await checkHealth();
+      for (let i = 0; i < 60 && !ok; i++) {
+        set((s) => { s.apiError = "Starting the Python sidecar… (first launch can take ~15s)"; });
+        await new Promise((r) => setTimeout(r, 750));
+        ok = await checkHealth();
+      }
       set((s) => {
         s.healthy = ok;
       });
       if (!ok) {
         set((s) => {
           s.apiError =
-            "Cannot reach the Python sidecar on http://127.0.0.1:8765. Start it with dev-launch.sh.";
+            "Couldn't reach the Python sidecar. It may have failed to start — check sidecar.log in the " +
+            "app's data folder, and that python3 has the required packages (fastapi, torch, SAM2, SimpleITK).";
         });
         return;
       }

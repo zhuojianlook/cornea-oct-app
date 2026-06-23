@@ -97,15 +97,25 @@ fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Option<Child> {
     cmd.arg(&script)
         .arg("--port")
         .arg(port.to_string())
-        .current_dir(&sidecar_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .current_dir(&sidecar_dir);
     // Stamp the sidecar with this shell's version so /api/health can confirm the right one is up.
     cmd.env("CORNEA_SHELL_VERSION", app.package_info().version.to_string());
-    // Installed app: write cases/state to the OS app-data dir, not the read-only bundle.
+    // Installed app: write cases/state to the OS app-data dir (not the read-only bundle), and tee the
+    // sidecar's stdout/stderr to sidecar.log there so a failed start (missing Python deps, etc.) is
+    // diagnosable instead of vanishing into /dev/null.
+    let mut logged = false;
     if let Ok(data_dir) = app.path().app_data_dir() {
         let _ = std::fs::create_dir_all(&data_dir);
         cmd.env("CORNEA_DATA_DIR", &data_dir);
+        if let Ok(log) = std::fs::File::create(data_dir.join("sidecar.log")) {
+            if let Ok(errlog) = log.try_clone() {
+                cmd.stdout(Stdio::from(log)).stderr(Stdio::from(errlog));
+                logged = true;
+            }
+        }
+    }
+    if !logged {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
     match cmd.spawn() {
         Ok(child) => {
