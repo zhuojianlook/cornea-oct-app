@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, currentVox, paintBrush, beginStroke, tileAtScreen, voxAtScreen, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, voxAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -132,12 +132,12 @@ export function AnnotatorCanvas() {
             strokeTile.current = tileAtScreen(x, y);
             if (strokeTile.current < 0) return;                    // started off any 2-D pane → ignore
             beginStroke();                                         // snapshot for undo (start of stroke)
-            const v = currentVox();                                // voxel niivue just set from the click
+            const v = voxAtScreen(x, y);                           // cursor-exact voxel; null in a tile's letterbox padding / off-image
             if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel); lastVox.current = v; }
             restoreCrosshair();
           } else if (wandActive) {
             if (tileAtScreen(x, y) < 0) return;
-            const v = currentVox();
+            const v = voxAtScreen(x, y);
             if (v) wandAt(v[0], v[1], v[2]);                       // threshold-grow scar from the click
           }
         }}
@@ -150,8 +150,9 @@ export function AnnotatorCanvas() {
           // paint a 3-D sphere at the cursor voxel, confined to the stroke's pane; crosshair stays put.
           if (painting && !modPan && (e.buttons & 1)) {
             if (tile >= 0 && tile === strokeTile.current) {
-              const v = currentVox();
+              const v = voxAtScreen(x, y);                         // cursor-exact; null in the tile's letterbox padding / off-image → no stray center paint
               if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel); lastVox.current = v; }
+              else lastVox.current = null;                         // dragged into padding/off-image → break continuity (don't bridge the gap)
             } else lastVox.current = null;
             restoreCrosshair();
           } else if (painting && !modPan) lockCrosshair();
