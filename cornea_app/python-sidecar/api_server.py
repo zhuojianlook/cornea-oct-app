@@ -65,7 +65,9 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok"}
+    # shell_version echoes the env the Tauri shell set when it spawned this sidecar, so the app can
+    # confirm it's talking to the sidecar IT launched (not a stale/foreign one). Empty in dev.
+    return {"status": "ok", "shell_version": os.environ.get("CORNEA_SHELL_VERSION", "")}
 
 
 @app.get("/api/config")
@@ -1509,6 +1511,45 @@ def cases_stat() -> dict:
     root = settings.CASES_ROOT
     n = sum(1 for c in root.iterdir() if c.is_dir()) if root.exists() else 0
     return {"count": n, "cases_root": str(root)}
+
+
+@app.get("/api/cases/list")
+def cases_list() -> dict:
+    """Enumerate persisted OCT cases so the loader can re-hydrate them on startup WITHOUT a folder
+    reload. Returns the LoadedCase shape (case_id, filename, patient, eye, n_volumes, preprocessed),
+    matching /api/oct/load-dir. Skips synthetic consensus cases (those open via the consensus viewer)
+    and non-OCT cases (e.g. directly-registered volumes)."""
+    root = settings.CASES_ROOT
+    out: list[dict] = []
+    if not root.exists():
+        return {"cases": []}
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        cid = child.name
+        try:
+            m = orch.read_manifest(cid)
+        except Exception:  # noqa: BLE001 — skip an unreadable case, keep the rest
+            continue
+        if not m or m.get("consensus_cases"):
+            continue
+        src = m.get("oct_source") or m.get("companion_txt")
+        if not src:
+            continue  # not an OCT-loader case
+        meta = {}
+        try:
+            meta = metrics_export.parse_case_meta(src)
+        except Exception:  # noqa: BLE001
+            pass
+        out.append({
+            "case_id": cid,
+            "filename": os.path.basename(str(src)),
+            "patient": ((m.get("patient_id") or meta.get("patient_id") or "").strip() or None),
+            "eye": ((m.get("eye") or meta.get("eye") or "").strip() or None),
+            "n_volumes": m.get("n_frames") or m.get("n_volumes"),
+            "preprocessed": bool(m.get("oct_preprocessed")),
+        })
+    return {"cases": out}
 
 
 @app.post("/api/cases/wipe")

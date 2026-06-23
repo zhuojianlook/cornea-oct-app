@@ -270,6 +270,24 @@ export function OctLoader() {
     return { nGroups: order.length, firstCase: cases.find((c) => !c.error)?.case_id };
   };
 
+  // On startup, re-hydrate the loader from cases already processed in prior sessions so they're
+  // viewable without re-loading the folder. Retries while the sidecar is still starting; never
+  // clobbers a folder the user loads manually in the meantime.
+  useEffect(() => {
+    let stop = false;
+    (async () => {
+      for (let i = 0; i < 20 && !stop; i++) {
+        try {
+          const r = await api.json<{ cases: LoadedCase[] }>("/api/cases/list");
+          if (!stop && scansRef.current.length === 0 && r.cases?.length) { ingest(r.cases); setLoaded(true); }
+          return; // got a response (even empty) → stop retrying
+        } catch { await new Promise((res) => setTimeout(res, 600)); }
+      }
+    })();
+    return () => { stop = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Keep only .OCT (+ companion .txt) from a file/dir selection.
   const pickFiles = (fs: File[]) => fs.filter((f) => /\.(oct|txt)$/i.test(f.name));
 
@@ -447,8 +465,13 @@ export function OctLoader() {
             ...(edited ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
           }));
           patchScan(s.id, { status: "done" });
-          // If the corrected scan is the one on screen, refresh the viewer to show it.
-          if (s.caseId === activeId) initTabs(false);
+          // Show the freshly-corrected scan in the viewer (switch to it even if another was on
+          // screen) so the user immediately sees the preprocessed result. openCase loads the
+          // corrected working volume; initTabs refetches the corrected previews.
+          setActiveId(s.caseId!);
+          setCaseId(s.caseId!);
+          await openCase();
+          initTabs(false);
         } catch (e) {
           patchScan(s.id, { status: "error", error: msg(e) });
           failed++;

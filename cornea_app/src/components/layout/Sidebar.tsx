@@ -77,8 +77,6 @@ function NormalBaselinePanel() {
 }
 
 export function Sidebar() {
-  const { config, busy, exportInfo, exportNnunet } = useCaseStore();
-
   return (
     <div className="flex flex-col">
       <Section title="Open existing case">
@@ -95,24 +93,6 @@ export function Sidebar() {
 
       <Section title="Normal baseline (controls)">
         <NormalBaselinePanel />
-      </Section>
-
-      <Divider sx={{ borderColor: "var(--c-border)" }} />
-
-      <Section title="Training export">
-        <Button variant="outlined" onClick={exportNnunet} disabled={busy}>
-          Export all → nnU-Net
-        </Button>
-        {exportInfo && (
-          <Typography variant="caption" sx={{ color: "var(--c-text-dim)", wordBreak: "break-all" }}>
-            {exportInfo}
-          </Typography>
-        )}
-        {config?.slicer_executable && (
-          <Typography variant="caption" sx={{ color: "var(--c-text-dim)", wordBreak: "break-all" }}>
-            Slicer: {config.slicer_executable}
-          </Typography>
-        )}
       </Section>
 
       <Divider sx={{ borderColor: "var(--c-border)" }} />

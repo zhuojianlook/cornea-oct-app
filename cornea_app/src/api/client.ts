@@ -7,7 +7,27 @@
 
 import type { AppConfig } from "./types";
 
-const DEFAULT_BASE = "http://127.0.0.1:8765";
+// The sidecar base URL. In the Tauri shell the shell picks the port at startup (8765 if free, else a
+// free one — so it always owns its OWN sidecar, never a stale/foreign one) and exposes it via
+// get_sidecar_base. We resolve it once here so DIRECT resource fetches (resourceUrl → niivue) and the
+// browser-fetch fallback hit the right sidecar. JSON/upload calls in the shell go via proxy_request,
+// which reads the same port shell-side.
+let _base = "http://127.0.0.1:8765";
+let _basePromise: Promise<void> | null = null;
+export function initSidecarBase(): Promise<void> {
+  if (!_basePromise) {
+    _basePromise = (async () => {
+      const invoke = await getInvoke();
+      if (invoke) {
+        try {
+          const b = (await invoke("get_sidecar_base", {})) as string;
+          if (b) _base = b;
+        } catch { /* older shell without the command → keep the default :8765 */ }
+      }
+    })();
+  }
+  return _basePromise;
+}
 
 let _invoke: ((cmd: string, args: Record<string, unknown>) => Promise<unknown>) | null = null;
 let _invokeReady = false;
@@ -37,7 +57,7 @@ async function apiRequest(path: string, method = "GET", body?: string): Promise<
   if (invoke) {
     return invoke("proxy_request", { method, path, body: body ?? null }) as Promise<string>;
   }
-  const res = await fetch(`${DEFAULT_BASE}${path}`, {
+  const res = await fetch(`${_base}${path}`, {
     method,
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body,
@@ -73,7 +93,7 @@ async function apiUpload<T>(path: string, files: File[]): Promise<T> {
   } else {
     const form = new FormData();
     for (const f of files) form.append("files", f);
-    const res = await fetch(`${DEFAULT_BASE}${path}`, { method: "POST", body: form });
+    const res = await fetch(`${_base}${path}`, { method: "POST", body: form });
     text = await res.text();
     if (!res.ok) {
       let detail = text;
@@ -95,13 +115,14 @@ async function apiUpload<T>(path: string, files: File[]): Promise<T> {
 
 /** Absolute URL for a binary sidecar resource (volume / segmentation NIfTI). */
 export function resourceUrl(path: string): string {
-  return `${DEFAULT_BASE}${path}`;
+  return `${_base}${path}`;
 }
 
 export let lastHealthError = "";
 
 export async function checkHealth(): Promise<boolean> {
   try {
+    await initSidecarBase(); // resolve the real sidecar port before any direct resource fetch
     const text = await apiRequest("/api/health");
     const data = JSON.parse(text);
     if (data.status === "ok") {
@@ -125,3 +146,7 @@ export const api = {
   json: apiJson,
   upload: apiUpload,
 };
+
+// Resolve the sidecar base as early as possible (Tauri injects its internals before app JS runs),
+// so resourceUrl is correct by the time the first volume/preview loads.
+void initSidecarBase();
