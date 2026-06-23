@@ -3,7 +3,7 @@
    user list + the ground-truth manifest (for inter/intra-observer analysis). */
 
 import { open } from "@tauri-apps/plugin-dialog";
-import { readFile, writeFile, readTextFile, writeTextFile, readDir, mkdir, exists } from "@tauri-apps/plugin-fs";
+import { readFile, writeFile, readTextFile, writeTextFile, readDir, mkdir, exists, remove } from "@tauri-apps/plugin-fs";
 import { appConfigDir, join, basename } from "@tauri-apps/api/path";
 
 export interface VolumeEntry { name: string; path: string; }
@@ -92,6 +92,38 @@ export async function writeLabelmap(outputDir: string, volumeStem: string, usern
   const full = await join(dir, fname);
   await writeFile(full, bytes);
   return full;
+}
+
+// ── autosave: in-progress annotations survive app close/restart (#5) ──────────
+// A per-(user,volume) cache of the CURRENT (unsaved) drawing in the app-config dir, so reopening a
+// volume — or restarting the app — restores work that was never "Saved" as final ground truth. Keyed
+// by a short hash of user|path so filenames stay short + collision-free across folders.
+function autosaveName(user: string, volPath: string): string {
+  const s = `${user}|${volPath}`;
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return `as_${h.toString(16)}.nii.gz`;
+}
+async function autosaveDir(): Promise<string> {
+  const dir = await join(await appConfigDir(), "autosave");
+  if (!(await exists(dir))) await mkdir(dir, { recursive: true });
+  return dir;
+}
+export async function writeAutosave(user: string, volPath: string, bytes: Uint8Array): Promise<void> {
+  await writeFile(await join(await autosaveDir(), autosaveName(user, volPath)), bytes);
+}
+export async function readAutosave(user: string, volPath: string): Promise<Uint8Array | null> {
+  try {
+    const p = await join(await autosaveDir(), autosaveName(user, volPath));
+    if (await exists(p)) return await readFile(p);
+  } catch { /* no autosave / unreadable */ }
+  return null;
+}
+export async function removeAutosave(user: string, volPath: string): Promise<void> {
+  try {
+    const p = await join(await autosaveDir(), autosaveName(user, volPath));
+    if (await exists(p)) await remove(p);
+  } catch { /* already gone */ }
 }
 
 const CSV_COLS: (keyof ManifestRow)[] = ["username", "volume_stem", "volume_path", "session_id",

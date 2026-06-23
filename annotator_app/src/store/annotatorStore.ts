@@ -6,8 +6,42 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.17";
+export const APP_VERSION = "0.1.19";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+
+// ── Annotation persistence (#5) — never lose work on volume swap OR app close/restart ─────────────
+type AnnotSnap = { seed: Uint8Array; committed: Uint8Array; preview: Uint8Array; previewing: boolean };
+// In-memory, keyed by volume path → LOSSLESS restore (incl. an unconfirmed smart fill) when swapping
+// volumes within a session. The disk autosave (io.writeAutosave) backs this across app restarts.
+const annotCache = new Map<string, AnnotSnap>();
+// Key by user|path (mirrors the disk autosave key) so switching users mid-session never restores the
+// previous user's paint onto the new user's volume.
+const ckey = (user: string | null, p: string): string => `${user ?? ""}|${p}`;
+let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+// Serialize snapshots: exportLabelmapBytes() temporarily mutates the shared drawBitmap, so two exports
+// (or an export racing the next volume's load) must never overlap. openVolume awaits this before loading.
+let snapInFlight: Promise<void> = Promise.resolve();
+
+/** Capture the current volume's drawing into the in-memory cache + to disk, so it survives a swap and a
+    restart. Serialized via snapInFlight; awaiting the returned promise drains any prior in-flight export. */
+function snapshotVolume(user: string | null, volPath: string | null): Promise<void> {
+  const run = snapInFlight.then(async () => {
+    if (!volPath) return;
+    const st = nv.getAnnotationState();
+    if (!st) return;
+    if (nv.hasPaint()) {
+      annotCache.set(ckey(user, volPath), st);
+      if (user) {
+        try { const bytes = await nv.exportLabelmapBytes(); if (bytes) await io.writeAutosave(user, volPath, bytes); } catch { /* best-effort */ }
+      }
+    } else {
+      annotCache.delete(ckey(user, volPath)); // cleared the drawing → don't restore stale paint
+      if (user) { try { await io.removeAutosave(user, volPath); } catch { /* */ } }
+    }
+  });
+  snapInFlight = run.catch(() => {}); // keep the chain alive even if one snapshot throws
+  return run;
+}
 
 interface State {
   // identity / session
@@ -96,6 +130,8 @@ interface State {
   toggleLock: (label: number) => void;
   persistConfig: () => void;
   resumePending: () => void;
+  autosaveDraw: () => void;       // #5: debounced snapshot of the current drawing (cache + disk)
+  flushAutosave: () => Promise<void>; // #5: synchronous flush (app close / before unload)
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -155,6 +191,20 @@ export const useStore = create<State>((set, get) => ({
   persistConfig: () => {
     const s = get();
     void io.saveConfig({ users: s.users, outputDir: s.outputDir, lastFolder: s.folder, lang: s.lang, lastVolume: s.activeVolume?.path ?? null });
+  },
+
+  // #5: debounced autosave — coalesce rapid edits, then snapshot the current drawing (cache + disk).
+  autosaveDraw: () => {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => {
+      autosaveTimer = null;
+      void snapshotVolume(get().activeUser, get().activeVolume?.path ?? null);
+    }, 1200);
+  },
+  // #5: flush immediately (app close / beforeunload / explicit save).
+  flushAutosave: async () => {
+    if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
+    await snapshotVolume(get().activeUser, get().activeVolume?.path ?? null);
   },
 
   // After login + canvas attach, reopen the volume from the previous session (#2).
@@ -237,13 +287,29 @@ export const useStore = create<State>((set, get) => ({
   openVolume: async (v) => {
     set({ busy: true, status: `Loading ${v.name}…`, loaded: false });
     try {
+      // #5: capture the OUTGOING volume's drawing first so swapping never loses it (incl. an
+      // unconfirmed smart fill). Cancel any pending debounced autosave — we flush synchronously here.
+      if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
+      await snapshotVolume(get().activeUser, get().activeVolume?.path ?? null);
       const bytes = await io.readVolume(v.path);
       await nv.loadVolumeBytes(bytes, v.name, get().drawOpacity);
       nv.setPenSize(get().penSize);
       nv.setPen(get().penLabel, get().penFilled);
       nv.setSliceListener((vx) => set({ vox: vx })); // keep slice scrollbars synced to scroll-wheel nav
       nv.setLockedLabels(get().locked);              // re-apply label locks for the new volume (#4)
-      set({ activeVolume: v, loaded: true, tool: "paint", volumeStartMs: Date.now(), canConfirm: false,
+      // #5: restore this volume's drawing — lossless from the in-memory cache (same session) or, on a
+      // fresh start, from the disk autosave (restored as committed). Both keep work the user never "Saved".
+      let restoredPreviewing = false;
+      const cached = annotCache.get(ckey(get().activeUser, v.path));
+      if (cached && nv.setAnnotationState(cached)) {
+        restoredPreviewing = cached.previewing;
+      } else {
+        try {
+          const ab = await io.readAutosave(get().activeUser ?? "", v.path);
+          if (ab) await nv.loadSegmentationBytes(ab, `${v.name}__autosave`);
+        } catch { /* no autosave / unreadable — start blank */ }
+      }
+      set({ activeVolume: v, loaded: true, tool: "paint", volumeStartMs: Date.now(), canConfirm: restoredPreviewing,
             dims: nv.getDims(), vox: nv.currentVox() ?? [0, 0, 0], brightness: 0, contrast: 0,
             status: `Annotating ${v.name}. Paint cornea/scar; Smart fill helps; then Save.` });
       nv.setWindow(0, 0);     // new volume → reset display window + counts
@@ -303,7 +369,7 @@ export const useStore = create<State>((set, get) => ({
     if (!r.ok) {
       set({ status: r.reason === "below-threshold" ? "Wand: that spot is below the threshold — lower it or click a brighter area."
         : r.reason === "outside-cornea" ? "Wand: click inside the cornea (scar grows within it)." : "Wand: nothing to fill here." });
-    } else { get().refreshStats(); set({ status: `Wand: filled ${r.count} scar voxels. Adjust the threshold or Undo if needed.` }); }
+    } else { get().refreshStats(); get().autosaveDraw(); set({ status: `Wand: filled ${r.count} scar voxels. Adjust the threshold or Undo if needed.` }); }
   },
   setCursorIntensity: (x, y, z) => { set({ cursorIntensity: nv.intensityAt(x, y, z) }); },
   setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
@@ -338,6 +404,7 @@ export const useStore = create<State>((set, get) => ({
           : "Load a volume first." });
       } else {
         get().refreshStats();
+        get().autosaveDraw();
         set({ canConfirm: true,
           status: "Smart-fill PREVIEW — refine your brushstrokes and Smart fill again, or Confirm to keep it." });
       }
@@ -348,13 +415,13 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   confirmFill: () => {
-    if (nv.confirmFill()) { get().refreshStats(); set({ canConfirm: false, status: "Smart fill confirmed — added to the segmentation." }); }
+    if (nv.confirmFill()) { get().refreshStats(); get().autosaveDraw(); set({ canConfirm: false, status: "Smart fill confirmed — added to the segmentation." }); }
   },
-  undo: () => { nv.undoDrawing(); get().refreshStats(); set({ canConfirm: nv.isPreviewing() }); },
-  redo: () => { nv.redoDrawing(); get().refreshStats(); set({ canConfirm: nv.isPreviewing() }); },
+  undo: () => { nv.undoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing() }); },
+  redo: () => { nv.redoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing() }); },
   requestClear: () => set({ confirmClear: true }),
   cancelClear: () => set({ confirmClear: false }),
-  clearDrawing: () => { nv.clearDrawing(); get().refreshStats(); set({ canConfirm: false, confirmClear: false, status: "Cleared — blank drawing." }); },
+  clearDrawing: () => { nv.clearDrawing(); get().refreshStats(); void get().flushAutosave(); set({ canConfirm: false, confirmClear: false, status: "Cleared — blank drawing." }); },
 
   save: async (force = false) => {
     const { activeUser, activeVolume, outputDir, sessionId: sid } = get();

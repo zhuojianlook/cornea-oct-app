@@ -293,6 +293,30 @@ export function voxAtScreen(xCss: number, yCss: number): [number, number, number
   return [ix(0), ix(1), ix(2)];
 }
 
+/** Like voxAtScreen but CLAMPED to a specific pane (tile) — returns the NEAREST in-volume voxel even
+    when the cursor is in the tile's letterbox padding or dragged off the pane entirely (#1). Lets a
+    round brush paint right up to the image edge instead of vanishing (its centre clamps to the border
+    voxel, so the disk still covers the edge pixels). The cursor is clamped to the pane rect and the
+    texture frac to [0,1]. Used ONLY during an active stroke (the wand still needs the exact voxel). */
+export function voxAtScreenClamped(xCss: number, yCss: number, tile: number): [number, number, number] | null {
+  const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => ArrayLike<number> }).screenXY2TextureFrac;
+  const slices = (nv as unknown as { screenSlices?: Array<{ leftTopWidthHeight: number[]; axCorSag: number }> }).screenSlices;
+  if (!nv || !dr || typeof f2f !== "function" || !slices || tile < 0 || tile >= slices.length) return null;
+  const s = slices[tile];
+  if (s.axCorSag > 2) return null; // not a paintable 2-D pane
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const [lx, ly, lw, lh] = s.leftTopWidthHeight;
+  // Clamp the cursor into the pane, then the resulting texture frac into the image.
+  const xd = Math.max(lx, Math.min(lx + lw, xCss * dpr));
+  const yd = Math.max(ly, Math.min(ly + lh, yCss * dpr));
+  const f = f2f.call(nv, xd, yd, tile);
+  if (!f) return null;
+  const cl = (v: number) => Math.max(0, Math.min(1, v));
+  const ix = (a: number) => Math.max(0, Math.min(dr[a + 1] - 1, Math.round(cl(f[a]) * dr[a + 1] - 0.5)));
+  return [ix(0), ix(1), ix(2)];
+}
+
 // ── Layered drawing: seeds (brushstrokes) ▸ preview (last smart fill) ▸ committed (confirmed) ────────
 // Smart fill must grow ONLY from the user's brushstrokes (seeds), never from its own output — so the
 // fill is a recomputable PREVIEW. "Confirm" bakes the preview into the committed segmentation. The
@@ -559,12 +583,50 @@ export async function loadSegmentationBytes(bytes: Uint8Array, name: string): Pr
   return { ok: true };
 }
 
+// ── Annotation state get/set — for LOSSLESS volume swapping + autosave restore (#5) ──────────────
+/** Snapshot the full editable state (seeds + committed + UNCONFIRMED preview) so swapping away from a
+    volume and back restores EXACTLY what was on screen, including an un-confirmed smart fill. */
+export function getAnnotationState(): { seed: Uint8Array; committed: Uint8Array; preview: Uint8Array; previewing: boolean } | null {
+  if (!seedBmp || !committedBmp || !previewBmp) return null;
+  return { seed: seedBmp.slice(), committed: committedBmp.slice(), preview: previewBmp.slice(), previewing };
+}
+/** Restore a snapshot onto the CURRENT volume's drawing (must be same dims). Resets undo history. */
+export function setAnnotationState(st: { seed: Uint8Array; committed: Uint8Array; preview: Uint8Array; previewing: boolean }): boolean {
+  if (!seedBmp || !committedBmp || !previewBmp) return false;
+  if (st.seed.length !== seedBmp.length) return false; // dims mismatch — don't apply a wrong-sized state
+  seedBmp.set(st.seed); committedBmp.set(st.committed); previewBmp.set(st.preview); previewing = !!st.previewing;
+  undoStack = []; redoStack = [];
+  compose();
+  return true;
+}
+/** True if the current drawing has ANY paint (committed, seed, or preview) — gates autosave. */
+export function hasPaint(): boolean {
+  if (!seedBmp || !committedBmp || !previewBmp) return false;
+  const s = seedBmp, c = committedBmp, p = previewBmp;
+  for (let i = 0; i < c.length; i++) if (c[i] || s[i] || p[i]) return true;
+  return false;
+}
+
 // ── 2-D zoom / pan ────────────────────────────────────────────────────────────
+/** Zoom toward the RED CROSSHAIR, not the slice centre (#4). niivue zooms about the slice centre, so
+    we pan the crosshair's mm position to the centre and zoom there — the region under the crosshair
+    magnifies in place. pan2Dxyzmm = [panXmm, panYmm, panZmm, zoom]; pan moves the volume vs the centre,
+    so pan = centre_mm − crosshair_mm. (One global zoom for all 2-D panes — niivue has no per-tile zoom.) */
 export function zoomBy(factor: number): void {
   if (!nv) return;
   const p = nv.scene.pan2Dxyzmm as unknown as number[];
   const z = Math.max(1, Math.min(8, (p[3] || 1) * factor));
-  try { nv.setPan2Dxyzmm([p[0], p[1], p[2], z]); } catch { /* */ }
+  let pan: [number, number, number] = [p[0], p[1], p[2]];
+  try {
+    const cp = nv.scene?.crosshairPos as Float32Array | undefined;
+    const f2m = (nv as unknown as { frac2mm?: (f: number[]) => Float32Array }).frac2mm;
+    if (cp && typeof f2m === "function") {
+      const cm = f2m.call(nv, [cp[0], cp[1], cp[2]]);
+      const ctr = f2m.call(nv, [0.5, 0.5, 0.5]);
+      pan = [ctr[0] - cm[0], ctr[1] - cm[1], ctr[2] - cm[2]];
+    }
+  } catch { /* keep current pan if frac2mm is unavailable */ }
+  try { nv.setPan2Dxyzmm([pan[0], pan[1], pan[2], z]); } catch { /* */ }
 }
 export function resetView(): void { if (nv) { try { nv.setPan2Dxyzmm([0, 0, 0, 1]); } catch { /* */ } } }
 

@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -56,6 +56,7 @@ export function AnnotatorCanvas() {
   const wandAt = useStore((s) => s.wandAt);
   const setCursorIntensity = useStore((s) => s.setCursorIntensity);
   const refreshStats = useStore((s) => s.refreshStats);
+  const autosaveDraw = useStore((s) => s.autosaveDraw);
   const zoomIn = useStore((s) => s.zoomIn);
   const zoomOut = useStore((s) => s.zoomOut);
   const resetView = useStore((s) => s.resetView);
@@ -67,6 +68,14 @@ export function AnnotatorCanvas() {
       setNoWebgl(err);
       if (!err) useStore.getState().resumePending(); // #2 reopen last session's volume once attached
     }
+  }, []);
+
+  // #5: best-effort final autosave when the window/app is closing (the per-stroke debounced autosave
+  // already covers the common case; this catches a close right after the last edit).
+  useEffect(() => {
+    const flush = () => { void useStore.getState().flushAutosave(); };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
   }, []);
 
   // Defensive repaint once the layout has settled after a volume loads / the view changes — recovers
@@ -134,7 +143,9 @@ export function AnnotatorCanvas() {
             if (strokeTile.current < 0) return;                    // started off any 2-D pane → ignore
             strokeAxis.current = tileThroughAxis(strokeTile.current); // confine paint to this pane's slice
             beginStroke();                                         // snapshot for undo (start of stroke)
-            const v = voxAtScreen(x, y);                           // cursor-exact voxel; null in a tile's letterbox padding / off-image
+            // Clamp to the stroke pane so a brush near (or past) the edge still paints the border
+            // pixels instead of vanishing — the round brush's centre clamps to the edge voxel (#1).
+            const v = voxAtScreenClamped(x, y, strokeTile.current);
             if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel, strokeAxis.current); lastVox.current = v; }
             restoreCrosshair();
           } else if (wandActive) {
@@ -143,7 +154,7 @@ export function AnnotatorCanvas() {
             if (v) wandAt(v[0], v[1], v[2]);                       // threshold-grow scar from the click
           }
         }}
-        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); } }}
+        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); autosaveDraw(); } }}
         onMouseMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           const x = e.clientX - r.left, y = e.clientY - r.top;
@@ -151,11 +162,12 @@ export function AnnotatorCanvas() {
           const tile = (painting || wandActive) ? tileAtScreen(x, y) : -1;
           // paint a 3-D sphere at the cursor voxel, confined to the stroke's pane; crosshair stays put.
           if (painting && !modPan && (e.buttons & 1)) {
-            if (tile >= 0 && tile === strokeTile.current) {
-              const v = voxAtScreen(x, y);                         // cursor-exact; null in the tile's letterbox padding / off-image → no stray center paint
-              if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel, strokeAxis.current); lastVox.current = v; }
-              else lastVox.current = null;                         // dragged into padding/off-image → break continuity (don't bridge the gap)
-            } else lastVox.current = null;
+            // Clamp to the STROKE pane: keep painting the edge even when the cursor leaves the image /
+            // pane, so a round brush covers the border pixels instead of disappearing (#1). The clamp
+            // also maps off-image cursors to the nearest edge voxel (never the crosshair centre).
+            const v = strokeTile.current >= 0 ? voxAtScreenClamped(x, y, strokeTile.current) : null;
+            if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel, strokeAxis.current); lastVox.current = v; }
+            else lastVox.current = null;
             restoreCrosshair();
           } else if (painting && !modPan) lockCrosshair();
           // wand: show the intensity under the cursor (helps choose the threshold)
@@ -166,7 +178,7 @@ export function AnnotatorCanvas() {
             setBrush({ x, y, w: sz ? Math.max(4, sz.w) : Math.max(4, penSize), h: sz ? Math.max(4, sz.h) : Math.max(4, penSize) });
           } else if (brush) setBrush(null);
         }}
-        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); } setBrush(null); }}
+        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); autosaveDraw(); } setBrush(null); }}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting || wandActive ? "crosshair" : "default" }} />
         {showBrush && (
