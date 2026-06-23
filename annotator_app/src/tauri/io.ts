@@ -7,11 +7,13 @@ import { readFile, writeFile, readTextFile, writeTextFile, readDir, mkdir, exist
 import { appConfigDir, join, basename } from "@tauri-apps/api/path";
 
 export interface VolumeEntry { name: string; path: string; }
-export interface AppConfig { users: string[]; outputDir: string | null; lastFolder: string | null; lang: "en" | "zh"; lastVolume?: string | null; }
+export interface AppConfig { users: string[]; outputDir: string | null; lastFolder: string | null; lang: "en" | "zh"; lastVolume?: string | null; replicates?: number; }
 export interface ManifestRow {
   username: string; volume_stem: string; volume_path: string;
   session_id: string; saved_at: string; cornea_voxels: number; scar_voxels: number;
   scar_mm3: number; spacing: string; duration_s: number; app_version: string;
+  replicate: number;   // #4: which repeat (1..N) this annotation is — drives intra-observer analysis
+  blind_label: string; // the neutral label the annotator saw (e.g. "Scan B") — real name stays hidden in-app
 }
 
 const isNifti = (n: string) => /\.nii(\.gz)?$/i.test(n);
@@ -70,7 +72,8 @@ export async function loadConfig(): Promise<AppConfig> {
     if (await exists(p)) {
       const d = JSON.parse(await readTextFile(p));
       return { users: Array.isArray(d.users) ? d.users : [], outputDir: d.outputDir ?? null,
-               lastFolder: d.lastFolder ?? null, lang: d.lang === "zh" ? "zh" : "en", lastVolume: d.lastVolume ?? null };
+               lastFolder: d.lastFolder ?? null, lang: d.lang === "zh" ? "zh" : "en", lastVolume: d.lastVolume ?? null,
+               replicates: typeof d.replicates === "number" ? d.replicates : 2 };
     }
   } catch { /* fall through to defaults */ }
   return { users: [], outputDir: null, lastFolder: null, lang: "en", lastVolume: null };
@@ -85,10 +88,11 @@ export async function saveConfig(cfg: AppConfig): Promise<void> {
 
 // ── ground-truth output: labelmap file + manifest (json + csv) ───────────────
 export async function writeLabelmap(outputDir: string, volumeStem: string, username: string,
-                                    sessionId: string, bytes: Uint8Array): Promise<string> {
+                                    sessionId: string, bytes: Uint8Array, replicate = 1): Promise<string> {
   const dir = await join(outputDir, volumeStem);
   if (!(await exists(dir))) await mkdir(dir, { recursive: true });
-  const fname = `${username}__${sessionId}.nii.gz`;
+  // include the replicate so the SAME user's two repeats of a scan never collide (#4 intra-observer)
+  const fname = `${username}__rep${replicate}__${sessionId}.nii.gz`;
   const full = await join(dir, fname);
   await writeFile(full, bytes);
   return full;
@@ -127,7 +131,7 @@ export async function removeAutosave(user: string, volPath: string): Promise<voi
 }
 
 const CSV_COLS: (keyof ManifestRow)[] = ["username", "volume_stem", "volume_path", "session_id",
-  "saved_at", "cornea_voxels", "scar_voxels", "scar_mm3", "spacing", "duration_s", "app_version"];
+  "replicate", "blind_label", "saved_at", "cornea_voxels", "scar_voxels", "scar_mm3", "spacing", "duration_s", "app_version"];
 
 export async function appendManifest(outputDir: string, row: ManifestRow): Promise<void> {
   if (!(await exists(outputDir))) await mkdir(outputDir, { recursive: true });
@@ -145,7 +149,8 @@ export async function appendManifest(outputDir: string, row: ManifestRow): Promi
   await writeTextFile(await join(outputDir, "manifest.csv"), csv);
 }
 
-/** Which volume stems this user has already annotated (from the manifest) — for the volume-list badges. */
+/** Which (stem, replicate) pairs this user has already saved — keys `${stem}__rep${replicate}` — for the
+    per-entry ✓ badges (#4: each replicate is tracked separately so both repeats must be done). */
 export async function annotatedStems(outputDir: string | null, username: string): Promise<Set<string>> {
   const done = new Set<string>();
   if (!outputDir) return done;
@@ -153,7 +158,7 @@ export async function annotatedStems(outputDir: string | null, username: string)
     const jsonP = await join(outputDir, "manifest.json");
     if (await exists(jsonP)) {
       const rows: ManifestRow[] = JSON.parse(await readTextFile(jsonP));
-      for (const r of rows) if (r.username === username) done.add(r.volume_stem);
+      for (const r of rows) if (r.username === username) done.add(`${r.volume_stem}__rep${r.replicate ?? 1}`);
     }
   } catch { /* ignore */ }
   return done;

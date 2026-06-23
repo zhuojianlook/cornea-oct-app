@@ -6,7 +6,31 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.22";
+export const APP_VERSION = "0.1.23";
+
+// #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
+// (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
+// annotates it multiple times (intra-observer); different users annotate the same scans (inter-observer).
+export interface BlindEntry { name: string; path: string; stem: string; blindLabel: string; replicate: number; }
+const ADMIN_PASSWORD = "OCTAPP";
+// A→Z, AA→… blind label for the i-th scan (real name stays hidden).
+function blindLetter(i: number): string { let s = ""; i++; while (i > 0) { s = String.fromCharCode(65 + (i - 1) % 26) + s; i = Math.floor((i - 1) / 26); } return s; }
+// Build the blinded, replicate-expanded queue. Interleaved by replicate ROUND (all scans' rep 1, then
+// all scans' rep 2, …) so a user doesn't annotate the same scan back-to-back — better intra-observer.
+function buildBlindQueue(vols: io.VolumeEntry[], replicates: number): BlindEntry[] {
+  const reps = Math.max(1, Math.min(4, Math.round(replicates || 2)));
+  const out: BlindEntry[] = [];
+  for (let r = 1; r <= reps; r++)
+    for (let i = 0; i < vols.length; i++) {
+      const v = vols[i]; const stem = v.name.replace(/\.nii(\.gz)?$/i, "");
+      out.push({ name: `Scan ${blindLetter(i)} · rep ${r}`, path: v.path, stem, blindLabel: `Scan ${blindLetter(i)}`, replicate: r });
+    }
+  return out;
+}
+const entryKey = (e: { stem: string; replicate: number }): string => `${e.stem}__rep${e.replicate}`;
+// Autosave/in-session-cache key MUST include the replicate — two replicates of one scan share a path but
+// are independent annotations, so they need separate autosaves/caches (#4 + #5).
+const aKey = (e: BlindEntry | null): string | null => (e ? `${e.path}#rep${e.replicate}` : null);
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 // ── Annotation persistence (#5) — never lose work on volume swap OR app close/restart ─────────────
@@ -52,10 +76,13 @@ interface State {
   outputDir: string | null;
   // volumes
   folder: string | null;
-  volumes: io.VolumeEntry[];
-  activeVolume: io.VolumeEntry | null;
+  volumes: io.VolumeEntry[];       // the REAL files in the folder (names hidden from the UI)
+  blindEntries: BlindEntry[];      // #4: the BLINDED queue actually shown — each scan ×N replicates
+  activeVolume: BlindEntry | null; // the blinded entry being annotated (carries real stem + replicate)
+  replicates: number;              // #4: how many repeats per scan each user does (default 2; admin 2–4)
+  adminUnlocked: boolean;          // #4: OCTAPP entered → real scan names + replicate count revealed/editable
   loaded: boolean;
-  annotated: Set<string>;          // volume stems this user already saved (this output dir)
+  annotated: Set<string>;          // `${stem}__rep${n}` keys this user already saved (this output dir)
   volumeStartMs: number;
   dims: [number, number, number] | null;   // [nx, ny, nz] of the loaded volume
   vox: [number, number, number];           // current crosshair slice indices [x, y, z]
@@ -106,8 +133,11 @@ interface State {
   deleteUser: (name: string) => Promise<void>;
   selectUser: (name: string) => Promise<void>;
   pickFolder: () => Promise<void>;
-  openVolume: (v: io.VolumeEntry) => Promise<void>;
+  openVolume: (v: BlindEntry) => Promise<void>;
   nextUnannotated: () => void;
+  unlockAdmin: (pw: string) => boolean;     // #4: reveal real names + replicate control (password OCTAPP)
+  lockAdmin: () => void;
+  setReplicates: (n: number) => void;       // #4: admin-only — repeats per scan (2–4); rebuilds the queue
   loadSegmentation: () => Promise<void>;
   chooseOutputDir: () => Promise<void>;
   setPenLabel: (p: Pen) => void;
@@ -155,7 +185,10 @@ export const useStore = create<State>((set, get) => ({
   outputDir: null,
   folder: null,
   volumes: [],
+  blindEntries: [],
   activeVolume: null,
+  replicates: 2,
+  adminUnlocked: false,
   loaded: false,
   annotated: new Set(),
   volumeStartMs: 0,
@@ -197,21 +230,22 @@ export const useStore = create<State>((set, get) => ({
 
   init: async () => {
     const cfg = await io.loadConfig();
-    set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder, lang: cfg.lang, pendingVolume: cfg.lastVolume ?? null });
+    const reps = Math.max(1, Math.min(4, Math.round(cfg.replicates ?? 2)));
+    set({ users: cfg.users, outputDir: cfg.outputDir, folder: cfg.lastFolder, lang: cfg.lang, replicates: reps, pendingVolume: cfg.lastVolume ?? null });
     // A2: auto-restore the last folder's volume list so the user need not re-pick the folder. The last
     // volume is reopened (resumePending) once a user logs in and the canvas has attached.
     if (cfg.lastFolder) {
       try {
         const volumes = await io.listNifti(cfg.lastFolder);
-        set({ volumes });
+        set({ volumes, blindEntries: buildBlindQueue(volumes, reps) });   // #4 blinded queue
       } catch { set({ folder: null, pendingVolume: null }); } // folder moved/deleted
     }
   },
 
-  // Persist the full config (users, output dir, last folder + volume, language) — best-effort.
+  // Persist the full config (users, output dir, last folder + volume, language, replicate count) — best-effort.
   persistConfig: () => {
     const s = get();
-    void io.saveConfig({ users: s.users, outputDir: s.outputDir, lastFolder: s.folder, lang: s.lang, lastVolume: s.activeVolume?.path ?? null });
+    void io.saveConfig({ users: s.users, outputDir: s.outputDir, lastFolder: s.folder, lang: s.lang, replicates: s.replicates, lastVolume: aKey(s.activeVolume) });
   },
 
   // #5: debounced autosave — coalesce rapid edits, then snapshot the current drawing (cache + disk).
@@ -219,22 +253,22 @@ export const useStore = create<State>((set, get) => ({
     if (autosaveTimer) clearTimeout(autosaveTimer);
     autosaveTimer = setTimeout(() => {
       autosaveTimer = null;
-      void snapshotVolume(get().activeUser, get().activeVolume?.path ?? null);
+      void snapshotVolume(get().activeUser, aKey(get().activeVolume));
     }, 1200);
   },
   // #5: flush immediately (app close / beforeunload / explicit save).
   flushAutosave: async () => {
     if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
-    await snapshotVolume(get().activeUser, get().activeVolume?.path ?? null);
+    await snapshotVolume(get().activeUser, aKey(get().activeVolume));
   },
 
-  // After login + canvas attach, reopen the volume from the previous session (#2).
+  // After login + canvas attach, reopen the blinded entry from the previous session (#2/#4).
   resumePending: () => {
     const s = get();
     if (!s.activeUser || s.activeVolume || s.loaded || !s.pendingVolume) return;
-    const v = s.volumes.find((x) => x.path === s.pendingVolume);
+    const e = s.blindEntries.find((x) => aKey(x) === s.pendingVolume);
     set({ pendingVolume: null });
-    if (v) void get().openVolume(v);
+    if (e) void get().openVolume(e);
   },
 
   setLang: (l) => { set({ lang: l }); get().persistConfig(); },
@@ -296,7 +330,8 @@ export const useStore = create<State>((set, get) => ({
     set({ busy: true });
     try {
       const volumes = await io.listNifti(folder);
-      set({ folder, volumes, status: `${volumes.length} volume(s) found. Select one to annotate.` });
+      const blindEntries = buildBlindQueue(volumes, get().replicates);   // #4: blind + replicate-expand
+      set({ folder, volumes, blindEntries, status: `${blindEntries.length} blinded entries (${volumes.length} scan(s) × ${get().replicates}). Select one to annotate.` });
       get().persistConfig();
     } catch (e) {
       set({ status: `Could not list folder: ${e instanceof Error ? e.message : String(e)}` });
@@ -311,22 +346,23 @@ export const useStore = create<State>((set, get) => ({
       // #5: capture the OUTGOING volume's drawing first so swapping never loses it (incl. an
       // unconfirmed smart fill). Cancel any pending debounced autosave — we flush synchronously here.
       if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
-      await snapshotVolume(get().activeUser, get().activeVolume?.path ?? null);
-      const bytes = await io.readVolume(v.path);
+      await snapshotVolume(get().activeUser, aKey(get().activeVolume));
+      const bytes = await io.readVolume(v.path);                       // v.path = the REAL file
       await nv.loadVolumeBytes(bytes, v.name, get().drawOpacity);
       nv.setPenSize(get().penSize);
       nv.setPen(get().penLabel, get().penFilled);
       nv.setSliceListener((vx) => set({ vox: vx })); // keep slice scrollbars synced to scroll-wheel nav
-      nv.setLockedLabels(get().locked);              // re-apply label locks for the new volume (#4)
-      // #5: restore this volume's drawing — lossless from the in-memory cache (same session) or, on a
-      // fresh start, from the disk autosave (restored as committed). Both keep work the user never "Saved".
+      nv.setLockedLabels(get().locked);              // re-apply label locks for the new volume
+      // #5: restore this ENTRY's drawing (keyed by path#rep so the two replicates stay independent) —
+      // lossless from the in-memory cache (same session) or the disk autosave (restored as committed).
       let restoredPreviewing = false;
-      const cached = annotCache.get(ckey(get().activeUser, v.path));
+      const key = aKey(v)!;
+      const cached = annotCache.get(ckey(get().activeUser, key));
       if (cached && nv.setAnnotationState(cached)) {
         restoredPreviewing = cached.previewing;
       } else {
         try {
-          const ab = await io.readAutosave(get().activeUser ?? "", v.path);
+          const ab = await io.readAutosave(get().activeUser ?? "", key);
           if (ab) await nv.loadSegmentationBytes(ab, `${v.name}__autosave`);
         } catch { /* no autosave / unreadable — start blank */ }
       }
@@ -345,14 +381,23 @@ export const useStore = create<State>((set, get) => ({
   },
 
   nextUnannotated: () => {
-    const { volumes, annotated, activeVolume } = get();
-    if (!volumes.length) return;
-    const startIdx = activeVolume ? volumes.findIndex((v) => v.path === activeVolume.path) : -1;
-    for (let k = 1; k <= volumes.length; k++) {
-      const v = volumes[(startIdx + k + volumes.length) % volumes.length];
-      if (!annotated.has(v.name.replace(/\.nii(\.gz)?$/i, ""))) { void get().openVolume(v); return; }
+    const { blindEntries, annotated, activeVolume } = get();
+    if (!blindEntries.length) return;
+    const startIdx = activeVolume ? blindEntries.findIndex((e) => aKey(e) === aKey(activeVolume)) : -1;
+    for (let k = 1; k <= blindEntries.length; k++) {
+      const e = blindEntries[(startIdx + k + blindEntries.length) % blindEntries.length];
+      if (!annotated.has(entryKey(e))) { void get().openVolume(e); return; }
     }
-    set({ status: "All volumes in this folder are annotated." });
+    set({ status: "All blinded entries in this folder are annotated." });
+  },
+
+  // #4: admin controls — OCTAPP reveals real scan names + lets you set the replicate count.
+  unlockAdmin: (pw) => { const ok = pw === ADMIN_PASSWORD; if (ok) set({ adminUnlocked: true }); return ok; },
+  lockAdmin: () => set({ adminUnlocked: false }),
+  setReplicates: (n) => {
+    const reps = Math.max(1, Math.min(4, Math.round(n || 2)));
+    set({ replicates: reps, blindEntries: buildBlindQueue(get().volumes, reps) });
+    get().persistConfig();
   },
 
   loadSegmentation: async () => {
@@ -482,29 +527,33 @@ export const useStore = create<State>((set, get) => ({
   save: async (force = false) => {
     const { activeUser, activeVolume, outputDir, sessionId: sid } = get();
     if (!activeUser || !activeVolume) return;
-    const vstem = await io.stem(activeVolume.path);
-    // A1: if this scan already has a saved ground truth, confirm before overwriting.
-    if (!force && get().annotated.has(vstem)) { set({ confirmOverwrite: true }); return; }
+    const vstem = activeVolume.stem;              // #4: the REAL stem (blinded in the UI)
+    const rep = activeVolume.replicate;
+    const key = entryKey(activeVolume);          // `${stem}__rep${rep}`
+    // A1: if THIS replicate already has a saved ground truth, confirm before overwriting.
+    if (!force && get().annotated.has(key)) { set({ confirmOverwrite: true }); return; }
     set({ confirmOverwrite: false });
     if (!outputDir) { await get().chooseOutputDir(); if (!get().outputDir) return; }
     set({ busy: true, status: "Saving ground truth…" });
     try {
       const bytes = await nv.exportLabelmapBytes();
       if (!bytes) throw new Error("Nothing to export.");
+      nv.forceDrawAll();   // NEW: exportLabelmapBytes' saveImage can blank the GL canvas on WebKitGTK — repaint
       const st = nv.drawStats();
       const out = get().outputDir!;
-      const file = await io.writeLabelmap(out, vstem, activeUser, sid, bytes);
+      const file = await io.writeLabelmap(out, vstem, activeUser, sid, bytes, rep);
       await io.appendManifest(out, {
         username: activeUser, volume_stem: vstem, volume_path: activeVolume.path,
-        session_id: sid, saved_at: new Date().toISOString(),
+        session_id: sid, replicate: rep, blind_label: activeVolume.blindLabel, saved_at: new Date().toISOString(),
         cornea_voxels: st.cornea, scar_voxels: st.scar,
         scar_mm3: Math.round(st.scar * st.mm3 * 1e4) / 1e4,
         spacing: st.spacing.map(s => s.toFixed(4)).join("×"),
         duration_s: Math.round((Date.now() - get().volumeStartMs) / 1000),
         app_version: APP_VERSION,
       });
-      const done = new Set(get().annotated); done.add(vstem);
-      set({ annotated: done, status: `Saved ${file.split(/[/\\]/).pop()} (scar ${st.scar} vox).` });
+      const done = new Set(get().annotated); done.add(key);
+      nv.forceDrawAll();   // NEW: ensure the image is visible again after the save round-trip (WebKitGTK)
+      set({ annotated: done, status: `Saved ${file.split(/[/\\]/).pop()} (${activeVolume.blindLabel} rep ${rep}, scar ${st.scar} vox).` });
     } catch (e) {
       set({ status: `Save failed: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
