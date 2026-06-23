@@ -167,6 +167,17 @@ export function setSliceListener(fn: ((vox: [number, number, number]) => void) |
 /** Mark a paint stroke active so the slice readout doesn't follow the brush mid-stroke. */
 export function setStroke(active: boolean): void { strokeActive = active; }
 
+/** The through-plane RAS axis (0=x/sagittal, 1=y/coronal, 2=z/axial) of a 2-D pane (tile index from
+    tileAtScreen), or null for the 3-D render / invalid tile. niivue's axCorSag is 0=axial,1=coronal,
+    2=sagittal, whose through-plane axis is z,y,x → 2-axCorSag. paintBrush uses this to confine a
+    stroke to the slice under the cursor. */
+export function tileThroughAxis(tile: number): number | null {
+  const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number }> }).screenSlices;
+  if (!nv || !slices || tile < 0 || tile >= slices.length) return null;
+  const acs = slices[tile].axCorSag;
+  return acs >= 0 && acs <= 2 ? 2 - acs : null;
+}
+
 /** Per-axis voxel counts [nx, ny, nz] of the loaded volume (RAS/display order), or null. */
 export function getDims(): [number, number, number] | null {
   const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
@@ -332,7 +343,8 @@ export function beginStroke(): void { pushUndo(); }
 /** Stamp a sphere (mm) of the current brush at voxel (cx,cy,cz) into the SEEDS layer (erase clears all
     layers), interpolating from a previous voxel so fast drags stay continuous. label 0 erases. The
     display is updated in place; refresh is rAF-throttled to keep dragging responsive. */
-export function paintBrush(cx: number, cy: number, cz: number, px: number, py: number, pz: number, label: number): void {
+export function paintBrush(cx: number, cy: number, cz: number, px: number, py: number, pz: number, label: number,
+                           throughAxis: number | null = null): void {
   const d = nv?.drawBitmap;
   const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
   const sp = rasSpacing();
@@ -341,7 +353,14 @@ export function paintBrush(cx: number, cy: number, cz: number, px: number, py: n
   const R = brushRadiusMm();
   if (R <= 0) return;
   const R2 = R * R;
-  const rx = Math.ceil(R / sp[0]), ry = Math.ceil(R / sp[1]), rz = Math.ceil(R / sp[2]);
+  // Paint a 2-D DISK on the CURRENT slice of the pane being painted (throughAxis = that pane's
+  // through-plane RAS axis), NOT a 3-D sphere: the cornea sits at a different depth on every slice,
+  // so a stroke must annotate only the slice under the cursor. The user paints sparse slices across
+  // panes; smart-fill then interpolates the 3-D label between them. Zeroing the through-axis radius
+  // collapses the sphere to a disk on that one slice. (throughAxis null → 3-D sphere, legacy.)
+  const rr = [Math.ceil(R / sp[0]), Math.ceil(R / sp[1]), Math.ceil(R / sp[2])];
+  if (throughAxis !== null && throughAxis >= 0 && throughAxis <= 2) rr[throughAxis] = 0;
+  const rx = rr[0], ry = rr[1], rz = rr[2];
   const hasLocks = lockedLabels.size > 0;
   const erasing = label === 0;
   const s = seedBmp, c = committedBmp, p = previewBmp;

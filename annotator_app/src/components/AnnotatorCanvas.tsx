@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, voxAtScreen, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -38,6 +38,7 @@ export function AnnotatorCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastVox = useRef<[number, number, number] | null>(null); // previous painted voxel (stroke continuity)
   const strokeTile = useRef<number>(-1);                          // pane the current stroke started on
+  const strokeAxis = useRef<number | null>(null);                 // that pane's through-plane axis (paint stays on one slice)
   const [view, setV] = useState<ViewName>("multi");
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
   const [brush, setBrush] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
@@ -131,9 +132,10 @@ export function AnnotatorCanvas() {
           if (painting) {
             strokeTile.current = tileAtScreen(x, y);
             if (strokeTile.current < 0) return;                    // started off any 2-D pane → ignore
+            strokeAxis.current = tileThroughAxis(strokeTile.current); // confine paint to this pane's slice
             beginStroke();                                         // snapshot for undo (start of stroke)
             const v = voxAtScreen(x, y);                           // cursor-exact voxel; null in a tile's letterbox padding / off-image
-            if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel); lastVox.current = v; }
+            if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel, strokeAxis.current); lastVox.current = v; }
             restoreCrosshair();
           } else if (wandActive) {
             if (tileAtScreen(x, y) < 0) return;
@@ -151,7 +153,7 @@ export function AnnotatorCanvas() {
           if (painting && !modPan && (e.buttons & 1)) {
             if (tile >= 0 && tile === strokeTile.current) {
               const v = voxAtScreen(x, y);                         // cursor-exact; null in the tile's letterbox padding / off-image → no stray center paint
-              if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel); lastVox.current = v; }
+              if (v) { const p = lastVox.current ?? v; paintBrush(v[0], v[1], v[2], p[0], p[1], p[2], penLabel, strokeAxis.current); lastVox.current = v; }
               else lastVox.current = null;                         // dragged into padding/off-image → break continuity (don't bridge the gap)
             } else lastVox.current = null;
             restoreCrosshair();
