@@ -4,7 +4,7 @@
    Two modeling modes + config/length dropdowns; live status + log tail. */
 
 import { useEffect, useRef, useState } from "react";
-import { MenuItem, Select, Button, CircularProgress } from "@mui/material";
+import { MenuItem, Select, Button, CircularProgress, Checkbox } from "@mui/material";
 import { api } from "../../api/client";
 
 type Mode = "single3" | "cascade";
@@ -42,6 +42,10 @@ export function NnunetTrainPanel() {
   const [status, setStatus] = useState<TrainStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [setupPending, setSetupPending] = useState(false);
+  // Per-scan "include in first-run training" subset (case id → included). Default: all included
+  // (mirrors the backend default of training on every per-scan segmentation). Deselections persist
+  // across status polls; newly discovered cases default to included.
+  const [included, setIncluded] = useState<Record<string, boolean>>({});
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const fetchStatus = async () => {
@@ -74,6 +78,22 @@ export function NnunetTrainPanel() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [status?.log_tail]);
 
+  // Seed the include-in-training map for any newly discovered candidate case (default: included);
+  // leave existing user choices untouched.
+  const candidateKey = (status?.candidate_cases ?? []).join("|");
+  useEffect(() => {
+    const cands = status?.candidate_cases ?? [];
+    setIncluded((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const c of cands) {
+        if (!(c in next)) { next[c] = true; changed = true; }
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidateKey]);
+
   const setup = async () => {
     setSetupPending(true);
     try {
@@ -87,7 +107,14 @@ export function NnunetTrainPanel() {
   const start = async () => {
     setBusy(true);
     try {
-      await api.json("/api/train/nnunet/start", "POST", JSON.stringify({ mode, config, length }));
+      // Only the cases the user ticked "Include in training" go to the backend. (Backend treats an
+      // omitted / empty subset as "train on all" — kept for backward compatibility.)
+      const subset = candidateCases.filter((c) => included[c]);
+      await api.json(
+        "/api/train/nnunet/start",
+        "POST",
+        JSON.stringify({ mode, config, length, cases: subset }),
+      );
       await fetchStatus();
     } catch (e) {
       setStatus((s) => (s ? { ...s, error: e instanceof Error ? e.message : String(e) } : s));
@@ -97,16 +124,69 @@ export function NnunetTrainPanel() {
   };
 
   const venvReady = status?.venv_ready ?? false;
-  const nCases = status?.candidate_cases?.length ?? 0;
+  const candidateCases = status?.candidate_cases ?? [];
+  const nCases = candidateCases.length;
+  const nIncluded = candidateCases.filter((c) => included[c]).length;
   const running = status?.running ?? false;
   const dim = "var(--c-text-dim)";
+
+  const setAllIncluded = (val: boolean) =>
+    setIncluded((prev) => {
+      const next = { ...prev };
+      for (const c of candidateCases) next[c] = val;
+      return next;
+    });
 
   return (
     <div className="flex flex-col gap-2">
       <span className="text-[11px]" style={{ color: dim }}>
         Trains on each scan's own segmentation (not the consensus), all subgroups. Per-scan scans
         with a labelmap: <b style={{ color: "var(--c-text)" }}>{nCases}</b>
+        {nCases > 0 && (
+          <>
+            {" · "}including <b style={{ color: "var(--c-text)" }}>{nIncluded}</b> in this run
+          </>
+        )}
       </span>
+
+      {/* Per-scan training subset: tick which SAM2-segmented scans to include in this first run. */}
+      {nCases > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center justify-between">
+            <label className="text-[10px] uppercase tracking-wide" style={{ color: dim }}>
+              Include in training
+            </label>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setAllIncluded(true)}
+                disabled={running || nIncluded === nCases}
+                style={{ background: "none", border: "none", color: "var(--c-accent)", cursor: "pointer", padding: 0, fontSize: 10 }}>
+                Select all
+              </button>
+              <button
+                onClick={() => setAllIncluded(false)}
+                disabled={running || nIncluded === 0}
+                style={{ background: "none", border: "none", color: "var(--c-accent)", cursor: "pointer", padding: 0, fontSize: 10 }}>
+                Clear all
+              </button>
+            </div>
+          </div>
+          <div style={{
+            maxHeight: 160, overflow: "auto", border: "1px solid var(--c-border)",
+            borderRadius: 4, background: "var(--c-bg)", padding: 2,
+          }}>
+            {candidateCases.map((c) => (
+              <label key={c} className="flex items-center gap-1 text-[11px] rounded px-1"
+                style={{ cursor: running ? "default" : "pointer", color: "var(--c-text)" }}
+                title={c}>
+                <Checkbox size="small" checked={!!included[c]} disabled={running} sx={{ p: 0.25 }}
+                  onChange={(e) => setIncluded((prev) => ({ ...prev, [c]: e.target.checked }))} />
+                <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", lineHeight: 1.3 }}>{c}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Model + config dropdowns */}
       <label className="text-[10px] uppercase tracking-wide" style={{ color: dim }}>Model</label>
@@ -142,8 +222,8 @@ export function NnunetTrainPanel() {
           </span>
         </>
       ) : (
-        <Button variant="contained" size="small" onClick={start} disabled={busy || running || nCases === 0}>
-          {running ? "Training…" : "Start training"}
+        <Button variant="contained" size="small" onClick={start} disabled={busy || running || nIncluded === 0}>
+          {running ? "Training…" : `Start training${nCases > 0 ? ` (${nIncluded}/${nCases})` : ""}`}
         </Button>
       )}
 

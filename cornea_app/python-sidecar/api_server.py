@@ -39,6 +39,7 @@ import settings
 import orchestration as orch
 import volume_io
 import labels
+import gt_compare
 import slicer_runner
 import masks
 import scar as scar_mod
@@ -561,6 +562,119 @@ def get_segmentation_nifti(case_id: str) -> FileResponse:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"Segmentation conversion failed: {exc}")
     return FileResponse(str(dst), media_type="application/gzip", filename="segmentation.nii.gz")
+
+
+# ── manual ground-truth import + comparison vs the auto segmentation ───────────
+@app.post("/api/case/{case_id}/manual-gt")
+async def import_manual_gt(case_id: str, files: List[UploadFile] = File(...)) -> dict:
+    """Import one or more MANUAL ground-truth labelmaps (0/1/2) made in the annotator app on this
+    case's exported working volume. Each file is validated (shape + affine + label values) against the
+    working volume, then stored under manual_gt/<name>.nii.gz. Per-file errors don't abort the batch."""
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, f"No such case: {case_id}")
+    if not files:
+        raise HTTPException(400, "No file uploaded.")
+    try:
+        base = _working_volume(cid)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"This case has no working volume to align against: {exc}")
+    imported: list[dict] = []
+    errors: list[dict] = []
+    for f in files:
+        data = await f.read()
+        try:
+            dst = gt_compare.manual_gt_path(cid, Path(f.filename or "gt").name)
+            imported.append(gt_compare.validate_and_store(data, f.filename or "gt", base, dst))
+        except Exception as exc:  # noqa: BLE001 — surface a per-file error, keep importing the rest
+            errors.append({"file": f.filename or "gt", "error": str(exc)})
+    if not imported and errors:
+        raise HTTPException(400, "; ".join(e["error"] for e in errors))
+    return {"imported": imported, "errors": errors, "gts": gt_compare.list_gts(cid)}
+
+
+@app.get("/api/case/{case_id}/manual-gt")
+def list_manual_gt(case_id: str) -> dict:
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, f"No such case: {case_id}")
+    auto, src = labels.best_labelmap_nnunet(cid)
+    return {"gts": gt_compare.list_gts(cid), "has_segmentation": auto is not None, "auto_source": src}
+
+
+@app.get("/api/case/{case_id}/manual-gt/{name}/labelmap.nii.gz")
+def get_manual_gt_nifti(case_id: str, name: str) -> FileResponse:
+    cid = orch.safe_case_id(case_id)
+    p = gt_compare.manual_gt_path(cid, name)
+    if not p.exists():
+        raise HTTPException(404, f"No imported GT named {name}.")
+    return FileResponse(str(p), media_type="application/gzip", filename=f"{gt_compare.safe_name(name)}.nii.gz")
+
+
+@app.get("/api/case/{case_id}/manual-gt/{name}/compare")
+def compare_manual_gt(case_id: str, name: str) -> dict:
+    """Per-class (cornea, scar) Dice / Jaccard / HD95 / ASSD / volume(+diff) / voxel-overlap of the
+    named manual GT vs the app's auto labelmap, plus full scar.quantify for each side."""
+    cid = orch.safe_case_id(case_id)
+    p = gt_compare.manual_gt_path(cid, name)
+    if not p.exists():
+        raise HTTPException(404, f"No imported GT named {name}.")
+    auto, src = labels.best_labelmap_nnunet(cid)
+    if auto is None:
+        raise HTTPException(400, "No auto segmentation yet — run SAM2 / scar detection first, then compare.")
+    # Quantify on the RAW volume (spacing + reflectivity) so the numbers match what /scar/auto persists
+    # (raw reflectivity is the cross-scan biomarker). GT and auto share this index grid, so it's exact.
+    base = _ensure_volume_nifti(cid)
+    try:
+        return gt_compare.compare(p, auto, base, name=gt_compare.safe_name(name), auto_source=src or "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Comparison failed: {exc}")
+
+
+@app.get("/api/case/{case_id}/manual-gt/{name}/agreement.nii.gz")
+def get_manual_gt_agreement(case_id: str, name: str, klass: str = "scar") -> FileResponse:
+    """Agreement overlay for one class (scar|cornea): 1=agree (TP), 2=auto-only (FP), 3=GT-only (FN).
+    Stamped with the working-volume affine so it aligns with /volume.nii.gz in the compare viewer."""
+    cid = orch.safe_case_id(case_id)
+    p = gt_compare.manual_gt_path(cid, name)
+    if not p.exists():
+        raise HTTPException(404, f"No imported GT named {name}.")
+    auto, _ = labels.best_labelmap_nnunet(cid)
+    if auto is None:
+        raise HTTPException(400, "No auto segmentation yet.")
+    klass = "cornea" if klass == "cornea" else "scar"
+    base = _working_volume(cid)
+    gt = gt_compare.load_labelmap(p)
+    amap = gt_compare.agreement_map(gt, auto, klass)
+    dst = gt_compare.agreement_dir(cid) / f"{gt_compare.safe_name(name)}__{klass}.nii.gz"
+    try:
+        labels.write_label_nifti(amap, base, dst)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Agreement map failed: {exc}")
+    return FileResponse(str(dst), media_type="application/gzip", filename=f"agreement_{klass}.nii.gz")
+
+
+@app.delete("/api/case/{case_id}/manual-gt/{name}")
+def delete_manual_gt(case_id: str, name: str) -> dict:
+    cid = orch.safe_case_id(case_id)
+    p = gt_compare.manual_gt_path(cid, name)
+    if p.exists():
+        try:
+            p.unlink()
+        except OSError as exc:
+            raise HTTPException(500, f"Could not delete: {exc}")
+    ad = gt_compare.agreement_dir(cid)
+    if ad.exists():
+        for f in ad.glob(f"{gt_compare.safe_name(name)}__*.nii.gz"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    return {"gts": gt_compare.list_gts(cid)}
 
 
 @app.get("/api/case/{case_id}/agreement.nii.gz")
@@ -1785,6 +1899,7 @@ class TrainRequest(BaseModel):
     mode: str = "single3"      # "single3" (bg/cornea/scar) | "cascade" (cornea, then scar-in-cornea)
     config: str = "2d"         # "2d" | "3d_fullres"
     length: str = "short"      # "short" (~10 epochs) | "full" (1000 epochs)
+    cases: list[str] | None = None   # optional subset of candidate cases to train on (None = all)
 
 
 @app.get("/api/train/nnunet/status")
@@ -1817,7 +1932,8 @@ def train_start(req: TrainRequest) -> dict:
     """Build the per-scan dataset(s) across all subgroups and run the standard nnU-Net workflow
     (plan_and_preprocess → train) in the isolated venv. Returns immediately; poll /status."""
     try:
-        return nntrain.start_training(req.mode, req.config, req.length, _ensure_volume_nifti)
+        return nntrain.start_training(req.mode, req.config, req.length, _ensure_volume_nifti,
+                                      subset=req.cases)
     except RuntimeError as exc:
         raise HTTPException(400, str(exc))
 

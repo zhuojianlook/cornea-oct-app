@@ -77,6 +77,12 @@ interface WorkflowState {
   // to correct it (survives the case switch — deliberately NOT cleared by resetForCase).
   reviewConsensusId: string | null;
 
+  // Manual ground-truth comparison: the Sidebar ManualGtPanel sets these to swap the central
+  // viewer to the GtCompareViewer (auto vs imported GT agreement overlay). Reset on case change.
+  gtViewerActive: boolean;
+  gtViewerName: string | null;          // which imported GT is being compared
+  gtViewerClass: "scar" | "cornea";     // which class the agreement overlay shows (a preference)
+
   // busy + status
   segBusy: boolean;
   scarBusy: boolean;
@@ -145,6 +151,10 @@ export const useWorkflowStore = create<WorkflowState>()(
     overlayMode: "self",
     reviewConsensusId: null,
 
+    gtViewerActive: false,
+    gtViewerName: null,
+    gtViewerClass: "scar",
+
     segBusy: false,
     scarBusy: false,
     status: { kind: "idle", title: "Waiting", detail: "Register a volume, then segment the cornea." },
@@ -179,6 +189,9 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.previewGroup = null;
         s.activeTab = "consensus";
         s.overlayMode = "self";
+        s.gtViewerActive = false;
+        s.gtViewerName = null;
+        s.gtViewerClass = "scar";
         s.segBusy = false;
         s.scarBusy = false;
         s.status = { kind: "idle", title: "Waiting", detail: "Segment the cornea to begin." };

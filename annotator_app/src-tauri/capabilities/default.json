@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Annotator: dialogs + broad filesystem read/write (user picks arbitrary NIfTI folders and an output folder; config lives in the OS app-config dir, e.g. ~/.config on Linux). $APPCONFIG is granted explicitly because '**'/'$HOME/**' will NOT traverse the leading-dot '.config' component under the unix glob rule (require_literal_leading_dot=true).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "fs:default",
+    "updater:default",
+    "process:default",
+    { "identifier": "fs:allow-read-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-write-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-read-text-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-write-text-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-read-dir", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-mkdir", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-exists", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] }
+  ]
+}

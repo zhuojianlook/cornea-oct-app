@@ -368,9 +368,15 @@ def _push_step(text: str) -> None:
         _STATE["stage"] = text
 
 
-def start_training(mode: str, config: str, length: str, image_resolver) -> dict:
+def start_training(mode: str, config: str, length: str, image_resolver,
+                   subset: list[str] | None = None) -> dict:
     """Kick off a background training job. Returns immediately with the resolved plan; progress
-    is polled via status(). One job at a time."""
+    is polled via status(). One job at a time.
+
+    `subset` (optional) restricts training to the chosen candidate cases (the user's first-run
+    training subset). It is intersected with the discovered per-scan segmentations, so unknown /
+    stale ids are dropped silently. When None/empty, ALL per-scan segmentations are used (the
+    prior behaviour — backward compatible)."""
     # Claim the slot ATOMICALLY (check + set under one lock) so two near-simultaneous requests
     # can't both pass and corrupt the shared dataset/state. Released on any validation/launch failure.
     with _LOCK:
@@ -383,6 +389,12 @@ def start_training(mode: str, config: str, length: str, image_resolver) -> dict:
         cases = per_scan_segmented_cases()
         if not cases:
             raise RuntimeError("No per-scan segmentations found. Segment some scans (SAM2) first.")
+        if subset:                              # honor the user's chosen first-run training subset
+            chosen = set(subset)
+            cases = [c for c in cases if c in chosen]   # preserve discovery order; drop stale ids
+            if not cases:
+                raise RuntimeError("None of the selected cases have a per-scan segmentation. "
+                                   "Pick at least one segmented scan to include in training.")
         config = config if config in ("2d", "3d_fullres") else "2d"
         trainer = _resolve_short_trainer() if length == "short" else "nnUNetTrainer"
 

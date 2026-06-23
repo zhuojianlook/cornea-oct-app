@@ -1,0 +1,85 @@
+name: build-annotator
+
+# Builds the Cornea Ground-Truth Annotator desktop installers for macOS, Windows and Linux on GitHub.
+# Download them from the workflow run's Artifacts (any run) or, when triggered by an `annotator-v*` tag,
+# from the auto-created GitHub Release (e.g. the macOS .dmg). Tauri can't cross-compile, so we matrix
+# over the three runner OSes (CI installs all system deps itself — no local setup needed).
+on:
+  workflow_dispatch:
+  push:
+    tags: ["annotator-v*"]
+
+permissions:
+  contents: write   # needed to create the Release on tag
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            label: macos-arm64
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            label: macos-intel
+          - platform: ubuntu-22.04
+            args: ""
+            label: linux
+          - platform: windows-latest
+            args: ""
+            label: windows
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install JS deps
+        working-directory: annotator_app
+        run: npm install
+
+      - name: Build app + (on tag) publish Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Sign the bundles + emit latest.json so the in-app updater can verify & self-update.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: annotator_app
+          args: ${{ matrix.args }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ${{ github.ref_type == 'tag' && format('Cornea Annotator {0}', github.ref_name) || '' }}
+          releaseDraft: false
+          prerelease: false
+
+      - name: Upload installers as artifacts (download from this run)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: annotator-${{ matrix.label }}
+          if-no-files-found: warn
+          path: |
+            annotator_app/src-tauri/target/**/release/bundle/**/*.dmg
+            annotator_app/src-tauri/target/**/release/bundle/**/*.app.tar.gz
+            annotator_app/src-tauri/target/**/release/bundle/**/*.AppImage
+            annotator_app/src-tauri/target/**/release/bundle/**/*.deb
+            annotator_app/src-tauri/target/**/release/bundle/**/*.rpm
+            annotator_app/src-tauri/target/**/release/bundle/**/*.msi
+            annotator_app/src-tauri/target/**/release/bundle/**/*.exe
+            annotator_app/src-tauri/target/**/release/bundle/**/*.sig

@@ -82,3 +82,53 @@ export interface ScarMetrics {
   scar_bounds_ijk?: { min: number[]; max: number[] };
   note?: string;
 }
+
+// ── manual ground-truth import + comparison (annotator-app labelmaps) ──────────
+export interface ManualGtInfo {
+  name: string;
+  cornea_voxels: number;
+  scar_voxels: number;
+  imported_at?: number;
+  error?: string;
+}
+
+export interface ManualGtList {
+  gts: ManualGtInfo[];
+  has_segmentation: boolean;
+  auto_source: string | null;
+}
+
+export interface ManualGtImportResult {
+  imported: ManualGtInfo[];
+  errors: { file: string; error: string }[];
+  gts: ManualGtInfo[];
+}
+
+// Per-class (cornea / scar) agreement of a manual GT vs the app's auto segmentation.
+export interface GtClassMetrics {
+  dice: number | null;
+  jaccard: number | null;
+  hd95_mm: number | null;
+  assd_mm: number | null;
+  gt_voxels: number;
+  auto_voxels: number;
+  tp: number;
+  fp: number; // auto-only (over-segmentation)
+  fn: number; // gt-only (missed)
+  gt_volume_mm3: number;
+  auto_volume_mm3: number;
+  volume_signed_diff_mm3: number; // auto − manual
+  volume_abs_diff_mm3: number;
+  volume_rel_diff_pct: number | null;
+  gt_area_mm2?: number;
+  auto_area_mm2?: number;
+}
+
+export interface GtCompareResult {
+  name: string;
+  auto_source: string;
+  spacing_mm: number[];
+  classes: { cornea: GtClassMetrics; scar: GtClassMetrics };
+  gt_quant: ScarMetrics;
+  auto_quant: ScarMetrics;
+}

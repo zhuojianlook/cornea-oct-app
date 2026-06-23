@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "/home/zhuojian/.local/bin/npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    }
+  }
+}

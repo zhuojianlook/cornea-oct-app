@@ -4,6 +4,7 @@ import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { OctLoader } from "../panels/OctLoader";
 import { NnunetTrainPanel } from "../panels/NnunetTrainPanel";
+import { ManualGtPanel } from "../panels/ManualGtPanel";
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -93,6 +94,12 @@ export function Sidebar() {
 
       <Section title="Normal baseline (controls)">
         <NormalBaselinePanel />
+      </Section>
+
+      <Divider sx={{ borderColor: "var(--c-border)" }} />
+
+      <Section title="Manual ground truth (compare)">
+        <ManualGtPanel />
       </Section>
 
       <Divider sx={{ borderColor: "var(--c-border)" }} />

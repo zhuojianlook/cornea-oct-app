@@ -9,6 +9,7 @@ import { attach, loadVolume, setView, webglFailure, type ViewName } from "../../
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
+import { GtCompareViewer } from "./GtCompareViewer";
 
 export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -17,6 +18,9 @@ export function VolumeCanvas() {
   const setCaseId = useCaseStore((s) => s.setCaseId);
   const openCase = useCaseStore((s) => s.openCase);
   const reviewConsensusId = useWorkflowStore((s) => s.reviewConsensusId);
+  const gtViewerActive = useWorkflowStore((s) => s.gtViewerActive);
+  const gtViewerName = useWorkflowStore((s) => s.gtViewerName);
+  const gtViewerClass = useWorkflowStore((s) => s.gtViewerClass);
   const wfSet = useWorkflowStore((s) => s.set);
   const correcting = useWorkflowStore((s) => s.correcting);
   const paintMode = useWorkflowStore((s) => s.paintMode);
@@ -94,6 +98,21 @@ export function VolumeCanvas() {
     setViewState(v);
     setView(v);
   };
+
+  // Manual-GT comparison: swap in the auto-vs-GT agreement overlay viewer (its own niivue).
+  if (gtViewerActive && gtViewerName && caseInfo?.case_id) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
+        <GtCompareViewer
+          caseId={caseInfo.case_id}
+          name={gtViewerName}
+          klass={gtViewerClass}
+          onClose={() => wfSet("gtViewerActive", false)}
+          onClassChange={(k) => wfSet("gtViewerClass", k)}
+        />
+      </div>
+    );
+  }
 
   // A per-subgroup consensus: the synchronized multi-scan grid is the view (2D, no WebGL needed).
   if (isSubgroup) {
