@@ -56,11 +56,19 @@ def resolve_case_meta(case_id: str) -> dict:
     ref = rep.get("reference")
     if ref and ref != case_id:
         return {**resolve_case_meta(ref), "variant": "consensus"}
+    meta = parse_case_meta(None)
     for key in ("oct_source", "input_volume"):
-        meta = parse_case_meta(m.get(key))
-        if meta.get("patient_id"):
-            return meta
-    return parse_case_meta(None)
+        parsed = parse_case_meta(m.get(key))
+        if parsed.get("patient_id"):
+            meta = parsed
+            break
+    # A user-corrected patient/eye persisted on the case (group-header edit) wins over the
+    # filename parse; date/variant still come from the filename.
+    if m.get("patient_id"):
+        meta = {**meta, "patient_id": str(m["patient_id"]).upper()}
+    if m.get("eye"):
+        meta = {**meta, "eye": str(m["eye"]).upper()}
+    return meta
 
 
 def _cases_with_labelmap() -> list[str]:

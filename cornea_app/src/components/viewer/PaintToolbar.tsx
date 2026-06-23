@@ -1,6 +1,7 @@
-/* Pen controls for the correction drawing layer (cornea / background / scar / erase). */
+/* Pen controls for the correction drawing layer (cornea / background / scar / erase) + brush size,
+   filled-region pen, and the Smart fill (3-D GrowCut) that propagates scribbles across all slices. */
 
-import { ToggleButton, ToggleButtonGroup, Slider, Tooltip } from "@mui/material";
+import { ToggleButton, ToggleButtonGroup, Slider, Tooltip, Button } from "@mui/material";
 import { useWorkflowStore, type PenLabel } from "../../store/workflowStore";
 import { setDrawOpacity } from "../../niivue/nvController";
 
@@ -12,15 +13,22 @@ const PENS: { value: PenLabel; label: string; color: string }[] = [
 ];
 
 export function PaintToolbar() {
-  const { penLabel, correcting, drawOpacity, setPenLabel, set } = useWorkflowStore();
+  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity,
+          setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, set } = useWorkflowStore();
   if (!correcting) return null;
 
   return (
-    <div className="flex items-center gap-3 px-3 border-b" style={{ height: 36, borderColor: "var(--c-border)" }}>
-      <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--c-text-dim)" }}>
+    <div className="flex items-center gap-3 px-3 border-b overflow-x-auto [&>*]:shrink-0" style={{ minHeight: 36, borderColor: "var(--c-border)" }}>
+      <ToggleButtonGroup size="small" exclusive value={paintMode ? "paint" : "nav"}
+        onChange={(_, v) => v !== null && setPaintMode(v === "paint")}>
+        <ToggleButton value="paint" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>✏ Paint</ToggleButton>
+        <ToggleButton value="nav" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>✋ Navigate</ToggleButton>
+      </ToggleButtonGroup>
+      <div style={{ width: 1, height: 22, background: "var(--c-border)" }} />
+      <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--c-text-dim)", opacity: paintMode ? 1 : 0.4 }}>
         Pen
       </span>
-      <ToggleButtonGroup size="small" exclusive value={penLabel} onChange={(_, v) => v !== null && setPenLabel(v)}>
+      <ToggleButtonGroup size="small" exclusive disabled={!paintMode} value={penLabel} onChange={(_, v) => v !== null && setPenLabel(v)}>
         {PENS.map((p) => (
           <ToggleButton key={p.value} value={p.value}>
             <span
@@ -30,6 +38,25 @@ export function PaintToolbar() {
           </ToggleButton>
         ))}
       </ToggleButtonGroup>
+      <Tooltip title="Brush size (voxels)">
+        <div className="flex items-center gap-2" style={{ width: 120 }}>
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>Size</span>
+          <Slider size="small" min={1} max={15} step={1} value={penSize} valueLabelDisplay="auto"
+            onChange={(_, v) => setPenSize(v as number)} />
+        </div>
+      </Tooltip>
+      <Tooltip title="Filled pen: draw a closed outline around a region and the enclosed area is painted (one stroke per patch).">
+        <ToggleButton size="small" value="filled" selected={penFilled}
+          onChange={() => setPenFilled(!penFilled)} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>
+          ▣ Fill region
+        </ToggleButton>
+      </Tooltip>
+      <Tooltip title="Smart fill (GrowCut): after scribbling a little Cornea, Background AND Scar on a few slices, this propagates those labels through the whole 3-D volume by intensity similarity — so you don't paint every slice/view. Review and correct, then Apply.">
+        <Button size="small" variant="contained" onClick={() => runSmartFill()}
+          sx={{ py: 0.25, px: 1.2, fontSize: 12, textTransform: "none" }}>
+          ✨ Smart fill
+        </Button>
+      </Tooltip>
       <Tooltip title="Drawing opacity">
         <div className="flex items-center gap-2" style={{ width: 140 }}>
           <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>

@@ -24,13 +24,19 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
-def write_png_rgb(path, rgb):
+def write_png_rgb(path, rgb, compress_level=6):
     """Write an RGB uint8 numpy array to a PNG file using only stdlib."""
     rgb = np.asarray(rgb, dtype=np.uint8)
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("write_png_rgb expects an HxWx3 uint8 array")
     height, width, _ = rgb.shape
-    raw = b"".join(b"\x00" + rgb[row].tobytes() for row in range(height))
+    # PNG scanlines = a filter byte (0) prepended to each row. Build it vectorised (no Python
+    # per-row loop, which held the GIL and dominated dense renders) so it parallelises across
+    # threads and is simply much faster.
+    scanlines = np.empty((height, 1 + width * 3), dtype=np.uint8)
+    scanlines[:, 0] = 0
+    scanlines[:, 1:] = np.ascontiguousarray(rgb).reshape(height, width * 3)
+    raw = scanlines.tobytes()
 
     def chunk(kind, data):
         return (
@@ -43,7 +49,7 @@ def write_png_rgb(path, rgb):
     png = (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IDAT", zlib.compress(raw, compress_level))
         + chunk(b"IEND", b"")
     )
     with open(path, "wb") as fp:
@@ -302,77 +308,103 @@ def sampled_indices_for_orientation(volume_shape_kji, masks_by_name, orientation
 
 
 def save_previews(volume_array, masks_by_name, output_dir, prefix, spacing_ijk=None,
-                  max_slices_per_orientation=9, max_dim=None):
+                  max_slices_per_orientation=9, max_dim=None, rotate=None, compress_level=None):
     """`max_slices_per_orientation` may be an int (all orientations) OR a dict
     {orientation: count} for per-axis density (e.g. dense axial B-scans for OCT scrub).
-    `max_dim` caps the longest PNG side (keeps payload small when rendering many slices)."""
+    `max_dim` caps the longest PNG side (keeps payload small when rendering many slices).
+    `rotate` is an optional {orientation: k} of 90° CCW turns (np.rot90 k; negative = CW)
+    baked into the saved PNG so the gallery shows the slice the right way up (cornea on top).
+    image_width/height in the manifest reflect the rotated PNG."""
     ensure_dir(output_dir)
     cleanup_prefix(output_dir, prefix)
     spacing_ijk = spacing_ijk or [1.0, 1.0, 1.0]
-    saved = []
-    manifest_items = []
+    # Dense renders (plain context scrubs OR dense overlay panels) are served lazily one slice
+    # at a time, so trade a little file size for a much faster render (zlib level 1). Small
+    # overlay sets (the 9-slice segmentation previews) keep level 6.
+    if compress_level is None:
+        compress_level = 1 if not masks_by_name else 6
+
+    def _render_slice(orientation, stack_position, index):
+        rgb = gray_to_rgb(slice_volume(volume_array, orientation, index))
+        source_height, source_width = rgb.shape[:2]
+        for segment_name in ("background", "cornea", "scar_diffuse", "scar_mod", "scar"):
+            mask = masks_by_name.get(segment_name)
+            if mask is None:
+                continue
+            if segment_name.startswith("scar"):
+                alpha = 0.62          # paint scar tiers last (diffuse→dense), on top
+            elif segment_name == "cornea":
+                alpha = 0.56
+            elif prefix == "seeds":
+                alpha = 0.58
+            else:
+                alpha = 0.20
+            rgb = overlay_mask(
+                rgb,
+                slice_mask(mask, orientation, index) > 0,
+                SEGMENT_COLORS.get(segment_name, (255, 255, 255)),
+                alpha=alpha,
+            )
+        rgb = scale_to_physical_aspect(rgb, orientation, spacing_ijk)
+        if max_dim:
+            h, w = rgb.shape[:2]
+            longest = max(h, w)
+            if longest > max_dim:
+                s = max_dim / longest
+                rgb = resize_rgb_nearest(rgb, round(h * s), round(w * s))
+        path = os.path.join(output_dir, f"{prefix}_{orientation}_{index:04d}.png")
+        final = np.flipud(rgb)
+        k = (rotate or {}).get(orientation, 0)
+        if k:
+            final = np.ascontiguousarray(np.rot90(final, k))
+        write_png_rgb(path, final, compress_level=compress_level)
+        axes = orientation_axes(orientation)
+        return path, {
+            "file_name": os.path.basename(path),
+            "prefix": prefix,
+            "orientation": orientation,
+            "slice_index": int(index),
+            "stack_position": int(stack_position),
+            "fixed_axis": axes["fixed_axis"],
+            "row_axis": axes["row_axis"],
+            "column_axis": axes["column_axis"],
+            "source_width": int(source_width),
+            "source_height": int(source_height),
+            "image_width": int(final.shape[1]),
+            "image_height": int(final.shape[0]),
+            "rotate_k": int(k),   # 90° CCW turns baked into the PNG (so clicks can undo it)
+            "spacing_ijk": [float(value) for value in spacing_ijk],
+            "paint_pixels": {
+                name: int(np.count_nonzero(slice_mask(mask, orientation, index) > 0))
+                for name, mask in masks_by_name.items()
+                if mask is not None
+            },
+        }
+
+    tasks = []
     for orientation in ("axial", "coronal", "sagittal"):
         mx = (max_slices_per_orientation.get(orientation, 9)
               if isinstance(max_slices_per_orientation, dict) else max_slices_per_orientation)
-        indices = sampled_indices_for_orientation(
-            volume_array.shape,
-            masks_by_name,
-            orientation,
-            mx,
-        )
+        indices = sampled_indices_for_orientation(volume_array.shape, masks_by_name, orientation, mx)
         for stack_position, index in enumerate(indices):
-            rgb = gray_to_rgb(slice_volume(volume_array, orientation, index))
-            source_height, source_width = rgb.shape[:2]
-            for segment_name in ("background", "cornea", "scar_diffuse", "scar_mod", "scar"):
-                mask = masks_by_name.get(segment_name)
-                if mask is None:
-                    continue
-                if segment_name.startswith("scar"):
-                    alpha = 0.62          # paint scar tiers last (diffuse→dense), on top
-                elif segment_name == "cornea":
-                    alpha = 0.56
-                elif prefix == "seeds":
-                    alpha = 0.58
-                else:
-                    alpha = 0.20
-                rgb = overlay_mask(
-                    rgb,
-                    slice_mask(mask, orientation, index) > 0,
-                    SEGMENT_COLORS.get(segment_name, (255, 255, 255)),
-                    alpha=alpha,
-                )
-            rgb = scale_to_physical_aspect(rgb, orientation, spacing_ijk)
-            if max_dim:
-                h, w = rgb.shape[:2]
-                longest = max(h, w)
-                if longest > max_dim:
-                    s = max_dim / longest
-                    rgb = resize_rgb_nearest(rgb, round(h * s), round(w * s))
-            path = os.path.join(output_dir, f"{prefix}_{orientation}_{index:04d}.png")
-            write_png_rgb(path, np.flipud(rgb))
-            saved.append(path)
-            axes = orientation_axes(orientation)
-            manifest_items.append(
-                {
-                    "file_name": os.path.basename(path),
-                    "prefix": prefix,
-                    "orientation": orientation,
-                    "slice_index": int(index),
-                    "stack_position": int(stack_position),
-                    "fixed_axis": axes["fixed_axis"],
-                    "row_axis": axes["row_axis"],
-                    "column_axis": axes["column_axis"],
-                    "source_width": int(source_width),
-                    "source_height": int(source_height),
-                    "image_width": int(rgb.shape[1]),
-                    "image_height": int(rgb.shape[0]),
-                    "spacing_ijk": [float(value) for value in spacing_ijk],
-                    "paint_pixels": {
-                        name: int(np.count_nonzero(slice_mask(mask, orientation, index) > 0))
-                        for name, mask in masks_by_name.items()
-                        if mask is not None
-                    },
-                }
-            )
+            tasks.append((orientation, stack_position, index))
+
+    # Render slices in parallel across threads. The per-slice work (numpy resize + zlib PNG
+    # encode) releases the GIL, so threads scale well — and, unlike a fork/spawn pool, they
+    # never touch the sidecar's CUDA/torch state, so this is safe to run in-process.
+    results = [None] * len(tasks)
+    if len(tasks) <= 1:
+        for i, t in enumerate(tasks):
+            results[i] = _render_slice(*t)
+    else:
+        import concurrent.futures
+        workers = max(1, min(16, (os.cpu_count() or 2)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_render_slice, *t): i for i, t in enumerate(tasks)}
+            for fut in concurrent.futures.as_completed(futs):
+                results[futs[fut]] = fut.result()
+
+    saved = [r[0] for r in results]
+    manifest_items = [r[1] for r in results]
     save_manifest(output_dir, manifest_items)
     return saved

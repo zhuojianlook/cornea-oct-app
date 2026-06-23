@@ -301,6 +301,75 @@ def segment_scar_from_clicks(base_nifti: Path, labelmap_ijk: np.ndarray, clicks,
     return scar, {"per_plane": per_plane, "model": "sam2.1_hiera_small"}
 
 
+def _plane_2d(arr3d: np.ndarray, plane: str, frame: int) -> np.ndarray:
+    """The 2-D slice SAM2 sees for (plane, frame). Indexed [row, col]; a SAM2 point is (x=col, y=row)
+    — matching _ijk_to_prompt (axial vol[:,:,k], coronal vol[:,j,:], sagittal vol[i,:,:])."""
+    if plane == "axial":
+        return arr3d[:, :, frame]
+    if plane == "coronal":
+        return arr3d[:, frame, :]
+    return arr3d[frame, :, :]
+
+
+def _dim_negatives(vol2d: np.ndarray, cornea2d: np.ndarray, pos_xy, k: int = 2, min_dist: int = 12):
+    """Negative SAM2 points = the dimmest in-cornea pixels of this frame, spaced apart and away from
+    the positive seeds — telling SAM2 'scar is the bright spot, NOT the normal stroma', so it carves
+    the lesion instead of grabbing the whole reflective band."""
+    ys, xs = np.where(cornea2d)
+    if ys.size == 0:
+        return []
+    order = np.argsort(vol2d[ys, xs])               # dimmest first
+    chosen = []
+    for oi in order[:4000]:
+        x, y = int(xs[oi]), int(ys[oi])
+        if all(abs(x - px) + abs(y - py) > min_dist for px, py in pos_xy) and \
+           all(abs(x - cx) + abs(y - cy) > min_dist for cx, cy in chosen):
+            chosen.append((x, y))
+        if len(chosen) >= k:
+            break
+    return chosen
+
+
+def segment_scar_consensus(base_nifti: Path, labelmap_ijk: np.ndarray, seed_ijks, work: Path,
+                           vote: int = 2, planes=("axial", "coronal", "sagittal"), neg_per_frame: int = 2):
+    """AUTO scar via the same 3-views-as-videos + consensus strategy used for cornea: prompt SAM2 on
+    EACH plane (as a video) at the brightness seed points — PLUS dim-stroma negative points on each
+    prompted frame so SAM2 carves the scar rather than the whole reflective band — propagate in 3D
+    (fwd+back), and keep the CONSENSUS (≥`vote` of 3 views) ∩ cornea. Returns (mask, meta)."""
+    raw = np.asarray(nib.load(str(base_nifti)).dataobj).astype(np.float32)
+    vol = gaussian_filter(raw, sigma=(1.0, 1.0, 0.4))
+    work = Path(work); work.mkdir(parents=True, exist_ok=True)
+    cornea = (labelmap_ijk == 1) | (labelmap_ijk == 2)
+    if not seed_ijks:
+        return np.zeros(vol.shape, bool), {"per_plane": {}, "vote": vote, "n_seeds": 0,
+                                           "model": "sam2.1_hiera_small", "reason": "no seeds"}
+    votes = np.zeros(vol.shape, np.uint8)
+    per_plane = {}
+    for pl in planes:
+        frame_points: dict = {}
+        for ijk in seed_ijks:
+            frame, (x, y) = _ijk_to_prompt(pl, ijk)
+            frame_points.setdefault(int(frame), []).append((x, y, 1))   # positive (scar)
+        if neg_per_frame > 0:                                            # add dim-stroma negatives per frame
+            for frame in list(frame_points):
+                pos_xy = [(p[0], p[1]) for p in frame_points[frame] if p[2] == 1]
+                for nx, ny in _dim_negatives(_plane_2d(vol, pl, frame), _plane_2d(cornea, pl, frame),
+                                             pos_xy, k=neg_per_frame):
+                    frame_points[frame].append((nx, ny, 0))
+        try:
+            m = segment_plane_prompted(vol, pl, work, frame_points) & cornea
+        except Exception as exc:  # noqa: BLE001 — keep other planes if one OOMs
+            per_plane[pl] = {"voxels": 0, "error": str(exc)[:200]}
+            _free_gpu()
+            continue
+        votes += m.astype(np.uint8)
+        per_plane[pl] = {"voxels": int(m.sum()), "seed_frames": sorted(frame_points)}
+    fused = (votes >= vote) & cornea
+    _free_gpu()
+    return fused, {"per_plane": per_plane, "vote": vote, "n_seeds": len(seed_ijks),
+                   "neg_per_frame": neg_per_frame, "model": "sam2.1_hiera_small"}
+
+
 def segment_volume(volume_nifti: Path, work: Path,
                    planes=("axial", "coronal", "sagittal"),
                    vote: int = 2) -> tuple[np.ndarray, dict]:

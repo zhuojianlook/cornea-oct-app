@@ -5,11 +5,16 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ToggleButton, ToggleButtonGroup, Slider, CircularProgress } from "@mui/material";
-import { api } from "../../api/client";
+import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { pxToIjk, brushVoxels } from "../../api/coords";
 import type { PreviewImage } from "../../api/types";
+
+// A preview either carries an inline base64 data_url (segmentation/consensus) or a lazy `src`
+// URL loaded on demand (dense context scrub) — resolve `src` to an absolute sidecar URL.
+const imgSrc = (im?: PreviewImage | null): string =>
+  im ? (im.src ? resourceUrl(im.src) : im.data_url) : "";
 
 type Group = "segmentation" | "context";
 const GROUP_LABEL: Record<Group, string> = {
@@ -46,8 +51,26 @@ export function SliceGallery() {
   const [group, setGroup] = useState<Group>("context");
   const [orient, setOrient] = useState<(typeof ORIENTS)[number]>("axial");
   const [images, setImages] = useState<PreviewImage[]>([]);
+  const [rawImages, setRawImages] = useState<PreviewImage[]>([]);
+  const [beforeAfter, setBeforeAfter] = useState(false);
   const [idx, setIdx] = useState(0);
   const [loading, setLoading] = useState(false);
+  // "Fix columns" → mark BAD frame-columns with the mouse (click/drag; click again to unmark),
+  // then re-run preprocessing on them. Every non-bad column is an anchor (good) by default.
+  const [colSel, setColSel] = useState(false);
+  const [badCols, setBadCols] = useState<Set<number>>(new Set());
+  const [rerunBusy, setRerunBusy] = useState(false);
+  const colPaintingRef = useRef(false);
+  const colDragModeRef = useRef<"add" | "remove">("add"); // a drag adds or removes (set on press)
+  const lastCaseRef = useRef<string | null>(null); // reset slice position only when the case changes
+  // Display-only image enhancement (does NOT change the data) to aid seeing the corneal border.
+  const [enhContrast, setEnhContrast] = useState(false);
+  const [enhBlur, setEnhBlur] = useState(false);
+  // Preprocessing-steps filmstrip: every intermediate output for the central sagittal slice,
+  // shown in an overlay on demand (button or double-click on a slice).
+  const [stepsOpen, setStepsOpen] = useState(false);
+  const [stepsBusy, setStepsBusy] = useState(false);
+  const [steps, setSteps] = useState<{ label: string; data_url: string }[]>([]);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -104,10 +127,15 @@ export function SliceGallery() {
         if (cancelled) return;
         const imgs = r.images || [];
         setImages(imgs);
-        // Default to a middle slice of the current orientation (edge slices often
-        // miss the cornea), so the viewer/screenshots show the structure.
-        const mid = imgs.filter((i) => i.orientation === orient);
-        if (mid.length) setIdx(Math.floor(mid.length / 2));
+        // Reset to a middle slice ONLY when the case changed (a new scan) AND real slices have
+        // arrived. Claiming the case on the first (often EMPTY) response would skip centering once
+        // the real slices render. For re-renders of the SAME case — re-run preprocessing, SAM2, scar
+        // edit, group switch — keep the current frame (safeIdx clamps if the slice count shrank).
+        if (lastCaseRef.current !== caseId && imgs.length) {
+          lastCaseRef.current = caseId;
+          const mid = imgs.filter((i) => i.orientation === orient);
+          if (mid.length) setIdx(Math.floor(mid.length / 2));
+        }
       })
       .catch(() => !cancelled && setImages([]))
       .finally(() => !cancelled && setLoading(false));
@@ -115,6 +143,37 @@ export function SliceGallery() {
       cancelled = true;
     };
   }, [caseId, effectiveGroup, segSig, refetchTick]);
+
+  // The pre-correction ("before") slices for the same scan. They exist only once a scan has
+  // been preprocessed (the corrected slices then live in the normal context group = "after").
+  useEffect(() => {
+    setRawImages([]);   // clear first so a previous case's raw can't pair with the new corrected
+    if (!caseId) return;
+    let cancelled = false;
+    api
+      .json<{ images: PreviewImage[] }>(`/api/case/${caseId}/previews/context_raw`)
+      .then((r) => !cancelled && setRawImages(r.images || []))
+      .catch(() => !cancelled && setRawImages([]));
+    return () => { cancelled = true; };
+  }, [caseId, segSig]);
+
+  // The 3rd before/after panel overlays for this scan, rendered dense+rotated to match the
+  // context slices: "seg" = this scan's own cornea+scar (after SAM2), "cons" = its subgroup
+  // consensus (after a per-subgroup consensus build). Empty until those have run.
+  const [segImages, setSegImages] = useState<PreviewImage[]>([]);
+  const [consImages, setConsImages] = useState<PreviewImage[]>([]);
+  const [thirdMode, setThirdMode] = useState<"seg" | "cons">("seg");
+  useEffect(() => {
+    setSegImages([]);
+    setConsImages([]);
+    if (!caseId) return;
+    let cancelled = false;
+    api.json<{ images: PreviewImage[] }>(`/api/case/${caseId}/previews/context_seg`)
+      .then((r) => !cancelled && setSegImages(r.images || [])).catch(() => undefined);
+    api.json<{ images: PreviewImage[] }>(`/api/case/${caseId}/previews/context_cons`)
+      .then((r) => !cancelled && setConsImages(r.images || [])).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [caseId, segSig]);
 
   const orientImgs = useMemo(
     () =>
@@ -126,8 +185,129 @@ export function SliceGallery() {
   const safeIdx = Math.min(idx, Math.max(0, orientImgs.length - 1));
   const cur = orientImgs[safeIdx];
 
+  // Before/after is only meaningful on the working "context" slices, once the pre-correction
+  // ("before") snapshot exists. The current slice (cur) is the corrected "after"; match the
+  // raw "before" to it by slice index (raw + corrected share the same geometry).
+  const canBeforeAfter = effectiveGroup === "context" && rawImages.length > 0;
+  const rawCur = canBeforeAfter && cur
+    ? rawImages.find((i) => i.orientation === orient && i.slice_index === cur.slice_index)
+    : undefined;
+  const showBeforeAfter = beforeAfter && canBeforeAfter && !!cur;
+
+  // 3rd panel (shown beside before/after): toggles between this scan's own segmentation and its
+  // subgroup consensus, whichever are available. Matched to the corrected slice by index.
+  const hasSeg = segImages.length > 0;
+  const hasCons = consImages.length > 0;
+  const canThird = effectiveGroup === "context" && (hasSeg || hasCons);
+  const effThird: "seg" | "cons" = thirdMode === "cons" && hasCons ? "cons" : hasSeg ? "seg" : "cons";
+  const thirdList = effThird === "cons" ? consImages : segImages;
+  const thirdCur = showBeforeAfter && cur
+    ? thirdList.find((i) => i.orientation === orient && i.slice_index === cur.slice_index)
+    : undefined;
+
+  // "Mark bad columns" → re-run preprocessing on those frames. A scan is eligible the moment it's
+  // PREPROCESSED (context_raw exists) — NO SAM2 needed. Frame count comes from the raw snapshot's
+  // sagittal preview, so the button is discoverable on ANY view (Slices OR Segmentation); clicking
+  // it switches to the corrected sagittal view where the column band is shown.
+  const nFrames = rawImages.find((i) => i.orientation === "sagittal")?.source_height ?? 0;
+  const canMarkColumns = !previewGroup && rawImages.length > 0 && nFrames > 1 && !showBeforeAfter;
+
+  // Map a pointer position to a FRAME index. The same frame is a vertical COLUMN in the sagittal
+  // view (horizontal axis = frames) and a horizontal ROW in the coronal view (vertical axis =
+  // frames, flipped by the display flipud) — so a bad frame can be marked from whichever view
+  // shows it best (coronal often makes a misaligned frame's jagged left/right border obvious).
+  const frameAt = (clientX: number, clientY: number): number | null => {
+    const img = imgRef.current;
+    if (!img || nFrames < 2) return null;
+    const rect = img.getBoundingClientRect();
+    if (orient === "sagittal") {
+      const ffx = (clientX - rect.left) / rect.width;
+      return ffx < 0 || ffx > 1 ? null : Math.round(ffx * (nFrames - 1));
+    }
+    if (orient === "coronal") {
+      const ffy = (clientY - rect.top) / rect.height;
+      return ffy < 0 || ffy > 1 ? null : Math.round((1 - ffy) * (nFrames - 1)); // frames run bottom→top
+    }
+    return null;
+  };
+  const paintColAt = (clientX: number, clientY: number) => {
+    const f = frameAt(clientX, clientY);
+    if (f == null) return;
+    const r = 1; // ±1 frame brush
+    const touched: number[] = [];
+    for (let k = Math.max(0, f - r); k <= Math.min(nFrames - 1, f + r); k++) touched.push(k);
+    setBadCols((p) => {
+      const next = new Set(p);
+      if (colDragModeRef.current === "add") touched.forEach((x) => next.add(x));
+      else touched.forEach((x) => next.delete(x)); // click-again-to-deselect
+      return next;
+    });
+  };
+
+  const rerunColumns = async () => {
+    if (!caseId || badCols.size === 0) return;
+    setRerunBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify({
+        force_columns: [...badCols], good_columns: [], // every non-bad column is a good anchor
+      }));
+      setColSel(false);
+      setBadCols(new Set());
+      wfSet("segVersion", segSig + 1); // refetch corrected previews (re-rendered) + dropped seg
+    } catch {
+      /* surfaced via the spinner stopping; the volume is unchanged on failure */
+    } finally {
+      setRerunBusy(false);
+    }
+  };
+  // Render the preprocessing filmstrip for the central slice. Reflects the CURRENT bad-column
+  // selection (or the persisted one on a plain double-click) so step 8 matches a real re-run.
+  const loadSteps = async () => {
+    if (!caseId) return;
+    setStepsOpen(true);
+    setStepsBusy(true);
+    setSteps([]);
+    try {
+      const body = colSel ? { force_columns: [...badCols] } : {};
+      const r = await api.json<{ steps: { label: string; data_url: string }[] }>(
+        `/api/case/${caseId}/oct-preprocess-steps`, "POST", JSON.stringify(body),
+      );
+      setSteps(r.steps || []);
+    } catch {
+      setSteps([]);
+    } finally {
+      setStepsBusy(false);
+    }
+  };
+
+  // Double-click a slice → open the steps filmstrip (the discoverable gesture the user expects).
+  const onSliceDoubleClick = () => {
+    if (caseId && (effectiveGroup === "context" || showBeforeAfter)) loadSteps();
+  };
+
+  // Contiguous runs of selected frames → bands to draw on the slice.
+  const colRuns = (s: Set<number>): [number, number][] => {
+    const a = [...s].sort((x, y) => x - y);
+    const out: [number, number][] = [];
+    let st: number | null = null, pr: number | null = null;
+    for (const f of a) {
+      if (st == null) { st = f; pr = f; }
+      else if (f === (pr as number) + 1) { pr = f; }
+      else { out.push([st, pr as number]); st = f; pr = f; }
+    }
+    if (st != null) out.push([st, pr as number]);
+    return out;
+  };
+
+  // CSS filter for the display-only enhancement (applied to grayscale OCT images only).
+  const enhanceFilter = [enhContrast ? "contrast(2.2) brightness(1.12)" : "", enhBlur ? "blur(0.8px)" : ""]
+    .filter(Boolean).join(" ") || undefined;
+
   const onImgClick = (e: React.MouseEvent<HTMLImageElement>) => {
-    if (!hintMode || !cur) return;
+    // Scar hints must land on the UNROTATED previews (segmentation/consensus). The "context"
+    // slices are display-rotated for review, so their pixel→voxel mapping (pxToIjk) wouldn't
+    // match — ignore clicks there so a hint can't be placed at the wrong voxel.
+    if (!hintMode || !cur || effectiveGroup === "context") return;
     const img = e.currentTarget;
     const rect = img.getBoundingClientRect();
     const fx = (e.clientX - rect.left) / rect.width;
@@ -182,6 +362,16 @@ export function SliceGallery() {
     }
   };
   const onPointerDown = (e: React.PointerEvent) => {
+    if (colSel) {   // Fix-columns: toggle frame-columns instead of painting scar
+      e.preventDefault();
+      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+      colPaintingRef.current = true;
+      const f = frameAt(e.clientX, e.clientY);
+      // Press on an already-bad frame → this drag REMOVES (deselect); else it ADDS.
+      colDragModeRef.current = f != null && badCols.has(f) ? "remove" : "add";
+      paintColAt(e.clientX, e.clientY);
+      return;
+    }
     if (!editing) return;
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
@@ -190,9 +380,14 @@ export function SliceGallery() {
     paintAt(e);
   };
   const onPointerMove = (e: React.PointerEvent) => {
+    if (colSel) {
+      if (colPaintingRef.current) paintColAt(e.clientX, e.clientY);
+      return;
+    }
     if (editing && paintingRef.current) paintAt(e);
   };
   const onPointerUp = async () => {
+    if (colSel) { colPaintingRef.current = false; return; }
     if (!editing || !paintingRef.current) return;
     paintingRef.current = false;
     const voxels = Array.from(voxelsRef.current.values());
@@ -233,7 +428,79 @@ export function SliceGallery() {
           ))}
         </ToggleButtonGroup>
 
-        {cur && (
+        {canBeforeAfter && !colSel && (
+          <ToggleButton size="small" value="ba" selected={beforeAfter}
+            onChange={() => setBeforeAfter((b) => !b)}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="View all: original (raw), preprocessed (corrected), and segmented side by side, scrubbed together">
+            ⇆ View all
+          </ToggleButton>
+        )}
+
+        {canMarkColumns && (
+          <ToggleButton size="small" value="cols" selected={colSel}
+            onChange={() => {
+              const on = !colSel;
+              setColSel(on);
+              if (on) {
+                // Switch to the corrected "Slices" view; default to sagittal but KEEP coronal if the
+                // user is already there (both allow marking). Don't reset the slice position.
+                setGroup("context");
+                if (orient !== "sagittal" && orient !== "coronal") setOrient("sagittal");
+                wfSet("scarEditMode", false); // only one editing mode owns the canvas at a time
+              }
+            }}
+            disabled={rerunBusy}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Mark BAD columns (the rest are good anchors), then re-run preprocessing on just those columns (no SAM2 needed)">
+            ▥ Fix columns
+          </ToggleButton>
+        )}
+        {canMarkColumns && (
+          <ToggleButton size="small" value="steps" selected={stepsOpen}
+            onClick={loadSteps} disabled={stepsBusy}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Show every preprocessing step for the central sagittal slice (image enhancement, edge, quadratic fit, 3D active, final warp). Tip: double-click a slice to open this.">
+            ⚙ Steps
+          </ToggleButton>
+        )}
+        {colSel && canMarkColumns && (
+          <>
+            <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
+            <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>mark in sagittal (columns) or coronal (rows) · click again to unmark · the rest are anchors</span>
+            {badCols.size > 0 && (
+              <button onClick={() => setBadCols(new Set())} disabled={rerunBusy}
+                style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                Clear
+              </button>
+            )}
+            <button onClick={rerunColumns} disabled={rerunBusy || badCols.size === 0}
+              style={{ background: badCols.size ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !badCols.size ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !badCols.size ? 0.6 : 1 }}>
+              {rerunBusy ? "Re-running…" : "Re-run preprocessing"}
+            </button>
+          </>
+        )}
+
+        {/* Display-only image enhancement (contrast / denoise blur) to make the corneal border
+            easier to see when marking bad columns. Does NOT change the data. */}
+        {cur && (effectiveGroup === "context" || showBeforeAfter) && (
+          <>
+            <ToggleButton size="small" value="contrast" selected={enhContrast}
+              onChange={() => setEnhContrast((v) => !v)}
+              sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+              title="Display-only contrast boost (does not change the data)">
+              ◐ Contrast
+            </ToggleButton>
+            <ToggleButton size="small" value="blur" selected={enhBlur}
+              onChange={() => setEnhBlur((v) => !v)}
+              sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+              title="Display-only denoise blur — smooths speckle so the border is clearer (does not change the data)">
+              ◌ Blur
+            </ToggleButton>
+          </>
+        )}
+
+        {cur && !showBeforeAfter && !colSel && (
           <ToggleButton
             size="small"
             value="edit"
@@ -295,14 +562,53 @@ export function SliceGallery() {
               </div>
             </div>
           )
+        ) : showBeforeAfter ? (
+          <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>original (raw)</span>
+              {rawCur ? (
+                <img src={imgSrc(rawCur)} alt="raw" draggable={false}
+                  style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter }} />
+              ) : (
+                <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>no raw slice here</span>
+              )}
+            </div>
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+              <span className="text-[11px]" style={{ color: "var(--c-green)" }}>preprocessed</span>
+              <img src={imgSrc(cur)} alt="corrected" draggable={false} onDoubleClick={onSliceDoubleClick}
+                title="Double-click for the preprocessing steps"
+                style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter, cursor: "zoom-in" }} />
+            </div>
+            {canThird && (
+              <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                {hasSeg && hasCons ? (
+                  <ToggleButtonGroup size="small" exclusive value={effThird} onChange={(_, v) => v && setThirdMode(v)}>
+                    <ToggleButton value="seg" sx={{ py: 0, px: 0.8, fontSize: 10, textTransform: "none" }}>This scan</ToggleButton>
+                    <ToggleButton value="cons" sx={{ py: 0, px: 0.8, fontSize: 10, textTransform: "none" }}>Consensus</ToggleButton>
+                  </ToggleButtonGroup>
+                ) : (
+                  <span className="text-[11px]" style={{ color: "var(--c-accent)" }}>
+                    {effThird === "cons" ? "subgroup consensus" : "this scan (segmented)"}
+                  </span>
+                )}
+                {thirdCur ? (
+                  <img src={imgSrc(thirdCur)} alt={effThird} draggable={false}
+                    style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated" }} />
+                ) : (
+                  <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>no slice here</span>
+                )}
+              </div>
+            )}
+          </div>
         ) : (
           <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
             <img
               ref={imgRef}
-              src={cur.data_url}
+              src={imgSrc(cur)}
               alt={cur.file_name}
               draggable={false}
               onClick={onImgClick}
+              onDoubleClick={onSliceDoubleClick}
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
@@ -312,14 +618,23 @@ export function SliceGallery() {
                 maxHeight: "100%",
                 maxWidth: "100%",
                 imageRendering: "pixelated",
-                touchAction: editing ? "none" : undefined,
-                cursor: editing || hintMode ? "crosshair" : "default",
+                touchAction: editing || colSel ? "none" : undefined,
+                cursor: editing || hintMode || colSel ? "crosshair" : "zoom-in",
+                filter: effectiveGroup === "context" ? enhanceFilter : undefined,
               }}
             />
             <canvas
               ref={canvasRef}
               style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
             />
+            {colSel && (orient === "sagittal" || orient === "coronal") && nFrames > 1 &&
+              colRuns(badCols).map(([a, b], i) => {
+                const lo = a / (nFrames - 1), hiEnd = (b + 1) / (nFrames - 1);
+                const pos = orient === "sagittal"
+                  ? { left: `${lo * 100}%`, width: `${(hiEnd - lo) * 100}%`, top: 0, bottom: 0 }
+                  : { top: `${Math.max(0, 1 - hiEnd) * 100}%`, height: `${(hiEnd - lo) * 100}%`, left: 0, right: 0 };
+                return <div key={`b${i}`} style={{ position: "absolute", ...pos, background: "rgba(255,70,70,0.32)", pointerEvents: "none" }} />;
+              })}
             {hintsHere.map((h, i) => (
               <span
                 key={i}
@@ -356,6 +671,49 @@ export function SliceGallery() {
             value={safeIdx}
             onChange={(_, v) => setIdx(v as number)}
           />
+        </div>
+      )}
+
+      {stepsOpen && (
+        <div
+          onClick={() => setStepsOpen(false)}
+          style={{ position: "fixed", inset: 0, zIndex: 1300, background: "rgba(0,0,0,0.72)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: "var(--c-surface, #1b1b1f)", border: "1px solid var(--c-border)", borderRadius: 8, maxWidth: "94vw", maxHeight: "92vh", display: "flex", flexDirection: "column", overflow: "hidden" }}
+          >
+            <div className="flex items-center gap-3 px-4 py-2 border-b" style={{ borderColor: "var(--c-border)" }}>
+              <span className="text-sm" style={{ color: "var(--c-text)" }}>
+                Preprocessing steps — central sagittal slice
+              </span>
+              {stepsBusy && <CircularProgress size={16} />}
+              <div className="flex-1" />
+              <button onClick={() => setStepsOpen(false)}
+                style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 13, padding: "2px 10px" }}>
+                Close ✕
+              </button>
+            </div>
+            <div style={{ overflow: "auto", padding: 14 }}>
+              {stepsBusy && steps.length === 0 ? (
+                <div className="text-center" style={{ color: "var(--c-text-dim)", padding: 40, fontSize: 13 }}>
+                  Rendering every step (reads the .OCT + runs the pipeline)…
+                </div>
+              ) : steps.length === 0 ? (
+                <div className="text-center" style={{ color: "var(--c-text-dim)", padding: 40, fontSize: 13 }}>No steps produced.</div>
+              ) : (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 14 }}>
+                  {steps.map((s, i) => (
+                    <div key={i} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span className="text-[11px]" style={{ color: s.label.startsWith("C") ? "var(--c-accent)" : "var(--c-text-dim)" }}>{s.label}</span>
+                      <img src={s.data_url} alt={s.label} draggable={false}
+                        style={{ width: "100%", border: "1px solid var(--c-border)", borderRadius: 4, imageRendering: "pixelated" }} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

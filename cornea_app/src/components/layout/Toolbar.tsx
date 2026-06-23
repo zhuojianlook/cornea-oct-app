@@ -1,4 +1,4 @@
-import { Button, CircularProgress } from "@mui/material";
+import { Button, CircularProgress, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
 
@@ -9,10 +9,14 @@ export function Toolbar() {
   const correcting = useWorkflowStore((s) => s.correcting);
   const segLoaded = useWorkflowStore((s) => s.segLoaded);
   const sensitivity = useWorkflowStore((s) => s.scarSensitivity);
+  const scarMethod = useWorkflowStore((s) => s.scarMethod);
   const runSam2 = useWorkflowStore((s) => s.runSam2);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
+  const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
+  const undoCorrection = useWorkflowStore((s) => s.undoCorrection);
   const runScarAuto = useWorkflowStore((s) => s.runScarAuto);
+  const runScarAutoSam2 = useWorkflowStore((s) => s.runScarAutoSam2);
   const exportScarSummary = useWorkflowStore((s) => s.exportScarSummary);
   const setStage = useWorkflowStore((s) => s.setStage);
   const set = useWorkflowStore((s) => s.set);
@@ -32,17 +36,23 @@ export function Toolbar() {
           Correct ✎
         </Button>
       ) : (
-        <Button variant="contained" color="secondary" disabled={busy} onClick={() => saveCorrection()}>
-          Save correction
-        </Button>
+        <>
+          <Button variant="contained" color="secondary" disabled={busy} onClick={() => saveCorrection()}>
+            Save correction
+          </Button>
+          <Button variant="outlined" disabled={busy} onClick={() => undoCorrection()}
+            title="Undo the last brush stroke / smart fill">↶ Undo</Button>
+          <Button variant="outlined" color="inherit" disabled={busy} onClick={() => cancelCorrection()}
+            title="Discard all edits and exit correction (labelmap unchanged)">Cancel</Button>
+        </>
       )}
     </>
   );
 
   return (
     <div
-      className="flex items-center gap-2 px-3 border-b"
-      style={{ height: 44, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}
+      className="flex items-center gap-2 px-3 border-b overflow-x-auto [&>*]:shrink-0"
+      style={{ minHeight: 44, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}
     >
       {stage === 1 ? (
         <>
@@ -53,26 +63,40 @@ export function Toolbar() {
             title="Re-run SAM2 cornea segmentation on this one scan (cornea only, no scar/consensus — use the sidebar for the full pipeline)">
             Re-run SAM2 (this scan)
           </Button>
-          <Button variant="contained" color="secondary" disabled={busy || !segLoaded} onClick={() => setStage(2)}>
+          <Button variant="contained" color="secondary" disabled={busy || correcting || !segLoaded} onClick={() => setStage(2)}>
             Correct →
           </Button>
         </>
       ) : stage === 2 ? (
         <>
           {Correct}
-          <Button variant="outlined" disabled={busy} onClick={() => setStage(1)}>
+          <Button variant="outlined" disabled={busy || correcting} onClick={() => setStage(1)}>
             ← Segment
           </Button>
           <div style={{ width: 1, height: 24, background: "var(--c-border)" }} />
-          <Button variant="contained" color="secondary" disabled={busy || !segLoaded} onClick={() => setStage(3)}>
+          <Button variant="contained" color="secondary" disabled={busy || correcting || !segLoaded} onClick={() => setStage(3)}>
             Scar →
           </Button>
         </>
       ) : (
         <>
+          <Select size="small" value={scarMethod} onChange={(e) => set("scarMethod", e.target.value)}
+            disabled={busy} sx={{ fontSize: 12, maxWidth: 200, color: "var(--c-text)", ".MuiSelect-select": { py: 0.4, textOverflow: "ellipsis" }, "& fieldset": { borderColor: "var(--c-border)" } }}
+            title="Scar detection strategy (compare them on the same scan)">
+            <MenuItem value="hysteresis" sx={{ fontSize: 12 }}>Hysteresis (best reproducibility)</MenuItem>
+            <MenuItem value="depthnorm" sx={{ fontSize: 12 }}>Depth-normalised (subtract normal Bowman's; uses controls)</MenuItem>
+            <MenuItem value="normal_anchor" sx={{ fontSize: 12 }}>Normal-stroma anchor (highest overlap, larger vol)</MenuItem>
+            <MenuItem value="robust_mad" sx={{ fontSize: 12 }}>Robust MAD</MenuItem>
+            <MenuItem value="morph_lcc" sx={{ fontSize: 12 }}>Morph + largest component</MenuItem>
+            <MenuItem value="brightness" sx={{ fontSize: 12 }}>Brightness percentile (baseline)</MenuItem>
+          </Select>
           <Button variant="contained" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
-            title="Flag hyper-reflective regions inside the cornea as scar candidates to correct">
+            title="Run the selected scar strategy inside the cornea (overwrites/merges the scar candidate; correct as needed).">
             Detect scar (auto)
+          </Button>
+          <Button variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
+            title="Auto scar via SAM2 on all 3 views as videos → ≥2-of-3 consensus, seeded from the brightest in-cornea tissue (and confined to your scar frame-range). Slower (~1–2 min) but more coherent.">
+            Scar (SAM2 3-view)
           </Button>
           <label className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
             title="How much hyper-reflectivity to flag as scar candidates (higher = more)">
@@ -107,7 +131,7 @@ export function Toolbar() {
             title="Recompute scar volume (mm³) + en-face area (mm²) + density for every case → scar_summary.csv">
             Export scar metrics
           </Button>
-          <Button variant="outlined" disabled={busy} onClick={() => setStage(2)}>
+          <Button variant="outlined" disabled={busy || correcting} onClick={() => setStage(2)}>
             ← Correct
           </Button>
         </>
