@@ -5,7 +5,16 @@ import { create } from "zustand";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
-export const APP_VERSION = "0.0.2";
+// Read the REAL app version at runtime (from the built binary / tauri.conf) so the "latest version"
+// readout can never go stale against the actual release. Empty outside the Tauri shell.
+async function appVersion(): Promise<string> {
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return await getVersion();
+  } catch {
+    return "";
+  }
+}
 
 interface UpdaterState {
   update: Update | null;
@@ -28,7 +37,10 @@ export const useUpdater = create<UpdaterState>((set, get) => ({
     try {
       const u = await checkForUpdate();
       if (u) set({ update: u, msg: "" });
-      else set({ update: null, msg: manual ? `You're on the latest version (v${APP_VERSION}).` : "" });
+      else {
+        const v = await appVersion();
+        set({ update: null, msg: manual ? `You're on the latest version${v ? ` (v${v})` : ""}.` : "" });
+      }
     } catch (e) {
       set({ msg: manual ? `Update check failed: ${e instanceof Error ? e.message : String(e)}` : "" });
     } finally {
