@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.19";
+export const APP_VERSION = "0.1.20";
 const sessionId = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
 // ── Annotation persistence (#5) — never lose work on volume swap OR app close/restart ─────────────
@@ -18,6 +18,7 @@ const annotCache = new Map<string, AnnotSnap>();
 // previous user's paint onto the new user's volume.
 const ckey = (user: string | null, p: string): string => `${user ?? ""}|${p}`;
 let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+let wandTimer: ReturnType<typeof setTimeout> | null = null; // debounce live wand-preview recompute
 // Serialize snapshots: exportLabelmapBytes() temporarily mutates the shared drawBitmap, so two exports
 // (or an export racing the next volume's load) must never overlap. openVolume awaits this before loading.
 let snapInFlight: Promise<void> = Promise.resolve();
@@ -64,7 +65,15 @@ interface State {
   penFilled: boolean;
   tool: "paint" | "navigate" | "wand";   // active interaction tool
   drawOpacity: number;
-  wandThreshold: number;     // threshold scar wand, 0..1 of the intensity range
+  // intensity wand (live preview → Confirm)
+  wandThreshold: number;     // threshold mode: brightness cutoff, 0..1 of the intensity range
+  wandTolerance: number;     // tolerance mode: ± band around the clicked voxel, 0..1 of the range
+  wandMode: "threshold" | "tolerance";
+  wandScope: "2d" | "3d";    // flood the clicked slice only, or the whole volume
+  wandTarget: 1 | 2;         // paint cornea (1) or scar (2)
+  wandSeed: [number, number, number] | null; // current wand seed voxel (drives the live preview)
+  wandSeedAxis: number | null;               // the seed pane's through-axis (for 2-D recompute)
+  cursorIntensity01: number | null;          // cursor intensity as 0..1 of the range (indicator)
   // ui
   busy: boolean;
   status: string;
@@ -106,7 +115,12 @@ interface State {
   setPenFilled: (f: boolean) => void;
   setTool: (t: "paint" | "navigate" | "wand") => void;
   setWandThreshold: (t: number) => void;
-  wandAt: (x: number, y: number, z: number) => void;
+  setWandTolerance: (t: number) => void;
+  setWandMode: (m: "threshold" | "tolerance") => void;
+  setWandScope: (s: "2d" | "3d") => void;
+  setWandTarget: (t: 1 | 2) => void;
+  wandRecompute: () => void;
+  wandAt: (x: number, y: number, z: number, throughAxis: number | null) => void;
   setCursorIntensity: (x: number, y: number, z: number) => void;
   setDrawOpacity: (o: number) => void;
   setSliceAxis: (axis: 0 | 1 | 2, s: number) => void;
@@ -153,6 +167,13 @@ export const useStore = create<State>((set, get) => ({
   tool: "paint",
   drawOpacity: 0.6,
   wandThreshold: 0.55,
+  wandTolerance: 0.08,
+  wandMode: "threshold",
+  wandScope: "3d",
+  wandTarget: 2,
+  wandSeed: null,
+  wandSeedAxis: null,
+  cursorIntensity01: null,
   busy: false,
   status: "Select or add a user to begin.",
   lang: "en",
@@ -310,6 +331,7 @@ export const useStore = create<State>((set, get) => ({
         } catch { /* no autosave / unreadable — start blank */ }
       }
       set({ activeVolume: v, loaded: true, tool: "paint", volumeStartMs: Date.now(), canConfirm: restoredPreviewing,
+            wandSeed: null, wandSeedAxis: null,
             dims: nv.getDims(), vox: nv.currentVox() ?? [0, 0, 0], brightness: 0, contrast: 0,
             status: `Annotating ${v.name}. Paint cornea/scar; Smart fill helps; then Save.` });
       nv.setWindow(0, 0);     // new volume → reset display window + counts
@@ -362,16 +384,47 @@ export const useStore = create<State>((set, get) => ({
   setPenLabel: (p) => { nv.setPen(p, get().penFilled); set({ penLabel: p }); },
   setPenSize: (n) => { nv.setPenSize(n); set({ penSize: n }); },
   setPenFilled: (f) => { nv.setPen(get().penLabel, f); set({ penFilled: f }); },
-  setTool: (t) => { if (t === "paint") nv.lockCrosshair(); nv.setDrawingEnabled(false); set({ tool: t }); },
-  setWandThreshold: (t) => set({ wandThreshold: Math.max(0, Math.min(1, t)) }),
-  wandAt: (x, y, z) => {
-    const r = nv.wandFill(x, y, z, get().wandThreshold);
-    if (!r.ok) {
-      set({ status: r.reason === "below-threshold" ? "Wand: that spot is below the threshold — lower it or click a brighter area."
-        : r.reason === "outside-cornea" ? "Wand: click inside the cornea (scar grows within it)." : "Wand: nothing to fill here." });
-    } else { get().refreshStats(); get().autosaveDraw(); set({ status: `Wand: filled ${r.count} scar voxels. Adjust the threshold or Undo if needed.` }); }
+  setTool: (t) => { if (t === "paint") nv.lockCrosshair(); nv.setDrawingEnabled(false);
+    set(t === "wand" ? { tool: t } : { tool: t, wandSeed: null, wandSeedAxis: null }); },
+  // Recompute the live wand preview from the current seed + params (after a param change). Debounced so
+  // dragging a slider stays smooth. Clears the seed if a recompute no longer floods anything.
+  wandRecompute: () => {
+    const s = get();
+    if (!s.wandSeed) return;
+    if (wandTimer) clearTimeout(wandTimer);
+    wandTimer = setTimeout(() => {
+      wandTimer = null;
+      const st = get();
+      if (!st.wandSeed) return;
+      const [x, y, z] = st.wandSeed;
+      const r = nv.wandPreview(x, y, z, { mode: st.wandMode, threshold01: st.wandThreshold, tolerance01: st.wandTolerance,
+        scope: st.wandScope, throughAxis: st.wandSeedAxis, target: st.wandTarget });
+      if (r.ok) { get().refreshStats(); set({ canConfirm: true, status: `Wand preview: ${r.count} voxels — adjust, then Confirm (or click a new spot).` }); }
+      else { nv.clearPreview(); get().refreshStats(); set({ canConfirm: false }); }
+    }, 110);
   },
-  setCursorIntensity: (x, y, z) => { set({ cursorIntensity: nv.intensityAt(x, y, z) }); },
+  setWandThreshold: (t) => { set({ wandThreshold: Math.max(0, Math.min(1, t)) }); if (get().wandMode === "threshold") get().wandRecompute(); },
+  setWandTolerance: (t) => { set({ wandTolerance: Math.max(0, Math.min(1, t)) }); if (get().wandMode === "tolerance") get().wandRecompute(); },
+  setWandMode: (m) => { set({ wandMode: m }); get().wandRecompute(); },
+  setWandScope: (s) => { set({ wandScope: s }); get().wandRecompute(); },
+  setWandTarget: (t) => { set({ wandTarget: t }); get().wandRecompute(); },
+  // Click → seed the wand and show the live preview immediately (no commit yet — Confirm bakes it).
+  wandAt: (x, y, z, throughAxis) => {
+    const s = get();
+    const r = nv.wandPreview(x, y, z, { mode: s.wandMode, threshold01: s.wandThreshold, tolerance01: s.wandTolerance,
+      scope: s.wandScope, throughAxis, target: s.wandTarget });
+    if (!r.ok) {
+      nv.clearPreview();
+      set({ wandSeed: null, wandSeedAxis: null, canConfirm: false,
+        status: r.reason === "below-threshold" ? "Wand: nothing here at this threshold — lower it or click a brighter spot."
+          : r.reason === "outside-cornea" ? "Wand: click inside the cornea (scar grows within it)." : "Wand: nothing to fill here." });
+    } else {
+      get().refreshStats();
+      set({ wandSeed: [x, y, z], wandSeedAxis: throughAxis, canConfirm: true,
+        status: `Wand preview: ${r.count} voxels — adjust ${s.wandMode === "threshold" ? "threshold" : "tolerance"}, then Confirm (or click a new spot).` });
+    }
+  },
+  setCursorIntensity: (x, y, z) => { set({ cursorIntensity: nv.intensityAt(x, y, z), cursorIntensity01: nv.intensityAtNorm(x, y, z) }); },
   setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
   refreshStats: () => { const st = nv.drawStats(); set({ corneaVox: st.cornea, scarVox: st.scar, canUndo: nv.canUndo(), canRedo: nv.canRedo() }); },
   zoomIn: () => nv.zoomBy(1.25),
@@ -415,13 +468,13 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   confirmFill: () => {
-    if (nv.confirmFill()) { get().refreshStats(); get().autosaveDraw(); set({ canConfirm: false, status: "Smart fill confirmed — added to the segmentation." }); }
+    if (nv.confirmFill()) { get().refreshStats(); get().autosaveDraw(); set({ canConfirm: false, wandSeed: null, wandSeedAxis: null, status: "Confirmed — added to the segmentation." }); }
   },
-  undo: () => { nv.undoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing() }); },
-  redo: () => { nv.redoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing() }); },
+  undo: () => { nv.undoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing(), wandSeed: null, wandSeedAxis: null }); },
+  redo: () => { nv.redoDrawing(); get().refreshStats(); get().autosaveDraw(); set({ canConfirm: nv.isPreviewing(), wandSeed: null, wandSeedAxis: null }); },
   requestClear: () => set({ confirmClear: true }),
   cancelClear: () => set({ confirmClear: false }),
-  clearDrawing: () => { nv.clearDrawing(); get().refreshStats(); void get().flushAutosave(); set({ canConfirm: false, confirmClear: false, status: "Cleared — blank drawing." }); },
+  clearDrawing: () => { nv.clearDrawing(); get().refreshStats(); void get().flushAutosave(); set({ canConfirm: false, confirmClear: false, wandSeed: null, wandSeedAxis: null, status: "Cleared — blank drawing." }); },
 
   save: async (force = false) => {
     const { activeUser, activeVolume, outputDir, sessionId: sid } = get();

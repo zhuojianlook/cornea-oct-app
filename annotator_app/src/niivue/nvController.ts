@@ -79,7 +79,8 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
     rightButton: DRAG_MODE.pan, centerButton: DRAG_MODE.pan,
   };
   try { nv.setPan2Dxyzmm([0, 0, 0, 1]); } catch { /* */ } // reset zoom/pan for the new volume
-  rasIntensity = null; // drop the previous volume's cached intensity
+  rasIntensity = null; rasRange = null; // drop the previous volume's cached intensity + range
+  wandVisited = null; // free the previous volume's wand scratch (re-allocated on next wand use)
   // Three-layer drawing model (#smartfill-preview): seeds = the user's brushstrokes (the ONLY input to
   // smart fill), committed = confirmed segmentation, preview = last smart-fill result (recomputed each
   // run). The displayed drawBitmap is composed = seeds ▸ preview ▸ committed. Confirm bakes preview→committed.
@@ -326,6 +327,7 @@ let committedBmp: Uint8Array | null = null;
 let previewBmp: Uint8Array | null = null;
 let previewing = false;
 let rasIntensity: ArrayLike<number> | null = null; // RAS-ordered intensity (cached for wand + readout)
+let rasRange: [number, number] | null = null;      // cached [min,max] (so the cursor % readout is cheap)
 type Snap = { s: Uint8Array; c: Uint8Array };
 let undoStack: Snap[] = [];
 let redoStack: Snap[] = [];
@@ -509,56 +511,101 @@ export function intensityAt(x: number, y: number, z: number): number | null {
   if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return null;
   return ras[z * nx * ny + y * nx + x];
 }
-/** Volume intensity range [min,max] (for mapping the wand's 0..1 threshold to absolute intensity). */
+/** Volume intensity range [min,max] (for mapping the wand's 0..1 threshold to absolute intensity).
+    Cached per volume so the live cursor % readout doesn't rescan the volume on every mouse move. */
 export function intensityRange(): [number, number] | null {
+  if (rasRange) return rasRange;
   const vol = nv?.volumes[0] as unknown as { global_min?: number; global_max?: number } | undefined;
-  if (vol && vol.global_min != null && vol.global_max != null && vol.global_max > vol.global_min) return [vol.global_min, vol.global_max];
+  if (vol && vol.global_min != null && vol.global_max != null && vol.global_max > vol.global_min) { rasRange = [vol.global_min, vol.global_max]; return rasRange; }
   const ras = getRasIntensity();
   if (!ras) return null;
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < ras.length; i++) { const v = ras[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
-  return hi > lo ? [lo, hi] : null;
+  rasRange = hi > lo ? [lo, hi] : null;
+  return rasRange;
+}
+/** Cursor intensity as 0..1 of the volume range (for the wand intensity indicator), or null. */
+export function intensityAtNorm(x: number, y: number, z: number): number | null {
+  const v = intensityAt(x, y, z); const r = intensityRange();
+  if (v == null || !r) return null;
+  return Math.max(0, Math.min(1, (v - r[0]) / ((r[1] - r[0]) || 1)));
 }
 
-// ── Threshold-assisted scar wand ─────────────────────────────────────────────
-/** Flood-fill SCAR (committed=2) from a clicked voxel through 6-connected voxels with intensity ≥ a
-    threshold (0..1 of the volume range). If any cornea is committed, the flood is confined to the cornea
-    (scar is a sub-region of cornea). Respects label locks + supports undo. */
-export function wandFill(x: number, y: number, z: number, threshold01: number): { ok: boolean; reason?: string; count?: number } {
+// ── Intensity wand (live preview) ────────────────────────────────────────────
+export interface WandOpts {
+  mode: "threshold" | "tolerance"; // absolute brightness cutoff, or ±band around the clicked voxel
+  threshold01: number;             // threshold mode: 0..1 of the volume range
+  tolerance01: number;             // tolerance mode: ± band as a fraction of the volume range
+  scope: "2d" | "3d";             // flood within the clicked slice only, or the whole volume
+  throughAxis: number | null;      // the clicked pane's through-plane RAS axis (for 2-D scope)
+  target: 1 | 2;                   // paint cornea (1) or scar (2)
+}
+// reusable scratch buffers so the live preview can recompute on every slider tick without re-allocating
+// ~33 MB per call (one per volume; reset per run).
+let wandVisited: Uint8Array | null = null;
+let wandStack: Int32Array | null = null;
+
+/** Flood-fill from a clicked voxel into the PREVIEW layer (not committed) so the user can tune the
+    threshold/tolerance and SEE the result live, then Confirm (reuses the smart-fill preview→confirm
+    path). 6-connected in 3-D, or 4-connected within the clicked slice in 2-D. SCAR (target 2) is
+    confined to committed cornea (it's a sub-region); CORNEA (target 1) is unconfined. Respects label
+    locks (locked voxels are flooded through but not painted). Recomputes from scratch each call. */
+export function wandPreview(x: number, y: number, z: number, opts: WandOpts): { ok: boolean; reason?: string; count?: number } {
   const ras = getRasIntensity();
   const dr = nv?.volumes[0]?.dimsRAS as number[] | undefined;
-  if (!nv || !ras || !committedBmp || !dr) return { ok: false, reason: "no-volume" };
+  if (!nv || !ras || !committedBmp || !previewBmp || !seedBmp || !dr) return { ok: false, reason: "no-volume" };
   const range = intensityRange();
   if (!range) return { ok: false, reason: "no-volume" };
   const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny, N = nx * ny * nz;
   if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return { ok: false, reason: "out-of-bounds" };
-  const thr = range[0] + threshold01 * (range[1] - range[0]);
-  let hasCornea = false;
-  for (let i = 0; i < N; i++) { if (committedBmp[i] === 1) { hasCornea = true; break; } }
-  const c = committedBmp;
-  const inMask = (i: number) => ras[i] >= thr && (!hasCornea || c[i] === 1 || c[i] === 2);
+  const span = (range[1] - range[0]) || 1;
   const seed = z * nxny + y * nx + x;
-  if (!inMask(seed)) return { ok: false, reason: hasCornea ? "outside-cornea" : "below-threshold" };
-  pushUndo();
+  const seedVal = ras[seed];
+  const c = committedBmp, target = opts.target;
+  // scar is a sub-region of cornea → confine target 2 to committed cornea/scar if any cornea exists
+  let hasCornea = false;
+  if (target === 2) { for (let i = 0; i < N; i++) { if (c[i] === 1) { hasCornea = true; break; } } }
+  const confine = (i: number) => target === 2 ? (!hasCornea || c[i] === 1 || c[i] === 2) : true;
+  const inMask = opts.mode === "threshold"
+    ? (() => { const thr = range[0] + opts.threshold01 * span; return (i: number) => ras[i] >= thr && confine(i); })()
+    : (() => { const tol = opts.tolerance01 * span; return (i: number) => Math.abs(ras[i] - seedVal) <= tol && confine(i); })();
+  if (!inMask(seed)) return { ok: false, reason: (target === 2 && hasCornea) ? "outside-cornea" : "below-threshold" };
+  const twoD = opts.scope === "2d" && opts.throughAxis !== null && opts.throughAxis >= 0 && opts.throughAxis <= 2;
+  const ta = opts.throughAxis; // 0=x(step 1), 1=y(step nx), 2=z(step nxny); in 2-D skip steps along it
+  if (!wandVisited || wandVisited.length !== N) wandVisited = new Uint8Array(N);
+  const visited = wandVisited; visited.fill(0);
+  if (!wandStack) wandStack = new Int32Array(1 << 16);
+  let stack = wandStack, sp = 0;
+  const push = (i: number) => { if (sp === stack.length) { const n = new Int32Array(stack.length * 2); n.set(stack); stack = n; wandStack = n; } stack[sp++] = i; };
   const hasLocks = lockedLabels.size > 0;
-  const visited = new Uint8Array(N);
-  let stack = new Int32Array(4096), sp = 0;
-  const push = (i: number) => { if (sp === stack.length) { const n = new Int32Array(stack.length * 2); n.set(stack); stack = n; } stack[sp++] = i; };
+  previewBmp.fill(0); // a fresh preview each recompute (never accumulate across slider ticks)
   push(seed); visited[seed] = 1;
   let count = 0;
   while (sp > 0) {
     const i = stack[--sp];
-    if (!(hasLocks && lockedLabels.has(c[i]))) { c[i] = 2; count++; }
+    if (!(hasLocks && lockedLabels.has(c[i]))) { previewBmp[i] = target; count++; }
     const z2 = (i / nxny) | 0, r = i - z2 * nxny, y2 = (r / nx) | 0, x2 = r - y2 * nx;
-    if (x2 > 0 && !visited[i - 1] && inMask(i - 1)) { visited[i - 1] = 1; push(i - 1); }
-    if (x2 < nx - 1 && !visited[i + 1] && inMask(i + 1)) { visited[i + 1] = 1; push(i + 1); }
-    if (y2 > 0 && !visited[i - nx] && inMask(i - nx)) { visited[i - nx] = 1; push(i - nx); }
-    if (y2 < ny - 1 && !visited[i + nx] && inMask(i + nx)) { visited[i + nx] = 1; push(i + nx); }
-    if (z2 > 0 && !visited[i - nxny] && inMask(i - nxny)) { visited[i - nxny] = 1; push(i - nxny); }
-    if (z2 < nz - 1 && !visited[i + nxny] && inMask(i + nxny)) { visited[i + nxny] = 1; push(i + nxny); }
+    if (!twoD || ta !== 0) {
+      if (x2 > 0 && !visited[i - 1] && inMask(i - 1)) { visited[i - 1] = 1; push(i - 1); }
+      if (x2 < nx - 1 && !visited[i + 1] && inMask(i + 1)) { visited[i + 1] = 1; push(i + 1); }
+    }
+    if (!twoD || ta !== 1) {
+      if (y2 > 0 && !visited[i - nx] && inMask(i - nx)) { visited[i - nx] = 1; push(i - nx); }
+      if (y2 < ny - 1 && !visited[i + nx] && inMask(i + nx)) { visited[i + nx] = 1; push(i + nx); }
+    }
+    if (!twoD || ta !== 2) {
+      if (z2 > 0 && !visited[i - nxny] && inMask(i - nxny)) { visited[i - nxny] = 1; push(i - nxny); }
+      if (z2 < nz - 1 && !visited[i + nxny] && inMask(i + nxny)) { visited[i + nxny] = 1; push(i + nxny); }
+    }
   }
+  previewing = true;
   compose();
   return { ok: true, count };
+}
+/** Discard an un-confirmed wand/smart-fill preview (clears the preview layer, no commit). */
+export function clearPreview(): void {
+  if (!previewBmp) return;
+  previewBmp.fill(0); previewing = false; compose();
 }
 
 // ── Load an existing segmentation (open a prior .nii.gz / session GT) into the committed layer ────────

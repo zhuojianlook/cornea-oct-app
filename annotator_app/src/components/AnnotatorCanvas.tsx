@@ -14,11 +14,24 @@ function Readout() {
   const scar = useStore((s) => s.scarVox);
   const tool = useStore((s) => s.tool);
   const intensity = useStore((s) => s.cursorIntensity);
+  const intensity01 = useStore((s) => s.cursorIntensity01);
   return (
     <span className="flex items-center gap-3 flex-none" style={{ fontSize: 11, color: "var(--c-text-dim)" }}>
       <span><b style={{ color: "#1ab2ff" }}>{cornea.toLocaleString()}</b> {tr(lang, "pen.cornea")}</span>
       <span><b style={{ color: "#ff453a" }}>{scar.toLocaleString()}</b> {tr(lang, "pen.scar")}</span>
-      {tool === "wand" && intensity != null && <span>I: <b style={{ color: "var(--c-text)" }}>{Math.round(intensity)}</b></span>}
+      {tool === "wand" && (
+        <span className="flex items-center gap-1.5" title={tr(lang, "tb.intensityTip")}>
+          {tr(lang, "tb.intensity")}:
+          {intensity != null ? <>
+            <b style={{ color: "var(--c-text)" }}>{Math.round(intensity)}</b>
+            <span style={{ width: 56, height: 6, borderRadius: 3, background: "var(--c-border)", position: "relative", overflow: "hidden" }}>
+              <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${Math.round((intensity01 ?? 0) * 100)}%`,
+                             background: "linear-gradient(90deg,#3a3a3c,#e5e5ea)" }} />
+            </span>
+            <b style={{ color: "var(--c-text)", width: 30, textAlign: "right" }}>{Math.round((intensity01 ?? 0) * 100)}%</b>
+          </> : <span style={{ opacity: 0.6 }}>— hover the image</span>}
+        </span>
+      )}
     </span>
   );
 }
@@ -149,9 +162,10 @@ export function AnnotatorCanvas() {
             if (v) { paintBrush(v[0], v[1], v[2], v[0], v[1], v[2], penLabel, strokeAxis.current); lastVox.current = v; }
             restoreCrosshair();
           } else if (wandActive) {
-            if (tileAtScreen(x, y) < 0) return;
+            const t = tileAtScreen(x, y);
+            if (t < 0) return;
             const v = voxAtScreen(x, y);
-            if (v) wandAt(v[0], v[1], v[2]);                       // threshold-grow scar from the click
+            if (v) wandAt(v[0], v[1], v[2], tileThroughAxis(t));   // seed the wand → live preview (Confirm bakes it)
           }
         }}
         onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); autosaveDraw(); } }}
