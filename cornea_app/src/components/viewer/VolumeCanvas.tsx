@@ -10,6 +10,7 @@ import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
 import { GtCompareViewer } from "./GtCompareViewer";
+import { BeforeAfterViewer } from "./BeforeAfterViewer";
 
 export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -31,6 +32,10 @@ export function VolumeCanvas() {
   const [error, setError] = useState<string | null>(null);
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
   const [brush, setBrush] = useState<{ x: number; y: number } | null>(null);
+  // Before/after comparison (raw vs preprocessed). The button + view only exist once the scan has
+  // been preprocessed — i.e. its raw snapshot (context_raw previews) was captured.
+  const [hasRaw, setHasRaw] = useState(false);
+  const [compareView, setCompareView] = useState(false);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
   const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
   const painting = correcting && paintMode && view !== "render";
@@ -93,6 +98,23 @@ export function VolumeCanvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [volumeUrl]);
 
+  // Is a raw (pre-preprocessing) snapshot available for this case? Re-checked on case load AND on
+  // every (re)open (volumeUrl is cache-busted per openCase, so it changes right after a preprocess
+  // finishes → the Before/after button appears as soon as the raw snapshot exists).
+  useEffect(() => {
+    const id = caseInfo?.case_id;
+    if (!id) { setHasRaw(false); return; }
+    let cancelled = false;
+    api
+      .json<{ images: unknown[] }>(`/api/case/${id}/previews/context_raw`)
+      .then((r) => !cancelled && setHasRaw((r.images || []).length > 0))
+      .catch(() => !cancelled && setHasRaw(false));
+    return () => { cancelled = true; };
+  }, [caseInfo?.case_id, volumeUrl]);
+
+  // Leave the comparison when switching to a different case.
+  useEffect(() => { setCompareView(false); }, [caseInfo?.case_id]);
+
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
     setViewState(v);
@@ -143,6 +165,16 @@ export function VolumeCanvas() {
     );
   }
 
+  // Before/after comparison: raw vs preprocessed slices, side by side (its own 2D view).
+  if (compareView && volumeUrl) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
+        {backBanner}
+        <BeforeAfterViewer onClose={() => setCompareView(false)} />
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
       {backBanner}
@@ -157,6 +189,18 @@ export function VolumeCanvas() {
           <ToggleButton value="sagittal">Sagittal</ToggleButton>
           <ToggleButton value="render">3D</ToggleButton>
         </ToggleButtonGroup>
+        {hasRaw && (
+          <ToggleButton
+            size="small"
+            value="ba"
+            selected={compareView}
+            onChange={() => setCompareView((v) => !v)}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Compare the original (raw) scan with the preprocessed result, side by side"
+          >
+            ⇆ Before/after
+          </ToggleButton>
+        )}
         <div className="flex-1" />
         {loading && <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Loading volume…</span>}
         {error && <span className="text-xs" style={{ color: "var(--c-red)" }}>{error}</span>}
@@ -188,7 +232,7 @@ export function VolumeCanvas() {
             }}
           />
         )}
-        {noWebgl ? (
+        {noWebgl && (
           <div
             className="absolute inset-0 flex items-center justify-center flex-col gap-2 p-6 text-center"
             style={{ color: "var(--c-text-dim)" }}
@@ -196,16 +240,6 @@ export function VolumeCanvas() {
             <span style={{ fontSize: 14, color: "var(--c-red)" }}>3D viewer unavailable</span>
             <span style={{ fontSize: 12, opacity: 0.85, maxWidth: 460 }}>{noWebgl}</span>
           </div>
-        ) : (
-          !volumeUrl && (
-            <div
-              className="absolute inset-0 flex items-center justify-center flex-col gap-2 pointer-events-none"
-              style={{ color: "var(--c-text-dim)" }}
-            >
-              <span style={{ fontSize: 14 }}>No volume loaded</span>
-              <span style={{ fontSize: 12, opacity: 0.7 }}>Register an OCT volume from the sidebar.</span>
-            </div>
-          )
         )}
       </div>
     </div>
