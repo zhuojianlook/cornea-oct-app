@@ -1233,6 +1233,7 @@ class OctPreprocessRequest(BaseModel):
     good_columns: List[int] | None = None    # GOOD/anchor frame indices guiding the re-correction
                                              # (all reuse the scan's persisted settings)
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
+    inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1502,10 +1503,19 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
                 pass
         return out
 
-    if req.force_columns is not None:
-        eff_params["force_columns"] = _int_list(req.force_columns)
-    if req.good_columns is not None:
-        eff_params["good_columns"] = _int_list(req.good_columns)
+    # Per-pass column fix (inject_pass set): the marked frames apply to ONLY that pass of the
+    # iteration — they must NOT become global eff_params (which would force them at every pass). They
+    # ride along as --inject-* instead. Otherwise (legacy single-pass Fix-columns re-run, no
+    # inject_pass) force_columns stays a global param as before.
+    inject_pass = req.inject_pass if (req.inject_pass and int(req.inject_pass) > 0) else None
+    if inject_pass is None:
+        if req.force_columns is not None:
+            eff_params["force_columns"] = _int_list(req.force_columns)
+        if req.good_columns is not None:
+            eff_params["good_columns"] = _int_list(req.good_columns)
+    else:
+        eff_params.pop("force_columns", None)
+        eff_params.pop("good_columns", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
     cls = req.classification or m.get("scar_classification")
@@ -1519,9 +1529,13 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     iter_dir = orch.case_root(case_id) / "input" / "_iter"
     _sh.rmtree(iter_dir, ignore_errors=True)        # clear stale intermediate pass NIfTIs
     _clear_iter_preview_groups(case_id)             # clear stale per-pass preview groups
+    extra = ["--max-iter", str(max_it), "--iter-dir", str(iter_dir)]
+    if inject_pass is not None:
+        extra += ["--inject-pass", str(int(inject_pass)),
+                  "--inject-force", json.dumps(_int_list(req.force_columns)),
+                  "--inject-good", json.dumps(_int_list(req.good_columns))]
     worker_out = _run_oct_worker("preprocess", src, work, eff_params, vi,
-                                 companion=m.get("companion_txt"),
-                                 extra=["--max-iter", str(max_it), "--iter-dir", str(iter_dir)])
+                                 companion=m.get("companion_txt"), extra=extra)
     iter_info = _parse_iter_info(worker_out)
     # The corrected volume just changed → drop any segmentation built on the OLD correction so a
     # stale overlay can't show on the re-corrected volume (the user re-runs SAM2 next).

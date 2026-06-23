@@ -626,7 +626,8 @@ def _boundary_deviation(volume: np.ndarray, params: dict | None = None,
 
 def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
                           max_iter: int = 5, min_improvement: float = 0.15,
-                          abs_floor: float = 0.3, progress=None, workers: int | None = None):
+                          abs_floor: float = 0.3, progress=None, workers: int | None = None,
+                          inject_pass: int | None = None, inject_force=None, inject_good=None):
     """Iteratively re-apply smooth_volume to its own output, then KEEP THE BEST pass — the one whose
     detected corneal boundary deviates LEAST from a smooth fit (lowest "boundary deviation", px).
 
@@ -646,29 +647,43 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     pass-stepper); best_idx = index of the kept volume; info = {passes (corrected passes produced =
     len(chain)-1), best_pass, metrics (deviation px of each chain volume), stopped}."""
     max_iter = max(1, int(max_iter))
+    # The iteration applies a manual column fix PER-PASS only (the user's "fix columns for a particular
+    # iteration"): force_columns/good_columns are NOT global params here — they're injected at exactly
+    # inject_pass (1-based) and absent on every other pass.
+    base = dict(params or {})
+    base.pop("force_columns", None)
+    base.pop("good_columns", None)
     chain: list = [volume]       # V0 = raw, then each accepted pass
     rough: list = []             # rough[i] = boundary deviation of chain[i]
     stopped = "max_iter"
     for k in range(max_iter):
         lo = k / max_iter
         hi = (k + 1) / max_iter
+        pp = dict(base)
+        if inject_pass is not None and (k + 1) == int(inject_pass):
+            pp["force_columns"] = [int(c) for c in (inject_force or [])]
+            pp["good_columns"] = [int(c) for c in (inject_good or [])]
         # A re-fed pass (k>=1) runs on the PREVIOUS pass's warped output, whose black padding would
         # fool the edge detector into 100-360px runaway shifts — DETECT on a filled copy. But WARP the
         # real (unfilled) chain[k], so the output never carries the fill's fake pixels (only honest
         # zero padding). Pass 1 runs on raw with no fill → byte-identical to the faithful single pass.
         det = None if k == 0 else _fill_black_bands(chain[k])
-        nxt, r = smooth_volume(chain[k], params, progress=(
+        nxt, r = smooth_volume(chain[k], pp, progress=(
             (lambda f, lo=lo, hi=hi: progress(lo + (hi - lo) * f)) if progress else None),
             workers=workers, return_metric=True, detect_volume=det)   # r = deviation of chain[k]
         rough.append(float(r))
+        # Force the iteration to REACH (and keep) the injected pass — never early-stop before it, or
+        # the user's per-pass column fix would be silently discarded. Past the inject pass, the normal
+        # keep-best stop logic resumes.
+        force_reach = inject_pass is not None and (k + 1) <= int(inject_pass)
         # Stop producing more passes once the boundary stops getting smoother (but we've still
         # MEASURED chain[k], so it stays a candidate for the argmin below).
-        if k >= 1:
+        if not force_reach and k >= 1:
             if r >= rough[k - 1]:
                 stopped = "grew"; break          # chain[k] is MORE deviant than chain[k-1]
             if (rough[k - 1] - r) / max(rough[k - 1], 1e-9) < min_improvement:
                 stopped = "diminishing"; break
-        if r < abs_floor:
+        if not force_reach and r < abs_floor:
             stopped = "converged"
             chain.append(nxt)                    # a final tiny refinement is safe; keep + measure it
             break
@@ -678,7 +693,7 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     while len(rough) < len(chain):
         idx = len(rough)
         det = None if idx == 0 else _fill_black_bands(chain[idx])
-        rough.append(_boundary_deviation(chain[idx], params, workers=workers, detect_volume=det))
+        rough.append(_boundary_deviation(chain[idx], base, workers=workers, detect_volume=det))
     best_idx = min(range(len(chain)), key=lambda i: rough[i])
     info = {"passes": len(chain) - 1, "best_pass": best_idx,
             "metrics": [float(x) for x in rough], "stopped": stopped}
@@ -742,7 +757,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             params: dict | None = None, volume_index: int = 0,
                             progress=None, companion_txt: str | Path | None = None,
                             max_iterations: int = 1, min_improvement: float = 0.15,
-                            abs_floor: float = 0.3, iter_dir: str | Path | None = None) -> dict:
+                            abs_floor: float = 0.3, iter_dir: str | Path | None = None,
+                            inject_pass: int | None = None, inject_force=None, inject_good=None) -> dict:
     """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry.
 
     max_iterations<=1 → the faithful single pass (unchanged). max_iterations>1 → iterative
@@ -755,7 +771,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if max_iterations and int(max_iterations) > 1:
         chain, best_idx, info = iterate_smooth_volume(
             vol, params, max_iter=int(max_iterations),
-            min_improvement=min_improvement, abs_floor=abs_floor, progress=progress)
+            min_improvement=min_improvement, abs_floor=abs_floor, progress=progress,
+            inject_pass=inject_pass, inject_force=inject_force, inject_good=inject_good)
         corrected = chain[best_idx]                 # the BEST pass (least-deviant boundary)
         # Write EVERY corrected pass (V1..Vm) so the UI can step through them all and SEE why the
         # best was chosen (a worse pass is visibly more deviant). chain[0] = raw = context_raw.
@@ -892,6 +909,9 @@ if __name__ == "__main__":
     ap.add_argument("--min-improvement", type=float, default=0.15)
     ap.add_argument("--abs-floor", type=float, default=0.3)
     ap.add_argument("--iter-dir", default="")                 # where to write intermediate pass NIfTIs
+    ap.add_argument("--inject-pass", type=int, default=0)     # apply the column fix at ONLY this pass (1-based; 0=none)
+    ap.add_argument("--inject-force", default="[]")           # bad frame indices for the injected pass
+    ap.add_argument("--inject-good", default="[]")            # good/anchor frame indices for the injected pass
     a = ap.parse_args()
     _p = _json.loads(a.params)
     _comp = a.companion_txt or None
@@ -914,7 +934,9 @@ if __name__ == "__main__":
         _info = preprocess_oct_to_nifti(
             a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp,
             max_iterations=a.max_iter, min_improvement=a.min_improvement, abs_floor=a.abs_floor,
-            iter_dir=(a.iter_dir or None))
+            iter_dir=(a.iter_dir or None),
+            inject_pass=(a.inject_pass or None), inject_force=_json.loads(a.inject_force or "[]"),
+            inject_good=_json.loads(a.inject_good or "[]"))
         # Single machine-readable line the sidecar parses for the per-pass convergence report.
         print("ITER " + _json.dumps(_info))
     print("OK " + str(a.out_nifti))

@@ -4,7 +4,7 @@
    without WebGL2 (e.g. the VS Code Simple Browser). */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ToggleButton, ToggleButtonGroup, Slider, CircularProgress } from "@mui/material";
+import { ToggleButton, ToggleButtonGroup, Slider, CircularProgress, Select, MenuItem } from "@mui/material";
 import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
@@ -25,6 +25,17 @@ const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 
 export function SliceGallery() {
   const caseId = useCaseStore((s) => s.caseId);
+  const caseInfo = useCaseStore((s) => s.caseInfo);
+  // Iterative-refinement pass count (for the "fix at pass" selector) — from the manifest.
+  const octIter = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as { passes?: number } | undefined;
+  const passCount = Math.max(1, Number(octIter?.passes ?? 1));
+  // Which iteration pass the column fix is injected at (per-pass only). null = legacy single re-run.
+  const [fixPass, setFixPass] = useState<number | null>(null);
+  // Clamp the chosen pass if the case switched to one with fewer passes (else the selector shows an
+  // out-of-range value AND the backend would silently skip a never-reached inject pass).
+  useEffect(() => {
+    if (fixPass != null && fixPass > passCount) setFixPass(passCount > 1 ? passCount : null);
+  }, [passCount, fixPass]);
   // Re-fetch when the segmentation changes (SAM2/correct/scar re-render previews).
   const segSig = useWorkflowStore((s) => s.segVersion);
   const hintMode = useWorkflowStore((s) => s.hintMode);
@@ -248,10 +259,13 @@ export function SliceGallery() {
     if (!caseId || badCols.size === 0) return;
     setRerunBusy(true);
     try {
-      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify({
-        force_columns: [...badCols], good_columns: [], // every non-bad column is a good anchor
-        max_iterations: 1, // targeted column fix is a single pass (not iterative refinement)
-      }));
+      // Iterative scan (passCount>1): inject the column fix at the chosen pass ONLY and let the
+      // iteration re-converge from there (the user's "fix columns for a particular iteration").
+      // Single-pass scan: the legacy targeted re-run (one pass with the fix).
+      const body = (passCount > 1 && fixPass)
+        ? { inject_pass: fixPass, force_columns: [...badCols], good_columns: [] }
+        : { force_columns: [...badCols], good_columns: [], max_iterations: 1 };
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify(body));
       setColSel(false);
       setBadCols(new Set());
       wfSet("segVersion", segSig + 1); // refetch corrected previews (re-rendered) + dropped seg
@@ -449,6 +463,7 @@ export function SliceGallery() {
                 setGroup("context");
                 if (orient !== "sagittal" && orient !== "coronal") setOrient("sagittal");
                 wfSet("scarEditMode", false); // only one editing mode owns the canvas at a time
+                if (passCount > 1 && (fixPass == null || fixPass > passCount)) setFixPass(passCount); // default/clamp: fix the last pass
               }
             }}
             disabled={rerunBusy}
@@ -469,6 +484,18 @@ export function SliceGallery() {
           <>
             <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
             <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>mark in sagittal (columns) or coronal (rows) · click again to unmark · the rest are anchors</span>
+            {passCount > 1 && (
+              <span className="flex items-center gap-1" title="Apply this fix at ONLY this iteration pass, then re-converge the later passes from it. Earlier passes are unchanged.">
+                <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>fix at pass</span>
+                <Select size="small" variant="standard" value={fixPass ?? passCount}
+                  onChange={(e) => setFixPass(Number(e.target.value))}
+                  sx={{ fontSize: 11 }}>
+                  {Array.from({ length: passCount }, (_, i) => i + 1).map((k) => (
+                    <MenuItem key={k} value={k} sx={{ fontSize: 11 }}>{k}</MenuItem>
+                  ))}
+                </Select>
+              </span>
+            )}
             {badCols.size > 0 && (
               <button onClick={() => setBadCols(new Set())} disabled={rerunBusy}
                 style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
@@ -477,7 +504,7 @@ export function SliceGallery() {
             )}
             <button onClick={rerunColumns} disabled={rerunBusy || badCols.size === 0}
               style={{ background: badCols.size ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !badCols.size ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !badCols.size ? 0.6 : 1 }}>
-              {rerunBusy ? "Re-running…" : "Re-run preprocessing"}
+              {rerunBusy ? "Re-running…" : (passCount > 1 && fixPass ? `Re-run (fix at pass ${fixPass})` : "Re-run preprocessing")}
             </button>
           </>
         )}
