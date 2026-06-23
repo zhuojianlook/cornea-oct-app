@@ -68,7 +68,9 @@ export function VolumeCanvas() {
   }, []);
 
   useEffect(() => {
-    if (!volumeUrl || webglFailure()) return;
+    // No volume (fresh start, or a case reset/unload that interrupts an in-flight load): make sure the
+    // "Loading volume…" indicator can't stay stuck on — reset it instead of leaving the prior state.
+    if (!volumeUrl || webglFailure()) { setLoading(false); setError(null); return; }
     let cancelled = false;
     setLoading(true);
     setError(null);
