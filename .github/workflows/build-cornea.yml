@@ -107,6 +107,10 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # A copy-pasted RELEASE_PAT secret can carry a trailing newline, which makes gh send an
+          # invalid Authorization header ("invalid header field value"); strip whitespace before use.
+          # (tauri-action's octokit tolerates it, so the build/publish step is unaffected.)
+          export GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
           # tauri-action assembled the per-platform signed manifest as latest.json on the tag release.
           gh release download "$TAG" --repo "$REPO" --pattern "latest.json" --dir . --clobber
           mv latest.json cornea-latest.json
