@@ -143,21 +143,50 @@ fn kill_sidecar(app: &tauri::AppHandle) {
     }
 }
 
-/// Restart after a self-update. Kill the sidecar first so port 8765 frees and the new instance can
+/// Append a timestamped line to <app-data>/updater.log. Works in RELEASE builds (tauri_plugin_log only
+/// inits under debug_assertions, so log::* is invisible in the shipped AppImage). This is how we make
+/// the self-update path diagnosable: the startup line records the running version + the $APPIMAGE file
+/// size, so after an update you can SEE whether the file was actually replaced.
+fn ulog(app: &tauri::AppHandle, msg: &str) {
+    use std::io::Write;
+    if let Ok(dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("updater.log")) {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{t}] {msg}");
+        }
+    }
+}
+
+/// Restart after a self-update. Kill the sidecar first so its port frees and the new instance can
 /// respawn the *updated* sidecar (otherwise the stale one keeps serving and the update is wasted).
-/// On Linux AppImages Tauri's relaunch() can silently no-op, so exec the (already-updated) $APPIMAGE
-/// directly — exec replaces this process, guaranteeing a restart into the new version. Falls back to
-/// Tauri's restart elsewhere / if exec fails.
+///
+/// On Linux AppImages, `app.restart()` re-execs `current_exe()` — which is the binary INSIDE the
+/// (old) AppImage mount, NOT the .AppImage file the updater just replaced — so it would relaunch the
+/// OLD version, leaving the update banner up (the loop the user hit). Instead we run the (replaced)
+/// $APPIMAGE file itself: exec first (replaces this process); if exec fails, spawn it detached and
+/// exit. We NEVER fall back to app.restart() on an AppImage. Both paths + sizes are logged so a
+/// failure is diagnosable. Non-AppImage installs (deb/rpm/dmg/msi) use Tauri's restart.
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) {
     kill_sidecar(&app);
     #[cfg(target_os = "linux")]
     {
         if let Ok(appimage) = std::env::var("APPIMAGE") {
+            let size = std::fs::metadata(&appimage).map(|m| m.len()).unwrap_or(0);
+            ulog(&app, &format!("restart_app: exec APPIMAGE={appimage} size={size}"));
             use std::os::unix::process::CommandExt;
             let err = Command::new(&appimage).exec(); // only returns on failure
-            log::error!("exec restart failed: {err}");
+            ulog(&app, &format!("restart_app: exec failed ({err}) — spawning detached + exit"));
+            // exec failed → run the new AppImage as a detached process and exit, rather than
+            // app.restart() (which would re-launch the OLD in-mount binary → the update is lost).
+            let _ = Command::new(&appimage).spawn();
+            std::process::exit(0);
         }
+        ulog(&app, "restart_app: APPIMAGE unset — using app.restart() (update may not take effect)");
     }
     app.restart();
 }
@@ -201,6 +230,15 @@ pub fn run() {
             *app.state::<SidecarBase>().0.lock().unwrap() = format!("http://127.0.0.1:{port}");
             let child = spawn_sidecar(&app.handle(), port);
             *app.state::<Sidecar>().0.lock().unwrap() = child;
+            // Record this launch's version + the $APPIMAGE file size. After a self-update the new
+            // launch logs the NEW version/size IFF the AppImage was actually replaced — the single
+            // clearest signal for whether an updater loop is an install problem or a restart problem.
+            #[cfg(target_os = "linux")]
+            {
+                let ai = std::env::var("APPIMAGE").unwrap_or_default();
+                let size = if ai.is_empty() { 0 } else { std::fs::metadata(&ai).map(|m| m.len()).unwrap_or(0) };
+                ulog(&app.handle(), &format!("startup v{} APPIMAGE='{}' size={}", app.package_info().version, ai, size));
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
