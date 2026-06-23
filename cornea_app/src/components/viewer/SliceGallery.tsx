@@ -26,6 +26,7 @@ const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 export function SliceGallery() {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
+  const openCase = useCaseStore((s) => s.openCase); // refetch caseInfo after a fix-cols re-run (fresh persisted nudges)
   // Iterative-refinement pass count (for the "fix at pass" selector) — from the manifest.
   const octIter = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as { passes?: number } | undefined;
   const passCount = Math.max(1, Number(octIter?.passes ?? 1));
@@ -101,9 +102,13 @@ export function SliceGallery() {
   // Re-seed the editable shifts from the persisted set whenever it changes (clears pending after a re-run).
   useEffect(() => { setManualShifts(new Map(persistedShifts)); }, [persistedShifts]);
   // Pending = differs from what's already baked into the displayed volume (drives chips + the re-run enable).
+  // Must check BOTH directions: a frame newly nudged/changed (in manualShifts) AND a persisted frame the
+  // user dragged back to zero (removed from manualShifts) — else "drag the last nudge to zero" wouldn't
+  // register as dirty and the clear would never be sent.
   const pendingFrames = useMemo(() => {
     const s = new Set<number>();
     manualShifts.forEach((v, k) => { if ((persistedShifts.get(k) ?? 0) !== v) s.add(k); });
+    persistedShifts.forEach((_v, k) => { if (!manualShifts.has(k)) s.add(k); });
     return s;
   }, [manualShifts, persistedShifts]);
   const shiftsDirty = pendingFrames.size > 0;
@@ -298,22 +303,32 @@ export function SliceGallery() {
     if (!caseId || (!hasMarks && !shiftsDirty)) return;
     setRerunBusy(true);
     try {
-      // #2: send the COMPLETE manual depth-nudge set (absolute voxels) so every nudged frame keeps its
-      // correction; an empty {} would clear them. Rides along with whatever column-fix mode is active.
-      const manual_shifts: Record<string, number> = {};
-      manualShifts.forEach((v, k) => { if (v) manual_shifts[String(k)] = Math.round(v); });
       // Iterative scan (passCount>1): inject the column fix at the chosen pass ONLY and let the
       // iteration re-converge from there. Single-pass scan: the legacy targeted re-run (one pass).
       // Nudges-only (no marked frames): keep the persisted pipeline so the nudge lands relative to the
       // result the user dragged against, and clear any stale forced columns.
-      const body = (passCount > 1 && fixPass && hasMarks)
-        ? { inject_pass: fixPass, force_columns: [...badCols], good_columns: [], manual_shifts }
+      const body: Record<string, unknown> = (passCount > 1 && fixPass && hasMarks)
+        ? { inject_pass: fixPass, force_columns: [...badCols], good_columns: [] }
         : hasMarks
-          ? { force_columns: [...badCols], good_columns: [], max_iterations: 1, manual_shifts }
-          : { force_columns: [], good_columns: [], manual_shifts };
+          ? { force_columns: [...badCols], good_columns: [], max_iterations: 1 }
+          : { force_columns: [], good_columns: [] };
+      // ONLY touch manual_shifts when the user actually changed a nudge this session (shiftsDirty).
+      // Omitting it makes the backend KEEP the persisted set, so a plain mark-only re-run can never
+      // erase prior nudges (the data-loss the review caught). When dirty we send the COMPLETE absolute
+      // set (an empty {} then means "the user dragged every nudge back to zero" → clear). Non-finite
+      // values are filtered so a bad drag can't persist garbage.
+      if (shiftsDirty) {
+        const manual_shifts: Record<string, number> = {};
+        manualShifts.forEach((v, k) => { if (Number.isFinite(v) && v) manual_shifts[String(k)] = Math.round(v); });
+        body.manual_shifts = manual_shifts;
+      }
       await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify(body));
       setColSel(false);
       setBadCols(new Set());
+      // Refetch the case so caseInfo.manifest.oct_params.manual_shifts is FRESH — without this,
+      // persistedShifts stays stale, the "shifted" badge sticks, and a later re-run would resend a
+      // stale/incomplete set and silently drop nudges (the root cause behind the data-loss cluster).
+      await openCase();
       wfSet("segVersion", segSig + 1); // refetch corrected previews (re-rendered) + dropped seg
     } catch {
       /* surfaced via the spinner stopping; the volume is unchanged on failure */
@@ -322,7 +337,9 @@ export function SliceGallery() {
     }
   };
   // Render the preprocessing filmstrip for the central slice. Reflects the CURRENT bad-column
-  // selection (or the persisted one on a plain double-click) so step 8 matches a real re-run.
+  // selection (or the persisted one on a plain double-click) so step 8 matches a real re-run. NOTE: the
+  // steps show the AUTOMATIC boundary-correction stages only; the #2 manual depth nudges are a final
+  // post-correction applied to the whole volume (visible in the main viewer), not in this diagnostic.
   const loadSteps = async () => {
     if (!caseId) return;
     setStepsOpen(true);
@@ -424,12 +441,13 @@ export function SliceGallery() {
   };
   const onPointerDown = (e: React.PointerEvent) => {
     if (colSel && colMode === "shift" && orient === "sagittal") {  // #2: grab a frame and drag its depth
-      e.preventDefault();
-      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
       const f = frameAt(e.clientX, e.clientY);
       const img = imgRef.current;
-      if (f == null || !img || depthVox < 2) return;
-      const rect = img.getBoundingClientRect();
+      const rect = img?.getBoundingClientRect();
+      // Need a real image height to map screen→depth; bail (no capture) if it isn't measurable yet.
+      if (f == null || !img || !rect || rect.height <= 0 || depthVox < 2) return;
+      e.preventDefault();
+      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
       const frames: number[] = [];
       for (let k = Math.max(0, f - 1); k <= Math.min(nFrames - 1, f + 1); k++) frames.push(k); // ±1 frame, like the mark brush
       const baseAbs = new Map<number, number>();
@@ -457,9 +475,10 @@ export function SliceGallery() {
     paintAt(e);
   };
   const onPointerMove = (e: React.PointerEvent) => {
-    if (colSel && colMode === "shift" && orient === "sagittal") {
+    // Gate on the drag REF (not the current mode/orient) so a mode/orient switch mid-drag can't freeze
+    // or strand the gesture — the captured pointer keeps driving the shift it started.
+    if (shiftDragRef.current) {
       const d = shiftDragRef.current;
-      if (!d) return;
       const dy = Math.max(-d.rectH, Math.min(d.rectH, e.clientY - d.startY)); // clamp to one image height
       d.dy = dy;
       setDragGhost({ lo: d.lo, hiEnd: d.hiEnd, dy });
@@ -471,22 +490,21 @@ export function SliceGallery() {
     }
     if (editing && paintingRef.current) paintAt(e);
   };
-  const onPointerUp = async () => {
-    if (colSel && colMode === "shift" && orient === "sagittal") {  // #2: commit the dragged depth shift
+  const onPointerUp = async (e?: React.PointerEvent) => {
+    if (shiftDragRef.current) {  // #2: commit the dragged depth shift (always cleans up, any mode/orient)
       const d = shiftDragRef.current;
       shiftDragRef.current = null;
       setDragGhost(null);
-      if (d) {
-        const deltaVox = Math.round((d.dy / d.rectH) * d.depthVox); // screen px → depth voxels (down = +)
-        if (deltaVox !== 0) setManualShifts((prev) => {
-          const next = new Map(prev);
-          d.frames.forEach((k) => {
-            const abs = (d.baseAbs.get(k) ?? 0) + deltaVox;
-            if (abs) next.set(k, abs); else next.delete(k); // keep the map zero-free (matches persisted)
-          });
-          return next;
+      if (e) (e.target as HTMLElement).releasePointerCapture?.(e.pointerId);
+      const deltaVox = d.rectH > 0 ? Math.round((d.dy / d.rectH) * d.depthVox) : 0; // px → depth voxels (down = +)
+      if (deltaVox !== 0) setManualShifts((prev) => {
+        const next = new Map(prev);
+        d.frames.forEach((k) => {
+          const abs = (d.baseAbs.get(k) ?? 0) + deltaVox;
+          if (abs) next.set(k, abs); else next.delete(k); // keep the map zero-free (matches persisted)
         });
-      }
+        return next;
+      });
       return;
     }
     if (colSel) { colPaintingRef.current = false; return; }
@@ -602,7 +620,7 @@ export function SliceGallery() {
               </span>
             )}
             {(badCols.size > 0 || shiftsDirty) && (
-              <button onClick={() => { setBadCols(new Set()); setManualShifts(new Map(persistedShifts)); }} disabled={rerunBusy}
+              <button onClick={() => { setBadCols(new Set()); setManualShifts(new Map(persistedShifts)); }} disabled={rerunBusy || dragGhost !== null}
                 style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
                 Clear
               </button>

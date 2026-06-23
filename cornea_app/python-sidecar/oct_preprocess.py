@@ -16,6 +16,7 @@ unused `corr_factor` now scales the column displacement (default 1.0 = unchanged
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from pathlib import Path
@@ -856,8 +857,11 @@ def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
     n = 0
     for f, px in pairs:
         try:
-            fi, s = int(f), int(round(float(px)))
-        except (TypeError, ValueError):
+            fpx = float(px)
+            if not math.isfinite(fpx):   # reject NaN/Infinity defensively (never crash the worker)
+                continue
+            fi, s = int(f), int(round(fpx))
+        except (TypeError, ValueError, OverflowError):
             continue
         if not (0 <= fi < nz) or s == 0:
             continue

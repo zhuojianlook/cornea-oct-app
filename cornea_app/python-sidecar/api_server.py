@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -1520,17 +1521,24 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         eff_params.pop("good_columns", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
-    # #2 drag-to-correct: explicit per-frame manual depth nudges. When provided, override (an empty {}
-    # clears them); when omitted, the persisted nudges from oct_params carry through so manual ground
-    # truth stays applied on every later re-run. Flows to the worker inside eff_params (--params JSON).
+    # #2 drag-to-correct: explicit per-frame manual depth nudges. When provided (non-None), REPLACE the
+    # persisted set (an empty {} clears them); when omitted, the persisted nudges carry through so manual
+    # ground truth stays applied on every later re-run. Flows to the worker inside eff_params (--params).
     if req.manual_shifts is not None:
-        ms: dict = {}
-        for k, v in (req.manual_shifts or {}).items():
+        eff_params["manual_shifts"] = req.manual_shifts
+    # Sanitize the EFFECTIVE set (request-provided OR carried-through from persisted oct_params): drop any
+    # zero / NaN / Infinity / malformed entry so the manifest never accumulates no-op garbage and always
+    # matches the frontend's zero-free view (a zero shift is a no-op the frontend already removes).
+    if eff_params.get("manual_shifts"):
+        clean: dict = {}
+        for k, v in dict(eff_params["manual_shifts"]).items():
             try:
-                ms[str(int(k))] = int(round(float(v)))
-            except (TypeError, ValueError):
-                pass
-        eff_params["manual_shifts"] = ms
+                fv = float(v)
+                if math.isfinite(fv) and int(round(fv)) != 0:
+                    clean[str(int(k))] = int(round(fv))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        eff_params["manual_shifts"] = clean
     cls = req.classification or m.get("scar_classification")
     sr = req.scar_range or m.get("scar_range")
     # Iterative refinement: auto-converge by default (cap 8). Persisted as oct_max_iterations so a
