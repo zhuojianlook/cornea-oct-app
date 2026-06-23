@@ -26,6 +26,9 @@ export function Toolbar() {
   const applyScarHints = useWorkflowStore((s) => s.applyScarHints);
   const clearScarHints = useWorkflowStore((s) => s.clearScarHints);
   const hasVolume = useCaseStore((s) => Boolean(s.volumeUrl));
+  // #4: scar / not-scar (control) decision — made HERE, after preprocessing (not in the loader up front).
+  const classification = useCaseStore((s) => (s.caseInfo?.manifest as Record<string, unknown> | undefined)?.scar_classification as ("scar" | "control" | null | undefined)) ?? null;
+  const setClassification = useCaseStore((s) => s.setClassification);
   const busy = segBusy || scarBusy;
 
   const Correct = (
@@ -80,6 +83,16 @@ export function Toolbar() {
         </>
       ) : (
         <>
+          {/* #4: decide scar vs control HERE (post-preprocess), not in the loader up front. */}
+          <div className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
+            title="Does this corrected volume have a scar? Decide now (after preprocessing). Persists to the case; 'No scar' marks it a control (used as the normal baseline) and skips scar detection.">
+            scar?
+            <Button size="small" variant={classification === "scar" ? "contained" : "outlined"} color="error"
+              disabled={busy} onClick={() => setClassification(classification === "scar" ? null : "scar")}>Scar</Button>
+            <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
+              disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar</Button>
+          </div>
+          <div style={{ width: 1, height: 24, background: "var(--c-border)" }} />
           <Select size="small" value={scarMethod} onChange={(e) => set("scarMethod", e.target.value)}
             disabled={busy} sx={{ fontSize: 12, maxWidth: 200, color: "var(--c-text)", ".MuiSelect-select": { py: 0.4, textOverflow: "ellipsis" }, "& fieldset": { borderColor: "var(--c-border)" } }}
             title="Scar detection strategy (compare them on the same scan)">
@@ -90,12 +103,12 @@ export function Toolbar() {
             <MenuItem value="morph_lcc" sx={{ fontSize: 12 }}>Morph + largest component</MenuItem>
             <MenuItem value="brightness" sx={{ fontSize: 12 }}>Brightness percentile (baseline)</MenuItem>
           </Select>
-          <Button variant="contained" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
-            title="Run the selected scar strategy inside the cornea (overwrites/merges the scar candidate; correct as needed).">
+          <Button variant="contained" color="error" disabled={busy || !segLoaded || classification === "control"} onClick={() => runScarAuto()}
+            title={classification === "control" ? "Marked 'No scar' (control) — toggle to Scar to detect." : "Run the selected scar strategy inside the cornea (overwrites/merges the scar candidate; correct as needed)."}>
             Detect scar (auto)
           </Button>
-          <Button variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
-            title="Auto scar via SAM2 on all 3 views as videos → ≥2-of-3 consensus, seeded from the brightest in-cornea tissue (and confined to your scar frame-range). Slower (~1–2 min) but more coherent.">
+          <Button variant="outlined" color="error" disabled={busy || !segLoaded || classification === "control"} onClick={() => runScarAutoSam2()}
+            title={classification === "control" ? "Marked 'No scar' (control) — toggle to Scar to detect." : "Auto scar via SAM2 on all 3 views as videos → ≥2-of-3 consensus, seeded from the brightest in-cornea tissue (and confined to your scar frame-range). Slower (~1–2 min) but more coherent."}>
             Scar (SAM2 3-view)
           </Button>
           <label className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}

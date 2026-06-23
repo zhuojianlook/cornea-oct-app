@@ -27,6 +27,9 @@ interface CaseState {
   exportInfo: string | null;
   preprocessed: boolean;
   setPreprocess: (enabled: boolean) => Promise<void>;
+  // #4: scar / not-scar (control) decision, made AFTER preprocessing. Persists to the case manifest
+  // without re-running the correction; null = undecided.
+  setClassification: (cls: "scar" | "control" | null) => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -72,6 +75,18 @@ export const useCaseStore = create<CaseState>()(
         set((s) => {
           s.busy = false;
         });
+      }
+    },
+
+    setClassification: async (cls) => {
+      const id = get().caseId;
+      if (!id) return;
+      // optimistic: reflect the choice immediately, persist to the manifest in the background
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).scar_classification = cls; });
+      try {
+        await api.json(`/api/case/${id}/classification`, "POST", JSON.stringify({ classification: cls }));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }
     },
 

@@ -41,6 +41,20 @@ DEFAULT_PARAMS: dict = {
     "residual_threshold": 5.0,    # RANSAC quadratic residual
     "active_threshold": 5.0,      # 3D active correction across neighbouring slices
     "corr_factor": 1.0,           # scales the column-correction displacement (0..1)
+    # ── over-correction guard (#2) ── A low-signal lateral column gets a garbage edge whose deviation
+    # from the dome's quadratic is huge, so (quad-edge) demands a 100-360px shift that bends the edge
+    # and (re-detected on the warped output) compounds every pass. Any per-column displacement beyond
+    # max_displacement (px) is therefore NOT trusted: that column is treated as bad and its shift is
+    # interpolated from its good neighbours, then hard-clamped. Real corrections are a few px (a raw
+    # boundary deviates < ~17px from its fit), so this is a no-op on well-detected columns — clean scans
+    # are unchanged; only the pathological lateral runaway is tamed.
+    "max_displacement": 40.0,
+    # ── axial consistency (#3) ── Sagittal slices are corrected independently, so neighbouring slices
+    # can shift inconsistently → the en-face/axial corneal boundary turns jagged ("hairier"). Smoothing
+    # the per-column displacement FIELD across the slice (lateral) axis with this Gaussian sigma (px,
+    # 0 = off) makes neighbours shift consistently → a smoother axial boundary, while the per-slice
+    # quadratic still carries the real lateral curvature. Small sigma stays close to the per-slice fit.
+    "interslice_smooth": 1.0,
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
@@ -515,16 +529,38 @@ def _interp_bad_displacement(disp: np.ndarray, bad_cols, good_cols) -> np.ndarra
     return disp
 
 
-def _warp_worker(packed):
-    sl, active_edge, residual, corr_factor, bad_cols, good_cols = packed
+def _slice_displacement(active_edge, residual, corr_factor, bad_cols, good_cols, max_disp):
+    """The per-column shift that flattens one sagittal slice's boundary to its quadratic, WITH the
+    over-correction guard (#2): a column whose demanded shift |quad-edge| exceeds max_disp is a runaway
+    (a garbage low-signal edge the quadratic can't trust), so it is treated as bad and its shift is
+    interpolated from the good (well-detected) columns, then hard-clamped — a runaway can no longer bend
+    the slice by 100-360px or compound across passes. With NO runaway column (the normal case — a raw
+    boundary deviates < ~17px from its fit) this is exactly the faithful (quad-edge)*corr_factor field,
+    so well-detected scans/columns are unchanged. max_disp<=0 disables the guard (legacy)."""
     quad = _fit_quadratic_ransac(active_edge, residual)
     disp = (quad - active_edge) * corr_factor
-    disp = _interp_bad_displacement(disp, bad_cols, good_cols)
-    # Also report this slice's mean applied displacement (pixels). It is exactly the boundary's
-    # deviation from its quadratic fit (×corr_factor) — the signal iterative refinement watches:
-    # it shrinks each pass and stops shrinking once the cornea is flattened. The warped output is
-    # unchanged, so the single-pass path stays byte-identical to DICOMSmootherSteps.
-    return _warp_by_displacement(sl, disp), float(np.mean(np.abs(disp)))
+    bad = set(int(c) for c in bad_cols)
+    if max_disp and max_disp > 0:
+        bad |= {int(c) for c in np.where(np.abs(disp) > max_disp)[0]}
+    disp = _interp_bad_displacement(disp, sorted(bad), good_cols)  # runaway cols → good-neighbour shift
+    if max_disp and max_disp > 0:
+        np.clip(disp, -max_disp, max_disp, out=disp)              # backstop (e.g. an all-bad slice)
+    return disp
+
+
+def _disp_worker(packed):
+    sl, active_edge, residual, corr_factor, bad_cols, good_cols, max_disp = packed
+    return _slice_displacement(active_edge, residual, corr_factor, bad_cols, good_cols, max_disp)
+
+
+def _axial_roughness(edges: np.ndarray) -> float:
+    """Mean |first-difference of the detected corneal boundary ACROSS sagittal slices| (axis 0) — i.e.
+    how jagged the en-face / AXIAL boundary is. Per-slice correction is independent, so inconsistent
+    inter-slice shifts make this grow ('hairier' axial view, #3); lower = smoother axial boundary."""
+    e = np.asarray(edges, dtype=float)
+    if e.ndim != 2 or e.shape[0] < 2:
+        return 0.0
+    return float(np.mean(np.abs(np.diff(e, axis=0))))
 
 
 def _map_slices(worker, items, progress, lo, hi, workers):
@@ -563,9 +599,16 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     slice, but each slice's edge is computed once (O(N), not O(3N)) and the two
     independent per-slice phases are parallelised across CPU cores.
 
-    return_metric=True → also return the mean per-column correction magnitude (pixels) applied
-    this pass (the boundary's mean deviation from its fit) — the iterative-refinement signal. The
-    corrected array is identical either way (single-pass path stays byte-identical).
+    return_metric=True → also return (mean per-column correction magnitude px, axial roughness px):
+    the iterative-refinement convergence signal and the en-face boundary jaggedness (#3). The corrected
+    array is identical either way.
+
+    NOTE: the correction is no longer byte-identical to DICOMSmootherSteps — by design (the user asked
+    to fix two failure modes): the OVER-CORRECTION GUARD (#2, max_displacement) interpolates+clamps a
+    runaway lateral shift, and INTER-SLICE SMOOTHING (#3, interslice_smooth) smooths the displacement
+    field across slices for a consistent axial boundary. Both are no-ops at their off values
+    (max_displacement<=0, interslice_smooth=0) and the guard is a no-op on well-detected columns, so a
+    clean scan is essentially unchanged; only the pathological lateral runaway/hairiness is tamed.
 
     detect_volume: if given, the corneal edge is DETECTED on this volume (e.g. a black-band-filled
     copy, so re-detection on a warped input isn't fooled by the warp's zero padding) while the warp is
@@ -599,35 +642,54 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         dev = np.abs(edges[i] - med)
         active[i][dev > active_threshold] = med[dev > active_threshold]
 
-    # 3) flatten each slice to its quadratic via column warp — parallel — then revert.
+    # 3) per-slice displacement that flattens the boundary to its quadratic — parallel — WITH the
+    #    over-correction guard (#2): a runaway shift (garbage low-signal edge) is interpolated from good
+    #    neighbours + clamped, so it can't bend the edge or compound across passes.
     res = float(p["residual_threshold"])
+    max_disp = float(p.get("max_displacement", 0.0) or 0.0)
     bad_cols = [int(c) for c in (p.get("force_columns") or [])]
     good_cols = [int(c) for c in (p.get("good_columns") or [])]
-    items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols) for i in range(n)]
-    results = _map_slices(_warp_worker, items, progress, 0.5, 1.0, workers)
-    warped = [r[0] for r in results]
-    corrected = revert_sagittal(np.array(warped))
+    items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols, max_disp) for i in range(n)]
+    disp_field = np.array(_map_slices(_disp_worker, items, progress, 0.5, 0.9, workers))  # (n_slices, n_frames)
+    # The per-pass metric is the mean per-column deviation of the boundary from its quadratic fit (the
+    # iterative-refinement convergence signal + abs_floor calibration) — measured on the PRE-smoothing
+    # field so its meaning is unchanged by #3's inter-slice smoothing (which only affects the warp).
+    disp_mean = float(np.mean(np.abs(disp_field))) if disp_field.size else 0.0
+
+    # 3b) axial consistency (#3): smooth the displacement FIELD across the slice (lateral) axis so
+    #     neighbouring sagittal slices shift consistently → a smoother en-face/axial boundary. The
+    #     depth/frame axis is untouched (the per-slice quadratic governs it); sigma=0 → per-slice field.
+    ism = float(p.get("interslice_smooth", 0.0) or 0.0)
+    if ism > 0 and n > 2:
+        disp_field = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=ism, axis=0)
+
+    # 4) warp each slice by its guarded+smoothed displacement, then revert.
+    warped = np.array([_warp_by_displacement(sag[i], disp_field[i]) for i in range(n)])
+    if progress:
+        progress(1.0)
+    corrected = revert_sagittal(warped)
     if return_metric:
-        disp_means = [float(r[1]) for r in results]
-        return corrected, float(np.mean(disp_means)) if disp_means else 0.0
+        # disp_mean (deviation from fit, pre-smoothing) + axial roughness of the DETECTED boundary (the
+        # en-face jaggedness the keep-best selection should also minimise, #3).
+        return corrected, disp_mean, _axial_roughness(edges)
     return corrected
 
 
 def _boundary_deviation(volume: np.ndarray, params: dict | None = None,
-                        workers: int | None = None, detect_volume: np.ndarray | None = None) -> float:
-    """Mean (over sagittal slices/columns) absolute deviation of the DETECTED corneal boundary
-    from its own quadratic fit, in pixels — i.e. how jagged/non-smooth the boundary is. This is
-    the SAME quantity smooth_volume's per-pass metric reports for its input; computing it directly
-    (no warp) lets the iterator score a candidate volume's quality on its own terms. Lower = flatter
-    + smoother + less extreme."""
-    _, m = smooth_volume(volume, params, workers=workers, return_metric=True, detect_volume=detect_volume)
-    return float(m)
+                        workers: int | None = None, detect_volume: np.ndarray | None = None):
+    """Score a candidate volume's boundary quality on its own terms (no warp kept). Returns
+    (in_plane_deviation, axial_roughness): the mean per-column deviation of the DETECTED boundary from
+    its quadratic fit (how jagged WITHIN each sagittal slice), and the mean inter-slice first-difference
+    (how jagged ACROSS slices = the en-face/axial 'hairiness', #3). Both in pixels; lower = better."""
+    _, m, ax = smooth_volume(volume, params, workers=workers, return_metric=True, detect_volume=detect_volume)
+    return float(m), float(ax)
 
 
 def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
                           max_iter: int = 5, min_improvement: float = 0.15,
                           abs_floor: float = 0.3, progress=None, workers: int | None = None,
-                          inject_pass: int | None = None, inject_force=None, inject_good=None):
+                          inject_pass: int | None = None, inject_force=None, inject_good=None,
+                          axial_weight: float = 0.5):
     """Iteratively re-apply smooth_volume to its own output, then KEEP THE BEST pass — the one whose
     detected corneal boundary deviates LEAST from a smooth fit (lowest "boundary deviation", px).
 
@@ -654,7 +716,8 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     base.pop("force_columns", None)
     base.pop("good_columns", None)
     chain: list = [volume]       # V0 = raw, then each accepted pass
-    rough: list = []             # rough[i] = boundary deviation of chain[i]
+    rough: list = []             # rough[i] = in-plane boundary deviation of chain[i] (convergence signal)
+    axial: list = []             # axial[i] = en-face/axial roughness of chain[i] (#3, folded into select)
     stopped = "max_iter"
     for k in range(max_iter):
         lo = k / max_iter
@@ -668,10 +731,10 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
         # real (unfilled) chain[k], so the output never carries the fill's fake pixels (only honest
         # zero padding). Pass 1 runs on raw with no fill → byte-identical to the faithful single pass.
         det = None if k == 0 else _fill_black_bands(chain[k])
-        nxt, r = smooth_volume(chain[k], pp, progress=(
+        nxt, r, ax = smooth_volume(chain[k], pp, progress=(
             (lambda f, lo=lo, hi=hi: progress(lo + (hi - lo) * f)) if progress else None),
-            workers=workers, return_metric=True, detect_volume=det)   # r = deviation of chain[k]
-        rough.append(float(r))
+            workers=workers, return_metric=True, detect_volume=det)   # r/ax = in-plane/axial of chain[k]
+        rough.append(float(r)); axial.append(float(ax))
         # Force the iteration to REACH (and keep) the injected pass — never early-stop before it, or
         # the user's per-pass column fix would be silently discarded. Past the inject pass, the normal
         # keep-best stop logic resumes.
@@ -693,10 +756,16 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
     while len(rough) < len(chain):
         idx = len(rough)
         det = None if idx == 0 else _fill_black_bands(chain[idx])
-        rough.append(_boundary_deviation(chain[idx], base, workers=workers, detect_volume=det))
-    best_idx = min(range(len(chain)), key=lambda i: rough[i])
+        dev, ax = _boundary_deviation(chain[idx], base, workers=workers, detect_volume=det)
+        rough.append(dev); axial.append(ax)
+    # KEEP-THE-BEST by a COMBINED score: in-plane deviation + axial_weight × en-face/axial roughness
+    # (#3). A pass that flattens each sagittal slice but leaves a HAIRIER axial boundary now loses to a
+    # more axially-consistent pass — the old pure-in-plane argmin even preferred the hairiest pass.
+    score = [rough[i] + axial_weight * axial[i] for i in range(len(chain))]
+    best_idx = min(range(len(chain)), key=lambda i: score[i])
     info = {"passes": len(chain) - 1, "best_pass": best_idx,
-            "metrics": [float(x) for x in rough], "stopped": stopped}
+            "metrics": [float(x) for x in rough], "axial_metrics": [float(x) for x in axial],
+            "scores": [float(x) for x in score], "stopped": stopped}
     return chain, best_idx, info
 
 
@@ -761,10 +830,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             inject_pass: int | None = None, inject_force=None, inject_good=None) -> dict:
     """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry.
 
-    max_iterations<=1 → the faithful single pass (unchanged). max_iterations>1 → iterative
-    refinement (iterate_smooth_volume), auto-stopping when the boundary correction stops
-    shrinking. When iter_dir is given, each INTERMEDIATE pass volume (V1..V(n-1)) is written
-    there as pass_{k}.nii.gz so the UI can step through every pass; the final pass is out_nifti.
+    max_iterations<=1 → single pass. max_iterations>1 → iterative refinement (iterate_smooth_volume),
+    auto-stopping when the boundary correction stops shrinking, then keeping the BEST pass (lowest
+    in-plane deviation + axial roughness, #3). Both paths apply the over-correction guard (#2) +
+    inter-slice smoothing (#3) — see smooth_volume (no longer byte-identical to DICOMSmootherSteps by
+    design). When iter_dir is given, each INTERMEDIATE pass volume (V1..V(n-1)) is written there as
+    pass_{k}.nii.gz so the UI can step through every pass; the final pass is out_nifti.
     Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
@@ -782,8 +853,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             for k, pv in enumerate(chain[1:], start=1):
                 write_volume_nifti(pv, idir / f"pass_{k}.nii.gz", sp)
     else:
-        corrected, m = smooth_volume(vol, params, progress=progress, return_metric=True)
-        info = {"passes": 1, "best_pass": 1, "metrics": [float(m)], "stopped": "single"}
+        corrected, m, ax = smooth_volume(vol, params, progress=progress, return_metric=True)
+        info = {"passes": 1, "best_pass": 1, "metrics": [float(m)], "axial_metrics": [float(ax)], "stopped": "single"}
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     return info
@@ -882,11 +953,11 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     quad_a = _fit_quadratic_ransac(active_e, res)
     im7 = _draw_curve(_gray_rgb(sl), active_e, _C_MAGENTA)
     add("7. 3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True))
-    # Final warp: same logic as smooth_volume — bad-column displacement interpolated from good
-    # neighbours (so the filmstrip matches a real re-run).
-    bad = sorted(set(int(c) for c in (bad_cols or [])))
-    disp = (quad_a - active_e) * cf
-    disp = _interp_bad_displacement(disp, bad, [int(c) for c in (p.get("good_columns") or [])])
+    # Final warp: same logic as smooth_volume — with the over-correction guard (#2) so the filmstrip
+    # matches a real re-run (runaway shift interpolated from good neighbours + clamped).
+    disp = _slice_displacement(active_e, res, cf, [int(c) for c in (bad_cols or [])],
+                               [int(c) for c in (p.get("good_columns") or [])],
+                               float(p.get("max_displacement", 0.0) or 0.0))
     warped = _warp_by_displacement(sag[idx], disp)
     add("8. Final corrected — column warp", _gray_rgb(warped.astype(np.float32)))
     return steps

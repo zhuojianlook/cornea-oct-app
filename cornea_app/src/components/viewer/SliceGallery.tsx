@@ -231,13 +231,15 @@ export function SliceGallery() {
     const img = imgRef.current;
     if (!img || nFrames < 2) return null;
     const rect = img.getBoundingClientRect();
+    // Edge basis: the frame under the cursor is floor(fraction × nFrames), matching the band span
+    // [f/nFrames,(f+1)/nFrames] drawn above — so click and highlight land on the same texel. (#1)
     if (orient === "sagittal") {
       const ffx = (clientX - rect.left) / rect.width;
-      return ffx < 0 || ffx > 1 ? null : Math.round(ffx * (nFrames - 1));
+      return ffx < 0 || ffx > 1 ? null : Math.min(nFrames - 1, Math.max(0, Math.floor(ffx * nFrames)));
     }
     if (orient === "coronal") {
       const ffy = (clientY - rect.top) / rect.height;
-      return ffy < 0 || ffy > 1 ? null : Math.round((1 - ffy) * (nFrames - 1)); // frames run bottom→top
+      return ffy < 0 || ffy > 1 ? null : Math.min(nFrames - 1, Math.max(0, Math.floor((1 - ffy) * nFrames))); // frames run bottom→top
     }
     return null;
   };
@@ -657,7 +659,10 @@ export function SliceGallery() {
             />
             {colSel && (orient === "sagittal" || orient === "coronal") && nFrames > 1 &&
               colRuns(badCols).map(([a, b], i) => {
-                const lo = a / (nFrames - 1), hiEnd = (b + 1) / (nFrames - 1);
+                // Voxel-EDGE fractions: frame f occupies the image span [f/nFrames, (f+1)/nFrames] of
+                // the nFrames-wide PNG (NOT /(nFrames-1), which is the first→last CENTER span and drifts
+                // the band ~1 frame off by the far edge). Must match frameAt's inverse below. (#1)
+                const lo = a / nFrames, hiEnd = (b + 1) / nFrames;
                 const pos = orient === "sagittal"
                   ? { left: `${lo * 100}%`, width: `${(hiEnd - lo) * 100}%`, top: 0, bottom: 0 }
                   : { top: `${Math.max(0, 1 - hiEnd) * 100}%`, height: `${(hiEnd - lo) * 100}%`, left: 0, right: 0 };

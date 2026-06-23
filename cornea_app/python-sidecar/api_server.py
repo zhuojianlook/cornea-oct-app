@@ -1597,6 +1597,28 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     return out
 
 
+class ClassificationRequest(BaseModel):
+    classification: str | None = None   # "scar" | "control" | null (clear)
+    scar_range: list[int] | None = None # optional [start,end] frame range (1-based)
+
+
+@app.post("/api/case/{case_id}/classification")
+def set_case_classification(case_id: str, req: ClassificationRequest) -> dict:
+    """Set the scar / not-scar (control) decision AFTER preprocessing (#4) — manifest metadata only, no
+    re-correction (the geometric OCT correction never used it). Mirrors the keys oct-preprocess writes so
+    downstream consensus / control-baseline / nnUNet tooling keeps working, and lets the user defer the
+    choice until the corrected volume exists instead of declaring it up front."""
+    cls = (req.classification or "").strip().lower() or None
+    if cls is not None and cls not in ("scar", "control"):
+        raise HTTPException(status_code=400, detail="classification must be 'scar', 'control', or null")
+    updates: dict = {"scar_classification": cls}     # None clears it
+    if req.scar_range is not None:
+        updates["scar_range"] = [int(x) for x in req.scar_range] or None
+    m = orch.write_manifest_value(case_id, updates)
+    return {"ok": True, "scar_classification": m.get("scar_classification"),
+            "scar_range": m.get("scar_range")}
+
+
 @app.post("/api/case/{case_id}/oct-preprocess-steps")
 def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
     """Render EVERY preprocessing step for the central sagittal slice (original → hist-eq →

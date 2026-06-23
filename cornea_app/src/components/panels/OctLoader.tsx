@@ -615,7 +615,8 @@ export function OctLoader() {
     <div className="flex flex-col gap-2">
       <Typography variant="caption" sx={{ color: "var(--c-text-dim)" }}>
         Load Optovue .OCT scans — each needs its <b>.txt</b> next to it (a folder grabs both).
-        Scans auto-group by patient/eye; tag each group Scar/Control, scrub the replicate scans, then preprocess.
+        Scans auto-group by patient/eye; scrub the replicate scans, then preprocess. Decide Scar/Control
+        later, in the Scar stage (it doesn't affect the correction).
       </Typography>
       <input ref={fileRef} type="file" accept=".oct,.txt" multiple hidden
         onChange={(e) => onPicked(Array.from(e.target.files ?? []))} />
@@ -662,11 +663,10 @@ export function OctLoader() {
           </div>
           {groups.map((g) => {
             const groupScans = scans.filter((s) => s.groupId === g.id);
-            const needsTag = !g.condition;
             const isCollapsed = collapsed.has(g.id);
             const nDoneInGroup = groupScans.filter((s) => s.status === "done").length;
             return (
-              <div key={g.id} className="rounded" style={{ border: needsTag ? "1px solid var(--c-amber, #d9a441)" : "1px solid var(--c-border)" }}>
+              <div key={g.id} className="rounded" style={{ border: "1px solid var(--c-border)" }}>
                 {/* Group header: editable patient/eye + Scar/Control tag for the whole group. */}
                 <div className="flex flex-col gap-1 px-1.5 py-1.5" style={{ background: "var(--c-surface2)" }}>
                   <div className="flex items-center gap-1">
@@ -712,9 +712,6 @@ export function OctLoader() {
                       </span>
                     ) : null;
                   })()}
-                  {needsTag && (
-                    <span className="text-[10px]" style={{ color: "var(--c-amber, #d9a441)" }}>⚠ tag this group Scar or Control</span>
-                  )}
                   {groups.length > 1 && (
                     <select value="" disabled={busy}
                       onChange={(e) => { if (e.target.value) mergeGroup(g.id, e.target.value); }}
@@ -848,12 +845,14 @@ export function OctLoader() {
             {maxPasses === 1 ? "Single pass (faithful method)." : "Iterative — auto-stops at convergence; step through passes in ⇆ Before/after."}
           </span>
 
-          <Button variant="contained" size="small" onClick={runPreprocess} disabled={busy || nToRun < 1 || untaggedGroups.length > 0}>
+          {/* #4: tagging Scar/Control is NO LONGER required before preprocessing — decide it after, in
+              the Scar stage (the geometric correction never used it). Preprocess freely while untagged. */}
+          <Button variant="contained" size="small" onClick={runPreprocess} disabled={busy || nToRun < 1}>
             Preprocess selected ({nToRun})
           </Button>
           {untaggedGroups.length > 0 && (
-            <Typography variant="caption" sx={{ color: "var(--c-amber, #d9a441)", wordBreak: "break-word" }}>
-              Tag {untaggedGroups.length} group{untaggedGroups.length === 1 ? "" : "s"} Scar/Control first: {untaggedGroups.map((g) => `${g.patient} ${g.eye}`.trim()).join(", ")}
+            <Typography variant="caption" sx={{ color: "var(--c-text-dim)", wordBreak: "break-word" }}>
+              Scar/Control is optional here — you can set it after preprocessing in the Scar stage.
             </Typography>
           )}
           {nDone > 0 && maxScanPasses > 1 && (
