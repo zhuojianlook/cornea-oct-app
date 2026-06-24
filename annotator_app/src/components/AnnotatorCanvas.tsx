@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, flushCompose, setCrosshairAtScreen, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, flushCompose, setOverlayCanvas, setCrosshairAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -52,6 +52,7 @@ const VIEW_AXIS: { plane: "axial" | "coronal" | "sagittal"; axis: 0 | 1 | 2; key
 
 export function AnnotatorCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null); // 2-D drawing overlay (WebGL-independent)
   const lastVox = useRef<[number, number, number] | null>(null); // previous painted voxel (stroke continuity)
   const strokeTile = useRef<number>(-1);                          // pane the current stroke started on
   const strokeAxis = useRef<number | null>(null);                 // that pane's through-plane axis (paint stays on one slice)
@@ -80,10 +81,12 @@ export function AnnotatorCanvas() {
   useEffect(() => {
     if (canvasRef.current) {
       attach(canvasRef.current);
+      setOverlayCanvas(overlayRef.current); // WebGL-independent 2-D drawing overlay (see nvController)
       const err = webglFailure();
       setNoWebgl(err);
       if (!err) useStore.getState().resumePending(); // #2 reopen last session's volume once attached
     }
+    return () => setOverlayCanvas(null);
   }, []);
 
   // #5: best-effort final autosave when the window/app is closing (the per-stroke debounced autosave
@@ -213,6 +216,10 @@ export function AnnotatorCanvas() {
         onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); flushCompose(); autosaveDraw(); } setBrush(null); }}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting || wandActive ? "crosshair" : "default" }} />
+        {/* WebGL-independent 2-D drawing overlay: we render the labels here (over niivue) so paint is
+            always visible on every 2-D tile, incl. the en-face/coronal one that the desktop WebGL draw
+            layer doesn't reach. pointer-events:none so paint events still hit the container handlers. */}
+        <canvas ref={overlayRef} className="absolute inset-0 h-full w-full" style={{ pointerEvents: "none" }} />
         {showBrush && (
           <div className="absolute pointer-events-none" style={{
             left: brush!.x, top: brush!.y, transform: "translate(-50%, -50%)",

@@ -112,6 +112,7 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   // listener runs before React's onMouseDown sets strokeActive, so also gate on uiData.mousedown
   // (set true at the very start of mouseDownListener) so the readout never follows the brush.
   (nv as unknown as { onLocationChange: (loc: unknown) => void }).onLocationChange = () => {
+    renderDrawOverlay();   // niivue scrolled/scrubbed a slice (wheel/drag) → re-render the 2-D overlay
     if (strokeActive) return;
     const ui = (nv as unknown as { uiData?: { mousedown?: boolean } }).uiData;
     if (ui?.mousedown && nv!.opts.drawingEnabled) return; // a paint click/drag is in progress
@@ -122,10 +123,15 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
 }
 
 export function hasVolume(): boolean { return !!nv && nv.volumes.length > 0; }
-export function setView(v: ViewName): void { if (nv) nv.setSliceType(SLICE[v]); }
+export function setView(v: ViewName): void {
+  if (!nv) return;
+  nv.setSliceType(SLICE[v]);
+  // the tile layout changed → re-render the 2-D overlay now + after the layout settles.
+  renderDrawOverlay(); requestAnimationFrame(renderDrawOverlay); setTimeout(renderDrawOverlay, 120);
+}
 /** Force a repaint. Defensive: WebKitGTK can leave a freshly-loaded volume black if the canvas was
     resized right after the first draw — re-issuing drawScene once the layout has settled recovers it. */
-export function redraw(): void { if (nv) { try { nv.drawScene(); } catch { /* nothing */ } } }
+export function redraw(): void { if (nv) { try { nv.drawScene(); } catch { /* nothing */ } renderDrawOverlay(); } }
 
 // ── Pen / brush ────────────────────────────────────────────────────────────
 export function setPen(label: number, filled = false): void {
@@ -238,11 +244,89 @@ export function recreateDrawTexture(): void {
     }
     nv.refreshDrawing(false);   // upload the CURRENT drawBitmap into the freshly-created texture
   } catch { try { nv.refreshDrawing(true); } catch { /* */ } }
-  // escalating redraws for WebKitGTK layout-settle (same cadence as forceDrawAll).
-  const draw = () => { try { nv?.drawScene(); } catch { /* */ } };
+  // escalating redraws for WebKitGTK layout-settle (same cadence as forceDrawAll). Re-render the 2-D
+  // overlay each time too, so it tracks the settled tile layout.
+  const draw = () => { try { nv?.drawScene(); } catch { /* */ } renderDrawOverlay(); };
   draw();
   requestAnimationFrame(draw);
   for (const ms of [60, 180, 400]) setTimeout(draw, ms);
+}
+
+// ── 2-D drawing overlay (WebGL-independent) ──────────────────────────────────────────────────────
+// THE robust fix for "paint invisible on the en-face/coronal 2-D tile on the desktop": niivue draws the
+// labels into a 3-D WebGL texture sampled per tile, and on the user's WebKitGTK/NVIDIA stack that draw
+// layer does not reach the en-face tile (it shows in 3-D + readPixels but not on screen — not
+// reproducible via refreshDrawing/recreate, which is why v0.1.29-32 didn't fix it). So we render the
+// drawing OURSELVES onto a plain 2-D <canvas> layered over niivue: for every 2-D tile we inverse-sample
+// each device pixel → texture frac (niivue's OWN screenXY2TextureFrac, so it's pixel-aligned with the
+// background and needs no orientation maths) → drawBitmap label → colour. A 2-D canvas composites
+// reliably everywhere, so the strokes are always visible. Runs on demand (every redraw), not in a loop.
+let overlayCanvas: HTMLCanvasElement | null = null;
+export function setOverlayCanvas(c: HTMLCanvasElement | null): void { overlayCanvas = c; if (c) renderDrawOverlay(); }
+// label → on-screen RGBA. Cornea kept semi-transparent (matches its design intent) but clearly visible;
+// scar near-opaque; preview shades lighter. (1 cornea, 2 scar, 3 bg-seed, 4 cornea-preview, 5 scar-preview)
+const OVERLAY_RGBA: Record<number, [number, number, number, number]> = {
+  1: [40, 170, 255, 165], 2: [255, 70, 90, 225], 3: [170, 170, 185, 130],
+  4: [130, 205, 255, 140], 5: [255, 165, 175, 165],
+};
+export function renderDrawOverlay(): void {
+  const cv = overlayCanvas;
+  if (!nv || !cv) return;
+  const d = nv.drawBitmap;
+  const dr = nv.volumes?.[0]?.dimsRAS as number[] | undefined;
+  const gl = nv.gl as WebGL2RenderingContext | undefined;
+  const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number; leftTopWidthHeight: number[] }> }).screenSlices;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => number[] | null }).screenXY2TextureFrac;
+  if (!d || !dr || !gl || !slices || typeof f2f !== "function") return;
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  if (cv.width !== W) cv.width = W;
+  if (cv.height !== H) cv.height = H;
+  const ctx = cv.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, W, H);
+  const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny;
+  const img = ctx.createImageData(W, H);
+  const data = img.data;
+  let any = false;
+  for (let ti = 0; ti < slices.length; ti++) {
+    const s = slices[ti];
+    if (s.axCorSag > 2) continue;                       // skip the 3-D render tile
+    const [lx, ly, lw, lh] = s.leftTopWidthHeight;
+    if (lw <= 2 || lh <= 2) continue;
+    // The screen→frac map is AFFINE per tile; derive it from 3 INSET points (inset dodges any
+    // edge-clamp in the letterbox margin), then apply per pixel → exact + fast, no per-pixel f2f.
+    const ox = Math.min(2, lw / 4), oy = Math.min(2, lh / 4);
+    const p0 = f2f.call(nv, lx + ox, ly + oy, ti);
+    const p1 = f2f.call(nv, lx + lw - ox, ly + oy, ti);
+    const p2 = f2f.call(nv, lx + ox, ly + lh - oy, ti);
+    if (!p0 || !p1 || !p2) continue;
+    const dx = (lw - 2 * ox), dy = (lh - 2 * oy);
+    // per RAS component k: frac = A*px + B*py + C
+    const A = [0, 0, 0], B = [0, 0, 0], C = [0, 0, 0];
+    for (let k = 0; k < 3; k++) {
+      A[k] = (p1[k] - p0[k]) / dx;
+      B[k] = (p2[k] - p0[k]) / dy;
+      C[k] = p0[k] - A[k] * (lx + ox) - B[k] * (ly + oy);
+    }
+    const x0 = Math.max(0, Math.floor(lx)), x1 = Math.min(W, Math.ceil(lx + lw));
+    const y0 = Math.max(0, Math.floor(ly)), y1 = Math.min(H, Math.ceil(ly + lh));
+    for (let py = y0; py < y1; py++) {
+      const fy0 = A[0] * 0 + B[0] * py + C[0], fy1 = A[1] * 0 + B[1] * py + C[1], fy2 = A[2] * 0 + B[2] * py + C[2];
+      let rowOff = py * W;
+      for (let px = x0; px < x1; px++) {
+        const fx = A[0] * px + fy0, fy = A[1] * px + fy1, fz = A[2] * px + fy2;
+        const ix = Math.round(fx * nx - 0.5); if (ix < 0 || ix >= nx) continue;
+        const iy = Math.round(fy * ny - 0.5); if (iy < 0 || iy >= ny) continue;
+        const iz = Math.round(fz * nz - 0.5); if (iz < 0 || iz >= nz) continue;
+        const lab = d[iz * nxny + iy * nx + ix];
+        if (!lab) continue;
+        const c = OVERLAY_RGBA[lab]; if (!c) continue;
+        const o = (rowOff + px) * 4;
+        data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = c[3]; any = true;
+      }
+    }
+  }
+  if (any) ctx.putImageData(img, 0, 0);
 }
 
 /** Force a COMPLETE redraw of every tile now + after the layout settles. WebKitGTK (desktop) can leave a
@@ -251,7 +335,7 @@ export function recreateDrawTexture(): void {
     delays. Cheap; Chromium is unaffected. (#1) */
 export function forceDrawAll(): void {
   if (!nv) return;
-  const go = () => { if (!nv) return; try { nv.refreshDrawing(true); } catch { /* */ } try { nv.drawScene(); } catch { /* */ } };
+  const go = () => { if (!nv) return; try { nv.refreshDrawing(true); } catch { /* */ } try { nv.drawScene(); } catch { /* */ } renderDrawOverlay(); };
   go();
   requestAnimationFrame(go);
   // Escalating retries: on some WebKitGTK builds a single late repaint still misses the B-scan
@@ -304,6 +388,7 @@ export function setVoxAxis(axis: 0 | 1 | 2, slice: number): void {
   cp[axis] = (s + 0.5) / n;
   lockCrosshair();          // a subsequent paint stroke restores to THIS slice, not the previous one
   nv.drawScene();
+  renderDrawOverlay();      // the displayed slice changed → re-render the overlay for the new slice
 }
 
 /** RAS-axis voxel spacing in mm, or null. */
@@ -358,6 +443,7 @@ function scheduleRefresh(): void {
     if (!nv) return;
     try { nv.refreshDrawing(true); } catch { /* */ }
     nv.drawScene();
+    renderDrawOverlay();   // keep the 2-D overlay live during a drag (one render per rAF)
   });
 }
 
