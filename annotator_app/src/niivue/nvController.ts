@@ -685,6 +685,58 @@ export async function loadSegmentationBytes(bytes: Uint8Array, name: string): Pr
   return { ok: true };
 }
 
+/** LOSSLESS autosave encoder: pack the EDITABLE state (seeds INCLUDING background + committed) into one
+    labelmap so a RESTART restores seeds — which is what Smart fill grows from — not just a flattened
+    committed result. Without this the disk autosave (exportLabelmapBytes) stripped background seeds
+    (3→0) and flattened seeds into committed, so Smart fill after a restart found no seeds and did
+    nothing. Codes: 1=committed cornea, 2=committed scar, 3=seed bg, 4=seed cornea, 5=seed scar (a seed
+    wins where a voxel has both). */
+export async function exportAutosaveBytes(): Promise<Uint8Array | null> {
+  if (!nv?.drawBitmap || !seedBmp || !committedBmp) return null;
+  const d = nv.drawBitmap, s = seedBmp, c = committedBmp;
+  for (let i = 0; i < d.length; i++) {
+    const sv = s[i];
+    if (sv === BG_SEED) d[i] = 3;
+    else if (sv === 1) d[i] = 4;
+    else if (sv === 2) d[i] = 5;
+    else { const cv = c[i]; d[i] = cv === 1 ? 1 : cv === 2 ? 2 : 0; }
+  }
+  try { nv.refreshDrawing(true); } catch { /* */ }
+  const r = await nv.saveImage({ filename: "", isSaveDrawing: true, volumeByIndex: 0 });
+  compose(); // restore the on-screen display (seeds/preview shading)
+  return r instanceof Uint8Array ? r : null;
+}
+
+/** Decode an autosave written by exportAutosaveBytes back into the SEED + committed layers, so restored
+    brushstrokes are SEEDS again (Smart fill works on them). Backward-compatible with the old 0/1/2
+    autosave format (1/2 decode as committed cornea/scar; no seeds — same as before). */
+export async function restoreAutosaveBytes(bytes: Uint8Array, name: string): Promise<{ ok: boolean; reason?: string }> {
+  if (!nv || !nv.drawBitmap || !committedBmp || !seedBmp || !previewBmp) return { ok: false, reason: "no-volume" };
+  const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart]));
+  try {
+    const img = await NVImage.loadFromUrl({ url, name });
+    const ok = nv.loadDrawing(img);
+    if (!ok) return { ok: false, reason: "dims-mismatch" };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : "load-failed" };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  const d = nv.drawBitmap;
+  for (let i = 0; i < d.length; i++) {
+    const v = d[i];
+    if (v === 1) { committedBmp[i] = 1; seedBmp[i] = 0; }
+    else if (v === 2) { committedBmp[i] = 2; seedBmp[i] = 0; }
+    else if (v === 3) { seedBmp[i] = BG_SEED; committedBmp[i] = 0; }
+    else if (v === 4) { seedBmp[i] = 1; committedBmp[i] = 0; }
+    else if (v === 5) { seedBmp[i] = 2; committedBmp[i] = 0; }
+    else { seedBmp[i] = 0; committedBmp[i] = 0; }
+  }
+  previewBmp.fill(0); previewing = false;
+  compose();
+  return { ok: true };
+}
+
 // ── Annotation state get/set — for LOSSLESS volume swapping + autosave restore (#5) ──────────────
 /** Snapshot the full editable state (seeds + committed + UNCONFIRMED preview) so swapping away from a
     volume and back restores EXACTLY what was on screen, including an un-confirmed smart fill. */

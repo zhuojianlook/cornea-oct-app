@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.26";
+export const APP_VERSION = "0.1.27";
 
 // #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
 // (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
@@ -57,7 +57,7 @@ function snapshotVolume(user: string | null, volPath: string | null): Promise<vo
     if (nv.hasPaint()) {
       annotCache.set(ckey(user, volPath), st);
       if (user) {
-        try { const bytes = await nv.exportLabelmapBytes(); if (bytes) await io.writeAutosave(user, volPath, bytes); } catch { /* best-effort */ }
+        try { const bytes = await nv.exportAutosaveBytes(); if (bytes) await io.writeAutosave(user, volPath, bytes); } catch { /* best-effort */ }
       }
     } else {
       annotCache.delete(ckey(user, volPath)); // cleared the drawing → don't restore stale paint
@@ -368,7 +368,9 @@ export const useStore = create<State>((set, get) => ({
       } else {
         try {
           const ab = await io.readAutosave(get().activeUser ?? "", key);
-          if (ab) await nv.loadSegmentationBytes(ab, `autosave${ext}`); // .nii.gz name (niivue needs the ext)
+          // restore as the LOSSLESS seed+committed encoding (so Smart fill works on restored strokes);
+          // backward-compatible with old 0/1/2 autosaves (decoded as committed).
+          if (ab) await nv.restoreAutosaveBytes(ab, `autosave${ext}`); // .nii.gz name (niivue needs the ext)
         } catch { /* no autosave / unreadable — start blank */ }
       }
       set({ activeVolume: v, loaded: true, tool: "paint", volumeStartMs: Date.now(), canConfirm: restoredPreviewing,

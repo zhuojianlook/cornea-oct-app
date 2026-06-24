@@ -176,7 +176,7 @@ export function PaintToolbar() {
       <Tooltip title={tr(lang, "tb.lockTip")} arrow>
         <span className="flex items-center gap-1.5">
           <Label>{tr(lang, "tb.lock")}</Label>
-          {([[1, "pen.cornea", "#1ab2ff"], [2, "pen.scar", "#ff453a"]] as const).map(([v, key, color]) => (
+          {([[1, "pen.cornea", "#1ab2ff"], [2, "pen.scar", "#ff453a"], [0, "pen.background", "#9aa0aa"]] as const).map(([v, key, color]) => (
             <ToggleButton key={v} size="small" value={v} selected={locked.includes(v)} disabled={off}
               onChange={() => toggleLock(v)} sx={tbSx}>
               {locked.includes(v) ? "🔒" : "🔓"}
