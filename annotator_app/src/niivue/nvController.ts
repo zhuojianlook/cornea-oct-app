@@ -402,8 +402,10 @@ function compose(): void {
     if (sv !== 0) d[i] = sv;
     else { const pv = p[i]; d[i] = pv !== 0 ? (pv === 1 ? PREVIEW_CORNEA : pv === 2 ? PREVIEW_SCAR : pv) : c[i]; }
   }
-  try { nv.refreshDrawing(true); } catch { /* */ }
-  nv.drawScene();
+  // forceDrawAll (escalating redraws), NOT a single refreshDrawing — every compose() path (smart-fill
+  // result, autosave RESTORE, confirm, undo/redo) must survive WebKitGTK's stale-tile quirk, which left
+  // restored/filled paint invisible on the (coronal/en-face) tile. Infrequent (not per brush stroke).
+  forceDrawAll();
 }
 
 const snapshot = (): Snap => ({ s: seedBmp!.slice(), c: committedBmp!.slice() });
