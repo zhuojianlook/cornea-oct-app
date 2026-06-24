@@ -244,12 +244,14 @@ export function VolumeCanvas() {
             value="ba"
             selected={compareView}
             onChange={() => {
+              // Before/after is COMBINABLE with Fix-columns (it doesn't clear it): turning it on while
+              // fix-columns is active makes the fix-columns panel show raw beside the markable corrected.
               const on = !compareView;
-              setCompareView(on); setFixColsView(false); setStepsView(false);
+              setCompareView(on); setStepsView(false);
               if (on && (view === "multi" || view === "render")) onView(null, "sagittal");
             }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-            title="Compare the original (raw) scan with the preprocessed result, side by side"
+            title="Show the original (raw) scan beside the preprocessed result (combines with Fix columns)"
           >
             ⇆ Before/after
           </ToggleButton>
@@ -260,8 +262,9 @@ export function VolumeCanvas() {
             value="fix"
             selected={fixColsView}
             onChange={() => {
+              // Fix-columns is COMBINABLE with Before/after (it doesn't clear it).
               const on = !fixColsView;
-              setFixColsView(on); setCompareView(false); setStepsView(false);
+              setFixColsView(on); setStepsView(false);
               if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
               else if (!on) void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
             }}
@@ -327,14 +330,17 @@ export function VolumeCanvas() {
             niivue canvas but ONLY cover the content area — the single top toolbar stays visible and
             drives their orientation + display filter, so the user is never pushed into a nested sub-UI.
             (See the note above the return for why the canvas must stay mounted.) */}
-        {compareView && volumeUrl && (
+        {/* Before/after alone → the pass-stepper viewer. Fix-columns (with or without before/after) → the
+            marking panel, which shows raw beside the corrected when before/after is also on (showRaw). When
+            BOTH are on only ONE overlay mounts (the fix-cols panel) so they never stack. */}
+        {compareView && !fixColsView && volumeUrl && (
           <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
             <BeforeAfterViewer orient={orient2d} filter={viewerFilter} />
           </div>
         )}
         {fixColsView && volumeUrl && (
           <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
-            <SliceGallery fixCols orientProp={orient2d} filterCss={viewerFilter} />
+            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} />
           </div>
         )}
         {stepsView && volumeUrl && (

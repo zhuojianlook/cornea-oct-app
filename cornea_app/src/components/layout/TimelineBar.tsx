@@ -34,6 +34,7 @@ export function TimelineBar() {
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
   const vetPreprocessing = useCaseStore((s) => s.vetPreprocessing);
+  const approveRaw = useCaseStore((s) => s.approveRaw);
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const scheduled = Boolean(manifest?.training_scheduled);
 
@@ -91,6 +92,10 @@ export function TimelineBar() {
         <Button size="small" variant="contained" color="warning" disabled={busy} onClick={() => vetPreprocessing()}
           title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification.">
           ✓ Approve preprocessing
+        </Button>
+        <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => approveRaw()}
+          title="Use the ORIGINAL (raw) scan as the working volume instead of the correction — when the original is already good enough. Drops any segmentation; also marks it vetted.">
+          ↩ Use original (raw)
         </Button>
       </>
     );

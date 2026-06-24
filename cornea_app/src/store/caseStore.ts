@@ -33,6 +33,9 @@ interface CaseState {
   // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
   vetPreprocessing: () => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
+  // Before/after "Use original (raw)": discard the correction, make the raw .OCT the working volume +
+  // mark it vetted (drops any segmentation; reloads the volume).
+  approveRaw: () => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -112,6 +115,22 @@ export const useCaseStore = create<CaseState>()(
         await api.json(`/api/case/${id}/training/schedule`, "POST", JSON.stringify({ scheduled }));
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    approveRaw: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { s.busy = true; s.apiError = null; });
+      try {
+        await api.json(`/api/case/${id}/keep-raw`, "POST", "{}");
+        await get().openCase();                 // reload the now-raw working volume (cache-busted URL)
+        const wf = useWorkflowStore.getState();  // refresh previews + reflect the dropped segmentation
+        wf.set("segVersion", wf.segVersion + 1);
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      } finally {
+        set((s) => { s.busy = false; });
       }
     },
 

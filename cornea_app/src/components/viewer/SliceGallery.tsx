@@ -27,10 +27,11 @@ const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 // VolumeCanvas), `fixCols` auto-enters column-marking and hides this panel's own duplicate toggles
 // (group/orient/before-after/contrast/blur/scar) — orientation + display filter come from props so the
 // ONE top toolbar drives them. Called with NO props on the no-WebGL fallback path (unchanged behaviour).
-export function SliceGallery({ fixCols = false, orientProp, filterCss }: {
+export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw = false }: {
   fixCols?: boolean;
   orientProp?: "axial" | "coronal" | "sagittal";
   filterCss?: string;
+  showRaw?: boolean; // fix-cols: show the raw "before" beside the markable corrected "after"
 } = {}) {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
@@ -560,6 +561,91 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss }: {
     if (voxels.length) await runScarEdit(voxels, scarErase ? "erase" : "paint");
   };
 
+  // The markable corrected panel (imgRef + overlay canvas + colSel bands + depth-nudge ghosts + hints).
+  // Factored out so fix-columns can render it EITHER standalone OR as the "after" beside a raw "before"
+  // (showRaw) without duplicating the panel. The relative-positioned <div> must stay the single
+  // positioning context for the absolute overlays, so it's kept intact as one unit.
+  const correctedPanel = cur ? (
+    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
+      <img
+        ref={imgRef}
+        src={imgSrc(cur)}
+        alt={cur.file_name}
+        draggable={false}
+        onClick={onImgClick}
+        onDoubleClick={onSliceDoubleClick}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
+        style={{
+          display: "block",
+          maxHeight: "100%",
+          maxWidth: "100%",
+          imageRendering: "pixelated",
+          touchAction: editing || colSel ? "none" : undefined,
+          cursor: editing || hintMode || colSel ? "crosshair" : "zoom-in",
+          filter: effectiveGroup === "context" ? enhanceFilter : undefined,
+        }}
+      />
+      <canvas
+        ref={canvasRef}
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
+      />
+      {colSel && (orient === "sagittal" || orient === "coronal") && nFrames > 1 &&
+        colRuns(badCols).map(([a, b], i) => {
+          // Voxel-EDGE fractions: frame f occupies the image span [f/nFrames, (f+1)/nFrames] of
+          // the nFrames-wide PNG (NOT /(nFrames-1), which is the first→last CENTER span and drifts
+          // the band ~1 frame off by the far edge). Must match frameAt's inverse below. (#1)
+          const lo = a / nFrames, hiEnd = (b + 1) / nFrames;
+          const pos = orient === "sagittal"
+            ? { left: `${lo * 100}%`, width: `${(hiEnd - lo) * 100}%`, top: 0, bottom: 0 }
+            : { top: `${Math.max(0, 1 - hiEnd) * 100}%`, height: `${(hiEnd - lo) * 100}%`, left: 0, right: 0 };
+          return <div key={`b${i}`} style={{ position: "absolute", ...pos, background: "rgba(255,70,70,0.32)", pointerEvents: "none" }} />;
+        })}
+      {/* #2: pending (un-re-run) depth nudges from the arrow keys. Per same-delta run, GHOST the
+          frame strip translated to its new depth (so the user SEES where the columns will land) + a
+          chip with the voxel offset. translateY is a % of the strip's own height (= full displayed
+          depth), so delta/depthVox maps directly to the on-screen move with no pixel math. Runs are
+          split by delta (pendingRuns) so a mixed-nudge span renders each part at its own offset.
+          (sagittal only — that's the only view whose vertical axis is depth.) */}
+      {colSel && orient === "sagittal" && nFrames > 1 && depthVox > 1 && cur &&
+        pendingRuns().map(([a, b, delta], i) => {
+          const lo = a / nFrames, hiEnd = (b + 1) / nFrames, w = hiEnd - lo;
+          const tyPct = (delta / depthVox) * 100; // +down, as a fraction of the full depth
+          return (
+            <div key={`s${i}`} style={{ position: "absolute", top: 0, bottom: 0, left: `${lo * 100}%`, width: `${w * 100}%`, overflow: "hidden", pointerEvents: "none", outline: "1px solid rgba(93,176,255,0.85)", outlineOffset: -1, display: "flex", justifyContent: "center" }}>
+              <img src={imgSrc(cur)} alt="" draggable={false}
+                style={{ position: "absolute", top: 0, left: `${-(lo / w) * 100}%`, width: `${100 / w}%`, height: "100%", transform: `translateY(${tyPct}%)`, imageRendering: "pixelated", opacity: 0.92, filter: effectiveGroup === "context" ? enhanceFilter : undefined }} />
+              <span style={{ position: "relative", height: "fit-content", marginTop: 2, background: "rgba(30,80,150,0.92)", color: "#fff", fontSize: 10, lineHeight: 1.3, padding: "1px 4px", borderRadius: 3, whiteSpace: "nowrap" }}>
+                {delta > 0 ? `↓${delta}` : `↑${-delta}`} vox
+              </span>
+            </div>
+          );
+        })}
+      {hintsHere.map((h, i) => (
+        <span
+          key={i}
+          title={h.positive ? "scar hint" : "not-scar hint"}
+          style={{
+            position: "absolute",
+            left: `${h.fx * 100}%`,
+            top: `${h.fy * 100}%`,
+            width: 12,
+            height: 12,
+            marginLeft: -6,
+            marginTop: -6,
+            borderRadius: "50%",
+            border: "2px solid #fff",
+            background: h.positive ? "#ff2e55" : "#39d0ff",
+            boxShadow: "0 0 3px rgba(0,0,0,0.8)",
+            pointerEvents: "none",
+          }}
+        />
+      ))}
+    </div>
+  ) : null;
+
   return (
     <div className="flex flex-col h-full min-h-0" style={{ backgroundColor: "var(--c-bg)" }}>
       <div
@@ -796,86 +882,21 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss }: {
               </div>
             )}
           </div>
-        ) : (
-          <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
-            <img
-              ref={imgRef}
-              src={imgSrc(cur)}
-              alt={cur.file_name}
-              draggable={false}
-              onClick={onImgClick}
-              onDoubleClick={onSliceDoubleClick}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerLeave={onPointerUp}
-              style={{
-                display: "block",
-                maxHeight: "100%",
-                maxWidth: "100%",
-                imageRendering: "pixelated",
-                touchAction: editing || colSel ? "none" : undefined,
-                cursor: editing || hintMode || colSel ? "crosshair" : "zoom-in",
-                filter: effectiveGroup === "context" ? enhanceFilter : undefined,
-              }}
-            />
-            <canvas
-              ref={canvasRef}
-              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
-            />
-            {colSel && (orient === "sagittal" || orient === "coronal") && nFrames > 1 &&
-              colRuns(badCols).map(([a, b], i) => {
-                // Voxel-EDGE fractions: frame f occupies the image span [f/nFrames, (f+1)/nFrames] of
-                // the nFrames-wide PNG (NOT /(nFrames-1), which is the first→last CENTER span and drifts
-                // the band ~1 frame off by the far edge). Must match frameAt's inverse below. (#1)
-                const lo = a / nFrames, hiEnd = (b + 1) / nFrames;
-                const pos = orient === "sagittal"
-                  ? { left: `${lo * 100}%`, width: `${(hiEnd - lo) * 100}%`, top: 0, bottom: 0 }
-                  : { top: `${Math.max(0, 1 - hiEnd) * 100}%`, height: `${(hiEnd - lo) * 100}%`, left: 0, right: 0 };
-                return <div key={`b${i}`} style={{ position: "absolute", ...pos, background: "rgba(255,70,70,0.32)", pointerEvents: "none" }} />;
-              })}
-            {/* #2: pending (un-re-run) depth nudges from the arrow keys. Per same-delta run, GHOST the
-                frame strip translated to its new depth (so the user SEES where the columns will land) + a
-                chip with the voxel offset. translateY is a % of the strip's own height (= full displayed
-                depth), so delta/depthVox maps directly to the on-screen move with no pixel math. Runs are
-                split by delta (pendingRuns) so a mixed-nudge span renders each part at its own offset.
-                (sagittal only — that's the only view whose vertical axis is depth.) */}
-            {colSel && orient === "sagittal" && nFrames > 1 && depthVox > 1 && cur &&
-              pendingRuns().map(([a, b, delta], i) => {
-                const lo = a / nFrames, hiEnd = (b + 1) / nFrames, w = hiEnd - lo;
-                const tyPct = (delta / depthVox) * 100; // +down, as a fraction of the full depth
-                return (
-                  <div key={`s${i}`} style={{ position: "absolute", top: 0, bottom: 0, left: `${lo * 100}%`, width: `${w * 100}%`, overflow: "hidden", pointerEvents: "none", outline: "1px solid rgba(93,176,255,0.85)", outlineOffset: -1, display: "flex", justifyContent: "center" }}>
-                    <img src={imgSrc(cur)} alt="" draggable={false}
-                      style={{ position: "absolute", top: 0, left: `${-(lo / w) * 100}%`, width: `${100 / w}%`, height: "100%", transform: `translateY(${tyPct}%)`, imageRendering: "pixelated", opacity: 0.92, filter: effectiveGroup === "context" ? enhanceFilter : undefined }} />
-                    <span style={{ position: "relative", height: "fit-content", marginTop: 2, background: "rgba(30,80,150,0.92)", color: "#fff", fontSize: 10, lineHeight: 1.3, padding: "1px 4px", borderRadius: 3, whiteSpace: "nowrap" }}>
-                      {delta > 0 ? `↓${delta}` : `↑${-delta}`} vox
-                    </span>
-                  </div>
-                );
-              })}
-            {hintsHere.map((h, i) => (
-              <span
-                key={i}
-                title={h.positive ? "scar hint" : "not-scar hint"}
-                style={{
-                  position: "absolute",
-                  left: `${h.fx * 100}%`,
-                  top: `${h.fy * 100}%`,
-                  width: 12,
-                  height: 12,
-                  marginLeft: -6,
-                  marginTop: -6,
-                  borderRadius: "50%",
-                  border: "2px solid #fff",
-                  background: h.positive ? "#ff2e55" : "#39d0ff",
-                  boxShadow: "0 0 3px rgba(0,0,0,0.8)",
-                  pointerEvents: "none",
-                }}
-              />
-            ))}
+        ) : (fixCols && showRaw && rawCur) ? (
+          // Fix-columns WITH before/after: raw "before" (left, read-only) beside the markable corrected
+          // "after" (right). Marking + depth-nudge all stay on the corrected panel only.
+          <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>original (raw)</span>
+              <img src={imgSrc(rawCur)} alt="raw" draggable={false}
+                style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+              <span className="text-[11px]" style={{ color: "var(--c-green)" }}>corrected — mark here</span>
+              {correctedPanel}
+            </div>
           </div>
-        )}
+        ) : correctedPanel}
       </div>
 
       {orientImgs.length > 0 && (

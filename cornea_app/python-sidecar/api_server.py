@@ -1622,6 +1622,55 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     return out
 
 
+@app.post("/api/case/{case_id}/keep-raw")
+def keep_raw_case(case_id: str) -> dict:
+    """Before/after "Use original (raw)": make the RAW (un-corrected) .OCT conversion the working volume
+    — for scans where the original is already good enough and the edge/column correction would only add
+    warp. Re-converts raw → working path, drops any segmentation / per-pass previews / corrected label
+    built on the corrected volume, clears persisted warps (raw means no corrections), and marks the scan
+    preprocessed + manually VETTED (timeline → orange) so it advances straight to classification. SAM2
+    must be (re-)run afterwards. Mirrors the re-run's stale-artifact cleanup."""
+    import shutil as _sh
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not src or not Path(src).exists():
+        raise HTTPException(400, f"Case {case_id} has no .OCT source.")
+    vi = int(m.get("oct_volume_index", 0))
+    work = _oct_working_path(case_id, src)
+    # Raw means NO warps: strip persisted column / manual-shift corrections so neither this conversion
+    # nor a later re-preprocess re-applies them on top of the (intentionally raw) volume.
+    eff_params = {k: v for k, v in (m.get("oct_params") or {}).items()
+                  if k not in ("force_columns", "good_columns", "manual_shifts", "manual_columns", "coronal_check")}
+    # Convert the ORIGINAL .OCT to NIfTI with NO correction → the working volume.
+    oct_mod.raw_oct_to_nifti(src, work, volume_index=vi, params=eff_params, companion_txt=m.get("companion_txt"))
+    # The working volume changed → drop segmentation, per-pass previews/NIfTIs, corrected label, QA + metrics.
+    seg_dir = orch.segmentation_preview_dir(case_id)
+    if seg_dir.exists():
+        _sh.rmtree(seg_dir, ignore_errors=True)
+    for grp in ("context_seg", "context_cons"):
+        _sh.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
+    _clear_iter_preview_groups(case_id)
+    _sh.rmtree(orch.case_root(case_id) / "passes", ignore_errors=True)
+    labels.corrected_path(case_id).unlink(missing_ok=True)
+    orch.case_qa_json(case_id).unlink(missing_ok=True)
+    extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None,
+             # 0 passes / best_pass 0 = raw kept (BeforeAfterViewer reads this; passCount is Math.max(1,…)-guarded).
+             "oct_iter": {"passes": 0, "best_pass": 0, "metrics": [], "stopped": "kept_raw"},
+             "oct_kept_raw": True,
+             # the user explicitly approved the raw as the final preprocessing → vet it (timeline → orange);
+             # a later auto re-preprocess clears these as usual.
+             "preproc_vetted": True, "training_scheduled": False}
+    if m.get("scar_classification"):
+        extra["scar_classification"] = m.get("scar_classification")
+    if m.get("scar_range"):
+        extra["scar_range"] = m.get("scar_range")
+    out = _oct_render_volume(case_id, work, preprocessed=True, extra=extra)
+    out["preprocessed"] = True
+    out["kept_raw"] = True
+    out["n_frames"] = _nifti_frames(work)
+    return out
+
+
 class ClassificationRequest(BaseModel):
     classification: str | None = None   # "scar" | "control" | null (clear)
     scar_range: list[int] | None = None # optional [start,end] frame range (1-based)

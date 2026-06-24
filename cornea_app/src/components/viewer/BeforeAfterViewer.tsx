@@ -42,13 +42,15 @@ export function BeforeAfterViewer({ orient, filter }: {
   const metrics = Array.isArray(octIter?.metrics) ? (octIter!.metrics as number[]) : [];
   const bestPass = Number(octIter?.best_pass ?? passCount); // 0 = raw, k = pass k
 
-  // The right-panel steps. Iterative (passCount>1): one per CORRECTED pass (context_iter{k}), with
-  // the KEPT/best pass marked — a worse pass shows a HIGHER deviation, so the user sees why it was
-  // dropped. Single pass: a plain raw|preprocessed (the working "context" group; no per-pass groups).
+  // The right-panel steps. "Original (raw)" is ALWAYS first — sometimes the raw is good enough to keep
+  // directly (Approve original). Then the CORRECTED passes: iterative (passCount>1) lists each
+  // context_iter{k} with the KEPT/best pass marked (a worse pass shows a HIGHER deviation, so the user
+  // sees why it was dropped); single pass is a plain "preprocessed". best_pass===0 ⇒ raw was auto-kept.
   const steps = useMemo(() => {
     const out: { group: string; label: string; metric: number | null; best: boolean }[] = [];
+    out.push({ group: "context_raw", label: "Original (raw)", metric: metrics[0] ?? null, best: bestPass === 0 });
     if (passCount <= 1) {
-      out.push({ group: "context", label: "preprocessed", metric: null, best: true });
+      out.push({ group: "context", label: "preprocessed", metric: null, best: bestPass !== 0 });
     } else {
       for (let k = 1; k <= passCount; k++) {
         out.push({

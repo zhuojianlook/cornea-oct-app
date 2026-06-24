@@ -737,11 +737,15 @@ export function OctLoader() {
                     const done = s.status === "done";
                     // Per-scan lifecycle colour (red→orange→yellow→light blue→dark blue→green) from the
                     // timeline step; only from step 2 (preprocessed-auto) onward. The actively-viewed scan
-                    // still gets the ACCENT highlight so the open scan stands out.
+                    // keeps ITS lifecycle colour but a DARKER/stronger shade of it (not a blue accent) so the
+                    // open scan stands out without losing its step colour; a colourless (raw) scan falls back
+                    // to the accent tint so the selection is still visible.
                     const lifeStep = s.life ? scanStep(s.life) : 0;
                     const lifeColor = lifeStep >= 2 ? LIFECYCLE_STEPS[lifeStep].color : null;
-                    const rowBg = active ? "rgba(90,127,168,0.32)" : lifeColor ? `${lifeColor}22` : "transparent";
-                    const rowBorder = active ? "var(--c-accent)" : lifeColor ?? "transparent";
+                    const rowBg = active
+                      ? (lifeColor ? `${lifeColor}66` : "rgba(90,127,168,0.32)")
+                      : lifeColor ? `${lifeColor}22` : "transparent";
+                    const rowBorder = active ? (lifeColor ?? "var(--c-accent)") : lifeColor ?? "transparent";
                     return (
                       <div key={s.id} className="rounded px-1 py-0.5" style={{ background: rowBg, borderLeft: `2px solid ${rowBorder}` }}>
                         <div className="flex items-start gap-1.5 text-xs">
