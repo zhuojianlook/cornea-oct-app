@@ -169,7 +169,7 @@ export function setWindow(brightness: number, contrast: number): void {
 const lockedLabels = new Set<number>();
 export function setLockedLabels(labels: number[]): void { lockedLabels.clear(); for (const l of labels) lockedLabels.add(l); }
 export function setDrawingEnabled(on: boolean): void { if (nv) nv.setDrawingEnabled(on); }
-export function setDrawOpacity(o: number): void { if (nv) { nv.drawOpacity = o; nv.drawScene(); } }
+export function setDrawOpacity(o: number): void { if (nv) { nv.drawOpacity = o; nv.drawScene(); renderDrawOverlay(); } }
 
 // ── Crosshair lock ───────────────────────────────────────────────────────────
 // Painting in niivue moves the crosshair (and thus the other views) to the brush. The canvas captures
@@ -263,11 +263,11 @@ export function recreateDrawTexture(): void {
 // reliably everywhere, so the strokes are always visible. Runs on demand (every redraw), not in a loop.
 let overlayCanvas: HTMLCanvasElement | null = null;
 export function setOverlayCanvas(c: HTMLCanvasElement | null): void { overlayCanvas = c; if (c) renderDrawOverlay(); }
-// label → on-screen RGBA. Cornea kept semi-transparent (matches its design intent) but clearly visible;
-// scar near-opaque; preview shades lighter. (1 cornea, 2 scar, 3 bg-seed, 4 cornea-preview, 5 scar-preview)
+// label → on-screen RGBA. TRANSLUCENT base alphas (so the anatomy shows through) — further scaled by the
+// live draw-opacity slider in renderDrawOverlay. (1 cornea, 2 scar, 3 bg-seed, 4 cornea-preview, 5 scar-preview)
 const OVERLAY_RGBA: Record<number, [number, number, number, number]> = {
-  1: [40, 170, 255, 165], 2: [255, 70, 90, 225], 3: [170, 170, 185, 130],
-  4: [130, 205, 255, 140], 5: [255, 165, 175, 165],
+  1: [40, 170, 255, 120], 2: [255, 70, 90, 150], 3: [170, 170, 185, 90],
+  4: [130, 205, 255, 95], 5: [255, 165, 175, 110],
 };
 export function renderDrawOverlay(): void {
   const cv = overlayCanvas;
@@ -285,6 +285,9 @@ export function renderDrawOverlay(): void {
   if (!ctx) return;
   ctx.clearRect(0, 0, W, H);
   const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny;
+  // Scale the overlay alpha by the live draw-opacity slider so the user controls translucency.
+  const nvAny = nv as unknown as { drawOpacity?: number; opts?: { drawOpacity?: number } };
+  const op = Math.max(0.12, Math.min(1, nvAny.drawOpacity ?? nvAny.opts?.drawOpacity ?? 0.85));
   const img = ctx.createImageData(W, H);
   const data = img.data;
   let any = false;
@@ -322,7 +325,7 @@ export function renderDrawOverlay(): void {
         if (!lab) continue;
         const c = OVERLAY_RGBA[lab]; if (!c) continue;
         const o = (rowOff + px) * 4;
-        data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = c[3]; any = true;
+        data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = Math.round(c[3] * op); any = true;
       }
     }
   }
