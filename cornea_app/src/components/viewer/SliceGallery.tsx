@@ -281,7 +281,10 @@ export function SliceGallery() {
       if (tag === "TEXTAREA" || (tag === "INPUT" && type !== "range")) return; // don't steal arrows from text fields
       e.preventDefault();
       e.stopImmediatePropagation(); // beat the MUI slice slider + niivue's own arrow-key slice nav
-      const step = (e.shiftKey ? 5 : 1) * (e.key === "ArrowDown" ? 1 : -1); // ↓ deeper (+), ↑ shallower (−)
+      // Step is in DEPTH VOXELS. The depth axis is ~640 voxels tall, so a 1-voxel nudge is sub-pixel on
+      // screen (looks like nothing happened). Use a visible default (5 vox ≈ several px) with Shift for
+      // bigger jumps — corrections are typically tens of voxels anyway.
+      const step = (e.shiftKey ? 25 : 5) * (e.key === "ArrowDown" ? 1 : -1); // ↓ deeper (+), ↑ shallower (−)
       setManualShifts((prev) => {
         const next = new Map(prev);
         badCols.forEach((f) => {
@@ -598,10 +601,20 @@ export function SliceGallery() {
         {colSel && canMarkColumns && (
           <>
             <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
-            <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>
-              mark in sagittal (columns) or coronal (rows) · click again to unmark · then <b>↑/↓</b> to move
-              the marked columns to the right depth (Shift = ×5){pendingFrames.size ? ` · nudged: ${pendingFrames.size}` : ""}
-            </span>
+            {(() => {
+              // Representative pending depth offset of the marked set (arrows nudge all marked frames
+              // uniformly) — shown numerically so the user gets feedback even in coronal, where the
+              // sagittal depth-ghost can't be drawn. Best seen in the SAGITTAL view.
+              const f = badCols.size ? Math.min(...badCols) : (pendingFrames.size ? Math.min(...pendingFrames) : null);
+              const off = f == null ? 0 : (manualShifts.get(f) ?? 0) - (persistedShifts.get(f) ?? 0);
+              return (
+                <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>
+                  mark in sagittal (columns) or coronal (rows) · click again to unmark · then <b>↑/↓</b> to move
+                  the marked columns to the right depth (Shift = bigger){off ? "" : ""}
+                  {off ? <b style={{ color: "#5db0ff", marginLeft: 4 }}>{off > 0 ? `↓${off}` : `↑${-off}`} vox{orient !== "sagittal" ? " — view in Sagittal to see it" : ""}</b> : null}
+                </span>
+              );
+            })()}
             {passCount > 1 && (
               <span className="flex items-center gap-1" title="Apply this fix at ONLY this iteration pass, then re-converge the later passes from it. Earlier passes are unchanged.">
                 <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>fix at pass</span>
