@@ -70,11 +70,11 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   // copy into a fresh ArrayBuffer (avoids any shared-buffer surprises from the fs read)
   const ab = bytes.slice().buffer;
   await nv.loadFromArrayBuffer(ab, name);
-  // NEAREST-neighbour interpolation = crisp voxels. These OCT volumes are highly anisotropic (frames
-  // ~0.04mm vs depth ~0.003mm), so any view spanning the coarse FRAME axis (sagittal = frames×depth,
-  // coronal/en-face = lateral×frames) is upscaled ~13× and niivue's default LINEAR interp blurs it.
-  // Nearest renders the true voxel grid (matches the main app's pixelated previews). (#blur)
-  try { nv.setInterpolation(true); } catch { /* older niivue: leave default */ }
+  // NOTE: we deliberately do NOT call nv.setInterpolation(true) here. It set the volume texture to
+  // NEAREST (crisp voxels, requested in v0.1.26) but correlated with paint strokes becoming invisible on
+  // the desktop WebKitGTK build (a persistent GL-texture-state change WebKitGTK handles differently than
+  // Chromium). Paint visibility outranks crisp display, so interpolation stays at niivue's default. (#blur
+  // → revisit via a path that doesn't touch the shared GL texture state.)
   // capture the auto display window for the brightness/contrast controls (#3)
   const v0 = nv.volumes[0] as unknown as { cal_min?: number; cal_max?: number; global_min?: number; global_max?: number };
   baseWinLo = v0.cal_min ?? v0.global_min ?? 0;
