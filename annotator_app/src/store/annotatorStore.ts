@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.31";
+export const APP_VERSION = "0.1.32";
 
 // #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
 // (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
@@ -198,7 +198,7 @@ export const useStore = create<State>((set, get) => ({
   penSize: 8,
   penFilled: false,
   tool: "paint",
-  drawOpacity: 0.6,
+  drawOpacity: 0.85,  // higher default so the SEMI-TRANSPARENT cornea (colormap alpha 130) is clearly
   wandThreshold: 0.55,
   wandTolerance: 0.08,
   wandMode: "threshold",
