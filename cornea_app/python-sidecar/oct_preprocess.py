@@ -1037,6 +1037,28 @@ def _disp_resize(rgb: np.ndarray, out_h: int = 320, out_w: int = 460) -> np.ndar
     return np.ascontiguousarray(rgb[ri][:, ci])
 
 
+def border_curves(oct_path, params=None, volume_index=0, companion_txt=None, slice_index=None):
+    """Per-frame DETECTED corneal surface + RANSAC best-fit for ONE sagittal slice — as coordinate arrays
+    (depth row per frame), so the UI can draw + drag them. Same detection as preprocess_steps (the
+    side-corrected merged edge + its quadratic fit). reformat slice = (depth, frames), so edge[frame] is
+    a depth row in [0, depth_vox); the displayed sagittal preview has depth 0 at the TOP (flipud+rot90 CW),
+    so the UI maps x=frame/n_frames, y=edge/depth_vox."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    res = float(p["residual_threshold"])
+    vol = read_oct_zstack(oct_path, volume_index)
+    sag = reformat_to_sagittal(vol)                 # (lateral, depth, frames)
+    n = sag.shape[0]
+    idx = n // 2 if slice_index is None else max(0, min(n - 1, int(slice_index)))
+    sl = sag[idx].astype(np.float32)                # (depth, frames)
+    depth_vox, n_frames = sl.shape
+    edge = _merged_side_edge(sl, p)                 # depth row per frame
+    fit = _fit_quadratic_ransac(edge, res)
+    return {
+        "slices": int(n), "index": int(idx), "n_frames": int(n_frames), "depth_vox": int(depth_vox),
+        "edge": [float(v) for v in edge], "fit": [float(v) for v in fit],
+    }
+
+
 def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
                      bad_cols=None, workers=None, slice_index=None):
     """Return (n_sagittal_slices, idx, [(label, rgb_uint8, kind, branch)]) for every per-slice
@@ -1100,9 +1122,9 @@ if __name__ == "__main__":
     import argparse
     import json as _json
     ap = argparse.ArgumentParser(description="OCT preprocessing worker")
-    ap.add_argument("mode", choices=["raw", "preprocess", "steps"])
+    ap.add_argument("mode", choices=["raw", "preprocess", "steps", "border"])
     ap.add_argument("oct_path")
-    ap.add_argument("out_nifti")   # for mode=steps this is the OUTPUT DIRECTORY for the step PNGs
+    ap.add_argument("out_nifti")   # mode=steps: OUTPUT DIR for step PNGs; mode=border: OUTPUT JSON file
     ap.add_argument("--params", default="{}")
     ap.add_argument("--volume-index", type=int, default=0)
     ap.add_argument("--companion-txt", default="")
@@ -1135,6 +1157,10 @@ if __name__ == "__main__":
             _entries.append({"label": _label, "file": _fn, "kind": _kind, "branch": _branch})
         # New shape: {slices, index, steps}; the API reader tolerates the legacy list too.
         (_outdir / "labels.json").write_text(_json.dumps({"slices": _n, "index": _idx, "steps": _entries}))
+    elif a.mode == "border":
+        _si = None if a.slice_index < 0 else int(a.slice_index)
+        _bc = border_curves(a.oct_path, params=_p, volume_index=a.volume_index, companion_txt=_comp, slice_index=_si)
+        Path(a.out_nifti).write_text(_json.dumps(_bc))
     else:
         _info = preprocess_oct_to_nifti(
             a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp,

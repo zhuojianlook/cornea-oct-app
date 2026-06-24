@@ -1812,6 +1812,37 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
     return {"steps": steps, "slices": n_slices, "index": cur_index}
 
 
+@app.post("/api/case/{case_id}/oct-border-curve")
+def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Per-frame DETECTED corneal surface + RANSAC best-fit for one sagittal slice of the WORKING
+    (corrected) volume, as coordinate arrays, so the Fix-columns UI can draw the border + let the user
+    DRAG a frame's surface to where it should be — the drag becomes a per-frame depth nudge (manual_shifts,
+    same sign as the arrow nudge). Detected on the SAME volume + orientation the sagittal preview shows
+    (vol_kji = nibabel.transpose(2,1,0); sagittal = [:,:,idx]; depth 0 = TOP after the preview's
+    flipud+rot90), so the curves align with the displayed slice: x=frame/n_frames, y=depth/depth_vox."""
+    import numpy as np
+    import nibabel as nib
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    work = _ensure_volume_nifti(case_id)
+    try:
+        arr = np.asarray(nib.load(str(work)).dataobj)
+        vol_kji = np.ascontiguousarray(arr.transpose(2, 1, 0))      # matches postprocess.render_context_previews
+        n = int(vol_kji.shape[2])                                   # sagittal (fixed-lateral) slice count
+        idx = n // 2 if req.slice_index is None else max(0, min(n - 1, int(req.slice_index)))
+        sl = np.ascontiguousarray(vol_kji[:, :, idx].T).astype(np.float32)  # (depth, frames)
+        p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {}), **(req.params or {})}
+        edge = oct_mod._merged_side_edge(sl, p)
+        fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
+        return {"slices": n, "index": int(idx), "n_frames": int(sl.shape[1]), "depth_vox": int(sl.shape[0]),
+                "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT border curve failed: {exc}")
+
+
 class OctLoadDirRequest(BaseModel):
     directory: str
 
