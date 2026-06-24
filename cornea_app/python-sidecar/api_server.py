@@ -1238,6 +1238,8 @@ class OctPreprocessRequest(BaseModel):
     manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
                                              # depth nudges (positive = DOWN), applied LAST as manual ground truth
     slice_index: int | None = None           # steps viewer: which sagittal slice to render the border+fit on
+    border_pass: int | None = None            # border-curve: which pass to fix — detect on its INPUT (raw for
+                                              # pass 1, the prior pass's output for pass>1), never the result
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1812,31 +1814,69 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
     return {"steps": steps, "slices": n_slices, "index": cur_index}
 
 
+_BORDER_VOL_CACHE: dict = {}  # path -> (mtime, ndarray) — last border-input volume, so SCRUBBING a pass's
+                              # slices doesn't re-decompress the .nii.gz every request (smooth scrolling).
+def _load_border_vol(path: Path):
+    import os
+    import numpy as np
+    import nibabel as nib
+    key = str(path)
+    mt = os.path.getmtime(path)
+    cached = _BORDER_VOL_CACHE.get(key)
+    if cached and cached[0] == mt:
+        return cached[1]
+    arr = np.ascontiguousarray(np.asanyarray(nib.load(key).dataobj))
+    _BORDER_VOL_CACHE.clear()                       # keep only the most-recent input (bound memory)
+    _BORDER_VOL_CACHE[key] = (mt, arr)
+    return arr
+
+
+def _ensure_raw_border_nifti(case_id: str) -> Path:
+    """A persistent raw (un-corrected) NIfTI for the Fix-columns border (pass-1 input). Created once from
+    the .OCT; kept (own path, so a re-preprocess's tmp raw snapshot never clobbers it) so border-curve
+    requests load a single slice fast instead of re-reading the .OCT on every scrub."""
+    raw = orch.case_root(case_id) / "input" / "_raw_border.nii.gz"
+    if raw.exists():
+        return raw
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not src or not Path(src).exists():
+        raise HTTPException(400, f"Case {case_id} has no .OCT source.")
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    oct_mod.raw_oct_to_nifti(src, raw, volume_index=int(m.get("oct_volume_index", 0)), companion_txt=m.get("companion_txt"))
+    return raw
+
+
 @app.post("/api/case/{case_id}/oct-border-curve")
 def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
-    """Per-frame DETECTED corneal surface + RANSAC best-fit for one sagittal slice of the WORKING
-    (corrected) volume, as coordinate arrays, so the Fix-columns UI can draw the border + let the user
-    DRAG a frame's surface to where it should be — the drag becomes a per-frame depth nudge (manual_shifts,
-    same sign as the arrow nudge). Detected on the SAME volume + orientation the sagittal preview shows
-    (vol_kji = nibabel.transpose(2,1,0); sagittal = [:,:,idx]; depth 0 = TOP after the preview's
-    flipud+rot90), so the curves align with the displayed slice: x=frame/n_frames, y=depth/depth_vox."""
+    """Per-frame DETECTED corneal surface + RANSAC best-fit for ONE sagittal slice of the selected pass's
+    INPUT volume — pass 1's input is the RAW original, pass k's input is pass (k-1)'s output — because
+    correcting the detection on a pass's input is what improves that pass's result (editing the border on
+    the downstream/corrected result is meaningless). Returns coordinate arrays so the UI draws + drags the
+    border. Loads only the requested slice (fast scrubbing). Orientation matches the sagittal preview
+    (arr[idx] = (depth, frames); depth 0 = TOP), so x=frame/n_frames, y=depth/depth_vox align."""
     import numpy as np
     import nibabel as nib
     m = orch.read_manifest(case_id)
     if not (m.get("input_volume") or m.get("corrected_volume")):
         raise HTTPException(400, f"Case {case_id} has no working volume.")
-    work = _ensure_volume_nifti(case_id)
+    pass_n = max(1, int(req.border_pass or 1))
+    # INPUT of pass `pass_n`: raw for pass 1, else the prior pass's saved output (fallback to raw).
+    if pass_n <= 1:
+        inp = _ensure_raw_border_nifti(case_id)
+    else:
+        pv = orch.case_root(case_id) / "passes" / f"pass_{pass_n - 1}.nii.gz"
+        inp = pv if pv.exists() else _ensure_raw_border_nifti(case_id)
     try:
-        arr = np.asarray(nib.load(str(work)).dataobj)
-        vol_kji = np.ascontiguousarray(arr.transpose(2, 1, 0))      # matches postprocess.render_context_previews
-        n = int(vol_kji.shape[2])                                   # sagittal (fixed-lateral) slice count
+        arr = _load_border_vol(inp)                                # (lateral, depth, frames), cached
+        n = int(arr.shape[0])                                      # lateral = sagittal slice count
         idx = n // 2 if req.slice_index is None else max(0, min(n - 1, int(req.slice_index)))
-        sl = np.ascontiguousarray(vol_kji[:, :, idx].T).astype(np.float32)  # (depth, frames)
+        sl = np.ascontiguousarray(arr[idx]).astype(np.float32)     # (depth, frames)
         p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {}), **(req.params or {})}
         edge = oct_mod._merged_side_edge(sl, p)
         fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
         return {"slices": n, "index": int(idx), "n_frames": int(sl.shape[1]), "depth_vox": int(sl.shape[0]),
-                "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
+                "pass": pass_n, "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001

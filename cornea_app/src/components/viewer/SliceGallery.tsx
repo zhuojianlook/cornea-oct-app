@@ -146,7 +146,8 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     setGroup("context");
     setBeforeAfter(false);
     wfSet("scarEditMode", false);
-    if (passCount > 1) setFixPass((p) => (p == null || p > passCount ? passCount : p));
+    // Default to fixing pass 1 (edit the border on the RAW original — the most common + impactful fix).
+    if (passCount > 1) setFixPass((p) => (p == null || p > passCount ? 1 : p));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fixCols, passCount]);
   useEffect(() => {
@@ -297,23 +298,46 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const depthVox = rawImages.find((i) => i.orientation === "sagittal")?.source_width ?? 0;
   const canMarkColumns = !previewGroup && rawImages.length > 0 && nFrames > 1 && !showBeforeAfter;
 
-  // Fix-columns border-drag: fetch the detected surface + best-fit COORDS for the current sagittal slice
-  // (auto in fix-columns; re-fetched on slice change / after a re-run). x=frame/n_frames, y=depth/depth_vox.
+  // Which pass to fix → its INPUT is what we detect + draw the border on (pass 1 = the RAW original; pass k
+  // = pass k-1's output). Editing the detection on the INPUT improves that pass's result — editing the
+  // border on the downstream/corrected result is meaningless.
+  const borderPass = passCount > 1 ? (fixPass ?? 1) : 1;
+  const passInputLabel = borderPass <= 1 ? "original (raw)" : `pass ${borderPass - 1} output`;
+  // The input IMAGE the border is drawn over: raw (pass 1) or the prior pass's preview (pass > 1).
+  const [passInputImg, setPassInputImg] = useState<string | null>(null);
+  useEffect(() => {
+    if (!fixCols || borderPass <= 1 || !caseId || cur == null) { setPassInputImg(null); return; }
+    let cancelled = false;
+    api.json<{ images: PreviewImage[] }>(`/api/case/${caseId}/previews/context_iter${borderPass - 1}`)
+      .then((r) => {
+        if (cancelled) return;
+        const im = (r.images || []).find((i) => i.orientation === orient && i.slice_index === cur.slice_index);
+        setPassInputImg(im ? imgSrc(im) : null);
+      })
+      .catch(() => !cancelled && setPassInputImg(null));
+    return () => { cancelled = true; };
+  }, [fixCols, borderPass, caseId, cur?.slice_index, orient, segSig]);
+  const inputSrc = borderPass > 1 ? passInputImg : (rawCur ? imgSrc(rawCur) : null);
+
+  // Fetch the detected surface + best-fit COORDS for the selected pass's INPUT slice (auto in fix-columns;
+  // re-fetched on slice/pass change). x=frame/n_frames, y=depth/depth_vox.
   const borderSliceIdx = cur?.slice_index ?? null;
   useEffect(() => {
     if (!fixCols || !caseId || borderSliceIdx == null) { setBorderEdge(null); setBorderFit(null); return; }
     let cancelled = false;
     setBorderBusy(true);
     api.json<{ n_frames: number; depth_vox: number; edge: number[]; fit: number[] }>(
-      `/api/case/${caseId}/oct-border-curve`, "POST", JSON.stringify({ slice_index: borderSliceIdx }))
+      `/api/case/${caseId}/oct-border-curve`, "POST", JSON.stringify({ slice_index: borderSliceIdx, border_pass: borderPass }))
       .then((r) => { if (cancelled) return; setBorderEdge(r.edge || null); setBorderFit(r.fit || null); })
       .catch(() => { if (!cancelled) { setBorderEdge(null); setBorderFit(null); } })
       .finally(() => !cancelled && setBorderBusy(false));
     return () => { cancelled = true; };
-  }, [fixCols, caseId, borderSliceIdx, segSig]);
+  }, [fixCols, caseId, borderSliceIdx, borderPass, segSig]);
 
-  // Drag a frame's surface to where it should be → set that frame's depth nudge (manual_shifts) so the red
-  // border follows the cursor (WYSIWYG); the existing ghost + Re-run apply it. Same sign as the arrow nudge.
+  // Drag the detected border (red) to where the TRUE surface is on the INPUT → that frame's correction
+  // (manual_shifts) so its result flattens correctly. Red follows the cursor (WYSIWYG); edited frames turn
+  // PINK. Sign: the warp flattens the DETECTED edge, so a true surface at depth d needs a final shift of
+  // (edge − d) to land flat → manual_shifts[f] = edge[f] − d.
   const applyBorderDrag = (clientX: number, clientY: number, svg: SVGSVGElement) => {
     if (!borderEdge || nFrames <= 1 || depthVox <= 1) return;
     const r = svg.getBoundingClientRect();
@@ -321,8 +345,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     const frame = Math.round(((clientX - r.left) / r.width) * nFrames - 0.5);
     if (frame < 0 || frame >= nFrames || frame >= borderEdge.length) return;
     const depth = Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox));
-    // red shows at edge[f] + (manual − persisted); to put it at the cursor depth:
-    const shift = Math.round(depth - borderEdge[frame] + (persistedShifts.get(frame) ?? 0));
+    const shift = Math.round(borderEdge[frame] - depth);
     setManualShifts((prev) => { const mm = new Map(prev); if (shift === 0) mm.delete(frame); else mm.set(frame, shift); return mm; });
   };
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -489,22 +512,6 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   };
   // Pending depth-nudge runs as [start, end, delta]: maximal CONTIGUOUS frames that share the SAME pending
   // delta (vs persisted). Splitting on delta (not just contiguity) is required so the ghost + chip show the
-  // right offset when a contiguous span has mixed nudges (e.g. a sub-range re-marked and arrowed again).
-  const pendingRuns = (): [number, number, number][] => {
-    const frames = [...pendingFrames].sort((x, y) => x - y);
-    const dlt = (f: number) => (manualShifts.get(f) ?? 0) - (persistedShifts.get(f) ?? 0);
-    const out: [number, number, number][] = [];
-    let st: number | null = null, pr = 0, d = 0;
-    for (const f of frames) {
-      const fd = dlt(f);
-      if (st === null) { st = f; pr = f; d = fd; }
-      else if (f === pr + 1 && fd === d) { pr = f; }
-      else { out.push([st, pr, d]); st = f; pr = f; d = fd; }
-    }
-    if (st !== null) out.push([st, pr, d]);
-    return out;
-  };
-
   // CSS filter for the display-only enhancement (applied to grayscale OCT images only).
   // In the de-nested fix-columns panel the display filter comes from the top toolbar's sliders (blur is
   // greyed there); otherwise it's driven by this panel's own ◐ Contrast / ◌ Blur toggles.
@@ -640,49 +647,14 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         ref={canvasRef}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
       />
-      {/* Fix-columns border: DETECTED surface (red, draggable) + RANSAC best-fit (blue). Drag a frame's
-          red point to where the surface should be → that frame's depth nudge (manual_shifts). viewBox is
-          (n_frames × depth_vox) stretched to the image (depth 0 = top), so points map x=frame, y=depth. */}
-      {fixCols && borderEdge && borderFit && orient === "sagittal" && nFrames > 1 && depthVox > 1 && (
-        <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
-          onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
-          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
-          <polyline fill="none" stroke="#5db0ff" strokeWidth={1.2} vectorEffect="non-scaling-stroke" opacity={0.85}
-            points={borderFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
-          <polyline fill="none" stroke="#ff4d4d" strokeWidth={1.8} vectorEffect="non-scaling-stroke"
-            points={borderEdge.map((d, f) => `${f + 0.5},${d + (manualShifts.get(f) ?? 0) - (persistedShifts.get(f) ?? 0)}`).join(" ")} />
-        </svg>
-      )}
       {colSel && !fixCols && (orient === "sagittal" || orient === "coronal") && nFrames > 1 &&
         colRuns(badCols).map(([a, b], i) => {
-          // Voxel-EDGE fractions: frame f occupies the image span [f/nFrames, (f+1)/nFrames] of
-          // the nFrames-wide PNG (NOT /(nFrames-1), which is the first→last CENTER span and drifts
-          // the band ~1 frame off by the far edge). Must match frameAt's inverse below. (#1)
+          // Legacy no-WebGL column marking: frame f occupies the image span [f/nFrames, (f+1)/nFrames].
           const lo = a / nFrames, hiEnd = (b + 1) / nFrames;
           const pos = orient === "sagittal"
             ? { left: `${lo * 100}%`, width: `${(hiEnd - lo) * 100}%`, top: 0, bottom: 0 }
             : { top: `${Math.max(0, 1 - hiEnd) * 100}%`, height: `${(hiEnd - lo) * 100}%`, left: 0, right: 0 };
           return <div key={`b${i}`} style={{ position: "absolute", ...pos, background: "rgba(255,70,70,0.32)", pointerEvents: "none" }} />;
-        })}
-      {/* #2: pending (un-re-run) depth nudges from the arrow keys. Per same-delta run, GHOST the
-          frame strip translated to its new depth (so the user SEES where the columns will land) + a
-          chip with the voxel offset. translateY is a % of the strip's own height (= full displayed
-          depth), so delta/depthVox maps directly to the on-screen move with no pixel math. Runs are
-          split by delta (pendingRuns) so a mixed-nudge span renders each part at its own offset.
-          (sagittal only — that's the only view whose vertical axis is depth.) */}
-      {colSel && orient === "sagittal" && nFrames > 1 && depthVox > 1 && cur &&
-        pendingRuns().map(([a, b, delta], i) => {
-          const lo = a / nFrames, hiEnd = (b + 1) / nFrames, w = hiEnd - lo;
-          const tyPct = (delta / depthVox) * 100; // +down, as a fraction of the full depth
-          return (
-            <div key={`s${i}`} style={{ position: "absolute", top: 0, bottom: 0, left: `${lo * 100}%`, width: `${w * 100}%`, overflow: "hidden", pointerEvents: "none", outline: "1px solid rgba(93,176,255,0.85)", outlineOffset: -1, display: "flex", justifyContent: "center" }}>
-              <img src={imgSrc(cur)} alt="" draggable={false}
-                style={{ position: "absolute", top: 0, left: `${-(lo / w) * 100}%`, width: `${100 / w}%`, height: "100%", transform: `translateY(${tyPct}%)`, imageRendering: "pixelated", opacity: 0.92, filter: effectiveGroup === "context" ? enhanceFilter : undefined }} />
-              <span style={{ position: "relative", height: "fit-content", marginTop: 2, background: "rgba(30,80,150,0.92)", color: "#fff", fontSize: 10, lineHeight: 1.3, padding: "1px 4px", borderRadius: 3, whiteSpace: "nowrap" }}>
-                {delta > 0 ? `↓${delta}` : `↑${-delta}`} vox
-              </span>
-            </div>
-          );
         })}
       {hintsHere.map((h, i) => (
         <span
@@ -704,6 +676,31 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           }}
         />
       ))}
+    </div>
+  ) : null;
+
+  // Fix-columns BORDER panel: the selected pass's INPUT image (raw for pass 1) with the DETECTED surface
+  // (red, draggable) + RANSAC best-fit (blue) over it. Drag a frame's red point to the true surface → that
+  // frame's manual_shifts; edited segments turn PINK. viewBox (n_frames × depth_vox) is stretched to the
+  // image (depth 0 = top), so points map x=frame, y=depth.
+  const edgeY = (f: number): number => (borderEdge ? borderEdge[f] - (manualShifts.get(f) ?? 0) : 0);
+  const borderPanel = (inputSrc && borderEdge && borderFit && nFrames > 1 && depthVox > 1) ? (
+    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
+      <img src={inputSrc} alt="pass input" draggable={false}
+        style={{ display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: enhanceFilter }} />
+      <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
+        onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
+        <polyline fill="none" stroke="#5db0ff" strokeWidth={1.2} vectorEffect="non-scaling-stroke" opacity={0.85}
+          points={borderFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
+        <polyline fill="none" stroke="#ff4d4d" strokeWidth={1.8} vectorEffect="non-scaling-stroke"
+          points={borderEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
+        {/* edited frames → pink (over the red) */}
+        {colRuns(pendingFrames).map(([a, b], i) => a === b
+          ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(1, depthVox / 140)} fill="#ff5db0" stroke="none" />
+          : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={2.6} vectorEffect="non-scaling-stroke"
+              points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
+      </svg>
     </div>
   ) : null;
 
@@ -950,22 +947,27 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
               </div>
             )}
           </div>
-        ) : (fixCols && showRaw && rawCur) ? (
-          // Fix-columns + before/after: raw "before" (left) beside the corrected "after" with the draggable
-          // border (right). The corrected panel is wrapped in a sized flex box so its (inline-block) img
-          // gets a definite height in this column (avoids the "empty corrected panel" collapse).
+        ) : fixCols ? (
+          // Fix-columns: edit the border on the selected pass's INPUT (left, editable); when before/after
+          // is on, show the corrected RESULT beside it (right, read-only) so the effect is visible after a
+          // Re-run. Each panel is in a sized flex box so its inline-block img gets a definite height.
           <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "center", justifyContent: "center" }}>
             <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
-              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>original (raw)</span>
-              <img src={imgSrc(rawCur)} alt="reference" draggable={false}
-                style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter }} />
-            </div>
-            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
-              <span className="text-[11px]" style={{ color: "var(--c-green)" }}>corrected — drag the red border</span>
+              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{passInputLabel} — drag the red border</span>
               <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                {correctedPanel}
+                {borderPanel ?? (
+                  <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{borderBusy ? "Detecting border…" : "No border for this slice."}</span>
+                )}
               </div>
             </div>
+            {showRaw && correctedPanel && (
+              <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                <span className="text-[11px]" style={{ color: "var(--c-green)" }}>corrected (result)</span>
+                <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {correctedPanel}
+                </div>
+              </div>
+            )}
           </div>
         ) : correctedPanel}
       </div>
