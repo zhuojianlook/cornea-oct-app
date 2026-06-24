@@ -2,7 +2,7 @@
    pick a folder of NIfTI volumes, read a volume's bytes, write the exported labelmap, and persist the
    user list + the ground-truth manifest (for inter/intra-observer analysis). */
 
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { readFile, writeFile, readTextFile, writeTextFile, readDir, mkdir, exists, remove } from "@tauri-apps/plugin-fs";
 import { appConfigDir, join, basename } from "@tauri-apps/api/path";
 
@@ -147,6 +147,74 @@ export async function appendManifest(outputDir: string, row: ManifestRow): Promi
     }).join(",")))
     .join("\n");
   await writeTextFile(await join(outputDir, "manifest.csv"), csv);
+}
+
+/** The saved ground-truth labelmap files for one (stem, replicate) by this user (across sessions),
+    chronological (session id is ISO-ish, so lexical sort = oldest→newest; the LAST is the current GT). */
+export async function listLabelmapFiles(outputDir: string, stem: string, user: string, replicate: number): Promise<string[]> {
+  const dir = await join(outputDir, stem);
+  if (!(await exists(dir))) return [];
+  const prefix = `${user}__rep${replicate}__`;
+  const out: string[] = [];
+  for (const e of await readDir(dir)) {
+    if (e.isFile && e.name.startsWith(prefix) && isNifti(e.name)) out.push(await join(dir, e.name));
+  }
+  out.sort();
+  return out;
+}
+
+/** Delete one entry's saved ground truth: remove this user's labelmap file(s) for (stem, replicate) and
+    drop the matching rows from manifest.json + .csv (other users' / other entries' GT is untouched). */
+export async function deleteLabelmaps(outputDir: string, stem: string, user: string, replicate: number): Promise<number> {
+  let removed = 0;
+  for (const f of await listLabelmapFiles(outputDir, stem, user, replicate)) {
+    try { await remove(f); removed++; } catch { /* already gone */ }
+  }
+  try {
+    const jsonP = await join(outputDir, "manifest.json");
+    if (await exists(jsonP)) {
+      let rows: ManifestRow[] = JSON.parse(await readTextFile(jsonP));
+      rows = rows.filter((r) => !(r.username === user && r.volume_stem === stem && (r.replicate ?? 1) === replicate));
+      await writeTextFile(jsonP, JSON.stringify(rows, null, 2));
+      const csv = [CSV_COLS.join(",")]
+        .concat(rows.map(r => CSV_COLS.map(c => { const v = String(r[c] ?? ""); return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; }).join(",")))
+        .join("\n");
+      await writeTextFile(await join(outputDir, "manifest.csv"), csv);
+    }
+  } catch { /* manifest update best-effort */ }
+  return removed;
+}
+
+/** Copy one labelmap file to a user-chosen location (a Save-As dialog). Returns the dest path or null. */
+export async function downloadLabelmap(srcPath: string, suggestedName: string): Promise<string | null> {
+  if (!inTauri()) return null;
+  const dest = await save({ defaultPath: suggestedName, filters: [{ name: "NIfTI", extensions: ["nii.gz", "nii", "gz"] }] });
+  if (!dest) return null;
+  await writeFile(dest, await readFile(srcPath));
+  return dest;
+}
+
+/** Export EVERY saved labelmap (+ the manifest) to a chosen folder — for collecting the GT dataset. */
+export async function exportAllLabelmaps(outputDir: string, destDir: string): Promise<number> {
+  let n = 0;
+  for (const e of await readDir(outputDir)) {
+    if (e.isDirectory) {
+      const sub = await join(outputDir, e.name);
+      let made = false;
+      for (const f of await readDir(sub)) {
+        if (f.isFile && isNifti(f.name)) {
+          const dDir = await join(destDir, e.name);
+          if (!made) { if (!(await exists(dDir))) await mkdir(dDir, { recursive: true }); made = true; }
+          await writeFile(await join(dDir, f.name), await readFile(await join(sub, f.name)));
+          n++;
+        }
+      }
+    } else if (e.isFile && /^manifest\.(json|csv)$/.test(e.name)) {
+      if (!(await exists(destDir))) await mkdir(destDir, { recursive: true });
+      await writeFile(await join(destDir, e.name), await readFile(await join(outputDir, e.name)));
+    }
+  }
+  return n;
 }
 
 /** Which (stem, replicate) pairs this user has already saved — keys `${stem}__rep${replicate}` — for the

@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.34";
+export const APP_VERSION = "0.1.35";
 
 // #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
 // (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
@@ -167,6 +167,11 @@ interface State {
   zoomOut: () => void;
   resetView: () => void;
   save: (force?: boolean) => Promise<void>;
+  // Manage a saved ground truth from its ✓ badge: re-open to edit is openVolume; these delete it / download
+  // its labelmap; exportAllGt copies every saved labelmap to a chosen folder.
+  deleteGt: (entry: BlindEntry) => Promise<void>;
+  downloadGt: (entry: BlindEntry) => Promise<void>;
+  exportAllGt: () => Promise<void>;
   cancelOverwrite: () => void;
   setBrightness: (b: number) => void;
   setContrast: (c: number) => void;
@@ -566,6 +571,52 @@ export const useStore = create<State>((set, get) => ({
       set({ annotated: done, status: `Saved ${file.split(/[/\\]/).pop()} (${activeVolume.blindLabel} rep ${rep}, scar ${st.scar} vox).` });
     } catch (e) {
       set({ status: `Save failed: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  deleteGt: async (entry) => {
+    const { activeUser, outputDir } = get();
+    if (!activeUser || !outputDir) return;
+    set({ busy: true, status: "Deleting ground truth…" });
+    try {
+      const removed = await io.deleteLabelmaps(outputDir, entry.stem, activeUser, entry.replicate);
+      try { const ak = aKey(entry); if (ak) await io.removeAutosave(activeUser, ak); } catch { /* best-effort */ }
+      const done = new Set(get().annotated); done.delete(entryKey(entry));
+      set({ annotated: done, status: `Deleted ground truth for ${entry.blindLabel} · rep ${entry.replicate} (${removed} file(s)).` });
+    } catch (e) {
+      set({ status: `Delete failed: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  downloadGt: async (entry) => {
+    const { activeUser, outputDir } = get();
+    if (!activeUser || !outputDir) return;
+    try {
+      const files = await io.listLabelmapFiles(outputDir, entry.stem, activeUser, entry.replicate);
+      const latest = files[files.length - 1];
+      if (!latest) { set({ status: "No saved labelmap to download." }); return; }
+      const dest = await io.downloadLabelmap(latest, `${entry.stem}__${activeUser}__rep${entry.replicate}.nii.gz`);
+      if (dest) set({ status: `Downloaded ${dest.split(/[/\\]/).pop()}.` });
+    } catch (e) {
+      set({ status: `Download failed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  },
+
+  exportAllGt: async () => {
+    const { outputDir } = get();
+    if (!outputDir) { set({ status: "No saved ground truth yet (nothing to export)." }); return; }
+    const dest = await io.pickFolder("Choose where to export all saved labelmaps");
+    if (!dest) return;
+    set({ busy: true, status: "Exporting all saved labelmaps…" });
+    try {
+      const n = await io.exportAllLabelmaps(outputDir, dest);
+      set({ status: `Exported ${n} labelmap file(s) to ${dest.split(/[/\\]/).pop()}.` });
+    } catch (e) {
+      set({ status: `Export failed: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
       set({ busy: false });
     }
