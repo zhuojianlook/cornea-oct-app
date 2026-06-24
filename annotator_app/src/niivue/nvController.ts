@@ -6,10 +6,16 @@
 import { Niivue, NVImage, SLICE_TYPE, DRAG_MODE } from "@niivue/niivue";
 
 export type ViewName = "multi" | "axial" | "coronal" | "sagittal" | "render";
+// View-name → niivue SLICE_TYPE. NOTE the deliberate AXIAL↔CORONAL SWAP: these OCT volumes carry the
+// main app's direction (1,0,0,0,0,1,0,-1,0), so the frame axis (B-scans) maps to physical A-P → niivue
+// labels the B-scan plane "coronal" and the en-face/depth plane "axial". The user's convention (matching
+// the main app, where a B-scan = "axial") is the opposite, so we expose niivue-CORONAL as the user's
+// "Axial" (B-scan arcs) and niivue-AXIAL as the user's "Coronal" (en-face). Sagittal matches in both.
+// Paint is UNAFFECTED — it uses niivue's real per-tile axCorSag (tileThroughAxis), not these labels.
 const SLICE: Record<ViewName, number> = {
   multi: SLICE_TYPE.MULTIPLANAR,
-  axial: SLICE_TYPE.AXIAL,
-  coronal: SLICE_TYPE.CORONAL,
+  axial: SLICE_TYPE.CORONAL,    // user "Axial" = B-scan plane = niivue coronal
+  coronal: SLICE_TYPE.AXIAL,    // user "Coronal" = en-face/depth plane = niivue axial
   sagittal: SLICE_TYPE.SAGITTAL,
   render: SLICE_TYPE.RENDER,
 };
@@ -199,7 +205,9 @@ export function forceDrawAll(): void {
   const go = () => { if (!nv) return; try { nv.refreshDrawing(true); } catch { /* */ } try { nv.drawScene(); } catch { /* */ } };
   go();
   requestAnimationFrame(go);
-  setTimeout(go, 60);
+  // Escalating retries: on some WebKitGTK builds a single late repaint still misses the B-scan
+  // (niivue-coronal) tile, so re-issue a few more times as the layout settles. Cheap; Chromium no-ops.
+  for (const ms of [60, 180, 400]) setTimeout(go, ms);
 }
 
 // ── Slice navigation (per-view scrollbars, #1) ───────────────────────────────

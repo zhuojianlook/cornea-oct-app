@@ -40,10 +40,13 @@ const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff4
 const PEN_KEY = { 0: "pen.erase", 1: "pen.cornea", 2: "pen.scar", 3: "pen.background" } as const;
 const VIEWS: ViewName[] = ["multi", "axial", "coronal", "sagittal", "render"];
 
-// Through-plane voxel axis per plane (axial=z=2, coronal=y=1, sagittal=x=0) for the slice scrollbars.
+// Per-plane through-plane RAS axis for the slice scrollbars. The AXIAL↔CORONAL axes are SWAPPED to match
+// the user-facing label swap in nvController's SLICE map: the user's "Axial" view shows niivue's CORONAL
+// plane (RAS through-axis 1 = the B-scan / frame axis) and the user's "Coronal" shows niivue's AXIAL plane
+// (RAS through-axis 2 = the en-face/depth axis). So the "Axial" scrollbar scrolls B-scans, as expected.
 const VIEW_AXIS: { plane: "axial" | "coronal" | "sagittal"; axis: 0 | 1 | 2; key: TKey }[] = [
-  { plane: "axial", axis: 2, key: "view.axial" },
-  { plane: "coronal", axis: 1, key: "view.coronal" },
+  { plane: "axial", axis: 1, key: "view.axial" },     // user Axial = niivue coronal (B-scan), RAS axis 1
+  { plane: "coronal", axis: 2, key: "view.coronal" }, // user Coronal = niivue axial (en-face), RAS axis 2
   { plane: "sagittal", axis: 0, key: "view.sagittal" },
 ];
 
