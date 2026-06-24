@@ -100,6 +100,13 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   if (nv.drawBitmap) { const n = nv.drawBitmap.length;
     seedBmp = new Uint8Array(n); committedBmp = new Uint8Array(n); previewBmp = new Uint8Array(n);
     previewing = false; undoStack = []; redoStack = []; }
+  // Diagnostic (paint visibility): a low MAX_3D_TEXTURE_SIZE on a software/WebKitGTK GL backend forces
+  // niivue's single-slice 2-D draw-upload path; log which path is live so a paint report can be pinned to
+  // the real cause if the compose-on-stroke-end fix isn't sufficient.
+  try {
+    const dbg = nv as unknown as { opts?: { is2DSliceShader?: boolean }; uiData?: { max3D?: number; max2D?: number } };
+    console.info(`[annotator] draw path: is2DSliceShader=${dbg.opts?.is2DSliceShader} max3D=${dbg.uiData?.max3D} max2D=${dbg.uiData?.max2D} drawLen=${nv.drawBitmap?.length}`);
+  } catch { /* */ }
   // Keep the per-view slice scrollbars (#1) in sync when the user scroll-wheels through slices.
   // Ignore the location changes niivue fires from its OWN paint mousedown/drag: its native canvas
   // listener runs before React's onMouseDown sets strokeActive, so also gate on uiData.mousedown
@@ -407,6 +414,14 @@ function compose(): void {
   // restored/filled paint invisible on the (coronal/en-face) tile. Infrequent (not per brush stroke).
   forceDrawAll();
 }
+
+/** Rebuild the displayed bitmap from the three layers + a full WebKitGTK-proof redraw, NOW. The live
+    brush (paintBrush) mutates drawBitmap IN PLACE + a single rAF refresh for responsiveness, but on
+    WebKitGTK an in-place partial update can leave the en-face/coronal 2-D tile showing nothing — the
+    painted voxels ARE in the bitmap (so they show in the 3-D render) but never reach that 2-D tile.
+    Calling this at STROKE END routes the final result through the SAME compose()→forceDrawAll path that
+    smart-fill / undo / restore use (which DO repaint every tile), so the stroke becomes visible. */
+export function flushCompose(): void { if (nv) compose(); }
 
 const snapshot = (): Snap => ({ s: seedBmp!.slice(), c: committedBmp!.slice() });
 function restoreSnap(e: Snap): void {

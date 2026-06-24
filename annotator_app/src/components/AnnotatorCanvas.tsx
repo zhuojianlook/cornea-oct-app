@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, CircularProgress, Slider, ToggleButton, ToggleButtonGroup } from "@mui/material";
-import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, forceDrawAll, setCrosshairAtScreen, type ViewName } from "../niivue/nvController";
+import { attach, setView, webglFailure, brushScreenSize, lockCrosshair, restoreCrosshair, setStroke, redraw, paintBrush, beginStroke, tileAtScreen, tileThroughAxis, voxAtScreen, voxAtScreenClamped, flushCompose, setCrosshairAtScreen, type ViewName } from "../niivue/nvController";
 import { useStore } from "../store/annotatorStore";
 import { tr, type TKey } from "../i18n";
 
@@ -185,7 +185,7 @@ export function AnnotatorCanvas() {
             setCrosshairAtScreen(x, y);                            // #2: ONLY Navigate moves the crosshair (shift/ctrl already returned = pan)
           }
         }}
-        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); forceDrawAll(); autosaveDraw(); } }}
+        onMouseUp={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); flushCompose(); autosaveDraw(); } }}
         onMouseMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           const x = e.clientX - r.left, y = e.clientY - r.top;
@@ -210,7 +210,7 @@ export function AnnotatorCanvas() {
             setBrush({ x, y, w: sz ? Math.max(4, sz.w) : Math.max(4, penSize), h: sz ? Math.max(4, sz.h) : Math.max(4, penSize) });
           } else if (brush) setBrush(null);
         }}
-        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); forceDrawAll(); autosaveDraw(); } setBrush(null); }}
+        onMouseLeave={() => { if (painting) { lastVox.current = null; restoreCrosshair(); setStroke(false); syncVox(); refreshStats(); flushCompose(); autosaveDraw(); } setBrush(null); }}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: painting || wandActive ? "crosshair" : "default" }} />
         {showBrush && (
