@@ -70,6 +70,11 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   // copy into a fresh ArrayBuffer (avoids any shared-buffer surprises from the fs read)
   const ab = bytes.slice().buffer;
   await nv.loadFromArrayBuffer(ab, name);
+  // NEAREST-neighbour interpolation = crisp voxels. These OCT volumes are highly anisotropic (frames
+  // ~0.04mm vs depth ~0.003mm), so any view spanning the coarse FRAME axis (sagittal = frames×depth,
+  // coronal/en-face = lateral×frames) is upscaled ~13× and niivue's default LINEAR interp blurs it.
+  // Nearest renders the true voxel grid (matches the main app's pixelated previews). (#blur)
+  try { nv.setInterpolation(true); } catch { /* older niivue: leave default */ }
   // capture the auto display window for the brightness/contrast controls (#3)
   const v0 = nv.volumes[0] as unknown as { cal_min?: number; cal_max?: number; global_min?: number; global_max?: number };
   baseWinLo = v0.cal_min ?? v0.global_min ?? 0;
