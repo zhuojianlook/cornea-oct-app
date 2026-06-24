@@ -8,10 +8,14 @@ import { Niivue, SLICE_TYPE } from "@niivue/niivue";
 
 export type ViewName = "multi" | "axial" | "coronal" | "sagittal" | "render";
 
+// These OCT volumes' direction (NIFTI_DIRECTION) makes niivue's AXIAL tile the EN-FACE/depth plane (the
+// ring-shaped view) and niivue's CORONAL tile the B-scan stack — the opposite of the clinical naming the
+// user expects. So the user-facing "Coronal" button maps to niivue AXIAL (en-face ring) and "Axial" to
+// niivue CORONAL (B-scan). (Same swap the annotator app made; keep the labels clinically intuitive.)
 const SLICE: Record<ViewName, number> = {
   multi: SLICE_TYPE.MULTIPLANAR,
-  axial: SLICE_TYPE.AXIAL,
-  coronal: SLICE_TYPE.CORONAL,
+  axial: SLICE_TYPE.CORONAL,    // user "Axial" = niivue coronal = B-scan stack
+  coronal: SLICE_TYPE.AXIAL,    // user "Coronal" = niivue axial = en-face ring
   sagittal: SLICE_TYPE.SAGITTAL,
   render: SLICE_TYPE.RENDER,
 };

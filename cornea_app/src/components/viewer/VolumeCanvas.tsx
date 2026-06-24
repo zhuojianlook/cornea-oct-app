@@ -59,7 +59,7 @@ export function VolumeCanvas() {
     : (view === "axial" || view === "coronal" || view === "sagittal") ? view : "sagittal";
   // Slices | Segmentation overlay toggle (Segmentation greyed until SAM2 has run). On the niivue path it
   // simply shows/hides the cornea/scar overlay by opacity; the 2-D gallery reads the same flag.
-  const [showSeg, setShowSeg] = useState(true);
+  const [showSeg, setShowSeg] = useState(false); // default to SLICES; Segmentation is opt-in (and greyed until SAM2)
   useEffect(() => { setSegmentationOpacity(showSeg && segLoaded ? segOpacity : 0); }, [showSeg, segLoaded, segOpacity]);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
   const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
@@ -137,8 +137,9 @@ export function VolumeCanvas() {
     return () => { cancelled = true; };
   }, [caseInfo?.case_id, volumeUrl]);
 
-  // Leave the comparison / fix-columns / steps overlays when switching to a different case.
-  useEffect(() => { setCompareView(false); setFixColsView(false); setStepsView(false); }, [caseInfo?.case_id]);
+  // Leave the comparison / fix-columns / steps overlays when switching to a different case, and reset the
+  // overlay toggle to SLICES (segmentation is opt-in per scan; it's greyed until that scan has SAM2).
+  useEffect(() => { setCompareView(false); setFixColsView(false); setStepsView(false); setShowSeg(false); }, [caseInfo?.case_id]);
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -200,8 +201,8 @@ export function VolumeCanvas() {
     <div className="relative flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
       {backBanner}
       <div
-        className="flex items-center gap-2 px-3 border-b"
-        style={{ height: 36, borderColor: "var(--c-border)" }}
+        className="flex items-center gap-2 px-3 border-b overflow-x-auto [&>*]:shrink-0"
+        style={{ minHeight: 36, borderColor: "var(--c-border)" }}
       >
         <ToggleButtonGroup size="small" exclusive value={showSeg ? "seg" : "slices"}
           onChange={(_, v) => { if (v) setShowSeg(v === "seg"); }}

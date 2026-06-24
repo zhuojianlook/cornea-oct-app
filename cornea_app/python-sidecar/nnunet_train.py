@@ -441,6 +441,46 @@ def flow_counts() -> dict:
     return c
 
 
+def list_runs() -> list[dict]:
+    """Every completed/attempted First-Run Folder (first_run_v*), newest first, with the summary the UI
+    shows (version, timestamp, mode, config, counts) read from each run_spec.json."""
+    out: list[dict] = []
+    if not NN_BASE.exists():
+        return out
+    for d in sorted(NN_BASE.glob("first_run_v*"), reverse=True):
+        if not d.is_dir():
+            continue
+        spec = {}
+        try:
+            spec = json.loads((d / "run_spec.json").read_text())
+        except Exception:  # noqa: BLE001
+            pass
+        # Has the report (the publication artifact) been produced?
+        has_report = any(d.glob("*.pdf")) or (d / "report.json").exists() or any(d.glob("report*.html"))
+        out.append({
+            "name": d.name,
+            "version": spec.get("version"),
+            "timestamp": spec.get("timestamp"),
+            "mode": spec.get("mode"),
+            "config": spec.get("config"),
+            "counts": spec.get("counts") or {},
+            "has_report": bool(has_report),
+        })
+    return out
+
+
+def delete_run(name: str) -> bool:
+    """Delete ONE First-Run Folder by name. Guarded: the name must be a plain first_run_v* folder that
+    lives directly under NN_BASE (no path traversal, never the raw/preprocessed/results trees)."""
+    if not name or "/" in name or "\\" in name or ".." in name or not name.startswith("first_run_v"):
+        raise ValueError("invalid run name")
+    d = (NN_BASE / name).resolve()
+    if d.parent != NN_BASE.resolve() or not d.is_dir():
+        raise ValueError("run not found")
+    shutil.rmtree(d, ignore_errors=True)
+    return not d.exists()
+
+
 def _next_run_version() -> int:
     """Next run version number — scans existing first_run_v* folders (survives restarts), so every
     Start Training lands in its OWN versioned folder and never overwrites a prior run."""

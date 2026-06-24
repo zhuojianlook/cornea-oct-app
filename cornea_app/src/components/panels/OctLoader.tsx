@@ -180,6 +180,7 @@ export function OctLoader() {
   const toggleCollapse = (id: string) =>
     setCollapsed((cur) => { const n = new Set(cur); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const setCaseId = useCaseStore((s) => s.setCaseId);
+  const clearCase = useCaseStore((s) => s.clearCase);
   const openCase = useCaseStore((s) => s.openCase);
   const setStage = useWorkflowStore((s) => s.setStage);
   const initTabs = useWorkflowStore((s) => s.initTabs);
@@ -424,12 +425,13 @@ export function OctLoader() {
       `label and preview on disk — it cannot be undone. Re-uploads will then start fresh.`,
     )) return;
     setBusy(true);
+    // Clear the sidebar list + empty the viewer IMMEDIATELY (optimistic) so the UI responds at once — the
+    // on-disk delete of many case folders can take a while; the busy LinearProgress shows it's working.
+    setScans([]); setGroups([]); setLoaded(false); setReport(null); setReportLabel(""); setActiveId(null);
+    setCasesCount(0); clearCase();
+    setStep("Wiping all saved cases…");
     try {
-      setStep("Wiping all saved cases…");
       const r = await api.json<{ removed: number; freed_bytes: number }>("/api/cases/wipe", "POST", JSON.stringify({}));
-      // The just-loaded scans' case folders are gone — reset the loader to a clean state.
-      setScans([]); setGroups([]); setLoaded(false); setReport(null); setReportLabel(""); setActiveId(null);
-      setCasesCount(0);
       setStep(`Wiped ${r.removed} case(s), freed ${(r.freed_bytes / 1e9).toFixed(2)} GB. Upload to start fresh.`);
     } catch (e) {
       setStep(`Wipe failed: ${msg(e)}`);

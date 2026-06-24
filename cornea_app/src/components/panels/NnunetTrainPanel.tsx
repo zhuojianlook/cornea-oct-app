@@ -33,6 +33,16 @@ interface TrainStatus {
   run_version?: number | null;
 }
 
+interface RunInfo {
+  name: string;
+  version?: number | null;
+  timestamp?: string;
+  mode?: string;
+  config?: string;
+  counts?: Record<string, number>;
+  has_report?: boolean;
+}
+
 const sel = { fontSize: 12, ".MuiSelect-select": { py: 0.5 } } as const;
 
 export function NnunetTrainPanel() {
@@ -46,6 +56,7 @@ export function NnunetTrainPanel() {
   // (mirrors the backend default of training on every per-scan segmentation). Deselections persist
   // across status polls; newly discovered cases default to included.
   const [included, setIncluded] = useState<Record<string, boolean>>({});
+  const [runs, setRuns] = useState<RunInfo[]>([]);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const fetchStatus = async () => {
@@ -56,9 +67,34 @@ export function NnunetTrainPanel() {
     }
   };
 
+  const fetchRuns = async () => {
+    try {
+      const r = await api.json<{ runs: RunInfo[] }>("/api/train/nnunet/runs");
+      setRuns(r.runs || []);
+    } catch {
+      /* keep last */
+    }
+  };
+
+  const deleteRun = async (name: string) => {
+    if (!window.confirm(`Delete training run "${name}"?\n\nThis removes its First-Run Folder (model spec, report, metrics) on disk — it cannot be undone.`)) return;
+    try {
+      const r = await api.json<{ runs: RunInfo[] }>(`/api/train/nnunet/runs/${encodeURIComponent(name)}`, "DELETE");
+      setRuns(r.runs || []);
+    } catch {
+      fetchRuns();
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
+    fetchRuns();
   }, []);
+
+  // Refresh the run list whenever a training run finishes (a new First-Run Folder appears).
+  useEffect(() => {
+    if (status?.done) fetchRuns();
+  }, [status?.done, status?.run_version]);
 
   // Poll while a job is running or the venv is being set up.
   const polling = (status?.running ?? false) || setupPending;
@@ -263,6 +299,33 @@ export function NnunetTrainPanel() {
           fontSize: 10, lineHeight: 1.35, color: dim, background: "var(--c-bg)", border: "1px solid var(--c-border)",
           borderRadius: 4, padding: 6, margin: 0, maxHeight: 160, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all",
         }}>{status.log_tail}</pre>
+      )}
+
+      {/* Previous training runs — review + delete saved First-Run Folders. */}
+      {runs.length > 0 && (
+        <div style={{ marginTop: 10, borderTop: "1px solid var(--c-border)", paddingTop: 8 }}>
+          <div style={{ fontSize: 11, color: dim, marginBottom: 4 }}>Previous runs ({runs.length})</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {runs.map((r) => (
+              <div key={r.name} className="flex items-center gap-2"
+                style={{ fontSize: 11, border: "1px solid var(--c-border)", borderRadius: 4, padding: "4px 6px" }}>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ color: "var(--c-text)" }}>v{r.version ?? "?"}</span>
+                  <span style={{ color: dim }}>
+                    {r.mode ? ` · ${r.mode}` : ""}{r.config ? `/${r.config}` : ""}
+                    {r.counts?.trainval != null ? ` · ${r.counts.trainval} train · ${r.counts.test ?? "?"} test` : ""}
+                    {r.has_report ? " · report ✓" : ""}
+                  </span>
+                  {r.timestamp && <div style={{ color: dim, opacity: 0.8, fontSize: 10 }}>{r.timestamp}</div>}
+                </span>
+                <button onClick={() => deleteRun(r.name)} title="Delete this training run (cannot be undone)"
+                  style={{ flex: "none", background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "#ff6b6b", cursor: "pointer", fontSize: 12, padding: "1px 7px" }}>
+                  🗑
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

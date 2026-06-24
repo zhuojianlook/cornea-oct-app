@@ -150,9 +150,12 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
 
   // Auto-select the richest available group (segmentation > slices) so the
   // viewer (and screenshots of it) show the latest result by default. Skipped
-  // when a consensus tab pins the group.
+  // when a consensus tab pins the group OR in fix-columns mode (which must stay on
+  // the CORRECTED "context" slices — otherwise, for a scan that already has SAM2,
+  // this races the fixCols effect and flips the group to "segmentation", leaving the
+  // corrected panel empty when before/after is combined with Fix-columns).
   useEffect(() => {
-    if (!caseId || previewGroup) return;
+    if (!caseId || previewGroup || fixCols) return;
     let cancelled = false;
     (async () => {
       for (const g of ["segmentation", "context"] as Group[]) {
@@ -186,7 +189,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     return () => {
       cancelled = true;
     };
-  }, [caseId, segSig, previewGroup]);
+  }, [caseId, segSig, previewGroup, fixCols]);
 
   useEffect(() => {
     if (!caseId) return;

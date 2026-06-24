@@ -20,6 +20,7 @@ interface CaseState {
   fetchConfig: () => Promise<void>;
   setApiError: (msg: string | null) => void;
   setCaseId: (id: string) => void;
+  clearCase: () => void;   // empty the viewer immediately (e.g. wipe-all): drop caseId/caseInfo/volumeUrl
   openCase: () => Promise<void>;
   registerVolume: (path: string) => Promise<void>;
   uploadVolume: (file: File) => Promise<void>;
@@ -179,6 +180,12 @@ export const useCaseStore = create<CaseState>()(
       set((s) => {
         s.caseId = id;
       }),
+
+    clearCase: () => {
+      // Empty the viewer right away (wipe-all): no open case → VolumeCanvas drops the volume + overlays.
+      useWorkflowStore.getState().resetForCase();
+      set((s) => { s.caseId = null; s.caseInfo = null; s.volumeUrl = null; });
+    },
 
     openCase: async () => {
       const id = get().caseId;

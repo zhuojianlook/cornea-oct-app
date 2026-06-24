@@ -2227,6 +2227,22 @@ def train_start(req: TrainRequest) -> dict:
         raise HTTPException(400, str(exc))
 
 
+@app.get("/api/train/nnunet/runs")
+def train_runs() -> dict:
+    """List the saved First-Run Folders (previous training runs), newest first."""
+    return {"runs": nntrain.list_runs()}
+
+
+@app.delete("/api/train/nnunet/runs/{name}")
+def train_run_delete(name: str) -> dict:
+    """Delete one previous training run (its First-Run Folder) by name."""
+    try:
+        ok = nntrain.delete_run(name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": ok, "runs": nntrain.list_runs()}
+
+
 # ── Serve the built frontend (single-port mode) ────────────────────────────
 # When cornea_app/dist exists (after `npm run build`), the sidecar also serves the
 # React UI, so the whole app runs as ONE process on :8765 — handy where a separate
