@@ -9,8 +9,7 @@ import { useCaseStore } from "../../store/caseStore";
 import { useUpdater } from "../../store/updaterStore";
 import { DocumentTabs } from "./DocumentTabs";
 import { Sidebar } from "./Sidebar";
-import { Toolbar } from "./Toolbar";
-import { StageStepper } from "../stepper/StageStepper";
+import { TimelineBar } from "./TimelineBar";
 import { VolumeCanvas } from "../viewer/VolumeCanvas";
 import { UpdateBanner } from "../UpdateBanner";
 
@@ -87,8 +86,7 @@ export function AppShell() {
           </aside>
 
           <main className="flex flex-1 flex-col min-w-0 min-h-0">
-            <Toolbar />
-            <StageStepper />
+            <TimelineBar />
             <div className="flex flex-1 min-h-0 min-w-0">
               <VolumeCanvas />
             </div>

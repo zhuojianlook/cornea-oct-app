@@ -23,7 +23,15 @@ const GROUP_LABEL: Record<Group, string> = {
 };
 const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 
-export function SliceGallery() {
+// When embedded as the de-nested "Fix columns" panel (driven by the single top toolbar in
+// VolumeCanvas), `fixCols` auto-enters column-marking and hides this panel's own duplicate toggles
+// (group/orient/before-after/contrast/blur/scar) — orientation + display filter come from props so the
+// ONE top toolbar drives them. Called with NO props on the no-WebGL fallback path (unchanged behaviour).
+export function SliceGallery({ fixCols = false, orientProp, filterCss }: {
+  fixCols?: boolean;
+  orientProp?: "axial" | "coronal" | "sagittal";
+  filterCss?: string;
+} = {}) {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const openCase = useCaseStore((s) => s.openCase); // refetch caseInfo after a fix-cols re-run (fresh persisted nudges)
@@ -120,6 +128,22 @@ export function SliceGallery() {
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
+
+  // Embedded fix-columns: auto-enter marking on the corrected slices (no inner ▥ click needed) and
+  // mirror the top toolbar's orientation. The depth-fix workflow lives entirely in the colSel controls.
+  useEffect(() => {
+    if (!fixCols) return;
+    setColSel(true);
+    setGroup("context");
+    setBeforeAfter(false);
+    wfSet("scarEditMode", false);
+    if (passCount > 1) setFixPass((p) => (p == null || p > passCount ? passCount : p));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixCols, passCount]);
+  useEffect(() => {
+    if (fixCols && orientProp) { setOrient(orientProp); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixCols, orientProp]);
 
   const effectiveGroup = previewGroup ?? group;
 
@@ -284,7 +308,9 @@ export function SliceGallery() {
       // Step is in DEPTH VOXELS. The depth axis is ~640 voxels tall, so a 1-voxel nudge is sub-pixel on
       // screen (looks like nothing happened). Use a visible default (5 vox ≈ several px) with Shift for
       // bigger jumps — corrections are typically tens of voxels anyway.
-      const step = (e.shiftKey ? 25 : 5) * (e.key === "ArrowDown" ? 1 : -1); // ↓ deeper (+), ↑ shallower (−)
+      // Fine control: 1 image-pixel (1 depth voxel) per press, per the user's "1 pixel at a time"; Shift =
+      // coarse (10) for big moves. The numeric "↕N vox" readout + ghost make even a 1-voxel move legible.
+      const step = (e.shiftKey ? 10 : 1) * (e.key === "ArrowDown" ? 1 : -1); // ↓ deeper (+), ↑ shallower (−)
       setManualShifts((prev) => {
         const next = new Map(prev);
         badCols.forEach((f) => {
@@ -433,8 +459,12 @@ export function SliceGallery() {
   };
 
   // CSS filter for the display-only enhancement (applied to grayscale OCT images only).
-  const enhanceFilter = [enhContrast ? "contrast(2.2) brightness(1.12)" : "", enhBlur ? "blur(0.8px)" : ""]
-    .filter(Boolean).join(" ") || undefined;
+  // In the de-nested fix-columns panel the display filter comes from the top toolbar's sliders (blur is
+  // greyed there); otherwise it's driven by this panel's own ◐ Contrast / ◌ Blur toggles.
+  const enhanceFilter = fixCols
+    ? (filterCss || undefined)
+    : ([enhContrast ? "contrast(2.2) brightness(1.12)" : "", enhBlur ? "blur(0.8px)" : ""]
+        .filter(Boolean).join(" ") || undefined);
 
   const onImgClick = (e: React.MouseEvent<HTMLImageElement>) => {
     // Scar hints must land on the UNROTATED previews (segmentation/consensus). The "context"
@@ -536,12 +566,13 @@ export function SliceGallery() {
         className="flex items-center gap-2 px-3 border-b flex-wrap"
         style={{ minHeight: 40, borderColor: "var(--c-border)" }}
       >
-        {!previewGroup && (
+        {!previewGroup && !fixCols && (
           <ToggleButtonGroup size="small" exclusive value={group} onChange={(_, v) => v && setGroup(v)}>
             <ToggleButton value="segmentation">Segmentation</ToggleButton>
             <ToggleButton value="context">Slices</ToggleButton>
           </ToggleButtonGroup>
         )}
+        {!fixCols && (
         <ToggleButtonGroup
           size="small"
           exclusive
@@ -560,8 +591,9 @@ export function SliceGallery() {
             </ToggleButton>
           ))}
         </ToggleButtonGroup>
+        )}
 
-        {canBeforeAfter && !colSel && (
+        {!fixCols && canBeforeAfter && !colSel && (
           <ToggleButton size="small" value="ba" selected={beforeAfter}
             onChange={() => setBeforeAfter((b) => !b)}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
@@ -570,7 +602,7 @@ export function SliceGallery() {
           </ToggleButton>
         )}
 
-        {canMarkColumns && (
+        {!fixCols && canMarkColumns && (
           <ToggleButton size="small" value="cols" selected={colSel}
             onChange={() => {
               const on = !colSel;
@@ -590,7 +622,7 @@ export function SliceGallery() {
             ▥ Fix columns
           </ToggleButton>
         )}
-        {canMarkColumns && (
+        {!fixCols && canMarkColumns && (
           <ToggleButton size="small" value="steps" selected={stepsOpen}
             onClick={loadSteps} disabled={stepsBusy}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
@@ -647,7 +679,7 @@ export function SliceGallery() {
 
         {/* Display-only image enhancement (contrast / denoise blur) to make the corneal border
             easier to see when marking bad columns. Does NOT change the data. */}
-        {cur && (effectiveGroup === "context" || showBeforeAfter) && (
+        {!fixCols && cur && (effectiveGroup === "context" || showBeforeAfter) && (
           <>
             <ToggleButton size="small" value="contrast" selected={enhContrast}
               onChange={() => setEnhContrast((v) => !v)}
@@ -699,7 +731,7 @@ export function SliceGallery() {
         <div className="flex-1" />
         {(loading || scarBusy) && <CircularProgress size={16} />}
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
-          {scarEditMode ? "drag to edit scar" : "2D view (no WebGL)"}
+          {scarEditMode ? "drag to edit scar" : fixCols ? "fix columns" : "2D view (no WebGL)"}
         </span>
       </div>
 

@@ -1568,7 +1568,11 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     labels.corrected_path(case_id).unlink(missing_ok=True)
     orch.case_qa_json(case_id).unlink(missing_ok=True)
     extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None,
-             "oct_max_iterations": max_it, "oct_iter": iter_info}
+             "oct_max_iterations": max_it, "oct_iter": iter_info,
+             # a fresh preprocessing (auto OR a Fix-columns re-run) invalidates the manual-vetting and
+             # training-schedule flags → the per-scan timeline drops back to "Preprocessed [Auto]" (red)
+             # and the user re-approves. scar_classification is kept (it's scan content, not geometry).
+             "preproc_vetted": False, "training_scheduled": False}
     if cls:
         extra["scar_classification"] = cls
     if sr:
@@ -1638,6 +1642,27 @@ def set_case_classification(case_id: str, req: ClassificationRequest) -> dict:
     m = orch.write_manifest_value(case_id, updates)
     return {"ok": True, "scar_classification": m.get("scar_classification"),
             "scar_range": m.get("scar_range")}
+
+
+@app.post("/api/case/{case_id}/vet-preprocessing")
+def vet_preprocessing(case_id: str) -> dict:
+    """Timeline step 3: mark the preprocessing as MANUALLY VETTED (the user reviewed before/after +
+    Fix-columns and approves it). Manifest metadata only — turns the scan entry orange and is the gate
+    before scar/control classification. A later auto/Fix-columns re-run clears this (see oct-preprocess)."""
+    m = orch.write_manifest_value(case_id, {"preproc_vetted": True})
+    return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted"))}
+
+
+class TrainingScheduleRequest(BaseModel):
+    scheduled: bool = True
+
+
+@app.post("/api/case/{case_id}/training/schedule")
+def schedule_training(case_id: str, req: TrainingScheduleRequest) -> dict:
+    """Timeline final step: schedule (or unschedule) this scan for nnU-Net training (turns the entry
+    green). Manifest flag only; nnunet_train restricts to scheduled scans when any scan is scheduled."""
+    m = orch.write_manifest_value(case_id, {"training_scheduled": bool(req.scheduled)})
+    return {"ok": True, "training_scheduled": bool(m.get("training_scheduled"))}
 
 
 class ObserverAnalysisRequest(BaseModel):
@@ -1826,6 +1851,17 @@ def cases_list() -> dict:
             "n_volumes": m.get("n_frames") or m.get("n_volumes"),
             "preprocessed": bool(m.get("oct_preprocessed")),
             "passes": int((m.get("oct_iter") or {}).get("passes", 1)) if m.get("oct_iter") else 1,
+            # Per-scan lifecycle flags so the loader can colour each entry by its timeline step
+            # (mirrors api/lifecycle.ts scanStep). All booleans except scar_classification.
+            "life": {
+                "input_volume": bool(m.get("input_volume") or m.get("corrected_volume")),
+                "oct_preprocessed": bool(m.get("oct_preprocessed")),
+                "preproc_vetted": bool(m.get("preproc_vetted")),
+                "scar_classification": m.get("scar_classification") or None,
+                "sam2_meta": bool(m.get("sam2_meta")),
+                "corrected_labelmap": bool(m.get("corrected_labelmap")),
+                "training_scheduled": bool(m.get("training_scheduled")),
+            },
         })
     return {"cases": out}
 

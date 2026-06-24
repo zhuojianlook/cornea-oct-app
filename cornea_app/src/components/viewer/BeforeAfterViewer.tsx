@@ -25,7 +25,13 @@ interface OctIter {
   stopped?: string;
 }
 
-export function BeforeAfterViewer({ onClose }: { onClose: () => void }) {
+// Orientation + display filter are driven by the single top toolbar in VolumeCanvas (this panel is
+// embedded, not a separate sub-UI) — so this component owns ONLY the refinement-pass selector + the
+// slice scrubber. The top "⇆ Before/after" toggle is what closes it.
+export function BeforeAfterViewer({ orient, filter }: {
+  orient: (typeof ORIENTS)[number];
+  filter?: string;
+}) {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   // Re-fetch when previews re-render (e.g. a re-preprocess bumps segVersion).
@@ -57,13 +63,11 @@ export function BeforeAfterViewer({ onClose }: { onClose: () => void }) {
   }, [passCount, bestPass, metrics]);
   const bestStepIdx = Math.max(0, steps.findIndex((s) => s.best));
 
-  const [orient, setOrient] = useState<(typeof ORIENTS)[number]>("axial");
   const [passIdx, setPassIdx] = useState(bestStepIdx); // default: the kept (best) pass
   const [raw, setRaw] = useState<PreviewImage[]>([]); // context_raw (left)
   const [after, setAfter] = useState<PreviewImage[]>([]); // selected pass (right)
   const [idx, setIdx] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [enhContrast, setEnhContrast] = useState(false);
 
   // Default to the kept (best) pass when the case (and thus pass set) changes.
   useEffect(() => {
@@ -114,52 +118,55 @@ export function BeforeAfterViewer({ onClose }: { onClose: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orient, after.length]);
 
-  const enhanceFilter = enhContrast ? "contrast(1.6) brightness(1.05)" : undefined;
   const imgStyle: React.CSSProperties = {
     maxHeight: "calc(100% - 28px)",
     maxWidth: "100%",
     objectFit: "contain",
     imageRendering: "pixelated",
-    filter: enhanceFilter,
+    filter: filter || undefined,
   };
 
   return (
     <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
+      {/* Pass stepper + slice counter. Orientation / contrast live in the single top toolbar; this strip
+          only carries what's unique to before/after — the refinement-pass selector. */}
       <div
-        className="flex items-center gap-2 px-3 border-b flex-wrap"
-        style={{ minHeight: 40, borderColor: "var(--c-border)" }}
+        className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
+        style={{ minHeight: 32, borderColor: "var(--c-border)", background: "var(--c-surface)" }}
       >
-        <button
-          onClick={onClose}
-          style={{
-            background: "none",
-            border: "1px solid var(--c-border)",
-            borderRadius: 4,
-            color: "var(--c-accent)",
-            cursor: "pointer",
-            fontSize: 12,
-            padding: "2px 8px",
-          }}
-        >
-          ← 3D view
-        </button>
-        <ToggleButtonGroup size="small" exclusive value={orient} onChange={(_, v) => v && setOrient(v)}>
-          {ORIENTS.map((o) => (
-            <ToggleButton key={o} value={o} style={{ textTransform: "capitalize" }}>
-              {o}
-            </ToggleButton>
-          ))}
-        </ToggleButtonGroup>
-        <ToggleButton
-          size="small"
-          value="contrast"
-          selected={enhContrast}
-          onChange={() => setEnhContrast((v) => !v)}
-          sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-          title="Display-only contrast boost (does not change the data)"
-        >
-          ◐ Contrast
-        </ToggleButton>
+        {steps.length > 1 ? (
+          <>
+            <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+              refinement pass:
+            </span>
+            <ToggleButtonGroup
+              size="small"
+              exclusive
+              value={Math.min(passIdx, steps.length - 1)}
+              onChange={(_, v) => v !== null && setPassIdx(v as number)}
+            >
+              {steps.map((s, i) => (
+                <ToggleButton key={s.group} value={i} sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>
+                  {s.label}
+                </ToggleButton>
+              ))}
+            </ToggleButtonGroup>
+            {curStep?.metric != null && (
+              <span className="text-[11px]" style={{ color: curStep.best ? "var(--c-green)" : "var(--c-text-dim)" }}>
+                boundary deviation {curStep.metric.toFixed(2)} px{curStep.best ? " · kept (best)" : ""}
+              </span>
+            )}
+            {octIter?.stopped && (
+              <span className="text-[10px]" style={{ color: "var(--c-text-dim)", opacity: 0.8 }}>
+                · lower = flatter · stopped: {octIter.stopped}
+              </span>
+            )}
+          </>
+        ) : (
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+            original (raw) vs preprocessed — scrub the slice below
+          </span>
+        )}
         <div className="flex-1" />
         {cur && (
           <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
@@ -167,40 +174,6 @@ export function BeforeAfterViewer({ onClose }: { onClose: () => void }) {
           </span>
         )}
       </div>
-
-      {/* Pass stepper — only meaningful once there's more than one corrected pass. */}
-      {steps.length > 1 && (
-        <div
-          className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
-          style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}
-        >
-          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-            refinement pass:
-          </span>
-          <ToggleButtonGroup
-            size="small"
-            exclusive
-            value={Math.min(passIdx, steps.length - 1)}
-            onChange={(_, v) => v !== null && setPassIdx(v as number)}
-          >
-            {steps.map((s, i) => (
-              <ToggleButton key={s.group} value={i} sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>
-                {s.label}
-              </ToggleButton>
-            ))}
-          </ToggleButtonGroup>
-          {curStep?.metric != null && (
-            <span className="text-[11px]" style={{ color: curStep.best ? "var(--c-green)" : "var(--c-text-dim)" }}>
-              boundary deviation {curStep.metric.toFixed(2)} px{curStep.best ? " · kept (best)" : ""}
-            </span>
-          )}
-          {octIter?.stopped && (
-            <span className="text-[10px]" style={{ color: "var(--c-text-dim)", opacity: 0.8 }}>
-              · lower = flatter · stopped: {octIter.stopped}
-            </span>
-          )}
-        </div>
-      )}
 
       <div className="flex-1 min-h-0 flex items-center justify-center p-3">
         {!cur ? (

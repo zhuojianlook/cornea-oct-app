@@ -226,6 +226,14 @@ export const useWorkflowStore = create<WorkflowState>()(
     runSam2: async () => {
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
+      // Reordered lifecycle: SAM2 is gated until the scan is classified (scar/control set) — the timeline's
+      // "wait for selected to be labelled" between step 4 (classified) and step 5 (SAM2).
+      const m = (useCaseStore.getState().caseInfo?.manifest ?? {}) as Record<string, unknown>;
+      if (!m.scar_classification) {
+        set((s) => { s.status = { kind: "error", title: "Classify first",
+          detail: "Mark this scan as Scar or Control (and set replicates/controls) before running SAM2." }; });
+        return;
+      }
       set((s) => {
         s.segBusy = true;
         s.status = { kind: "working", title: "SAM2 segmenting", detail: "Tracking the cornea through axial, coronal and sagittal movies, then fusing in 3D. This takes a few minutes." };

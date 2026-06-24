@@ -11,6 +11,7 @@ import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import type { ConsensusReport } from "../../api/types";
+import { scanStep, LIFECYCLE_STEPS } from "../../api/lifecycle";
 
 type Status = "queued" | "uploading" | "ready" | "preprocessing" | "done" | "error";
 type Cls = "scar" | "control";
@@ -42,6 +43,7 @@ interface OctScan {
   selected: boolean;
   passes?: number;   // iterative-refinement passes produced (drives the download pass selector)
   error?: string;
+  life?: Record<string, unknown>;  // per-scan lifecycle flags from cases/list → entry colour (lifecycle.ts)
 }
 
 // Sanitise a subgroup label for the consensus case-id segment (lowercase alnum, "-"/"_" kept).
@@ -57,6 +59,7 @@ interface LoadedCase {
   preprocessed?: boolean;
   passes?: number;   // iterative-refinement passes produced (for the "download which pass" selector)
   error?: string;
+  life?: Record<string, unknown>;  // per-scan lifecycle flags (cases/list) → entry colour
 }
 
 const DOT: Record<Status, string> = {
@@ -276,7 +279,7 @@ export function OctLoader() {
         id: uid("s"), groupId: g.id, filename: c.filename, caseId: c.case_id, nVolumes: c.n_volumes,
         // A scan already corrected in a prior session loads as "done" so it's coloured + skipped on re-run.
         nFrames: 101, status: c.error ? "error" : c.preprocessed ? "done" : "ready",
-        error: c.error, scarRange: [1, 101], subgroup: "1", selected: !c.error, passes: c.passes,
+        error: c.error, scarRange: [1, 101], subgroup: "1", selected: !c.error, passes: c.passes, life: c.life,
       });
     }
     setGroups(order);
@@ -312,8 +315,9 @@ export function OctLoader() {
       try {
         const r = await api.json<{ cases: LoadedCase[] }>("/api/cases/list");
         if (stop || !r.cases) return;
-        const byId = new Map(r.cases.map((c) => [c.case_id, c.passes]));
-        setScans((cur) => cur.map((s) => (s.caseId && byId.has(s.caseId)) ? { ...s, passes: byId.get(s.caseId) ?? s.passes } : s));
+        const byId = new Map(r.cases.map((c) => [c.case_id, c]));
+        setScans((cur) => cur.map((s) => { const c = s.caseId ? byId.get(s.caseId) : undefined;
+          return c ? { ...s, passes: c.passes ?? s.passes, life: c.life ?? s.life } : s; }));
       } catch { /* best-effort */ }
     })();
     return () => { stop = true; };
@@ -731,23 +735,26 @@ export function OctLoader() {
                     const active = !!s.caseId && s.caseId === activeId;
                     const clickable = !busy && !!s.caseId && s.status !== "error";
                     const done = s.status === "done";
-                    // The actively-viewed scan gets a clear ACCENT tint (not grey) so the selected
-                    // scan stands out; a corrected (preprocessed) scan is green for before/after review.
-                    const rowBg = active ? "rgba(90,127,168,0.32)" : done ? "rgba(63,185,80,0.12)" : "transparent";
-                    const rowBorder = active ? "var(--c-accent)" : done ? "var(--c-green)" : "transparent";
+                    // Per-scan lifecycle colour (red→orange→yellow→light blue→dark blue→green) from the
+                    // timeline step; only from step 2 (preprocessed-auto) onward. The actively-viewed scan
+                    // still gets the ACCENT highlight so the open scan stands out.
+                    const lifeStep = s.life ? scanStep(s.life) : 0;
+                    const lifeColor = lifeStep >= 2 ? LIFECYCLE_STEPS[lifeStep].color : null;
+                    const rowBg = active ? "rgba(90,127,168,0.32)" : lifeColor ? `${lifeColor}22` : "transparent";
+                    const rowBorder = active ? "var(--c-accent)" : lifeColor ?? "transparent";
                     return (
                       <div key={s.id} className="rounded px-1 py-0.5" style={{ background: rowBg, borderLeft: `2px solid ${rowBorder}` }}>
                         <div className="flex items-start gap-1.5 text-xs">
                           <Checkbox size="small" checked={s.selected} disabled={busy || s.status === "error"} sx={{ p: 0.25 }}
                             onChange={(e) => patchScan(s.id, { selected: e.target.checked })} />
-                          <span style={{ width: 8, height: 8, borderRadius: "50%", background: DOT[s.status], flex: "none", marginTop: 5 }} />
+                          <span style={{ width: 8, height: 8, borderRadius: "50%", background: lifeColor ?? DOT[s.status], flex: "none", marginTop: 5 }} />
                           {/* Full name (wrap, don't truncate) — Optovue .OCT names are long & spaceless. */}
                           <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", lineHeight: 1.35, color: done ? "var(--c-green)" : undefined, cursor: clickable ? "pointer" : "default" }}
                             title={s.error || s.filename} onClick={() => clickable && preview(s.caseId)}>
                             {s.filename.replace(/\.OCT$/i, "")}
                           </span>
-                          <span style={{ color: s.status === "error" ? "var(--c-red)" : done ? "var(--c-green)" : "var(--c-text-dim)" }}>
-                            {s.status === "error" ? "failed" : done ? "corrected ✓" : s.status}
+                          <span style={{ color: s.status === "error" ? "var(--c-red)" : lifeColor ?? (done ? "var(--c-green)" : "var(--c-text-dim)") }}>
+                            {s.status === "error" ? "failed" : lifeColor ? LIFECYCLE_STEPS[lifeStep].short : s.status}
                           </span>
                           {done && s.caseId && (
                             <button title="Download this preprocessed scan (.nii.gz) for manual segmentation"

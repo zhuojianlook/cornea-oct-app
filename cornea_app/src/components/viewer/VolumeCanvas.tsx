@@ -5,7 +5,7 @@ import { ToggleButton, ToggleButtonGroup } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, webglFailure, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, type ViewName } from "../../niivue/nvController";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
@@ -25,6 +25,8 @@ export function VolumeCanvas() {
   const gtViewerClass = useWorkflowStore((s) => s.gtViewerClass);
   const wfSet = useWorkflowStore((s) => s.set);
   const correcting = useWorkflowStore((s) => s.correcting);
+  const segLoaded = useWorkflowStore((s) => s.segLoaded);
+  const segOpacity = useWorkflowStore((s) => s.segOpacity);
   const paintMode = useWorkflowStore((s) => s.paintMode);
   const penLabel = useWorkflowStore((s) => s.penLabel);
   const penSize = useWorkflowStore((s) => s.penSize);
@@ -42,6 +44,23 @@ export function VolumeCanvas() {
   const [fixColsView, setFixColsView] = useState(false);
   // Preprocessing-steps filmstrip (per-stage diagnostic) — also otherwise unreachable on the 3D path.
   const [stepsView, setStepsView] = useState(false);
+  // Display-only contrast / brightness / gaussian-blur (CSS filter on the viewer — covers BOTH the niivue
+  // canvas and the 2-D overlays, in the ONE top toolbar so the user never enters a nested sub-UI for them).
+  // Blur is reset + disabled while Fix-columns is active (you need the true pixels to mark a border).
+  const [contrast, setContrast] = useState(100);   // %
+  const [brightness, setBrightness] = useState(100); // %
+  const [blur, setBlur] = useState(0);              // px
+  const viewerFilter = `contrast(${contrast}%) brightness(${brightness}%)` + (blur > 0 && !fixColsView ? ` blur(${blur}px)` : "");
+  // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
+  // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
+  const overlay2d = compareView || fixColsView;
+  const orient2d: "axial" | "coronal" | "sagittal" = fixColsView
+    ? (view === "coronal" ? "coronal" : "sagittal")
+    : (view === "axial" || view === "coronal" || view === "sagittal") ? view : "sagittal";
+  // Slices | Segmentation overlay toggle (Segmentation greyed until SAM2 has run). On the niivue path it
+  // simply shows/hides the cornea/scar overlay by opacity; the 2-D gallery reads the same flag.
+  const [showSeg, setShowSeg] = useState(true);
+  useEffect(() => { setSegmentationOpacity(showSeg && segLoaded ? segOpacity : 0); }, [showSeg, segLoaded, segOpacity]);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
   const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
   const painting = correcting && paintMode && view !== "render";
@@ -184,19 +203,51 @@ export function VolumeCanvas() {
         className="flex items-center gap-2 px-3 border-b"
         style={{ height: 36, borderColor: "var(--c-border)" }}
       >
-        <ToggleButtonGroup size="small" exclusive value={view} onChange={onView}>
-          <ToggleButton value="multi">Multi</ToggleButton>
-          <ToggleButton value="axial">Axial</ToggleButton>
+        <ToggleButtonGroup size="small" exclusive value={showSeg ? "seg" : "slices"}
+          onChange={(_, v) => { if (v) setShowSeg(v === "seg"); }}
+          title={segLoaded ? "" : "Run SAM2 first to view the segmentation overlay"}>
+          <ToggleButton value="slices" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Slices</ToggleButton>
+          <ToggleButton value="seg" disabled={!segLoaded} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Segmentation</ToggleButton>
+        </ToggleButtonGroup>
+        <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
+        <ToggleButtonGroup size="small" exclusive value={overlay2d ? orient2d : view} onChange={onView}>
+          {!overlay2d && <ToggleButton value="multi">Multi</ToggleButton>}
+          {!fixColsView && <ToggleButton value="axial">Axial</ToggleButton>}
           <ToggleButton value="coronal">Coronal</ToggleButton>
           <ToggleButton value="sagittal">Sagittal</ToggleButton>
-          <ToggleButton value="render">3D</ToggleButton>
+          {!overlay2d && <ToggleButton value="render">3D</ToggleButton>}
         </ToggleButtonGroup>
+        {/* Display-only contrast / brightness / blur sliders (CSS filter on the viewer; does not change the
+            data). Blur is disabled while Fix-columns is active. */}
+        <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
+        {([
+          ["C", contrast, setContrast, 50, 250, false, "Contrast"],
+          ["B", brightness, setBrightness, 50, 250, false, "Brightness"],
+          ["✷", blur, setBlur, 0, 4, true, "Gaussian blur"],
+        ] as const).map(([lbl, val, setter, lo, hi, isBlur, title]) => (
+          <span key={title} className="flex items-center gap-1" title={`${title} (display only)`}>
+            <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>{lbl}</span>
+            <input type="range" min={lo} max={hi} step={isBlur ? 0.5 : 5} value={isBlur && fixColsView ? 0 : val}
+              disabled={isBlur && fixColsView}
+              onChange={(e) => setter(Number(e.target.value))} style={{ width: 56, opacity: isBlur && fixColsView ? 0.4 : 1 }} />
+          </span>
+        ))}
+        <button onClick={() => { setContrast(100); setBrightness(100); setBlur(0); }}
+          title="Reset display adjustments"
+          style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "1px 6px" }}>
+          reset
+        </button>
+        <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         {hasRaw && (
           <ToggleButton
             size="small"
             value="ba"
             selected={compareView}
-            onChange={() => { setCompareView((v) => !v); setFixColsView(false); setStepsView(false); }}
+            onChange={() => {
+              const on = !compareView;
+              setCompareView(on); setFixColsView(false); setStepsView(false);
+              if (on && (view === "multi" || view === "render")) onView(null, "sagittal");
+            }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title="Compare the original (raw) scan with the preprocessed result, side by side"
           >
@@ -208,7 +259,12 @@ export function VolumeCanvas() {
             size="small"
             value="fix"
             selected={fixColsView}
-            onChange={() => { setFixColsView((v) => !v); setCompareView(false); setStepsView(false); }}
+            onChange={() => {
+              const on = !fixColsView;
+              setFixColsView(on); setCompareView(false); setStepsView(false);
+              if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
+              else if (!on) void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
+            }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title="Manually fix mis-aligned B-scan frames: mark bad frames on a slice, then re-run preprocessing on them"
           >
@@ -244,7 +300,7 @@ export function VolumeCanvas() {
         onMouseLeave={() => setBrush(null)}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full"
-          style={{ cursor: painting ? "crosshair" : "default" }} />
+          style={{ cursor: painting ? "crosshair" : "default", filter: viewerFilter || undefined }} />
         {showBrush && (
           // Brush-size cursor (approx — actual voxels depend on zoom): shows the active pen + size.
           <div
@@ -267,34 +323,26 @@ export function VolumeCanvas() {
             <span style={{ fontSize: 12, opacity: 0.85, maxWidth: 460 }}>{noWebgl}</span>
           </div>
         )}
-      </div>
-
-      {/* Overlays over the (still-mounted) canvas — see the note above the return. */}
-      {compareView && volumeUrl && (
-        <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
-          <BeforeAfterViewer onClose={() => setCompareView(false)} />
-        </div>
-      )}
-      {fixColsView && volumeUrl && (
-        <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
-          <div className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
-            style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}>
-            <button onClick={async () => { setFixColsView(false); await openCase(); }}
-              style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-accent)", cursor: "pointer", fontSize: 12, padding: "2px 8px" }}>
-              ← 3D view
-            </button>
-            <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-              Click <b>▥ Fix columns</b>, mark bad B-scan frames on a sagittal/coronal slice, then <b>Re-run preprocessing</b>.
-            </span>
+        {/* The before/after, fix-columns and steps panels render as overlays over the (still-mounted)
+            niivue canvas but ONLY cover the content area — the single top toolbar stays visible and
+            drives their orientation + display filter, so the user is never pushed into a nested sub-UI.
+            (See the note above the return for why the canvas must stay mounted.) */}
+        {compareView && volumeUrl && (
+          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+            <BeforeAfterViewer orient={orient2d} filter={viewerFilter} />
           </div>
-          <div className="flex-1 min-h-0"><SliceGallery /></div>
-        </div>
-      )}
-      {stepsView && volumeUrl && (
-        <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
-          <StepsViewer onClose={() => setStepsView(false)} />
-        </div>
-      )}
+        )}
+        {fixColsView && volumeUrl && (
+          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+            <SliceGallery fixCols orientProp={orient2d} filterCss={viewerFilter} />
+          </div>
+        )}
+        {stepsView && volumeUrl && (
+          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+            <StepsViewer onClose={() => setStepsView(false)} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

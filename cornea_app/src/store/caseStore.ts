@@ -30,6 +30,9 @@ interface CaseState {
   // #4: scar / not-scar (control) decision, made AFTER preprocessing. Persists to the case manifest
   // without re-running the correction; null = undecided.
   setClassification: (cls: "scar" | "control" | null) => Promise<void>;
+  // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
+  vetPreprocessing: () => Promise<void>;
+  scheduleTraining: (scheduled: boolean) => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -85,6 +88,28 @@ export const useCaseStore = create<CaseState>()(
       set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).scar_classification = cls; });
       try {
         await api.json(`/api/case/${id}/classification`, "POST", JSON.stringify({ classification: cls }));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    vetPreprocessing: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).preproc_vetted = true; });
+      try {
+        await api.json(`/api/case/${id}/vet-preprocessing`, "POST", "{}");
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    scheduleTraining: async (scheduled) => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).training_scheduled = scheduled; });
+      try {
+        await api.json(`/api/case/${id}/training/schedule`, "POST", JSON.stringify({ scheduled }));
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }
