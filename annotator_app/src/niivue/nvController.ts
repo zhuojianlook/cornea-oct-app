@@ -208,6 +208,43 @@ export function centerView(): void {
   forceDrawAll();
 }
 
+// niivue's draw 3-D texture unit (TEXTURE_CONSTANTS.TEXTURE7_DRAW = gl.TEXTURE7). Used to RECREATE the
+// drawing texture — see recreateDrawTexture.
+const DRAW_TEX_UNIT = 33991;
+
+/** RECREATE the niivue drawing texture from the CURRENT drawBitmap, then redraw. THE fix for the
+    persistent "paint invisible on the en-face/coronal 2-D tile (but visible in 3-D)" bug on WebKitGTK:
+    plain refreshDrawing only does gl.texSubImage3D on the EXISTING draw texture, and WebKitGTK's GL drops
+    that partial update for the axial/en-face tile's sampling — so paint never appeared there. niivue's own
+    loadDrawing()/createEmptyDrawing() DELETE + recreate the texture (r8Tex → texStorage3D) before
+    uploading, which is exactly why LOADED segmentations DO show on every tile. So we replicate that
+    recreate on the live drawing: delete+create the draw texture, then refreshDrawing uploads the current
+    bitmap into the FRESH texture (a freshly-created texture honours the upload where a re-used one didn't).
+    Heavier than refreshDrawing, so it runs on stroke END + smart-fill/undo/restore (via compose), never
+    per drag frame. Falls back to a plain refresh if the internal r8Tex shape ever changes. */
+export function recreateDrawTexture(): void {
+  if (!nv) return;
+  const a = nv as unknown as {
+    opts?: { is2DSliceShader?: boolean }; back?: { dims?: number[] }; drawTexture?: unknown;
+    r8Tex?: (t: unknown, id: number, dims: number[], init: boolean) => unknown;
+    r8Tex2D?: (t: unknown, id: number, dims: number[], init: boolean) => unknown;
+  };
+  try {
+    const dims = a.back?.dims;
+    if (dims && typeof a.r8Tex === "function") {
+      a.drawTexture = (a.opts?.is2DSliceShader && typeof a.r8Tex2D === "function")
+        ? a.r8Tex2D(a.drawTexture, DRAW_TEX_UNIT, dims, true)
+        : a.r8Tex(a.drawTexture, DRAW_TEX_UNIT, dims, true);
+    }
+    nv.refreshDrawing(false);   // upload the CURRENT drawBitmap into the freshly-created texture
+  } catch { try { nv.refreshDrawing(true); } catch { /* */ } }
+  // escalating redraws for WebKitGTK layout-settle (same cadence as forceDrawAll).
+  const draw = () => { try { nv?.drawScene(); } catch { /* */ } };
+  draw();
+  requestAnimationFrame(draw);
+  for (const ms of [60, 180, 400]) setTimeout(draw, ms);
+}
+
 /** Force a COMPLETE redraw of every tile now + after the layout settles. WebKitGTK (desktop) can leave a
     pane (often the coronal one) showing a stale drawing after a paint/wand edit because the throttled
     single drawScene lands before the tile repaints — so re-issue refreshDrawing+drawScene on a couple of
@@ -409,10 +446,11 @@ function compose(): void {
     if (sv !== 0) d[i] = sv;
     else { const pv = p[i]; d[i] = pv !== 0 ? (pv === 1 ? PREVIEW_CORNEA : pv === 2 ? PREVIEW_SCAR : pv) : c[i]; }
   }
-  // forceDrawAll (escalating redraws), NOT a single refreshDrawing — every compose() path (smart-fill
-  // result, autosave RESTORE, confirm, undo/redo) must survive WebKitGTK's stale-tile quirk, which left
-  // restored/filled paint invisible on the (coronal/en-face) tile. Infrequent (not per brush stroke).
-  forceDrawAll();
+  // recreateDrawTexture (delete+recreate the draw texture, then upload), NOT a plain refreshDrawing —
+  // every compose() path (paint stroke-end via flushCompose, smart-fill result, autosave RESTORE,
+  // confirm, undo/redo) must survive WebKitGTK dropping the partial texSubImage3D update on the
+  // en-face/coronal tile (paint was invisible there but showed in 3-D). Infrequent (not per drag frame).
+  recreateDrawTexture();
 }
 
 /** Rebuild the displayed bitmap from the three layers + a full WebKitGTK-proof redraw, NOW. The live
