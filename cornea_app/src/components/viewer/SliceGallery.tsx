@@ -264,16 +264,23 @@ export function SliceGallery() {
   // #2 (merged): once columns are marked BAD, the ARROW KEYS nudge the whole marked set UP/DOWN in depth
   // to its correct position (↓ = deeper = +depth voxel, ↑ = -; Shift = ×5). Each marked frame's absolute
   // offset accumulates in manualShifts; on re-run a nudged frame is manually positioned (manual_shifts)
-  // and a marked-but-un-nudged frame is auto-interpolated (force_columns). Window listener (the slice
-  // <img> isn't focusable); guarded so it never steals arrows from a form control or a non-fix-cols view.
+  // and a marked-but-un-nudged frame is auto-interpolated (force_columns).
+  // CAPTURE phase + stopImmediatePropagation: the slice <img> isn't focusable, but the SLICE SLIDER (MUI)
+  // and the niivue canvas underneath BOTH grab arrow keys (scrolling the slice) before a bubble-phase
+  // window listener would see them — that was the "arrows scroll the slice instead of nudging" bug. A
+  // capture listener on window runs FIRST and stops the event before either can scroll. We still defer to
+  // genuine TEXT entry (so typing isn't hijacked); the range slider IS intercepted on purpose.
   useEffect(() => {
     if (!colSel) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (badCols.size === 0 || depthVox < 2) return;
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      const type = (el as HTMLInputElement | null)?.type;
+      if (tag === "TEXTAREA" || (tag === "INPUT" && type !== "range")) return; // don't steal arrows from text fields
       e.preventDefault();
+      e.stopImmediatePropagation(); // beat the MUI slice slider + niivue's own arrow-key slice nav
       const step = (e.shiftKey ? 5 : 1) * (e.key === "ArrowDown" ? 1 : -1); // ↓ deeper (+), ↑ shallower (−)
       setManualShifts((prev) => {
         const next = new Map(prev);
@@ -284,8 +291,8 @@ export function SliceGallery() {
         return next;
       });
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true); // capture
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [colSel, badCols, depthVox]);
 
   // Map a pointer position to a FRAME index. The same frame is a vertical COLUMN in the sagittal
