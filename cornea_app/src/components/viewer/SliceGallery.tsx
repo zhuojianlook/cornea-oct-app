@@ -126,6 +126,12 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const [stepsOpen, setStepsOpen] = useState(false);
   const [stepsBusy, setStepsBusy] = useState(false);
   const [steps, setSteps] = useState<{ label: string; data_url?: string; kind?: string; branch?: string; group?: string }[]>([]);
+  // Fix-columns "Border": show the DETECTED corneal edge (green) + the RANSAC best-fit curve (blue) on the
+  // CURRENT slice, beside the markable corrected panel — so the user sees where the detection/fit is off.
+  // Reuses the canonical step rendering (oct-preprocess-steps step 6) for cur's slice; no orientation math.
+  const [showBorder, setShowBorder] = useState(false);
+  const [borderImg, setBorderImg] = useState<string | null>(null);
+  const [borderBusy, setBorderBusy] = useState(false);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -288,6 +294,29 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // convert a vertical screen drag → a depth-voxel shift for #2 drag-to-correct.
   const depthVox = rawImages.find((i) => i.orientation === "sagittal")?.source_width ?? 0;
   const canMarkColumns = !previewGroup && rawImages.length > 0 && nFrames > 1 && !showBeforeAfter;
+
+  // Fix-columns "Border": fetch the detected-edge + best-fit render for the CURRENT slice (the canonical
+  // step-6 image from the preprocessing worker, for cur's slice index) whenever Border is on or the slice
+  // changes. Reuses the existing /oct-preprocess-steps endpoint + its slice_index.
+  const borderSliceIdx = cur?.slice_index ?? null;
+  useEffect(() => {
+    if (!fixCols || !showBorder || !caseId || borderSliceIdx == null) { setBorderImg(null); return; }
+    let cancelled = false;
+    setBorderBusy(true);
+    api.json<{ steps: { label: string; data_url?: string }[] }>(
+      `/api/case/${caseId}/oct-preprocess-steps`, "POST", JSON.stringify({ slice_index: borderSliceIdx }))
+      .then((r) => {
+        if (cancelled) return;
+        const steps = r.steps || [];
+        // Prefer the "Quadratic fit" step (green edge + blue fit); fall back to any step labelled "fit".
+        const s = steps.find((x) => /quadratic fit/i.test(x.label) && x.data_url)
+          ?? steps.find((x) => /fit/i.test(x.label) && x.data_url);
+        setBorderImg(s?.data_url ?? null);
+      })
+      .catch(() => !cancelled && setBorderImg(null))
+      .finally(() => !cancelled && setBorderBusy(false));
+    return () => { cancelled = true; };
+  }, [fixCols, showBorder, caseId, borderSliceIdx, segSig]);
 
   // #2 (merged): once columns are marked BAD, the ARROW KEYS nudge the whole marked set UP/DOWN in depth
   // to its correct position (↓ = deeper = +depth voxel, ↑ = -; Shift = ×5). Each marked frame's absolute
@@ -721,6 +750,12 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         )}
         {colSel && canMarkColumns && (
           <>
+            <ToggleButton size="small" value="border" selected={showBorder}
+              onChange={() => setShowBorder((v) => !v)} disabled={borderBusy}
+              sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+              title="Show the DETECTED corneal edge (green) + the RANSAC best-fit curve (blue) for this slice, beside the corrected panel, so you can see where the fit is off.">
+              ⌇ Border{borderBusy ? "…" : ""}
+            </ToggleButton>
             <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
             {(() => {
               // Representative pending depth offset of the marked set (arrows nudge all marked frames
@@ -885,18 +920,26 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
               </div>
             )}
           </div>
-        ) : (fixCols && showRaw && rawCur) ? (
-          // Fix-columns WITH before/after: raw "before" (left, read-only) beside the markable corrected
-          // "after" (right). Marking + depth-nudge all stay on the corrected panel only.
+        ) : (fixCols && ((showBorder && borderImg) || (showRaw && rawCur))) ? (
+          // Fix-columns with a LEFT reference panel beside the markable corrected "after" (right):
+          //  • Border on → the detected edge (green) + RANSAC fit (blue) for this slice;
+          //  • else before/after on → the raw "before".
+          // Marking + depth-nudge stay on the corrected panel only. The corrected panel is wrapped in a
+          // sized flex box so its (inline-block) img gets a definite height in this column and never
+          // collapses to nothing (the "empty corrected panel" bug).
           <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "center", justifyContent: "center" }}>
             <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
-              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>original (raw)</span>
-              <img src={imgSrc(rawCur)} alt="raw" draggable={false}
-                style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter }} />
+              <span className="text-[11px]" style={{ color: showBorder && borderImg ? "var(--c-accent)" : "var(--c-text-dim)" }}>
+                {showBorder && borderImg ? "detected edge (green) + best-fit (blue)" : "original (raw)"}
+              </span>
+              <img src={showBorder && borderImg ? borderImg : imgSrc(rawCur)} alt="reference" draggable={false}
+                style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: showBorder && borderImg ? undefined : enhanceFilter }} />
             </div>
             <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
               <span className="text-[11px]" style={{ color: "var(--c-green)" }}>corrected — mark here</span>
-              {correctedPanel}
+              <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {correctedPanel}
+              </div>
             </div>
           </div>
         ) : correctedPanel}
