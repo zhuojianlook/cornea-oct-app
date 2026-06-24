@@ -1038,22 +1038,25 @@ def _disp_resize(rgb: np.ndarray, out_h: int = 320, out_w: int = 460) -> np.ndar
 
 
 def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
-                     bad_cols=None, workers=None):
-    """Return [(label, rgb_uint8)] for every preprocessing step on the CENTRAL sagittal slice.
-    Faithful to the per-slice pipeline; the final warp reflects the current bad-column selection
-    so the filmstrip shows exactly what a re-run would produce."""
+                     bad_cols=None, workers=None, slice_index=None):
+    """Return (n_sagittal_slices, idx, [(label, rgb_uint8, kind, branch)]) for every per-slice
+    preprocessing step on ONE sagittal slice (the central one, or `slice_index` so the user can
+    inspect the detected border + fit on any slice). Faithful to the per-slice pipeline; the final
+    warp reflects the current bad-column selection so the filmstrip shows exactly what a re-run does.
+    `kind` is "stage" or "decision"; `branch` is the decision outcome text (for the tree)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     res = float(p["residual_threshold"]); cf = float(p.get("corr_factor", 1.0)); at = float(p.get("active_threshold", 5.0))
     vol = read_oct_zstack(oct_path, volume_index)
     sag = reformat_to_sagittal(vol)                 # (lateral, depth, frames)
-    n = sag.shape[0]; idx = n // 2
+    n = sag.shape[0]
+    idx = n // 2 if slice_index is None else max(0, min(n - 1, int(slice_index)))
     sl = sag[idx].astype(np.float32)
     steps = []
 
-    def add(label, rgb):
-        steps.append((label, _disp_resize(rgb)))
+    def add(label, rgb, kind="stage", branch=""):
+        steps.append((label, _disp_resize(rgb), kind, branch))
 
-    add(f"1. Original — central sagittal slice ({idx}/{n})", _gray_rgb(sl))
+    add(f"1. Original — sagittal slice {idx}/{n}", _gray_rgb(sl))
     heq = _histeq(sl)
     add("2. Histogram equalized", _gray_rgb(heq))
     filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
@@ -1062,10 +1065,12 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     raw_edge = _detect_surface_gradient(filt, p["sigma"])
     add("4. Surface edge detected (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED))
     merged = _merged_side_edge(sl, p)
-    add("5. Side-corrected boundary (green)", _draw_curve(_gray_rgb(sl), merged, _C_GREEN))
+    add("5. Side-corrected boundary (green)", _draw_curve(_gray_rgb(sl), merged, _C_GREEN),
+        kind="decision", branch="per side: keep the hist-eq OR raw edge, whichever fits its RANSAC quadratic best")
     quad = _fit_quadratic_ransac(merged, res)
     im6 = _draw_curve(_gray_rgb(sl), merged, _C_GREEN)
-    add("6. Quadratic fit — green=edge, blue=fit", _draw_curve(im6, quad, _C_BLUE, dashed=True))
+    add("6. Quadratic fit — green=edge, blue=fit", _draw_curve(im6, quad, _C_BLUE, dashed=True),
+        kind="decision", branch=f"RANSAC quadratic (residual ≤ {res:.0f}px); degree-2 polyfit fallback if RANSAC fails")
     nb = [merged]
     if idx > 0:
         nb.append(_merged_side_edge(sag[idx - 1].astype(np.float32), p))
@@ -1073,17 +1078,20 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
         nb.append(_merged_side_edge(sag[idx + 1].astype(np.float32), p))
     med = np.median(np.stack(nb), axis=0)
     active_e = merged.copy(); dvv = np.abs(merged - med); active_e[dvv > at] = med[dvv > at]
+    n_snapped = int(np.count_nonzero(dvv > at))
     quad_a = _fit_quadratic_ransac(active_e, res)
     im7 = _draw_curve(_gray_rgb(sl), active_e, _C_MAGENTA)
-    add("7. 3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True))
+    add("7. 3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True),
+        kind="decision", branch=f"snap cols deviating > {at:.0f}px from the 3-slice neighbour median → {n_snapped} snapped")
     # Final warp: same logic as smooth_volume — with the over-correction guard (#2) so the filmstrip
     # matches a real re-run (runaway shift interpolated from good neighbours + clamped).
+    max_disp = float(p.get("max_displacement", 0.0) or 0.0)
     disp = _slice_displacement(active_e, res, cf, [int(c) for c in (bad_cols or [])],
-                               [int(c) for c in (p.get("good_columns") or [])],
-                               float(p.get("max_displacement", 0.0) or 0.0))
+                               [int(c) for c in (p.get("good_columns") or [])], max_disp)
     warped = _warp_by_displacement(sag[idx], disp)
-    add("8. Final corrected — column warp", _gray_rgb(warped.astype(np.float32)))
-    return steps
+    guard = f"over-correction guard: clamp |shift| > {max_disp:.0f}px (interp from good neighbours)" if max_disp > 0 else "no over-correction guard (max_displacement=0)"
+    add("8. Final corrected — column warp", _gray_rgb(warped.astype(np.float32)), kind="decision", branch=guard)
+    return n, idx, steps
 
 
 # ── CLI: run the heavy pipeline in an isolated subprocess (called by the sidecar,
@@ -1099,6 +1107,7 @@ if __name__ == "__main__":
     ap.add_argument("--volume-index", type=int, default=0)
     ap.add_argument("--companion-txt", default="")
     ap.add_argument("--bad-cols", default="[]")
+    ap.add_argument("--slice-index", type=int, default=-1)     # which sagittal slice for steps (-1 = central)
     ap.add_argument("--max-iter", type=int, default=1)        # >1 = iterative refinement
     ap.add_argument("--min-improvement", type=float, default=0.15)
     ap.add_argument("--abs-floor", type=float, default=0.3)
@@ -1112,18 +1121,20 @@ if __name__ == "__main__":
     if a.mode == "raw":
         raw_oct_to_nifti(a.oct_path, a.out_nifti, volume_index=a.volume_index, params=_p, companion_txt=_comp)
     elif a.mode == "steps":
-        _steps = preprocess_steps(a.oct_path, params=_p, volume_index=a.volume_index, companion_txt=_comp,
-                                  bad_cols=_json.loads(a.bad_cols or "[]"))
+        _si = None if a.slice_index < 0 else int(a.slice_index)
+        _n, _idx, _steps = preprocess_steps(a.oct_path, params=_p, volume_index=a.volume_index, companion_txt=_comp,
+                                            bad_cols=_json.loads(a.bad_cols or "[]"), slice_index=_si)
         _outdir = Path(a.out_nifti)
         _outdir.mkdir(parents=True, exist_ok=True)
         for old in _outdir.glob("step_*.png"):   # clear stale steps from a prior run
             old.unlink()
-        _labels = []
-        for _i, (_label, _rgb) in enumerate(_steps):
+        _entries = []
+        for _i, (_label, _rgb, _kind, _branch) in enumerate(_steps):
             _fn = f"step_{_i:02d}.png"
             (_outdir / _fn).write_bytes(_png_bytes(_rgb))
-            _labels.append({"label": _label, "file": _fn})
-        (_outdir / "labels.json").write_text(_json.dumps(_labels))
+            _entries.append({"label": _label, "file": _fn, "kind": _kind, "branch": _branch})
+        # New shape: {slices, index, steps}; the API reader tolerates the legacy list too.
+        (_outdir / "labels.json").write_text(_json.dumps({"slices": _n, "index": _idx, "steps": _entries}))
     else:
         _info = preprocess_oct_to_nifti(
             a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp,

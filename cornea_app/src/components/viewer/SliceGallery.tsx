@@ -125,7 +125,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // shown in an overlay on demand (button or double-click on a slice).
   const [stepsOpen, setStepsOpen] = useState(false);
   const [stepsBusy, setStepsBusy] = useState(false);
-  const [steps, setSteps] = useState<{ label: string; data_url: string }[]>([]);
+  const [steps, setSteps] = useState<{ label: string; data_url?: string; kind?: string; branch?: string; group?: string }[]>([]);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -412,7 +412,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     setSteps([]);
     try {
       const body = colSel ? { force_columns: [...badCols] } : {};
-      const r = await api.json<{ steps: { label: string; data_url: string }[] }>(
+      const r = await api.json<{ steps: { label: string; data_url?: string; kind?: string; branch?: string; group?: string }[] }>(
         `/api/case/${caseId}/oct-preprocess-steps`, "POST", JSON.stringify(body),
       );
       setSteps(r.steps || []);
@@ -945,9 +945,14 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 14 }}>
                   {steps.map((s, i) => (
                     <div key={i} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <span className="text-[11px]" style={{ color: s.label.startsWith("C") ? "var(--c-accent)" : "var(--c-text-dim)" }}>{s.label}</span>
-                      <img src={s.data_url} alt={s.label} draggable={false}
-                        style={{ width: "100%", border: "1px solid var(--c-border)", borderRadius: 4, imageRendering: "pixelated" }} />
+                      <span className="text-[11px]" style={{ color: s.group === "volume" ? "var(--c-accent)" : s.kind === "decision" ? "#f59e0b" : "var(--c-text-dim)" }}>{s.label}</span>
+                      {s.data_url ? (
+                        <img src={s.data_url} alt={s.label} draggable={false}
+                          style={{ width: "100%", border: "1px solid var(--c-border)", borderRadius: 4, imageRendering: "pixelated" }} />
+                      ) : null}
+                      {s.branch && (
+                        <span className="text-[10px]" style={{ color: "var(--c-text-dim)", fontStyle: "italic" }}>↳ {s.branch}</span>
+                      )}
                     </div>
                   ))}
                 </div>

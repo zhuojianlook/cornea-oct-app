@@ -1237,6 +1237,7 @@ class OctPreprocessRequest(BaseModel):
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
     manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
                                              # depth nudges (positive = DOWN), applied LAST as manual ground truth
+    slice_index: int | None = None           # steps viewer: which sagittal slice to render the border+fit on
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1758,18 +1759,57 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
     bad = [int(c) for c in (req.force_columns if req.force_columns is not None else persisted.get("force_columns") or [])]
     out_dir = _preview_group_dir(case_id, "oct_steps")
     extra = ["--bad-cols", json.dumps(bad)]
+    if req.slice_index is not None:
+        extra += ["--slice-index", str(int(req.slice_index))]
     _run_oct_worker("steps", src, out_dir, eff_params, vi, companion=m.get("companion_txt"), extra=extra)
     try:
-        manifest = json.loads((out_dir / "labels.json").read_text())
+        raw = json.loads((out_dir / "labels.json").read_text())
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT steps produced no output: {exc}")
+    # New worker shape is {slices, index, steps:[…]}; tolerate the legacy bare list too.
+    entries = raw.get("steps", raw) if isinstance(raw, dict) else raw
+    n_slices = int(raw.get("slices", 0)) if isinstance(raw, dict) else 0
+    cur_index = int(raw.get("index", 0)) if isinstance(raw, dict) else 0
     steps = []
-    for it in manifest:
+    for it in entries:
         fp = out_dir / it["file"]
         if fp.exists():
             b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
-            steps.append({"label": it["label"], "data_url": f"data:image/png;base64,{b64}"})
-    return {"steps": steps}
+            steps.append({"label": it["label"], "data_url": f"data:image/png;base64,{b64}",
+                          "kind": it.get("kind", "stage"), "branch": it.get("branch", ""),
+                          "group": "per-slice"})
+    # ── VOLUME-LEVEL decisions (the newer steps): note nodes carrying the REAL numbers from the last
+    # preprocess. These are whole-volume decisions (keep-best iteration, axial ping-pong refine,
+    # inter-slice smoothing) that can't be faithfully shown from one slice, so they're reported as
+    # the decision + its outcome. (Images for these need an orientation check on a real scan first.)
+    oct_iter = m.get("oct_iter") or {}
+    passes = int(oct_iter.get("passes", 0) or 0)
+    if passes and passes > 0:
+        metrics = oct_iter.get("metrics") or []
+        best = oct_iter.get("best_pass")
+        stopped = oct_iter.get("stopped", "")
+        dev = ", ".join(f"{float(x):.2f}" for x in metrics) if metrics else "—"
+        steps.append({"label": f"9. Keep-best iteration — {passes} pass(es), kept pass {best}",
+                      "kind": "decision", "group": "volume",
+                      "branch": f"boundary deviation per pass: [{dev}] px · argmin kept · stop: {stopped}"})
+    ism = float((eff_params.get("interslice_smooth") or 0) or 0)
+    steps.append({"label": "10. Inter-slice smoothing",
+                  "kind": "decision", "group": "volume",
+                  "branch": (f"displacement field smoothed across slices (σ={ism:.1f})" if ism > 0
+                             else "off (interslice_smooth = 0)")})
+    axial_on = bool(eff_params.get("axial_refine", True))
+    ax = oct_iter.get("axial") or oct_iter.get("axial_refine") or {}
+    if isinstance(ax, dict) and ax:
+        ax_note = ", ".join(f"{k}={v}" for k, v in ax.items())
+    else:
+        ax_note = "ping-pong axial pass; per-frame kept only where it lowers lateral roughness (global never-worse guard)"
+    steps.append({"label": "11. Axial ping-pong refine — " + ("applied" if axial_on else "off"),
+                  "kind": "decision", "group": "volume", "branch": ax_note})
+    steps.append({"label": "12. Manual depth nudges (Fix-columns)",
+                  "kind": "decision", "group": "volume",
+                  "branch": (f"{len(eff_params.get('manual_shifts') or {})} frame(s) nudged — applied LAST as ground truth"
+                             if eff_params.get("manual_shifts") else "none — applied LAST, after all fitting/guards")})
+    return {"steps": steps, "slices": n_slices, "index": cur_index}
 
 
 class OctLoadDirRequest(BaseModel):
