@@ -21,9 +21,8 @@ jobs:
           - platform: macos-latest
             args: "--target aarch64-apple-darwin"
             label: macos-arm64
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-            label: macos-intel
+          # macOS-intel (x86_64-apple-darwin) intentionally dropped: it kept failing its publish step
+          # (the known auto-publish quirk) and a failed matrix job blocks the publish-manifest job.
           - platform: ubuntu-22.04
             args: ""
             label: linux
@@ -47,7 +46,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Install JS deps
         working-directory: cornea_app
