@@ -157,7 +157,33 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const [accurate, setAccurate] = useState<Map<number, { edge: number[]; fit: number[] }>>(new Map());
   const accurateRef = useRef(accurate); accurateRef.current = accurate;
   const [borderBusy, setBorderBusy] = useState(false);
-  const borderDragRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const borderDragRef = useRef<{ x: number; y: number; moved: boolean; mode: "edit" | "pan" } | null>(null);
+  // Fix-columns ZOOM/PAN — magnify the slice so the border can be corrected precisely. A CSS transform on
+  // the panel content; getBoundingClientRect stays transform-aware so the drag→(frame,depth) mapping is
+  // unchanged at any zoom. Wheel = zoom-to-cursor; middle/shift-drag = pan; left-drag = edit (unchanged).
+  const [bZoom, setBZoom] = useState(1);
+  const [bPan, setBPan] = useState({ x: 0, y: 0 });
+  const borderHostRef = useRef<HTMLDivElement | null>(null);
+  const resetBorderView = () => { setBZoom(1); setBPan({ x: 0, y: 0 }); };
+  useEffect(() => { resetBorderView(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [caseId, fixCols]);
+  const zoomBorderAt = (clientX: number, clientY: number, factor: number) => {
+    const host = borderHostRef.current?.getBoundingClientRect();
+    setBZoom((z) => {
+      const nz = Math.max(1, Math.min(10, z * factor));
+      if (nz === z) return z;
+      if (nz <= 1.0001) { setBPan({ x: 0, y: 0 }); return 1; }
+      if (host) {
+        const cx = host.left + host.width / 2, cy = host.top + host.height / 2;
+        const ratio = nz / z;
+        setBPan((p) => ({ x: p.x + (clientX - cx - p.x) * (1 - ratio), y: p.y + (clientY - cy - p.y) * (1 - ratio) }));
+      }
+      return nz;
+    });
+  };
+  const zoomBorderCentered = (factor: number) => {
+    const h = borderHostRef.current?.getBoundingClientRect();
+    if (h) zoomBorderAt(h.left + h.width / 2, h.top + h.height / 2, factor);
+  };
   // Editable anchor set (seeded from persisted; drag adds; Confirm persists). sliceIdx → frame → depth.
   const [borderAnchors, setBorderAnchors] = useState<Map<number, Map<number, number>>>(new Map());
   const [redetectBusy, setRedetectBusy] = useState(false);
@@ -424,11 +450,17 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // the detected edge auto-clears, so it merges cleanly).
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
-    borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false };
+    // middle-button OR shift+left = PAN (so you can move around while zoomed); plain left = edit the border
+    const mode: "edit" | "pan" = (e.button === 1 || e.shiftKey) ? "pan" : "edit";
+    borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode };
   };
   const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const d = borderDragRef.current;
     if (!d) return;
+    if (d.mode === "pan") {
+      setBPan((p) => ({ x: p.x + (e.clientX - d.x), y: p.y + (e.clientY - d.y) }));
+      d.x = e.clientX; d.y = e.clientY; return;
+    }
     if (!d.moved) {
       if (Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;   // ignore click jitter
       d.moved = true;
@@ -436,6 +468,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     applyBorderDrag(e.clientX, e.clientY, e.currentTarget);
   };
   const onBorderUp = () => { borderDragRef.current = null; };
+  const onBorderWheel = (e: React.WheelEvent) => { e.preventDefault(); zoomBorderAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.2 : 1 / 1.2); };
 
   // #2 (merged): once columns are marked BAD, the ARROW KEYS nudge the whole marked set UP/DOWN in depth
   // to its correct position (↓ = deeper = +depth voxel, ↑ = -; Shift = ×5). Each marked frame's absolute
@@ -801,7 +834,8 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   };
   const anchoredFrames = useMemo(() => new Set(curAnchors ? curAnchors.keys() : []), [curAnchors]);
   const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
-    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
+    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%",
+                  transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom})`, transformOrigin: "center center" }}>
       <img src={inputSrc} alt="pass input" draggable={false}
         style={{ display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: enhanceFilter }} />
       <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
@@ -1100,10 +1134,27 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           // Re-run. Each panel is in a sized flex box so its inline-block img gets a definite height.
           <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "center", justifyContent: "center" }}>
             <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
-              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{passInputLabel} — drag the red border</span>
-              <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+                {passInputLabel} — drag the red border{bZoom > 1 ? " · shift/middle-drag to pan" : " · scroll to zoom"}
+              </span>
+              <div ref={borderHostRef} onWheel={borderPanel ? onBorderWheel : undefined}
+                style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
                 {borderPanel ?? (
                   <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{borderBusy ? "Detecting border…" : "No border for this slice."}</span>
+                )}
+                {borderPanel && (
+                  <div style={{ position: "absolute", top: 6, right: 6, display: "flex", alignItems: "center", gap: 2, zIndex: 5,
+                                background: "var(--c-surface)", border: "1px solid var(--c-border)", borderRadius: 6, padding: "1px 2px", opacity: 0.92 }}>
+                    {([["−", () => zoomBorderCentered(1 / 1.4)],
+                       [`${Math.round(bZoom * 100)}%`, resetBorderView],
+                       ["+", () => zoomBorderCentered(1.4)]] as const).map(([lbl, fn], i) => (
+                      <button key={i} onClick={fn} title={i === 1 ? "Reset zoom" : i === 0 ? "Zoom out" : "Zoom in"}
+                        style={{ background: "none", border: "none", color: "var(--c-text)", cursor: "pointer", fontSize: 12,
+                                 padding: "1px 6px", minWidth: i === 1 ? 42 : 18, textAlign: "center", fontVariantNumeric: "tabular-nums" }}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
             </div>
