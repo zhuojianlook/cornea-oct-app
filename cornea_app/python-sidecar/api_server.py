@@ -2028,9 +2028,53 @@ def _border_anchors_sig(anchors: dict) -> str:
     return ";".join(parts)
 
 
+# Detection-relevant params: a baseline/redetect surface cache must invalidate if ANY of these change.
+# Today every param change already rmtrees border_cache, so this is defence-in-depth against a future writer.
+_DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColor", "sigmaSpace",
+                      "side_window", "side_threshold_factor", "residual_threshold", "active_threshold",
+                      "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band")
+
+
+def _detect_params_sig(p: dict) -> str:
+    """Canonical signature of the detection-relevant params (for surface-cache freshness)."""
+    return ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS)
+
+
 def _redetect_cache_path(case_id: str) -> Path:
     # NOT under passes/ or input/_iter (both rmtree'd on every preprocess) — its own dir, keyed to the RAW.
     return orch.case_root(case_id) / "border_cache" / "redetect.npz"
+
+
+def _baseline_cache_path(case_id: str) -> Path:
+    return orch.case_root(case_id) / "border_cache" / "baseline.npz"
+
+
+def _baseline_surface(case_id: str, arr, p: dict):
+    """The robust auto-detected surface for EVERY slice (the 'satisfactory rest' the local-band re-detection
+    keeps untouched), cached per-case keyed to the raw-border volume so repeat Confirms are fast."""
+    import os
+    import numpy as np
+    raw = _ensure_raw_border_nifti(case_id)
+    n, W = int(arr.shape[0]), int(arr.shape[2])
+    cp = _baseline_cache_path(case_id)
+    psig = _detect_params_sig(p)
+    if cp.exists():
+        try:
+            z = np.load(cp, allow_pickle=False)
+            if (abs(float(z["raw_mtime"]) - float(os.path.getmtime(raw))) <= 1e-6
+                    and str(z["params_sig"]) == psig):
+                s = np.asarray(z["surface"], dtype=np.float32)
+                if s.shape == (n, W):
+                    return s
+        except Exception:  # noqa: BLE001 — a corrupt/old cache just forces a recompute
+            pass
+    surface = oct_mod.detect_surface_all(arr, p)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cp.with_name("baseline.tmp.npz")   # MUST end .npz (np.savez_compressed appends it otherwise)
+    np.savez_compressed(tmp, surface=surface.astype(np.float32), raw_mtime=float(os.path.getmtime(raw)),
+                        params_sig=psig)
+    os.replace(tmp, cp)
+    return surface
 
 
 def _redetect_surface_fresh(case_id: str, anchors: dict):
@@ -2048,6 +2092,9 @@ def _redetect_surface_fresh(case_id: str, anchors: dict):
             return None
         if abs(float(z["raw_mtime"]) - float(os.path.getmtime(raw))) > 1e-6:
             return None
+        p = {**oct_mod.DEFAULT_PARAMS, **(orch.read_manifest(case_id).get("oct_params") or {})}
+        if str(z["params_sig"]) != _detect_params_sig(p):    # detection params changed → stale
+            return None
         return np.asarray(z["surface"], dtype=np.float32)
     except Exception:  # noqa: BLE001 — a corrupt/old cache just forces a recompute
         return None
@@ -2063,7 +2110,8 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     raw = _ensure_raw_border_nifti(case_id)
     arr = _load_border_vol(raw)                              # (lateral, depth, frames)
     p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
-    surface = oct_mod.redetect_surface(arr, anchors, p)      # (lateral, frames)
+    baseline = _baseline_surface(case_id, arr, p)           # cached auto surface (the satisfactory rest)
+    surface = oct_mod.redetect_surface(arr, anchors, p, baseline=baseline)   # local-band correction (lateral, frames)
     cp = _redetect_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     # tmp MUST end in .npz — np.savez_compressed appends '.npz' to any path that doesn't, which would make
@@ -2071,18 +2119,22 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     tmp = cp.with_name("redetect.tmp.npz")
     np.savez_compressed(tmp, surface=surface.astype(np.float32),
                         anchors_sig=_border_anchors_sig(anchors),
-                        raw_mtime=float(os.path.getmtime(raw)))
+                        raw_mtime=float(os.path.getmtime(raw)),
+                        params_sig=_detect_params_sig(p))
     os.replace(tmp, cp)
     return surface
 
 
 @app.post("/api/case/{case_id}/oct-border-redetect")
 def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
-    """Fix-columns "Confirm": MARCH a tilt-aware re-detection of the corneal surface across the WHOLE raw
-    volume, seeded by the user's accumulated anchors (true surface points). The surface is cached per-case
-    and the anchors persisted in oct_params, so the scrub preview (oct-border-curve) shows the NEW detected
-    border on every slice and a later Run flattens the volume to exactly that surface (preview == result).
-    Empty anchors clear it (revert to auto)."""
+    """Fix-columns "Confirm": LOCAL-BAND re-detection seeded by the user's anchors (true surface points).
+    The auto-detected surface is kept everywhere EXCEPT a local band around the corrected ("pink line")
+    region — the corrected frames plus the neighbouring slices around them, marched out until the
+    re-detection re-converges to the auto edge — so the rest of the satisfactory border is left untouched
+    (replaces the previous whole-volume march, which often replaced a good surface with a worse one). The
+    spliced surface is cached per-case and the anchors persisted in oct_params, so the scrub preview
+    (oct-border-curve) shows the corrected border and a later Run flattens the volume to exactly that surface
+    (preview == result). Empty anchors clear it (revert to auto)."""
     m = orch.read_manifest(case_id)
     if not (m.get("input_volume") or m.get("corrected_volume")):
         raise HTTPException(400, f"Case {case_id} has no working volume.")
