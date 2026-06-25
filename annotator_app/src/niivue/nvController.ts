@@ -623,13 +623,6 @@ export function paintBrush(cx: number, cy: number, cz: number, px: number, py: n
   scheduleRefresh();
 }
 
-/** Overwrite every `from`-labelled voxel with `to` in the drawing bitmap. */
-function remapLabel(from: number, to: number): void {
-  const b = nv?.drawBitmap;
-  if (!b) return;
-  for (let i = 0; i < b.length; i++) if (b[i] === from) b[i] = to;
-}
-
 // ── Smart fill = CPU "Grow from seeds" ───────────────────────────────────────
 // niivue's GPU drawGrowCut is unusable here: minutes-long and produces nothing (the render-to-3D-texture
 // compute fails on this WebGL — and there's no GPU at all on some target machines). We run a CPU geodesic
@@ -695,8 +688,11 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
   return { ok: true };
 }
 
-/** Confirm the current smart-fill preview → bake it into the committed segmentation; clear seeds+preview
-    so the next smart fill starts fresh (respects label locks). Returns false if there's nothing to confirm. */
+/** Confirm the current wand/smart-fill preview → bake it (+ any cornea/scar brushstrokes) into the
+    committed segmentation. BACKGROUND seeds are KEPT (they're smart-fill guidance, never annotation) so
+    they survive the Confirm and keep guiding the NEXT smart fill — losing them here is why a wand→Confirm
+    →paint→smart-fill round-trip used to ignore the user's background strokes. Cornea/scar seeds + the
+    preview are cleared (they're now committed). Respects label locks. Returns false if nothing to confirm. */
 export function confirmFill(): boolean {
   if (!previewing || !nv || !seedBmp || !committedBmp || !previewBmp) return false;
   pushUndo();
@@ -706,7 +702,9 @@ export function confirmFill(): boolean {
     if (v === BG_SEED) v = 0;                              // background seeds are never committed
     if (v !== 0 && !(hasLocks && lockedLabels.has(committedBmp[i]))) committedBmp[i] = v;
   }
-  seedBmp.fill(0); previewBmp.fill(0); previewing = false;
+  // keep ONLY background seeds; cornea/scar brushstroke seeds were just baked into committed above.
+  for (let i = 0; i < seedBmp.length; i++) if (seedBmp[i] !== BG_SEED) seedBmp[i] = 0;
+  previewBmp.fill(0); previewing = false;
   compose();
   return true;
 }
@@ -970,11 +968,18 @@ export function clearDrawing(): void {
 /** The drawing as NIfTI bytes (values 0/1/2, co-registered to the volume). Exports the full displayed
     segmentation (committed + preview + seeds); background seeds (3) are stripped. */
 export async function exportLabelmapBytes(): Promise<Uint8Array | null> {
-  if (!nv?.drawBitmap) return null;
-  // the saved GT is strictly 0/1/2: background seeds → 0, preview shades → their real label
-  remapLabel(BG_SEED, 0);
-  remapLabel(PREVIEW_CORNEA, 1);
-  remapLabel(PREVIEW_SCAR, 2);
+  if (!nv?.drawBitmap || !seedBmp || !committedBmp || !previewBmp) return null;
+  // the saved GT is strictly 0/1/2, composed from the LAYERS so guidance never corrupts it: cornea/scar
+  // brushstroke seeds (1/2) and the preview (wand/smart-fill region) save as their label; a BACKGROUND
+  // seed is TRANSPARENT — it reveals the committed voxel beneath it, never zeroes it (which a flat
+  // remap on the composed bitmap would, now that background seeds persist across a Confirm).
+  const d = nv.drawBitmap, s = seedBmp, c = committedBmp, p = previewBmp;
+  for (let i = 0; i < d.length; i++) {
+    const sv = s[i];
+    if (sv === 1 || sv === 2) { d[i] = sv; continue; }       // cornea/scar brushstroke seed
+    const pv = p[i];
+    d[i] = (pv === 1 || pv === 2) ? pv : (c[i] === 1 || c[i] === 2 ? c[i] : 0);  // preview, else committed, else bg
+  }
   try { nv.refreshDrawing(true); } catch { /* best-effort */ }
   const r = await nv.saveImage({ filename: "", isSaveDrawing: true, volumeByIndex: 0 });
   compose(); // restore the on-screen display (re-adds bg seeds + preview shading)
