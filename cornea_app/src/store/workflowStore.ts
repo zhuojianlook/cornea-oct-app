@@ -7,8 +7,24 @@ import * as nv from "../niivue/nvController";
 
 // Pen labels for the correction drawing: 0 erase, 1 cornea, 2 background, 3 scar.
 export type PenLabel = 0 | 1 | 2 | 3;
-// Workflow stages: 1 Segment (SAM2) → 2 Correct → 3 Scar (detect + quantify).
-export type Stage = 1 | 2 | 3;
+// Workflow stages: 1 Segment (SAM2) → 2 Correct → 3 Scar (detect + quantify) → 4 Motion (eye-motion spectrum).
+export type Stage = 1 | 2 | 3 | 4;
+
+// Eye-motion analysis result (POST /api/case/{id}/oct-motion) — the slow/frame axis is time, so the
+// detected corneal surface (shape removed) is the patient's motion during the ~0.7s scan.
+export interface MotionResult {
+  n_frames: number; frame_rate_hz: number; total_s: number; nyquist_hz: number; df_hz: number;
+  ascans_per_frame: number; ascan_rate_hz: number; um_per_px: number;
+  time_ms: number[]; motion_um: number[]; freqs_hz: number[]; power: number[];
+  peaks: { hz: number; period_ms: number | null; power_frac: number; label: string; resolved: boolean }[];
+  spikes: { frame: number; t_ms: number; velocity_um_per_s: number }[];
+  direction: {
+    axial_um_rms: number; inplane_lateral_um_rms: number | null; inplane_reliable?: boolean;
+    axial_frac: number; lateral_frac: number;
+    tilt_from_normal_deg: number; lateral_azimuth: string; coherence: number; variance_explained: number;
+  };
+  snr: number | null;
+}
 // Consensus scan-tab overlay: the scan's own scar mask vs the voted consensus mask.
 export type OverlayMode = "self" | "consensus";
 
@@ -86,6 +102,11 @@ interface WorkflowState {
   // busy + status
   segBusy: boolean;
   scarBusy: boolean;
+  // eye-motion tab (stage 4)
+  motionBusy: boolean;
+  motionResult: MotionResult | null;
+  ascanRateHz: number;   // A-scan (line) rate → frame rate → Hz axis; Avanti spec ~70000, editable
+  motionSinc: boolean;   // divide out the intra-frame motion-blur boxcar
   status: WorkflowStatus;
 
   setStage: (s: Stage) => void;
@@ -107,6 +128,7 @@ interface WorkflowState {
   runSmartFill: () => void;
   runScarAuto: () => Promise<void>;
   runScarAutoSam2: () => Promise<void>;
+  runMotionAnalysis: () => Promise<void>;
   addScarHint: (hint: ScarHint) => void;
   clearScarHints: () => void;
   applyScarHints: () => Promise<void>;
@@ -157,6 +179,10 @@ export const useWorkflowStore = create<WorkflowState>()(
 
     segBusy: false,
     scarBusy: false,
+    motionBusy: false,
+    motionResult: null,
+    ascanRateHz: 70000,
+    motionSinc: false,
     status: { kind: "idle", title: "Waiting", detail: "Register a volume, then segment the cornea." },
 
     setStage: (s) =>
@@ -194,6 +220,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.gtViewerClass = "scar";
         s.segBusy = false;
         s.scarBusy = false;
+        s.motionBusy = false;
+        s.motionResult = null;   // motion is per-scan; don't bleed across cases (ascanRateHz/sinc are prefs, kept)
         s.status = { kind: "idle", title: "Waiting", detail: "Segment the cornea to begin." };
         s.segVersion += 1;
       });
@@ -400,6 +428,34 @@ export const useWorkflowStore = create<WorkflowState>()(
         set((s) => {
           s.scarBusy = false;
         });
+      }
+    },
+
+    runMotionAnalysis: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => {
+        s.motionBusy = true;
+        s.status = { kind: "working", title: "Analysing eye motion", detail: "Tracking the corneal surface over the scan (the slow axis is time) + its spectrum." };
+      });
+      try {
+        const r = await api.json<MotionResult>(
+          `/api/case/${caseId}/oct-motion`, "POST",
+          JSON.stringify({ ascan_rate_hz: get().ascanRateHz, sinc_correct: get().motionSinc }),
+        );
+        set((s) => {
+          s.motionResult = r;
+          const top = r.peaks && r.peaks[0];
+          s.status = { kind: "done", title: "Eye motion analysed",
+            detail: `${r.frame_rate_hz} Hz frames · ${top ? `${top.hz} Hz dominant` : "no clear peak"} · SNR ${r.snr ?? "—"}` };
+        });
+      } catch (e) {
+        set((s) => {
+          s.motionResult = null;
+          s.status = { kind: "error", title: "Motion analysis failed", detail: e instanceof Error ? e.message : String(e) };
+        });
+      } finally {
+        set((s) => { s.motionBusy = false; });
       }
     },
 

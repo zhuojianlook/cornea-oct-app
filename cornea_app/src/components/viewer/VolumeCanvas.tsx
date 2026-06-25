@@ -12,6 +12,7 @@ import { SubgroupGrid } from "./SubgroupGrid";
 import { GtCompareViewer } from "./GtCompareViewer";
 import { BeforeAfterViewer } from "./BeforeAfterViewer";
 import { StepsViewer } from "./StepsViewer";
+import { MotionPanel } from "./MotionPanel";
 
 export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -25,6 +26,7 @@ export function VolumeCanvas() {
   const gtViewerClass = useWorkflowStore((s) => s.gtViewerClass);
   const wfSet = useWorkflowStore((s) => s.set);
   const correcting = useWorkflowStore((s) => s.correcting);
+  const stage = useWorkflowStore((s) => s.stage);
   const segLoaded = useWorkflowStore((s) => s.segLoaded);
   const segOpacity = useWorkflowStore((s) => s.segOpacity);
   const paintMode = useWorkflowStore((s) => s.paintMode);
@@ -347,6 +349,11 @@ export function VolumeCanvas() {
         {stepsView && volumeUrl && (
           <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
             <StepsViewer onClose={() => setStepsView(false)} />
+          </div>
+        )}
+        {stage === 4 && (
+          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+            <MotionPanel />
           </div>
         )}
       </div>

@@ -81,7 +81,7 @@ export function Toolbar() {
             Scar →
           </Button>
         </>
-      ) : (
+      ) : stage === 3 ? (
         <>
           {/* #4: decide scar vs control HERE (post-preprocess), not in the loader up front. */}
           <div className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
@@ -147,12 +147,26 @@ export function Toolbar() {
           <Button variant="outlined" disabled={busy || correcting} onClick={() => setStage(2)}>
             ← Correct
           </Button>
+          <div style={{ width: 1, height: 24, background: "var(--c-border)" }} />
+          <Button variant="contained" color="secondary" disabled={busy || correcting} onClick={() => setStage(4)}
+            title="Eye-motion spectrum derived from the corneal surface (the slow scan axis is a time axis)">
+            Motion →
+          </Button>
+        </>
+      ) : (
+        <>
+          <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
+            Eye-motion spectrum from the detected corneal surface — set the A-scan rate &amp; Analyze in the panel.
+          </span>
+          <Button variant="outlined" disabled={busy} onClick={() => setStage(3)}>
+            ← Scar
+          </Button>
         </>
       )}
       <div className="flex-1" />
       {busy && <CircularProgress size={16} />}
       <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
-        {stage === 1 ? "Segment" : stage === 2 ? "Correct" : "Scar"}
+        {stage === 1 ? "Segment" : stage === 2 ? "Correct" : stage === 3 ? "Scar" : "Motion"}
       </span>
     </div>
   );

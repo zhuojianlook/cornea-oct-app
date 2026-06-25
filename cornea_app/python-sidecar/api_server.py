@@ -52,6 +52,7 @@ import metrics_export
 import consensus as consensus_mod
 import normal_baseline
 import oct_preprocess as oct_mod
+import oct_motion as oct_motion_mod
 import cohort as cohort_mod
 
 app = FastAPI(title="Cornea OCT Segmentation Sidecar")
@@ -1245,6 +1246,9 @@ class OctPreprocessRequest(BaseModel):
                                               # a tilt-aware re-detection of the whole RAW volume seeded by these.
     use_redetect: bool | None = None          # oct-preprocess: flatten to the confirmed re-detected surface
                                               # (provided_edges) instead of auto-detecting — the fix-columns "Run".
+    ascan_rate_hz: float | None = None        # eye-motion tab: A-scan (line) rate → frame rate → Hz axis (Avanti ~70000)
+    detrend_order: int | None = None          # eye-motion tab: per-A-line shape-removal polynomial order (default 2)
+    sinc_correct: bool | None = None          # eye-motion tab: divide out the intra-frame motion-blur boxcar
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1930,6 +1934,38 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT border curves(all) failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-motion")
+def oct_motion_analyze(case_id: str, req: OctPreprocessRequest) -> dict:
+    """EYE-MOTION analysis from the detected corneal surface. The 3-D scan's SLOW (frame) axis is a TIME axis
+    (~136 Hz on the Avanti), so the per-frame surface depth — once the smooth corneal shape is removed — is the
+    patient's eye/head motion during the ~0.74 s scan. Returns the motion(t) trace (µm), its power spectrum +
+    labelled dominant-frequency peaks, candidate saccade/microsaccade spikes, a dominant motion direction
+    (axial vs in-plane), and an SNR gate. Reuses the cached raw-border volume → fast on a scrubbed case.
+    Frequencies derive from the A-scan rate (Avanti ~70 kHz, editable) since the .OCT carries no timing."""
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    try:
+        arr = _load_border_vol(_ensure_raw_border_nifti(case_id))    # (lateral, depth, frames), cached
+        eff = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        persisted = (m.get("oct_params") or {}).get("ascan_rate_hz")
+        rate = float(req.ascan_rate_hz) if req.ascan_rate_hz else float(persisted or oct_motion_mod.DEFAULT_ASCAN_RATE_HZ)
+        sp = oct_mod._resolve_spacing(eff, m.get("companion_txt"), n_frames=int(arr.shape[2]))  # (lateral, depth, slice)
+        res = oct_motion_mod.analyze_motion(
+            np.ascontiguousarray(arr), ascan_rate_hz=rate, ascans_per_frame=int(arr.shape[0]),
+            depth_spacing_mm=float(sp[1]), lateral_spacing_mm=float(sp[0]),
+            detrend_order=int(req.detrend_order or 2), sinc_correct=bool(req.sinc_correct), params=eff)
+        if req.ascan_rate_hz:                                        # remember a user-chosen rate on the case
+            op = dict(m.get("oct_params") or {}); op["ascan_rate_hz"] = rate
+            orch.write_manifest_value(case_id, {"oct_params": op})
+        return res
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT motion analysis failed: {exc}")
 
 
 @app.post("/api/case/{case_id}/oct-border-curve")

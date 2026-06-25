@@ -199,6 +199,13 @@ export const useCaseStore = create<CaseState>()(
         if (info.case_id !== _lastOpenedCase) {
           // Switching to a different case: clear the prior case's stale workflow state.
           useWorkflowStore.getState().resetForCase();
+          // Re-seed the A-scan rate from THIS case's persisted calibration (manifest.oct_params.ascan_rate_hz)
+          // so the Motion tab reflects what the user calibrated for this scan instead of silently defaulting
+          // to 70000 and overwriting the stored value on the next Analyze.
+          const rate = (info.manifest?.oct_params as Record<string, unknown> | undefined)?.ascan_rate_hz;
+          if (typeof rate === "number" && Number.isFinite(rate)) {
+            useWorkflowStore.getState().set("ascanRateHz", rate);
+          }
           _lastOpenedCase = info.case_id;
         }
         set((s) => {
