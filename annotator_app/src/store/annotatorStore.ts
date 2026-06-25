@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.35";
+export const APP_VERSION = "0.1.36";
 
 // #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
 // (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
@@ -92,6 +92,7 @@ interface State {
   penFilled: boolean;
   tool: "paint" | "navigate" | "wand";   // active interaction tool
   drawOpacity: number;
+  showAnnotations: boolean;  // toggle the user's annotations (2-D overlay + niivue draw/3-D) on/off
   // intensity wand (live preview → Confirm)
   wandThreshold: number;     // threshold mode: brightness cutoff, 0..1 of the intensity range
   wandTolerance: number;     // tolerance mode: ± band around the clicked voxel, 0..1 of the range
@@ -153,6 +154,7 @@ interface State {
   wandAt: (x: number, y: number, z: number, throughAxis: number | null) => void;
   setCursorIntensity: (x: number, y: number, z: number) => void;
   setDrawOpacity: (o: number) => void;
+  setShowAnnotations: (v: boolean) => void;
   setSliceAxis: (axis: 0 | 1 | 2, s: number) => void;
   syncVox: () => void;
   refreshStats: () => void;
@@ -203,6 +205,7 @@ export const useStore = create<State>((set, get) => ({
   penSize: 8,
   penFilled: false,
   tool: "paint",
+  showAnnotations: true,
   drawOpacity: 0.85,  // higher default so the SEMI-TRANSPARENT cornea (colormap alpha 130) is clearly
   wandThreshold: 0.55,
   wandTolerance: 0.08,
@@ -485,7 +488,8 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   setCursorIntensity: (x, y, z) => { set({ cursorIntensity: nv.intensityAt(x, y, z), cursorIntensity01: nv.intensityAtNorm(x, y, z) }); },
-  setDrawOpacity: (o) => { nv.setDrawOpacity(o); set({ drawOpacity: o }); },
+  setDrawOpacity: (o) => { set({ drawOpacity: o }); if (get().showAnnotations) nv.setDrawOpacity(o); },
+  setShowAnnotations: (v) => { set({ showAnnotations: v }); nv.setAnnotationsVisible(v, get().drawOpacity); },
   refreshStats: () => { const st = nv.drawStats(); set({ corneaVox: st.cornea, scarVox: st.scar, canUndo: nv.canUndo(), canRedo: nv.canRedo() }); },
   zoomIn: () => nv.zoomBy(1.25),
   zoomOut: () => nv.zoomBy(1 / 1.25),

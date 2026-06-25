@@ -81,7 +81,7 @@ export async function loadVolumeBytes(bytes: Uint8Array, name: string, drawOpaci
   baseWinHi = v0.cal_max ?? v0.global_max ?? (baseWinLo + 1);
   nv.createEmptyDrawing();
   try { nv.setDrawColormap(DRAW_CMAP as unknown as string); } catch { /* default LUT */ }
-  nv.setDrawOpacity(drawOpacity);
+  nv.setDrawOpacity(overlayVisible ? drawOpacity : 0); // honor a hidden-annotations toggle across volume loads
   nv.setDrawingEnabled(false); // custom sphere brush owns painting; niivue navigation still sets crosshair
   nv.opts.penSize = 1;
   // Pan/zoom: left-drag stays crosshair (NOT contrast); shift/ctrl+left, middle & right drag = pan.
@@ -263,6 +263,17 @@ export function recreateDrawTexture(): void {
 // reliably everywhere, so the strokes are always visible. Runs on demand (every redraw), not in a loop.
 let overlayCanvas: HTMLCanvasElement | null = null;
 export function setOverlayCanvas(c: HTMLCanvasElement | null): void { overlayCanvas = c; if (c) renderDrawOverlay(); }
+// Show/hide ALL of the user's annotations (the 2-D overlay AND niivue's WebGL draw / 3-D render), so the
+// user can compare against the raw OCT. Hidden = the bitmap is untouched, just not drawn.
+let overlayVisible = true;
+export function setAnnotationsVisible(visible: boolean, drawOpacity: number): void {
+  overlayVisible = visible;
+  if (nv) {
+    try { nv.drawOpacity = visible ? drawOpacity : 0; } catch { /* */ } // hides the niivue draw + 3-D render
+    try { nv.drawScene(); } catch { /* */ }
+  }
+  renderDrawOverlay();   // clears the 2-D overlay when hidden, redraws it when shown
+}
 // label → on-screen RGBA. TRANSLUCENT base alphas (so the anatomy shows through) — further scaled by the
 // live draw-opacity slider in renderDrawOverlay. (1 cornea, 2 scar, 3 bg-seed, 4 cornea-preview, 5 scar-preview)
 const OVERLAY_RGBA: Record<number, [number, number, number, number]> = {
@@ -284,6 +295,7 @@ export function renderDrawOverlay(): void {
   const ctx = cv.getContext("2d");
   if (!ctx) return;
   ctx.clearRect(0, 0, W, H);
+  if (!overlayVisible) return;   // annotations hidden → leave the overlay cleared (raw OCT shows alone)
   const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny;
   // Scale the overlay alpha by the live draw-opacity slider so the user controls translucency.
   const nvAny = nv as unknown as { drawOpacity?: number; opts?: { drawOpacity?: number } };

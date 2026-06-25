@@ -109,6 +109,8 @@ const T = {
   "tb.clear":     { en: "Clear", zh: "清除" },
   "tb.opacity":   { en: "Opacity", zh: "不透明度" },
   "tb.opacityTip":{ en: "Label overlay opacity", zh: "标签叠加不透明度" },
+  "tb.annotations":   { en: "Annotations", zh: "标注" },
+  "tb.annotationsTip":{ en: "Show / hide your annotations (compare against the raw OCT)", zh: "显示/隐藏你的标注（与原始 OCT 对比）" },
   "tb.brightness":{ en: "Bright", zh: "亮度" },
   "tb.contrast":  { en: "Contrast", zh: "对比度" },
   "tb.bcTip":     { en: "Brightness / contrast of the grayscale image (display only — does not change the data). Use Reset to restore the auto window.",

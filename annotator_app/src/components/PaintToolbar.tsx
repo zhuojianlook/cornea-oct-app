@@ -30,7 +30,7 @@ export function PaintToolbar() {
           canUndo, canRedo, brightness, contrast, locked, confirmClear,
           wandThreshold, wandTolerance, wandMode, wandScope, wandTarget,
           setPenLabel, setPenSize, setPenFilled, setTool, setWandThreshold, setWandTolerance, setWandMode, setWandScope,
-          setWandTarget, setDrawOpacity, smartFill, confirmFill,
+          setWandTarget, setDrawOpacity, smartFill, confirmFill, showAnnotations, setShowAnnotations,
           undo, redo, requestClear, cancelClear, clearDrawing, setBrightness, setContrast, resetWindow, toggleLock } = useStore();
   const off = !loaded || busy;            // lock controls while smart fill computes
   const filling = busy && smartPct !== null;
@@ -148,12 +148,18 @@ export function PaintToolbar() {
 
       {/* ── DISPLAY ──────────────────────────────────────── */}
       <Label>{tr(lang, "tb.display")}</Label>
+      <Tooltip title={tr(lang, "tb.annotationsTip")} arrow>
+        <ToggleButton size="small" value="anno" selected={showAnnotations} disabled={off}
+          onChange={() => setShowAnnotations(!showAnnotations)} sx={tbSx}>
+          {showAnnotations ? "👁" : "🚫"} {tr(lang, "tb.annotations")}
+        </ToggleButton>
+      </Tooltip>
       <Tooltip title={tr(lang, "tb.opacityTip")} arrow>
         <div className="flex items-center gap-2" style={{ width: 140 }}>
           <Label>{tr(lang, "tb.opacity")}</Label>
           <Slider size="small" min={0.1} max={1} step={0.05} value={drawOpacity} valueLabelDisplay="auto"
             valueLabelFormat={(v) => `${Math.round(v * 100)}%`}
-            disabled={off} onChange={(_, v) => setDrawOpacity(v as number)} />
+            disabled={off || !showAnnotations} onChange={(_, v) => setDrawOpacity(v as number)} />
         </div>
       </Tooltip>
       <Tooltip title={tr(lang, "tb.bcTip")} arrow>
