@@ -157,7 +157,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const [accurate, setAccurate] = useState<Map<number, { edge: number[]; fit: number[] }>>(new Map());
   const accurateRef = useRef(accurate); accurateRef.current = accurate;
   const [borderBusy, setBorderBusy] = useState(false);
-  const borderDragRef = useRef(false);
+  const borderDragRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   // Editable anchor set (seeded from persisted; drag adds; Confirm persists). sliceIdx → frame → depth.
   const [borderAnchors, setBorderAnchors] = useState<Map<number, Map<number, number>>>(new Map());
   const [redetectBusy, setRedetectBusy] = useState(false);
@@ -418,12 +418,24 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       return mm;
     });
   };
+  // Anchor ONLY on a deliberate DRAG, never on the press — a click/tap (or sub-threshold jitter) must NOT
+  // drop a stray anchor where you merely touched the line. We start anchoring once the pointer moves past a
+  // small threshold from the press point; dragging then reshapes the border (and a stretch dragged back onto
+  // the detected edge auto-clears, so it merges cleanly).
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
-    borderDragRef.current = true; applyBorderDrag(e.clientX, e.clientY, e.currentTarget);
+    borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false };
   };
-  const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => { if (borderDragRef.current) applyBorderDrag(e.clientX, e.clientY, e.currentTarget); };
-  const onBorderUp = () => { borderDragRef.current = false; };
+  const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const d = borderDragRef.current;
+    if (!d) return;
+    if (!d.moved) {
+      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;   // ignore click jitter
+      d.moved = true;
+    }
+    applyBorderDrag(e.clientX, e.clientY, e.currentTarget);
+  };
+  const onBorderUp = () => { borderDragRef.current = null; };
 
   // #2 (merged): once columns are marked BAD, the ARROW KEYS nudge the whole marked set UP/DOWN in depth
   // to its correct position (↓ = deeper = +depth voxel, ↑ = -; Shift = ×5). Each marked frame's absolute
