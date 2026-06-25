@@ -61,6 +61,17 @@ DEFAULT_PARAMS: dict = {
     # 0 = off) makes neighbours shift consistently → a smoother axial boundary, while the per-slice
     # quadratic still carries the real lateral curvature. Small sigma stays close to the per-slice fit.
     "interslice_smooth": 1.0,
+    # ── windowed re-detection (fix-columns "Confirm", tilt-aware surface prior) ── When a PRIOR surface
+    # (per-frame expected depth) is supplied to detection, the gradient argmax is restricted to a small
+    # window ±detect_window (depth voxels) around it per column, so a spurious peak (e.g. a reflection
+    # ABOVE the cornea) outside the window can't be picked. The prior is built by MARCHING outward from
+    # the user's anchored slice(s) (redetect_surface): each slice's prior is its already-resolved
+    # neighbour's surface, so the window tracks the tilted cornea. detect_seed_window is the (generous)
+    # window used on an anchored seed slice where the prior is only the interpolated anchors. These are
+    # used ONLY by redetect_surface; the normal auto pipeline passes no prior (prior=None → original
+    # unrestricted argmax), so it is byte-for-byte unchanged.
+    "detect_window": 10.0,
+    "detect_seed_window": 45.0,
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
@@ -345,12 +356,28 @@ def revert_sagittal(volume_sag: np.ndarray) -> np.ndarray:
     return np.transpose(volume_sag, (2, 1, 0))
 
 
-def _detect_surface_gradient(img: np.ndarray, sigma: float) -> np.ndarray:
+def _detect_surface_gradient(img: np.ndarray, sigma: float,
+                             prior: np.ndarray | None = None, window: float | None = None) -> np.ndarray:
     # Vectorized over columns: smooth each column along depth, take the gradient, and
     # the brightest rising edge → corneal surface row. (Same result as the per-column
     # loop in the original, but ~order-of-magnitude faster.)
+    # prior (per-FRAME expected depth, length = n_frames) + window (depth voxels): when both given, each
+    # column's argmax is restricted to depth rows [prior[f]-window, prior[f]+window], so a spurious
+    # gradient peak (e.g. a reflection above the cornea) OUTSIDE the window can't be picked. This is how
+    # the fix-columns marched re-detection (redetect_surface) tracks the tilted cornea. prior=None →
+    # unrestricted argmax (the original auto behaviour — the normal pipeline never passes a prior).
     sm = ndimage.gaussian_filter1d(img.astype(np.float32), sigma=sigma, axis=0)
-    return np.argmax(np.gradient(sm, axis=0), axis=0)
+    grad = np.gradient(sm, axis=0)                       # (depth, frames)
+    if prior is None or window is None or not (float(window) > 0):
+        return np.argmax(grad, axis=0)
+    H, W = grad.shape
+    pr = np.asarray(prior, dtype=np.float32)
+    lo = np.clip(np.round(pr - float(window)), 0, H - 1).astype(np.intp)   # (frames,)
+    hi = np.clip(np.round(pr + float(window)) + 1, 1, H).astype(np.intp)   # (frames,) exclusive
+    rows = np.arange(H)[:, None]                          # (depth, 1)
+    mask = (rows >= lo[None, :]) & (rows < hi[None, :])   # (depth, frames)
+    g = np.where(mask, grad, -np.inf)
+    return np.argmax(g, axis=0)
 
 
 def _correct_surface(surface_y: np.ndarray, max_jump: float) -> np.ndarray:
@@ -375,11 +402,13 @@ def _smooth_median(surface_y: np.ndarray, size: int) -> np.ndarray:
     return ndimage.median_filter(surface_y, size=size)
 
 
-def _advanced_edge(img: np.ndarray, p: dict) -> np.ndarray:
+def _advanced_edge(img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
     if img.dtype != np.uint8:
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     filt = cv2.bilateralFilter(img, d=int(p["d"]), sigmaColor=int(p["sigmaColor"]), sigmaSpace=int(p["sigmaSpace"]))
-    raw = _detect_surface_gradient(filt, sigma=p["sigma"])
+    # prior present (fix-columns marched re-detection) → windowed argmax around it; else unrestricted.
+    raw = _detect_surface_gradient(filt, sigma=p["sigma"], prior=prior,
+                                   window=(p.get("detect_window") if prior is not None else None))
     corrected = _correct_surface(raw, max_jump=p["max_jump"])
     return _smooth_median(corrected, size=int(p["median_filter_size"]))
 
@@ -497,11 +526,12 @@ def _fill_black_bands(volume: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(revert_sagittal(sag))
 
 
-def _merged_side_edge(slice_img: np.ndarray, p: dict) -> np.ndarray:
+def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
     """The per-slice corrected boundary (process_slice_single_stage → 'Merged Side Edge'),
-    choosing the lower-error edge of {hist-eq, raw} advanced-filtered detections."""
-    edge_h = _advanced_edge(_histeq(slice_img), p)
-    edge_r = _advanced_edge(slice_img, p)
+    choosing the lower-error edge of {hist-eq, raw} advanced-filtered detections. When a prior surface is
+    supplied (fix-columns marched re-detection) the underlying gradient argmax is windowed around it."""
+    edge_h = _advanced_edge(_histeq(slice_img), p, prior=prior)
+    edge_r = _advanced_edge(slice_img, p, prior=prior)
     q_h = _fit_quadratic_ransac(edge_h, p["residual_threshold"])
     q_r = _fit_quadratic_ransac(edge_r, p["residual_threshold"])
     chosen = edge_h if np.sum((edge_h - q_h) ** 2) <= np.sum((edge_r - q_r) ** 2) else edge_r
@@ -513,6 +543,105 @@ def _merged_side_edge(slice_img: np.ndarray, p: dict) -> np.ndarray:
 def _edge_worker(packed):
     sl, p = packed
     return _merged_side_edge(sl, p)
+
+
+def _redetect_one_slice(sl: np.ndarray, prior: np.ndarray, window: float, p: dict,
+                        light: bool = True) -> np.ndarray:
+    """Re-detect one sagittal slice's corneal surface within ±window of a per-frame `prior`. sl=(depth,
+    frames). light=False (seed slices) uses the full robust detector (_merged_side_edge: hist-eq/raw choice
+    + side-correction). light=True (the MARCH, called for every slice) uses a fast windowed gradient argmax
+    + outlier/median cleanup — no bilateral / hist-eq / double-RANSAC — which is reliable because the tight
+    window around the resolved neighbour already excludes confounders (and is ~10x faster, so a 513-slice
+    march finishes in seconds instead of minutes)."""
+    pr = np.asarray(prior, dtype=np.float32)
+    if not light:
+        return _merged_side_edge(sl, {**p, "detect_window": float(window)}, prior=pr)
+    raw = _detect_surface_gradient(sl, sigma=float(p["sigma"]), prior=pr, window=float(window))
+    corrected = _correct_surface(raw, max_jump=float(p["max_jump"]))
+    return _smooth_median(corrected, size=int(p["median_filter_size"]))
+
+
+def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None, progress=None) -> np.ndarray:
+    """TILT-AWARE whole-volume re-detection seeded by the user's fix-columns anchors.
+
+    `sag` = the SAGITTAL volume (lateral, depth, frames) — what _load_border_vol returns / the border
+    preview scrubs, depth 0 = TOP. `anchors` = {slice_index: {frame: true_depth}} (absolute depth rows
+    the user dragged the red border to). Returns the re-detected SURFACE (n_slices, n_frames).
+
+    Algorithm (marching): each anchored slice is SEEDED — its prior is the anchors interpolated across
+    frames, re-detected within a generous ±detect_seed_window. Then the surface MARCHES outward to every
+    other slice: an unresolved slice's prior is its already-resolved neighbour's surface, re-detected
+    within a small ±detect_window. Because the cornea moves only ~1 px/slice the small window tracks the
+    tilt, while a reflection many px away stays outside it (which a single global depth band could not do
+    on a tilted cornea). With ≥1 anchored slice the march covers the whole volume in both directions."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    n, depth, W = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
+    seed_win = float(p.get("detect_seed_window", 45.0))
+    march_win = float(p.get("detect_window", 10.0))
+    surface = np.zeros((n, W), dtype=np.float32)
+    resolved = np.zeros(n, dtype=bool)
+
+    # normalize anchors → {int slice: {int frame: float depth}} within bounds
+    anc: dict[int, dict[int, float]] = {}
+    for s_key, frames in (anchors or {}).items():
+        try:
+            s = int(s_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= s < n) or not isinstance(frames, dict):
+            continue
+        fm: dict[int, float] = {}
+        for f_key, d in frames.items():
+            try:
+                f = int(f_key); dv = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < W and np.isfinite(dv):
+                fm[f] = float(np.clip(dv, 0, depth - 1))
+        if fm:
+            anc[s] = fm
+    if not anc:
+        return surface  # no anchors → nothing to seed (caller guards against this)
+
+    # 1) seed each anchored slice from its interpolated anchors (generous window)
+    for s, fm in anc.items():
+        afs = np.array(sorted(fm.keys()), dtype=np.float32)
+        ads = np.array([fm[int(f)] for f in afs], dtype=np.float32)
+        prior = np.interp(np.arange(W, dtype=np.float32), afs, ads).astype(np.float32)  # flat-extrapolated
+        # seed slices use the ROBUST detector (a generous window + few slices) to anchor the march cleanly
+        surface[s] = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), prior, seed_win, p, light=False)
+        resolved[s] = True
+
+    # 2) march outward to every other slice (prior = resolved neighbour's surface, small window)
+    remaining = n - int(resolved.sum())
+    guard = 0
+    while remaining > 0 and guard < 2 * n:
+        guard += 1
+        made = 0
+        for s in range(n):                 # left→right cascade
+            if resolved[s]:
+                continue
+            nb = s - 1 if (s - 1 >= 0 and resolved[s - 1]) else (s + 1 if (s + 1 < n and resolved[s + 1]) else -1)
+            if nb >= 0:
+                surface[s] = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), surface[nb], march_win, p)
+                resolved[s] = True; made += 1
+        for s in range(n - 1, -1, -1):     # right→left cascade (same pass, fills the other side)
+            if resolved[s]:
+                continue
+            nb = s + 1 if (s + 1 < n and resolved[s + 1]) else (s - 1 if (s - 1 >= 0 and resolved[s - 1]) else -1)
+            if nb >= 0:
+                surface[s] = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), surface[nb], march_win, p)
+                resolved[s] = True; made += 1
+        remaining = n - int(resolved.sum())
+        if progress:
+            progress(min(1.0, (n - remaining) / max(1, n)))
+        if made == 0:
+            break
+    # any still-unresolved (disconnected — shouldn't happen with ≥1 anchor) → unrestricted auto
+    for s in range(n):
+        if not resolved[s]:
+            surface[s] = _merged_side_edge(np.ascontiguousarray(sag[s]).astype(np.float32), p)
+    return surface
 
 
 def _interp_bad_displacement(disp: np.ndarray, bad_cols, good_cols) -> np.ndarray:
@@ -597,7 +726,8 @@ def _map_slices(worker, items, progress, lo, hi, workers):
 
 def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
                   workers: int | None = None, return_metric: bool = False,
-                  detect_volume: np.ndarray | None = None):
+                  detect_volume: np.ndarray | None = None,
+                  provided_edges: np.ndarray | None = None):
     """Apply the corneal-edge + column correction with 3D active correction to a
     (frames, H, W) volume; returns the corrected volume (same shape/dtype).
 
@@ -620,7 +750,12 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     copy, so re-detection on a warped input isn't fooled by the warp's zero padding) while the warp is
     applied to `volume` itself — so the OUTPUT never contains the filled (fake-tissue) pixels, only the
     real data + honest zero padding. The cornea sits at the same row in both (filling only touches
-    padding), so the detected displacement aligns `volume`'s cornea correctly."""
+    padding), so the detected displacement aligns `volume`'s cornea correctly.
+
+    provided_edges (n_slices=lateral, n_frames): if given, USE these per-slice surface rows AS the detected
+    edge instead of detecting — and SKIP the 3D-active snap + inter-slice smoothing. This is the fix-columns
+    marched re-detection (redetect_surface) result: the warp then flattens EXACTLY to fit(provided_edges),
+    which is the same edge+fit the scrub preview drew → preview == result by construction."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     sag = reformat_to_sagittal(volume)             # the volume to WARP (real data, never filled)
     det = reformat_to_sagittal(detect_volume) if detect_volume is not None else sag  # detect on this
@@ -630,15 +765,26 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     if workers is None:
         workers = max(1, min(16, (os.cpu_count() or 2) - 2))
 
-    # 1) per-slice corrected boundary (the expensive bilateral+edge+RANSAC) — parallel. Detected on
-    #    `det` (the filled copy when iterating) so the warp's black padding can't fool the detector.
-    edges = np.array(_map_slices(_edge_worker, [(det[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
+    use_provided = provided_edges is not None
+    if use_provided:
+        # the marched re-detected surface IS the edge; flatten directly to its fit (no snap/smooth) so the
+        # warp matches the previewed border exactly.
+        edges = np.asarray(provided_edges, dtype=np.float32)
+        if edges.shape != (n, sag.shape[2]):
+            raise ValueError(f"provided_edges shape {edges.shape} != expected {(n, sag.shape[2])}")
+        if progress:
+            progress(0.5)
+    else:
+        # 1) per-slice corrected boundary (the expensive bilateral+edge+RANSAC) — parallel. Detected on
+        #    `det` (the filled copy when iterating) so the warp's black padding can't fool the detector.
+        edges = np.array(_map_slices(_edge_worker, [(det[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
 
     # 2) 3D active correction — faithful to DICOMSmootherSteps.process_slice_with_3d_active: snap
     #    each slice's edge toward the median of ITSELF + its available neighbours (boundaries
-    #    included), where the deviation exceeds the threshold.
+    #    included), where the deviation exceeds the threshold. SKIPPED for provided_edges (the marched
+    #    surface is already the desired boundary; snapping would pull it off the user's correction).
     active = edges.copy()
-    for i in range(n):
+    for i in (range(n) if not use_provided else range(0)):
         stack = [edges[i]]
         if i > 0:
             stack.append(edges[i - 1])
@@ -652,9 +798,12 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     #    over-correction guard (#2): a runaway shift (garbage low-signal edge) is interpolated from good
     #    neighbours + clamped, so it can't bend the edge or compound across passes.
     res = float(p["residual_threshold"])
-    max_disp = float(p.get("max_displacement", 0.0) or 0.0)
-    bad_cols = [int(c) for c in (p.get("force_columns") or [])]
-    good_cols = [int(c) for c in (p.get("good_columns") or [])]
+    # provided_edges (marched re-detect): flatten EXACTLY to fit(surface) — no force/good columns and no
+    # over-correction guard, so the warp equals what the preview drew (the real cornea ≈ its own quadratic,
+    # so disp stays small anyway).
+    max_disp = 0.0 if use_provided else float(p.get("max_displacement", 0.0) or 0.0)
+    bad_cols = [] if use_provided else [int(c) for c in (p.get("force_columns") or [])]
+    good_cols = [] if use_provided else [int(c) for c in (p.get("good_columns") or [])]
     items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols, max_disp) for i in range(n)]
     disp_field = np.array(_map_slices(_disp_worker, items, progress, 0.5, 0.9, workers))  # (n_slices, n_frames)
     # The per-pass metric is the mean per-column deviation of the boundary from its quadratic fit (the
@@ -665,7 +814,7 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     # 3b) axial consistency (#3): smooth the displacement FIELD across the slice (lateral) axis so
     #     neighbouring sagittal slices shift consistently → a smoother en-face/axial boundary. The
     #     depth/frame axis is untouched (the per-slice quadratic governs it); sigma=0 → per-slice field.
-    ism = float(p.get("interslice_smooth", 0.0) or 0.0)
+    ism = 0.0 if use_provided else float(p.get("interslice_smooth", 0.0) or 0.0)
     if ism > 0 and n > 2:
         disp_field = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=ism, axis=0)
 
@@ -934,7 +1083,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             progress=None, companion_txt: str | Path | None = None,
                             max_iterations: int = 1, min_improvement: float = 0.15,
                             abs_floor: float = 0.3, iter_dir: str | Path | None = None,
-                            inject_pass: int | None = None, inject_force=None, inject_good=None) -> dict:
+                            inject_pass: int | None = None, inject_force=None, inject_good=None,
+                            provided_edges: np.ndarray | None = None) -> dict:
     """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry.
 
     max_iterations<=1 → single pass. max_iterations>1 → iterative refinement (iterate_smooth_volume),
@@ -949,6 +1099,20 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
+    if provided_edges is not None:
+        # fix-columns marched re-detection: a SINGLE warp that flattens to the user-validated surface,
+        # NO iteration and NO axial-refine (both re-detect with no prior and could deviate from the
+        # previewed surface) — so the corrected volume matches the scrub preview exactly.
+        corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges)
+        info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "redetect"}
+        p_all = {**DEFAULT_PARAMS, **(params or {})}
+        ms = p_all.get("manual_shifts")
+        if ms:
+            corrected, n_ms = apply_manual_shifts(corrected, ms)
+            info["manual_shifts"] = {"n_frames": int(n_ms)}
+        write_volume_nifti(corrected, out_nifti, sp)
+        info["out"] = str(out_nifti)
+        return info
     if max_iterations and int(max_iterations) > 1:
         chain, best_idx, info = iterate_smooth_volume(
             vol, params, max_iter=int(max_iterations),
@@ -1137,6 +1301,7 @@ if __name__ == "__main__":
     ap.add_argument("--inject-pass", type=int, default=0)     # apply the column fix at ONLY this pass (1-based; 0=none)
     ap.add_argument("--inject-force", default="[]")           # bad frame indices for the injected pass
     ap.add_argument("--inject-good", default="[]")            # good/anchor frame indices for the injected pass
+    ap.add_argument("--provided-edges", default="")           # .npz with 'surface' (lateral,frames): fix-columns marched re-detect
     a = ap.parse_args()
     _p = _json.loads(a.params)
     _comp = a.companion_txt or None
@@ -1162,12 +1327,15 @@ if __name__ == "__main__":
         _bc = border_curves(a.oct_path, params=_p, volume_index=a.volume_index, companion_txt=_comp, slice_index=_si)
         Path(a.out_nifti).write_text(_json.dumps(_bc))
     else:
+        _pe = None
+        if a.provided_edges:
+            _pe = np.load(a.provided_edges)["surface"]
         _info = preprocess_oct_to_nifti(
             a.oct_path, a.out_nifti, params=_p, volume_index=a.volume_index, companion_txt=_comp,
             max_iterations=a.max_iter, min_improvement=a.min_improvement, abs_floor=a.abs_floor,
             iter_dir=(a.iter_dir or None),
             inject_pass=(a.inject_pass or None), inject_force=_json.loads(a.inject_force or "[]"),
-            inject_good=_json.loads(a.inject_good or "[]"))
+            inject_good=_json.loads(a.inject_good or "[]"), provided_edges=_pe)
         # Single machine-readable line the sidecar parses for the per-pass convergence report.
         print("ITER " + _json.dumps(_info))
     print("OK " + str(a.out_nifti))

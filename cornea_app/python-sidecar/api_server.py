@@ -1240,6 +1240,11 @@ class OctPreprocessRequest(BaseModel):
     slice_index: int | None = None           # steps viewer: which sagittal slice to render the border+fit on
     border_pass: int | None = None            # border-curve: which pass to fix — detect on its INPUT (raw for
                                               # pass 1, the prior pass's output for pass>1), never the result
+    border_anchors: dict | None = None        # fix-columns "Confirm": {str(slice_index): {str(frame): true_depth}}
+                                              # corrected ABSOLUTE surface depths (depth 0 = TOP). The server MARCHES
+                                              # a tilt-aware re-detection of the whole RAW volume seeded by these.
+    use_redetect: bool | None = None          # oct-preprocess: flatten to the confirmed re-detected surface
+                                              # (provided_edges) instead of auto-detecting — the fix-columns "Run".
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -1542,6 +1547,29 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             except (TypeError, ValueError, OverflowError):
                 continue
         eff_params["manual_shifts"] = clean
+    # Fix-columns "Run" (use_redetect): flatten the volume to the CONFIRMED tilt-aware re-detected surface
+    # (the cached marched result) instead of auto-detecting — the same surface the scrub preview drew, so
+    # preview == result. A SINGLE warp pass (no iteration / no axial-refine, see preprocess_oct_to_nifti).
+    redetect_npz: Path | None = None
+    if req.use_redetect:
+        anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
+        if not anchors:
+            raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
+        # ensure a FRESH cache for the persisted anchors (recompute if missing/stale), then feed it to the worker
+        if _redetect_surface_fresh(case_id, anchors) is None:
+            _compute_redetect_cache(case_id, m, anchors)
+        redetect_npz = _redetect_cache_path(case_id)
+        eff_params["border_anchors"] = anchors        # keep them persisted on the case
+        # the re-detect warp flattens to EXACTLY the previewed surface — legacy per-frame manual_shifts (which
+        # the scrub preview does NOT show) would break preview==result, so they're superseded here.
+        eff_params.pop("manual_shifts", None)
+    else:
+        # a NORMAL auto preprocess SUPERSEDES any prior manual re-detection: drop the persisted anchors +
+        # the cached surface so a later fix-columns scrub/Run can't show/apply a stale re-detected border.
+        eff_params.pop("border_anchors", None)
+        eff_params.pop("detect_lo", None); eff_params.pop("detect_hi", None)   # legacy band keys, if any
+        import shutil as _sh0
+        _sh0.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)
     cls = req.classification or m.get("scar_classification")
     sr = req.scar_range or m.get("scar_range")
     # Iterative refinement: auto-converge by default (cap 8). Persisted as oct_max_iterations so a
@@ -1549,12 +1577,16 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # fit; the worker auto-stops when the correction stops shrinking (see iterate_smooth_volume).
     max_it = req.max_iterations if req.max_iterations is not None else int(m.get("oct_max_iterations", 5))
     max_it = max(1, min(8, int(max_it)))
+    if redetect_npz is not None:
+        max_it = 1                                  # the re-detect warp is a single, deliberate pass
     import shutil as _sh
     iter_dir = orch.case_root(case_id) / "input" / "_iter"
     _sh.rmtree(iter_dir, ignore_errors=True)        # clear stale intermediate pass NIfTIs
     _clear_iter_preview_groups(case_id)             # clear stale per-pass preview groups
     extra = ["--max-iter", str(max_it), "--iter-dir", str(iter_dir)]
-    if inject_pass is not None:
+    if redetect_npz is not None:
+        extra += ["--provided-edges", str(redetect_npz)]   # flatten to the confirmed re-detected surface
+    elif inject_pass is not None:
         extra += ["--inject-pass", str(int(inject_pass)),
                   "--inject-force", json.dumps(_int_list(req.force_columns)),
                   "--inject-good", json.dumps(_int_list(req.good_columns))]
@@ -1643,7 +1675,9 @@ def keep_raw_case(case_id: str) -> dict:
     # Raw means NO warps: strip persisted column / manual-shift corrections so neither this conversion
     # nor a later re-preprocess re-applies them on top of the (intentionally raw) volume.
     eff_params = {k: v for k, v in (m.get("oct_params") or {}).items()
-                  if k not in ("force_columns", "good_columns", "manual_shifts", "manual_columns", "coronal_check")}
+                  if k not in ("force_columns", "good_columns", "manual_shifts", "manual_columns", "coronal_check",
+                               "detect_lo", "detect_hi", "border_anchors")}
+    _sh.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)   # raw = no re-detected surface
     # Convert the ORIGINAL .OCT to NIfTI with NO correction → the working volume.
     oct_mod.raw_oct_to_nifti(src, work, volume_index=vi, params=eff_params, companion_txt=m.get("companion_txt"))
     # The working volume changed → drop segmentation, per-pass previews/NIfTIs, corrected label, QA + metrics.
@@ -1873,7 +1907,15 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         idx = n // 2 if req.slice_index is None else max(0, min(n - 1, int(req.slice_index)))
         sl = np.ascontiguousarray(arr[idx]).astype(np.float32)     # (depth, frames)
         p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {}), **(req.params or {})}
-        edge = oct_mod._merged_side_edge(sl, p)
+        # If the user has CONFIRMED a fix-columns re-detection (pass 1 / raw), show that cached tilt-aware
+        # surface as the border instead of the live auto detection — so scrubbing reveals the new detected
+        # border the warp will use (preview == result). Falls back to live auto if no/stale cache.
+        anc = (m.get("oct_params") or {}).get("border_anchors") or {}
+        surf = _redetect_surface_fresh(case_id, anc) if (pass_n <= 1 and anc) else None
+        if surf is not None and 0 <= idx < surf.shape[0] and surf.shape[1] == sl.shape[1]:
+            edge = np.asarray(surf[idx], dtype=np.float32)
+        else:
+            edge = oct_mod._merged_side_edge(sl, p)
         fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
         return {"slices": n, "index": int(idx), "n_frames": int(sl.shape[1]), "depth_vox": int(sl.shape[0]),
                 "pass": pass_n, "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
@@ -1881,6 +1923,99 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT border curve failed: {exc}")
+
+
+def _border_anchors_sig(anchors: dict) -> str:
+    """Canonical signature of the anchor set (for cache freshness)."""
+    if not isinstance(anchors, dict):
+        return ""
+    parts = []
+    for s in sorted(anchors.keys(), key=lambda x: int(x)):
+        fr = anchors[s]
+        if not isinstance(fr, dict):
+            continue
+        inner = ",".join(f"{int(f)}={int(round(float(fr[f])))}"
+                         for f in sorted(fr.keys(), key=lambda x: int(x)))
+        if inner:
+            parts.append(f"{int(s)}:{inner}")
+    return ";".join(parts)
+
+
+def _redetect_cache_path(case_id: str) -> Path:
+    # NOT under passes/ or input/_iter (both rmtree'd on every preprocess) — its own dir, keyed to the RAW.
+    return orch.case_root(case_id) / "border_cache" / "redetect.npz"
+
+
+def _redetect_surface_fresh(case_id: str, anchors: dict):
+    """The cached tilt-aware re-detected surface (lateral, frames) iff it is FRESH for `anchors` + the
+    current raw-border volume; else None."""
+    import os
+    import numpy as np
+    cp = _redetect_cache_path(case_id)
+    if not cp.exists():
+        return None
+    try:
+        raw = _ensure_raw_border_nifti(case_id)
+        z = np.load(cp, allow_pickle=False)
+        if str(z["anchors_sig"]) != _border_anchors_sig(anchors):
+            return None
+        if abs(float(z["raw_mtime"]) - float(os.path.getmtime(raw))) > 1e-6:
+            return None
+        return np.asarray(z["surface"], dtype=np.float32)
+    except Exception:  # noqa: BLE001 — a corrupt/old cache just forces a recompute
+        return None
+
+
+def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
+    """MARCH the tilt-aware re-detection on the RAW volume seeded by `anchors`, cache it (+ anchors sig +
+    raw mtime), and return the surface (lateral, frames). Shared by Confirm and Run so both use the SAME
+    surface (preview == result). The RAW sagittal arr == reformat_to_sagittal(.OCT read) (SITK↔nibabel
+    axis reversal), so this surface aligns with the warp's sagittal volume."""
+    import os
+    import numpy as np
+    raw = _ensure_raw_border_nifti(case_id)
+    arr = _load_border_vol(raw)                              # (lateral, depth, frames)
+    p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+    surface = oct_mod.redetect_surface(arr, anchors, p)      # (lateral, frames)
+    cp = _redetect_cache_path(case_id)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    # tmp MUST end in .npz — np.savez_compressed appends '.npz' to any path that doesn't, which would make
+    # os.replace move a nonexistent file. Write tmp then atomically replace so a crash can't leave a partial.
+    tmp = cp.with_name("redetect.tmp.npz")
+    np.savez_compressed(tmp, surface=surface.astype(np.float32),
+                        anchors_sig=_border_anchors_sig(anchors),
+                        raw_mtime=float(os.path.getmtime(raw)))
+    os.replace(tmp, cp)
+    return surface
+
+
+@app.post("/api/case/{case_id}/oct-border-redetect")
+def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Fix-columns "Confirm": MARCH a tilt-aware re-detection of the corneal surface across the WHOLE raw
+    volume, seeded by the user's accumulated anchors (true surface points). The surface is cached per-case
+    and the anchors persisted in oct_params, so the scrub preview (oct-border-curve) shows the NEW detected
+    border on every slice and a later Run flattens the volume to exactly that surface (preview == result).
+    Empty anchors clear it (revert to auto)."""
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    anchors = req.border_anchors if isinstance(req.border_anchors, dict) else {}
+    try:
+        op = dict(m.get("oct_params") or {})
+        op.pop("detect_lo", None); op.pop("detect_hi", None)   # legacy global band — removed
+        op["border_anchors"] = anchors
+        orch.write_manifest_value(case_id, {"oct_params": op})
+        if anchors:
+            _compute_redetect_cache(case_id, {**m, "oct_params": op}, anchors)
+            n_anchors = sum(len(v) for v in anchors.values() if isinstance(v, dict))
+        else:
+            _redetect_cache_path(case_id).unlink(missing_ok=True)   # cleared → auto on scrub + run
+            n_anchors = 0
+        return {"ok": True, "n_anchors": int(n_anchors)}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT border re-detect failed: {exc}")
 
 
 class OctLoadDirRequest(BaseModel):

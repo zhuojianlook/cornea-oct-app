@@ -62,6 +62,25 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     } catch { /* none */ }
     return m;
   }, [persistedSig]);
+  // Fix-columns "Confirm" anchors: the user drags the red detected border onto the TRUE corneal surface →
+  // an ABSOLUTE depth anchor per (slice, frame). They ACCUMULATE across slices. Confirm sends them to the
+  // backend, which infers ONE GLOBAL detection band and re-detects the whole volume; scrubbing then shows
+  // the new detected border. Persisted in oct_params.border_anchors so they survive reopen + drive the warp.
+  const persistedAnchorsSig = JSON.stringify(
+    ((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.border_anchors ?? {});
+  const persistedAnchors = useMemo(() => {
+    const m = new Map<number, Map<number, number>>();
+    try {
+      for (const [s, frames] of Object.entries(JSON.parse(persistedAnchorsSig) as Record<string, Record<string, number>>)) {
+        const si = Number(s); if (!Number.isFinite(si) || !frames) continue;
+        const fm = new Map<number, number>();
+        for (const [f, d] of Object.entries(frames)) { const fi = Number(f), di = Number(d); if (Number.isFinite(fi) && Number.isFinite(di)) fm.set(fi, Math.round(di)); }
+        if (fm.size) m.set(si, fm);
+      }
+    } catch { /* none */ }
+    return m;
+  }, [persistedAnchorsSig]);
   // Re-fetch when the segmentation changes (SAM2/correct/scar re-render previews).
   const segSig = useWorkflowStore((s) => s.segVersion);
   const hintMode = useWorkflowStore((s) => s.hintMode);
@@ -134,6 +153,22 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const [borderFit, setBorderFit] = useState<number[] | null>(null);
   const [borderBusy, setBorderBusy] = useState(false);
   const borderDragRef = useRef(false);
+  // Editable anchor set (seeded from persisted; drag adds; Confirm persists). sliceIdx → frame → depth.
+  const [borderAnchors, setBorderAnchors] = useState<Map<number, Map<number, number>>>(new Map());
+  const [redetectBusy, setRedetectBusy] = useState(false);
+  const cloneAnchors = (m: Map<number, Map<number, number>>) => { const o = new Map<number, Map<number, number>>(); m.forEach((fm, s) => o.set(s, new Map(fm))); return o; };
+  const anchorsToApi = (m: Map<number, Map<number, number>>) => {
+    const o: Record<string, Record<string, number>> = {};
+    m.forEach((fm, s) => { if (fm.size) { const inner: Record<string, number> = {}; fm.forEach((d, f) => { inner[String(f)] = Math.round(d); }); o[String(s)] = inner; } });
+    return o;
+  };
+  const anchorsSig = (m: Map<number, Map<number, number>>) => [...m.keys()].sort((a, b) => a - b)
+    .map((s) => { const fm = m.get(s)!; return fm.size ? s + ":" + [...fm.keys()].sort((a, b) => a - b).map((f) => f + "=" + Math.round(fm.get(f)!)).join(",") : ""; })
+    .filter(Boolean).join(";");
+  // Re-seed editable anchors from the persisted set whenever it changes (case load / after Confirm).
+  useEffect(() => { setBorderAnchors(cloneAnchors(persistedAnchors)); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [persistedAnchorsSig]);
+  const anchorsDirty = anchorsSig(borderAnchors) !== anchorsSig(persistedAnchors);
+  const anchorCount = useMemo(() => { let n = 0; borderAnchors.forEach((fm) => { n += fm.size; }); return n; }, [borderAnchors]);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -151,7 +186,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fixCols, passCount]);
   useEffect(() => {
-    if (fixCols && orientProp) { setOrient(orientProp); }
+    // Fix-columns anchors are keyed by the SAGITTAL slice index (the backend re-detects on sagittal
+    // slices arr[idx]); dragging in another orientation would write mis-indexed anchors. So the border
+    // editor is sagittal-only — force it regardless of the incoming 2-D orientation.
+    if (fixCols) { setOrient("sagittal"); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fixCols, orientProp]);
 
@@ -301,7 +339,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // Which pass to fix → its INPUT is what we detect + draw the border on (pass 1 = the RAW original; pass k
   // = pass k-1's output). Editing the detection on the INPUT improves that pass's result — editing the
   // border on the downstream/corrected result is meaningless.
-  const borderPass = passCount > 1 ? (fixPass ?? 1) : 1;
+  // The anchor re-detect always operates on the RAW volume (pass 1): the marched surface is built on raw
+  // and a single warp flattens raw to it. (The "fix at pass" selector is for the legacy column path only.)
+  const borderPass = fixCols ? 1 : (passCount > 1 ? (fixPass ?? 1) : 1);
   const passInputLabel = borderPass <= 1 ? "original (raw)" : `pass ${borderPass - 1} output`;
   // The input IMAGE the border is drawn over: raw (pass 1) or the prior pass's preview (pass > 1).
   const [passInputImg, setPassInputImg] = useState<string | null>(null);
@@ -334,19 +374,27 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     return () => { cancelled = true; };
   }, [fixCols, caseId, borderSliceIdx, borderPass, segSig]);
 
-  // Drag the detected border (red) to where the TRUE surface is on the INPUT → that frame's correction
-  // (manual_shifts) so its result flattens correctly. Red follows the cursor (WYSIWYG); edited frames turn
-  // PINK. Sign: the warp flattens the DETECTED edge, so a true surface at depth d needs a final shift of
-  // (edge − d) to land flat → manual_shifts[f] = edge[f] − d.
+  // Drag the detected border (red) onto where the TRUE surface is → an ABSOLUTE depth ANCHOR for that
+  // (slice, frame). Red follows the cursor (WYSIWYG); anchored frames turn PINK. Anchors accumulate across
+  // slices; Confirm infers ONE global detection band from them and re-detects the whole volume. Dragging a
+  // frame back to its detected depth removes its anchor. (NOT a manual_shift — anchors steer DETECTION.)
   const applyBorderDrag = (clientX: number, clientY: number, svg: SVGSVGElement) => {
-    if (!borderEdge || nFrames <= 1 || depthVox <= 1) return;
+    // sagittal-only: anchors are keyed by the sagittal slice index (see the fix-columns orient effect)
+    if (orient !== "sagittal" || !borderEdge || nFrames <= 1 || depthVox <= 1 || borderSliceIdx == null) return;
     const r = svg.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
     const frame = Math.round(((clientX - r.left) / r.width) * nFrames - 0.5);
     if (frame < 0 || frame >= nFrames || frame >= borderEdge.length) return;
-    const depth = Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox));
-    const shift = Math.round(borderEdge[frame] - depth);
-    setManualShifts((prev) => { const mm = new Map(prev); if (shift === 0) mm.delete(frame); else mm.set(frame, shift); return mm; });
+    const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
+    const s = borderSliceIdx;
+    setBorderAnchors((prev) => {
+      const mm = cloneAnchors(prev);
+      const fm = mm.get(s) ?? new Map<number, number>();
+      // dragging onto the detected edge (±0.5) clears the anchor; otherwise set the absolute true depth
+      if (Math.abs(depth - borderEdge[frame]) < 1) fm.delete(frame); else fm.set(frame, depth);
+      if (fm.size) mm.set(s, fm); else mm.delete(s);
+      return mm;
+    });
   };
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
@@ -428,24 +476,47 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     });
   };
 
+  // Fix-columns "Confirm": send the accumulated anchors → the backend MARCHES a tilt-aware re-detection of
+  // the whole raw volume, caches the surface + persists the anchors, then we refetch the case + bump
+  // segVersion so the border-curve fetch re-pulls the RE-DETECTED surface for the current slice. Scrubbing
+  // then shows the new detection everywhere; Run flattens to the SAME surface, so preview == result.
+  // Confirm with no anchors clears it (revert to auto).
+  const confirmRedetect = async () => {
+    if (!caseId) return;
+    setRedetectBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-border-redetect`, "POST",
+        JSON.stringify({ border_pass: borderPass, border_anchors: anchorsToApi(borderAnchors) }));
+      await openCase();                       // refresh oct_params (persisted anchors → enables Run)
+      wfSet("segVersion", segSig + 1);        // re-pull the re-detected border (this slice + on scrub)
+    } catch {
+      /* surfaced via the spinner stopping; the volume is unchanged on failure */
+    } finally {
+      setRedetectBusy(false);
+    }
+  };
   const rerunColumns = async () => {
     // A marked frame the user has NUDGED (in manualShifts) is manually positioned (manual_shifts, applied
     // last) — it must NOT also be auto-interpolated, or the nudge would be relative to a re-interpolated
     // base instead of what the user saw. So force_columns = marked frames WITHOUT a manual nudge.
     const forced = [...badCols].filter((f) => !manualShifts.has(f));
     const hasForced = forced.length > 0;
-    if (!caseId || (!hasForced && !shiftsDirty)) return;
+    if (!caseId) return;
+    // fix-columns: Run flattens the volume to the CONFIRMED re-detected surface (use_redetect) — the cached
+    // marched surface the scrub preview drew, so preview == result. The button is only enabled when the case
+    // has persisted anchors with no un-confirmed drags. Non-fix-columns keeps the legacy "needs a change" guard.
+    if (!fixCols && !hasForced && !shiftsDirty) return;
     setRerunBusy(true);
     try {
-      // Iterative scan (passCount>1): inject the column fix at the chosen pass ONLY and let the iteration
-      // re-converge from there. Single-pass scan: the legacy targeted re-run (one pass). No forced columns
-      // (nudges only): keep the persisted pipeline so the nudge lands relative to the result the user saw,
-      // and clear any stale forced columns.
-      const body: Record<string, unknown> = (passCount > 1 && fixPass && hasForced)
-        ? { inject_pass: fixPass, force_columns: forced, good_columns: [] }
-        : hasForced
-          ? { force_columns: forced, good_columns: [], max_iterations: 1 }
-          : { force_columns: [], good_columns: [] };
+      // fix-columns Run → apply the confirmed re-detected surface (single warp). Otherwise the legacy paths:
+      // iterative scan injects the column fix at the chosen pass; single-pass scan does the targeted re-run.
+      const body: Record<string, unknown> = fixCols
+        ? { use_redetect: true }
+        : (passCount > 1 && fixPass && hasForced)
+          ? { inject_pass: fixPass, force_columns: forced, good_columns: [] }
+          : hasForced
+            ? { force_columns: forced, good_columns: [], max_iterations: 1 }
+            : { force_columns: [], good_columns: [] };
       // ONLY touch manual_shifts when the user actually changed a nudge this session (shiftsDirty).
       // Omitting it makes the backend KEEP the persisted set, so a plain mark-only re-run can never
       // erase prior nudges (the data-loss the review caught). When dirty we send the COMPLETE absolute
@@ -683,7 +754,18 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // (red, draggable) + RANSAC best-fit (blue) over it. Drag a frame's red point to the true surface → that
   // frame's manual_shifts; edited segments turn PINK. viewBox (n_frames × depth_vox) is stretched to the
   // image (depth 0 = top), so points map x=frame, y=depth.
-  const edgeY = (f: number): number => (borderEdge ? borderEdge[f] - (manualShifts.get(f) ?? 0) : 0);
+  // The red border's y for frame f on the CURRENT slice: an UN-confirmed anchor follows the cursor (its
+  // absolute depth); a confirmed/un-anchored frame shows the DETECTED edge (which, after Confirm, is the
+  // band-re-detected surface). So before Confirm the user sees their drag; after Confirm they see the new
+  // detection passing through it.
+  const curAnchors = borderSliceIdx != null ? borderAnchors.get(borderSliceIdx) : undefined;
+  const persistedCur = borderSliceIdx != null ? persistedAnchors.get(borderSliceIdx) : undefined;
+  const edgeY = (f: number): number => {
+    const a = curAnchors?.get(f);
+    if (a != null && a !== (persistedCur?.get(f) ?? null)) return a;   // un-confirmed drag → WYSIWYG
+    return borderEdge ? borderEdge[f] : 0;                              // detected / band-re-detected
+  };
+  const anchoredFrames = useMemo(() => new Set(curAnchors ? curAnchors.keys() : []), [curAnchors]);
   const borderPanel = (inputSrc && borderEdge && borderFit && nFrames > 1 && depthVox > 1) ? (
     <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
       <img src={inputSrc} alt="pass input" draggable={false}
@@ -695,8 +777,8 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           points={borderFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
         <polyline fill="none" stroke="#ff4d4d" strokeWidth={1.8} vectorEffect="non-scaling-stroke"
           points={borderEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
-        {/* edited frames → pink (over the red) */}
-        {colRuns(pendingFrames).map(([a, b], i) => a === b
+        {/* anchored frames on this slice → pink (over the red) */}
+        {colRuns(anchoredFrames).map(([a, b], i) => a === b
           ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(1, depthVox / 140)} fill="#ff5db0" stroke="none" />
           : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={2.6} vectorEffect="non-scaling-stroke"
               points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
@@ -778,8 +860,8 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           <>
             {fixCols ? (
               <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-                {borderBusy ? "Detecting border…" : (
-                  <>Drag the <b style={{ color: "#ff4d4d" }}>red border</b> onto the true surface (<b style={{ color: "#5db0ff" }}>blue</b> = best fit), then <b>Re-run</b>{pendingFrames.size ? ` · ${pendingFrames.size} frame(s) adjusted` : ""}.</>
+                {borderBusy || redetectBusy ? (redetectBusy ? "Re-detecting the whole volume…" : "Detecting border…") : (
+                  <>Drag the <b style={{ color: "#ff4d4d" }}>red border</b> onto the true surface, then <b>Confirm</b> to re-detect the whole volume; scrub to check, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>
                 )}
               </span>
             ) : (
@@ -798,7 +880,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                 })()}
               </>
             )}
-            {passCount > 1 && (
+            {passCount > 1 && !fixCols && (
               <span className="flex items-center gap-1" title="Apply this fix at ONLY this iteration pass, then re-converge the later passes from it. Earlier passes are unchanged.">
                 <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>fix at pass</span>
                 <Select size="small" variant="standard" value={fixPass ?? passCount}
@@ -810,21 +892,52 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                 </Select>
               </span>
             )}
-            {(badCols.size > 0 || shiftsDirty) && (
-              <button onClick={() => { setBadCols(new Set()); setManualShifts(new Map(persistedShifts)); }} disabled={rerunBusy}
-                style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
-                Clear
-              </button>
-            )}
-            {(() => {
-              const ready = badCols.size > 0 || shiftsDirty;
-              return (
-                <button onClick={rerunColumns} disabled={rerunBusy || !ready}
-                  style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !ready ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !ready ? 0.6 : 1 }}>
-                  {rerunBusy ? "Re-running…" : (passCount > 1 && fixPass && badCols.size > 0 ? `Re-run (fix at pass ${fixPass})` : "Re-run preprocessing")}
+            {fixCols ? (
+              <>
+                {(anchorCount > 0 || anchorsDirty) && (
+                  <button onClick={() => setBorderAnchors(new Map())} disabled={redetectBusy || rerunBusy}
+                    style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                    Clear
+                  </button>
+                )}
+                <button onClick={confirmRedetect} disabled={redetectBusy || rerunBusy || !anchorsDirty}
+                  title="Re-detect the corneal border across the WHOLE volume from your anchors — then scrub to verify"
+                  style={{ background: anchorsDirty ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (redetectBusy || rerunBusy || !anchorsDirty) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (redetectBusy || rerunBusy || !anchorsDirty) ? 0.6 : 1 }}>
+                  {redetectBusy ? "Re-detecting…" : "Confirm border"}
                 </button>
-              );
-            })()}
+                {(() => {
+                  // ready ONLY when the case has confirmed anchors PERSISTED (== what the backend has cached
+                  // to apply) and there are no un-confirmed drags. This both fixes the reopen deadlock and
+                  // prevents enabling Run after a Clear+Confirm revert-to-auto (empty anchors → backend 400).
+                  const ready = !anchorsDirty && persistedAnchors.size > 0;
+                  return (
+                    <button onClick={rerunColumns} disabled={rerunBusy || redetectBusy || !ready}
+                      title={anchorsDirty ? "Confirm your changes first, then scrub to verify" : "Run preprocessing with the re-detected border — only when you're satisfied"}
+                      style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || redetectBusy || !ready) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || redetectBusy || !ready) ? 0.6 : 1 }}>
+                      {rerunBusy ? "Running…" : "Run preprocessing"}
+                    </button>
+                  );
+                })()}
+              </>
+            ) : (
+              <>
+                {(badCols.size > 0 || shiftsDirty) && (
+                  <button onClick={() => { setBadCols(new Set()); setManualShifts(new Map(persistedShifts)); }} disabled={rerunBusy}
+                    style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                    Clear
+                  </button>
+                )}
+                {(() => {
+                  const ready = badCols.size > 0 || shiftsDirty;
+                  return (
+                    <button onClick={rerunColumns} disabled={rerunBusy || !ready}
+                      style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !ready ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !ready ? 0.6 : 1 }}>
+                      {rerunBusy ? "Re-running…" : (passCount > 1 && fixPass && badCols.size > 0 ? `Re-run (fix at pass ${fixPass})` : "Re-run preprocessing")}
+                    </button>
+                  );
+                })()}
+              </>
+            )}
           </>
         )}
 
