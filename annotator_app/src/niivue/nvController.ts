@@ -526,6 +526,8 @@ let seedBmp: Uint8Array | null = null;
 let committedBmp: Uint8Array | null = null;
 let previewBmp: Uint8Array | null = null;
 let previewing = false;
+let previewIsWand = false; // the current (unconfirmed) preview came from the WAND (vs smart fill) — so smart
+                          // fill SEEDS from it; gated by `previewing`, so it only matters while a preview is live.
 let rasIntensity: ArrayLike<number> | null = null; // RAS-ordered intensity (cached for wand + readout)
 let rasRange: [number, number] | null = null;      // cached [min,max] (so the cursor % readout is cheap)
 type Snap = { s: Uint8Array; c: Uint8Array };
@@ -640,10 +642,25 @@ function getGrowWorker(): Worker {
 }
 
 export async function smartFill(onProgress?: (pct: number) => void): Promise<{ ok: boolean; reason?: "no-volume" | "no-seeds" }> {
-  if (!nv || !nv.volumes.length || !seedBmp || !previewBmp) return { ok: false, reason: "no-volume" };
+  if (!nv || !nv.volumes.length || !seedBmp || !previewBmp || !committedBmp) return { ok: false, reason: "no-volume" };
+  // SEED from: the user's brushstrokes (seedBmp, incl. background seeds) + the confirmed annotation
+  // (committedBmp, which includes a CONFIRMED magic-wand region) + an unconfirmed WAND preview. This is
+  // what lets smart fill build on wand-created voxels. We do NOT seed from an unconfirmed SMART-FILL
+  // preview (that would compound on re-runs) — `previewIsWand` distinguishes the two.
+  const useWandPreview = previewing && previewIsWand;
+  const seedsForGrow = seedBmp.slice();
+  const cB = committedBmp, pB = previewBmp;
   let hasFg = false;
-  for (let i = 0; i < seedBmp.length; i++) { const s = seedBmp[i]; if (s === 1 || s === 2) { hasFg = true; break; } }
-  if (!hasFg) return { ok: false, reason: "no-seeds" }; // grow only from the user's brushstrokes (seeds)
+  for (let i = 0; i < seedsForGrow.length; i++) {
+    let s = seedsForGrow[i];
+    if (s === 0) {
+      if (cB[i] === 1 || cB[i] === 2) s = cB[i];                                  // confirmed (incl. wand)
+      else if (useWandPreview && (pB[i] === 1 || pB[i] === 2)) s = pB[i];         // unconfirmed wand region
+      seedsForGrow[i] = s;
+    }
+    if (s === 1 || s === 2) hasFg = true;
+  }
+  if (!hasFg) return { ok: false, reason: "no-seeds" }; // need at least one cornea/scar seed somewhere
 
   // intensity in RAS order (matches drawBitmap), quantised to 8-bit over the display window
   const vol = nv.volumes[0] as unknown as {
@@ -656,7 +673,6 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
   const q = new Uint8Array(ras.length);
   for (let i = 0; i < ras.length; i++) { const t = (ras[i] - lo) * scale; q[i] = t <= 0 ? 0 : t >= 255 ? 255 : t | 0; }
   const dr = nv.volumes[0].dimsRAS as number[];
-  const seedsCopy = seedBmp.slice(); // ONLY the brushstrokes are sent to growcut (never the previous fill)
 
   const label = await new Promise<Uint8Array>((resolve, reject) => {
     const worker = getGrowWorker();
@@ -667,13 +683,14 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
     };
     worker.addEventListener("message", onMsg);
     worker.onerror = (e) => { worker.removeEventListener("message", onMsg); reject(new Error(e.message || "growcut worker failed")); };
-    worker.postMessage({ intensity: q, seeds: seedsCopy, nx: dr[1], ny: dr[2], nz: dr[3], spatial: 1 },
-                       [q.buffer, seedsCopy.buffer]);
+    worker.postMessage({ intensity: q, seeds: seedsForGrow, nx: dr[1], ny: dr[2], nz: dr[3], spatial: 1 },
+                       [q.buffer, seedsForGrow.buffer]);
   });
 
   pushUndo(); // so Undo can revert the fill (restores pre-fill state + clears the preview)
   for (let i = 0; i < previewBmp.length; i++) { const l = label[i]; previewBmp[i] = l === BG_SEED ? 0 : l; }
   previewing = true;
+  previewIsWand = false;  // this preview is a smart-fill result, not a wand region
   compose(); // show committed + preview; seeds stay on top
   return { ok: true };
 }
@@ -810,6 +827,7 @@ export function wandPreview(x: number, y: number, z: number, opts: WandOpts): { 
     }
   }
   previewing = true;
+  previewIsWand = true;   // a wand region → smart fill seeds from it (see smartFill)
   compose();
   return { ok: true, count };
 }
