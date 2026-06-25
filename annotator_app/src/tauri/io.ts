@@ -194,25 +194,60 @@ export async function downloadLabelmap(srcPath: string, suggestedName: string): 
   return dest;
 }
 
-/** Export EVERY saved labelmap (+ the manifest) to a chosen folder — for collecting the GT dataset. */
-export async function exportAllLabelmaps(outputDir: string, destDir: string): Promise<number> {
+const csvCell = (v: unknown) => { const s = String(v ?? ""); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+const csvOf = (cols: string[], rows: Record<string, unknown>[]) =>
+  [cols.join(",")].concat(rows.map(r => cols.map(c => csvCell(r[c])).join(","))).join("\n");
+// stable, non-reversible label for any stem missing a blind label in the manifest (never leaks the real name)
+const stemHash = (s: string) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); };
+const safeName = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "scan";
+
+/** Export EVERY saved labelmap to a chosen folder under BLINDED names — for collecting the GT dataset.
+ *  The on-disk folder name is the real stem (= cornea case id, which encodes scan identity), so a raw
+ *  copy would destroy blinding. We instead key each output folder by the annotator-facing blind label
+ *  (e.g. "Scan_B") from the manifest, and write a BLINDED manifest with no real stem/path. The labelmap
+ *  NIfTI bytes are copied unchanged, so they stay valid + geometry-matched for the main app's GT import.
+ *  When `includeMapping` (admin only) a `_deblind_mapping.csv` (blind_label → real stem/path) is written
+ *  so a researcher can pair each labelmap back to its case (open that case → upload → import). */
+export async function exportAllLabelmaps(outputDir: string, destDir: string, includeMapping = false): Promise<number> {
+  let rows: ManifestRow[] = [];
+  try { const jp = await join(outputDir, "manifest.json"); if (await exists(jp)) rows = JSON.parse(await readTextFile(jp)); } catch { rows = []; }
+  const stemToBlind = new Map<string, string>();
+  for (const r of rows) if (r.volume_stem && r.blind_label) stemToBlind.set(r.volume_stem, r.blind_label);
+  const blindOf = (stem: string) => safeName(stemToBlind.get(stem) ?? `Scan_${stemHash(stem)}`);
+
   let n = 0;
   for (const e of await readDir(outputDir)) {
-    if (e.isDirectory) {
-      const sub = await join(outputDir, e.name);
-      let made = false;
-      for (const f of await readDir(sub)) {
-        if (f.isFile && isNifti(f.name)) {
-          const dDir = await join(destDir, e.name);
-          if (!made) { if (!(await exists(dDir))) await mkdir(dDir, { recursive: true }); made = true; }
-          await writeFile(await join(dDir, f.name), await readFile(await join(sub, f.name)));
-          n++;
-        }
+    if (!e.isDirectory) continue; // skip the real-name manifest.* at the root — never copy it (it leaks names)
+    const sub = await join(outputDir, e.name);
+    const blind = blindOf(e.name);
+    let made = false;
+    for (const f of await readDir(sub)) {
+      if (f.isFile && isNifti(f.name)) {
+        const dDir = await join(destDir, blind);
+        if (!made) { if (!(await exists(dDir))) await mkdir(dDir, { recursive: true }); made = true; }
+        await writeFile(await join(dDir, f.name), await readFile(await join(sub, f.name)));
+        n++;
       }
-    } else if (e.isFile && /^manifest\.(json|csv)$/.test(e.name)) {
-      if (!(await exists(destDir))) await mkdir(destDir, { recursive: true });
-      await writeFile(await join(destDir, e.name), await readFile(await join(outputDir, e.name)));
     }
+  }
+  if (!(await exists(destDir))) await mkdir(destDir, { recursive: true });
+  // blinded manifest: drop volume_stem + volume_path (the only real-name fields); keep label + metrics
+  if (rows.length) {
+    const cols = ["blind_label", "username", "replicate", "session_id", "saved_at",
+                  "cornea_voxels", "scar_voxels", "scar_mm3", "spacing", "duration_s", "app_version"];
+    const blinded = rows.map(r => { const rr = r as unknown as Record<string, unknown>; const o: Record<string, unknown> = {}; for (const c of cols) o[c] = rr[c]; return o; });
+    await writeTextFile(await join(destDir, "manifest.json"), JSON.stringify(blinded, null, 2));
+    await writeTextFile(await join(destDir, "manifest.csv"), csvOf(cols, blinded));
+  }
+  // de-blind key (admin only) — kept OUT of a blinded distribution; lets a researcher re-pair to cases
+  if (includeMapping) {
+    const seen = new Set<string>();
+    const mrows: Record<string, unknown>[] = [];
+    for (const r of rows) if (r.volume_stem && !seen.has(r.volume_stem)) {
+      seen.add(r.volume_stem);
+      mrows.push({ blind_label: blindOf(r.volume_stem), volume_stem: r.volume_stem, volume_path: r.volume_path });
+    }
+    await writeTextFile(await join(destDir, "_deblind_mapping.csv"), csvOf(["blind_label", "volume_stem", "volume_path"], mrows));
   }
   return n;
 }

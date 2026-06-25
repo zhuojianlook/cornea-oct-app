@@ -6,7 +6,7 @@ import * as io from "../tauri/io";
 import { checkForUpdate, installAndRelaunch } from "../tauri/updater";
 
 export type Pen = 0 | 1 | 2 | 3; // 0 erase, 1 cornea, 2 scar, 3 background seed (Smart fill only)
-export const APP_VERSION = "0.1.37";
+export const APP_VERSION = "0.1.38";
 
 // #4: a BLINDED queue entry. The annotator sees only `name` ("Scan B · rep 1"); the real file is hidden
 // (`stem`/`path`) unless an admin unlocks. Each real scan yields `replicates` entries so the same user
@@ -611,14 +611,18 @@ export const useStore = create<State>((set, get) => ({
   },
 
   exportAllGt: async () => {
-    const { outputDir } = get();
+    const { outputDir, adminUnlocked } = get();
     if (!outputDir) { set({ status: "No saved ground truth yet (nothing to export)." }); return; }
     const dest = await io.pickFolder("Choose where to export all saved labelmaps");
     if (!dest) return;
     set({ busy: true, status: "Exporting all saved labelmaps…" });
     try {
-      const n = await io.exportAllLabelmaps(outputDir, dest);
-      set({ status: `Exported ${n} labelmap file(s) to ${dest.split(/[/\\]/).pop()}.` });
+      // blinded folder names always; the de-blind mapping (to re-pair with the main app) only for an admin
+      const n = await io.exportAllLabelmaps(outputDir, dest, adminUnlocked);
+      const where = dest.split(/[/\\]/).pop();
+      set({ status: adminUnlocked
+        ? `Exported ${n} labelmap file(s) (blinded names + _deblind_mapping.csv) to ${where}.`
+        : `Exported ${n} labelmap file(s) under blinded names to ${where}. (Unlock admin to also get the de-blind mapping.)` });
     } catch (e) {
       set({ status: `Export failed: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
