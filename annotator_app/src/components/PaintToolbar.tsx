@@ -22,6 +22,15 @@ const Dot = ({ color, sz = 10 }: { color: string; sz?: number }) => (
   <span style={{ width: sz, height: sz, borderRadius: "50%", background: color, marginRight: 6, display: "inline-block",
                  boxShadow: "0 0 0 1px rgba(0,0,0,0.35)" }} />
 );
+// A crisp open/closed PADLOCK (clearer than the 🔒/🔓 emoji): closed shackle = locked, open shackle =
+// unlocked. Inherits the button colour (currentColor) so a locked toggle reads red at a glance.
+const LockGlyph = ({ locked }: { locked: boolean }) => (
+  <svg width="13" height="15" viewBox="0 0 16 18" style={{ flex: "none", marginRight: 5 }} aria-hidden>
+    <path d={locked ? "M5 8.5V5.5a3 3 0 0 1 6 0V8.5" : "M5 8.5V5.5a3 3 0 0 1 5.6-1.6"}
+      stroke="currentColor" strokeWidth="1.7" fill="none" strokeLinecap="round" />
+    <rect x="3" y="8" width="10" height="8.5" rx="1.6" fill="currentColor" />
+  </svg>
+);
 
 const tbSx = { py: 0.4, px: 1.1, fontSize: 12, textTransform: "none" as const, lineHeight: 1.4 };
 
@@ -53,6 +62,31 @@ export function PaintToolbar() {
         <Tooltip title={tr(lang, "tb.wandTip")} arrow><ToggleButton value="wand" sx={tbSx}>✨ {tr(lang, "tb.wand")}</ToggleButton></Tooltip>
         <ToggleButton value="navigate" sx={tbSx}>✋ {tr(lang, "tb.navigate")}</ToggleButton>
       </ToggleButtonGroup>
+
+      <Sep />
+
+      {/* ── LOCK (protect a label from ANY edit) — beside TOOL ─────────────── */}
+      <Tooltip title={tr(lang, "tb.lockTip")} arrow>
+        <span className="flex items-center gap-1.5">
+          <Label>{tr(lang, "tb.lock")}</Label>
+          {([[1, "pen.cornea", "#1ab2ff"], [2, "pen.scar", "#ff453a"], [0, "pen.background", "#9aa0aa"]] as const).map(([v, key, color]) => {
+            const isLk = locked.includes(v);
+            return (
+              <ToggleButton key={v} size="small" value={v} selected={isLk} disabled={off}
+                onChange={() => toggleLock(v)}
+                sx={{ ...tbSx, px: 0.9, fontWeight: isLk ? 700 : 400,
+                      ...(isLk
+                        ? { color: "#ff453a", bgcolor: "rgba(255,69,58,0.16)", borderColor: "#ff453a",
+                            "&:hover": { bgcolor: "rgba(255,69,58,0.26)" }, "&.Mui-selected": { bgcolor: "rgba(255,69,58,0.16)", color: "#ff453a" } }
+                        : { color: "var(--c-text-dim)" }) }}>
+                <LockGlyph locked={isLk} />
+                <Dot color={color} sz={9} />
+                {tr(lang, key as TKey)}
+              </ToggleButton>
+            );
+          })}
+        </span>
+      </Tooltip>
 
       <Sep />
 
@@ -175,24 +209,6 @@ export function PaintToolbar() {
         </div>
       </Tooltip>
       <Button size="small" variant="outlined" color="inherit" disabled={off} onClick={() => resetWindow()} sx={tbSx}>{tr(lang, "tb.reset")}</Button>
-
-      <Sep />
-
-      {/* Label locks — protect a label from brush/erase/smart-fill/wand */}
-      <Tooltip title={tr(lang, "tb.lockTip")} arrow>
-        <span className="flex items-center gap-1.5">
-          <Label>{tr(lang, "tb.lock")}</Label>
-          {([[1, "pen.cornea", "#1ab2ff"], [2, "pen.scar", "#ff453a"], [0, "pen.background", "#9aa0aa"]] as const).map(([v, key, color]) => (
-            <ToggleButton key={v} size="small" value={v} selected={locked.includes(v)} disabled={off}
-              onChange={() => toggleLock(v)} sx={tbSx}>
-              {locked.includes(v) ? "🔒" : "🔓"}
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, margin: "0 5px",
-                             display: "inline-block", boxShadow: "0 0 0 1px rgba(0,0,0,0.35)" }} />
-              {tr(lang, key as TKey)}
-            </ToggleButton>
-          ))}
-        </span>
-      </Tooltip>
 
       {/* Clear confirmation */}
       <Dialog open={confirmClear} onClose={() => cancelClear()}>

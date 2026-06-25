@@ -164,10 +164,25 @@ export function setWindow(brightness: number, contrast: number): void {
 }
 
 // ── Label locks (#4) ─────────────────────────────────────────────────────────
-// Labels in this set are protected: brush, erase and smart-fill will not overwrite voxels that already
-// carry a locked label (e.g. lock cornea → a scar/erase stroke can't change cornea voxels).
+// Labels in this set are protected: brush, erase, wand AND smart-fill cannot change voxels that already
+// carry a locked label (e.g. lock cornea → a scar/erase stroke can't change cornea voxels). Lock values
+// are the LOGICAL labels 1=cornea, 2=scar, 0=background (empty + background seeds).
 const lockedLabels = new Set<number>();
 export function setLockedLabels(labels: number[]): void { lockedLabels.clear(); for (const l of labels) lockedLabels.add(l); }
+// A voxel's LOGICAL label for lock checks (∈ {0,1,2}), normalised across the three layers so locks behave
+// IDENTICALLY for the brush/eraser/wand/smart-fill regardless of which layer a voxel lives in: a cornea/
+// scar brush seed wins; a background seed counts as background (0); else an unconfirmed preview (1/2); else
+// the committed label (1/2); else empty (0). (previewBmp holds logical 1/2 — the 4/5 PREVIEW_* shades only
+// exist in the composed drawBitmap, which is why a plain drawBitmap lookup missed locked preview voxels.)
+function effLabelAt(i: number): number {
+  const sv = seedBmp ? seedBmp[i] : 0;
+  if (sv === 1 || sv === 2) return sv;
+  if (sv === BG_SEED) return 0;
+  const pv = previewBmp ? previewBmp[i] : 0;
+  if (pv === 1 || pv === 2) return pv;
+  const cv = committedBmp ? committedBmp[i] : 0;
+  return (cv === 1 || cv === 2) ? cv : 0;
+}
 export function setDrawingEnabled(on: boolean): void { if (nv) nv.setDrawingEnabled(on); }
 export function setDrawOpacity(o: number): void { if (nv) { nv.drawOpacity = o; nv.drawScene(); renderDrawOverlay(); } }
 
@@ -610,7 +625,7 @@ export function paintBrush(cx: number, cy: number, cz: number, px: number, py: n
         const base = zz * nxny + yy * nx;
         for (let i = -rx; i <= rx; i++) { const xx = ox + i; if (xx < 0 || xx >= nx) continue; const ix = i * sp[0];
           if (ix * ix + jyz2 <= R2) { const idx = base + xx;
-            if (hasLocks && lockedLabels.has(d[idx])) continue;       // protect locked labels (as displayed)
+            if (hasLocks && lockedLabels.has(effLabelAt(idx))) continue;   // protect locked labels (any layer)
             if (erasing) { s[idx] = 0; c[idx] = 0; p[idx] = 0; d[idx] = 0; } // eraser clears everything
             else { s[idx] = label; d[idx] = label; }                  // paint a seed; seed wins in the display
           } } } }
@@ -644,6 +659,7 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
   const seedsForGrow = seedBmp.slice();
   const cB = committedBmp, pB = previewBmp;
   let hasFg = false;
+  let wandScar = false;   // an unconfirmed WAND region of SCAR is feeding this fill → close its 3-D shape
   for (let i = 0; i < seedsForGrow.length; i++) {
     let s = seedsForGrow[i];
     if (s === 0) {
@@ -652,6 +668,7 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
       seedsForGrow[i] = s;
     }
     if (s === 1 || s === 2) hasFg = true;
+    if (useWandPreview && pB[i] === 2) wandScar = true;
   }
   if (!hasFg) return { ok: false, reason: "no-seeds" }; // need at least one cornea/scar seed somewhere
 
@@ -676,12 +693,26 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
     };
     worker.addEventListener("message", onMsg);
     worker.onerror = (e) => { worker.removeEventListener("message", onMsg); reject(new Error(e.message || "growcut worker failed")); };
-    worker.postMessage({ intensity: q, seeds: seedsForGrow, nx: dr[1], ny: dr[2], nz: dr[3], spatial: 1 },
+    // close=true → the worker morphologically CLOSES + hole-fills the scar (label 2) after the grow, so a
+    // magic-wand-derived 3-D scar comes back as a solid, closed shape instead of a ragged/hollow region.
+    worker.postMessage({ intensity: q, seeds: seedsForGrow, nx: dr[1], ny: dr[2], nz: dr[3], spatial: 1,
+                         close: wandScar, closeLabel: 2 },
                        [q.buffer, seedsForGrow.buffer]);
   });
 
   pushUndo(); // so Undo can revert the fill (restores pre-fill state + clears the preview)
-  for (let i = 0; i < previewBmp.length; i++) { const l = label[i]; previewBmp[i] = l === BG_SEED ? 0 : l; }
+  // Write the fill into the preview, but NEVER change a voxel whose committed/seed label is LOCKED
+  // (smart fill must respect locks too — promised by the lock tooltip): leave previewBmp 0 there so the
+  // locked committed/seed shows through unchanged.
+  const lk = lockedLabels.size > 0;
+  for (let i = 0; i < previewBmp.length; i++) {
+    if (lk) {
+      const sv = seedBmp[i];
+      const eff = (sv === 1 || sv === 2) ? sv : sv === BG_SEED ? 0 : (cB[i] === 1 || cB[i] === 2 ? cB[i] : 0);
+      if (lockedLabels.has(eff)) { previewBmp[i] = 0; continue; }
+    }
+    const l = label[i]; previewBmp[i] = l === BG_SEED ? 0 : l;
+  }
   previewing = true;
   previewIsWand = false;  // this preview is a smart-fill result, not a wand region
   compose(); // show committed + preview; seeds stay on top
@@ -809,7 +840,8 @@ export function wandPreview(x: number, y: number, z: number, opts: WandOpts): { 
   let count = 0;
   while (sp > 0) {
     const i = stack[--sp];
-    if (!(hasLocks && lockedLabels.has(c[i]))) { previewBmp[i] = target; count++; }
+    // protect locked labels across ALL layers (committed cornea/scar AND brush seeds), not committed-only
+    if (!(hasLocks && lockedLabels.has(effLabelAt(i)))) { previewBmp[i] = target; count++; }
     const z2 = (i / nxny) | 0, r = i - z2 * nxny, y2 = (r / nx) | 0, x2 = r - y2 * nx;
     if (!twoD || ta !== 0) {
       if (x2 > 0 && !visited[i - 1] && inMask(i - 1)) { visited[i - 1] = 1; push(i - 1); }
