@@ -1881,6 +1881,57 @@ def _ensure_raw_border_nifti(case_id: str) -> Path:
     return raw
 
 
+@app.post("/api/case/{case_id}/oct-border-curves-all")
+def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
+    """ALL per-slice detected borders for a pass in ONE call, computed with a FAST detector (gradient
+    argmax + outlier/median cleanup — no bilateral / hist-eq / RANSAC), so the frontend can cache the whole
+    set and scrubbing the fix-columns border is INSTANT (no per-slice round-trip; the per-slice detector is
+    ~258ms, the whole-volume fast pass is ~0.5s). The slower, more robust per-slice detector
+    (oct-border-curve) then refines just the slice the user settles on. x=frame, y=depth (depth 0 = TOP)."""
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    pass_n = max(1, int(req.border_pass or 1))
+    if pass_n <= 1:
+        inp = _ensure_raw_border_nifti(case_id)
+    else:
+        pv = orch.case_root(case_id) / "passes" / f"pass_{pass_n - 1}.nii.gz"
+        inp = pv if pv.exists() else _ensure_raw_border_nifti(case_id)
+    try:
+        arr = _load_border_vol(inp)                                # (lateral, depth, frames), cached
+        n = int(arr.shape[0]); depth_vox = int(arr.shape[1]); n_frames = int(arr.shape[2])
+        p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        sigma = float(p["sigma"]); max_jump = float(p["max_jump"]); mfs = int(p["median_filter_size"])
+        xs = np.arange(n_frames, dtype=np.float64)
+        # If the user has CONFIRMED a re-detection (pass 1), serve the cached tilt-aware surface for EVERY
+        # slice (so scrubbing shows the confirmed border, matching oct-border-curve's per-slice cache read);
+        # otherwise the fast auto detector.
+        anc = (m.get("oct_params") or {}).get("border_anchors") or {}
+        surf = _redetect_surface_fresh(case_id, anc) if (pass_n <= 1 and anc) else None
+        use_surf = surf is not None and surf.shape[0] == n and surf.shape[1] == n_frames
+        edges: list = []; fits: list = []
+        for i in range(n):
+            if use_surf:
+                e = np.asarray(surf[i], dtype=np.float64)
+            else:
+                sl = np.ascontiguousarray(arr[i]).astype(np.float32)
+                raw = oct_mod._detect_surface_gradient(sl, sigma)  # fast, no prior, no bilateral
+                e = oct_mod._smooth_median(oct_mod._correct_surface(raw, max_jump), mfs).astype(np.float64)
+            try:
+                f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
+            except Exception:  # noqa: BLE001
+                f = e
+            edges.append([round(float(v), 1) for v in e])
+            fits.append([round(float(v), 1) for v in f])
+        return {"slices": n, "n_frames": n_frames, "depth_vox": depth_vox, "pass": pass_n,
+                "edges": edges, "fits": fits}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT border curves(all) failed: {exc}")
+
+
 @app.post("/api/case/{case_id}/oct-border-curve")
 def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
     """Per-frame DETECTED corneal surface + RANSAC best-fit for ONE sagittal slice of the selected pass's

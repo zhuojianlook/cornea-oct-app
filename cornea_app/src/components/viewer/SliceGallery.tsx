@@ -149,8 +149,13 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // sagittal slice as COORDINATE arrays (depth per frame, on the working volume), drawn over the slice so
   // the user DRAGS a frame's surface to where it should be → a per-frame depth nudge (manual_shifts). Auto
   // on in fix-columns; no column selection. x=frame/n_frames, y=depth/depth_vox (depth 0 = top).
-  const [borderEdge, setBorderEdge] = useState<number[] | null>(null);
-  const [borderFit, setBorderFit] = useState<number[] | null>(null);
+  // ALL per-slice border curves (FAST detector), fetched ONCE per pass → scrubbing is an instant client-side
+  // lookup instead of a ~258ms per-slice round-trip (the user's "can't wait for the red line" complaint).
+  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][] } | null>(null);
+  // The slice the user SETTLES on is refined to the slower, more ACCURATE (robust) detector + cached here,
+  // so the border you actually inspect/drag is the precise one while scrubbing stays smooth.
+  const [accurate, setAccurate] = useState<Map<number, { edge: number[]; fit: number[] }>>(new Map());
+  const accurateRef = useRef(accurate); accurateRef.current = accurate;
   const [borderBusy, setBorderBusy] = useState(false);
   const borderDragRef = useRef(false);
   // Editable anchor set (seeded from persisted; drag adds; Confirm persists). sliceIdx → frame → depth.
@@ -359,20 +364,37 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   }, [fixCols, borderPass, caseId, cur?.slice_index, orient, segSig]);
   const inputSrc = borderPass > 1 ? passInputImg : (rawCur ? imgSrc(rawCur) : null);
 
-  // Fetch the detected surface + best-fit COORDS for the selected pass's INPUT slice (auto in fix-columns;
-  // re-fetched on slice/pass change). x=frame/n_frames, y=depth/depth_vox.
   const borderSliceIdx = cur?.slice_index ?? null;
+  // 1) Fetch ALL slices' borders ONCE (fast detector) so scrubbing is instant. Re-fetched on pass change
+  //    or after a re-detect/preprocess (segVersion). x=frame/n_frames, y=depth/depth_vox.
   useEffect(() => {
-    if (!fixCols || !caseId || borderSliceIdx == null) { setBorderEdge(null); setBorderFit(null); return; }
+    if (!fixCols || !caseId) { setAllCurves(null); setAccurate(new Map()); return; }
     let cancelled = false;
-    setBorderBusy(true);
-    api.json<{ n_frames: number; depth_vox: number; edge: number[]; fit: number[] }>(
-      `/api/case/${caseId}/oct-border-curve`, "POST", JSON.stringify({ slice_index: borderSliceIdx, border_pass: borderPass }))
-      .then((r) => { if (cancelled) return; setBorderEdge(r.edge || null); setBorderFit(r.fit || null); })
-      .catch(() => { if (!cancelled) { setBorderEdge(null); setBorderFit(null); } })
+    setBorderBusy(true); setAllCurves(null); setAccurate(new Map());
+    api.json<{ edges: number[][]; fits: number[][] }>(
+      `/api/case/${caseId}/oct-border-curves-all`, "POST", JSON.stringify({ border_pass: borderPass }))
+      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [] }); })
+      .catch(() => !cancelled && setAllCurves(null))
       .finally(() => !cancelled && setBorderBusy(false));
     return () => { cancelled = true; };
-  }, [fixCols, caseId, borderSliceIdx, borderPass, segSig]);
+  }, [fixCols, caseId, borderPass, segSig]);
+  // 2) When the user SETTLES on a slice (~250ms), refine it to the accurate per-slice detector + cache it,
+  //    so the border you inspect/drag is precise while scrubbing stays smooth (fast curves).
+  useEffect(() => {
+    if (!fixCols || !caseId || borderSliceIdx == null || !allCurves) return;
+    const idx = borderSliceIdx;
+    if (accurateRef.current.has(idx)) return;
+    const t = setTimeout(() => {
+      api.json<{ edge: number[]; fit: number[] }>(
+        `/api/case/${caseId}/oct-border-curve`, "POST", JSON.stringify({ slice_index: idx, border_pass: borderPass }))
+        .then((r) => { if (r.edge) setAccurate((prev) => prev.has(idx) ? prev : new Map(prev).set(idx, { edge: r.edge, fit: r.fit })); })
+        .catch(() => { /* keep the fast curve */ });
+    }, 250);
+    return () => clearTimeout(t);
+  }, [fixCols, caseId, borderSliceIdx, borderPass, allCurves]);
+  // The border for the CURRENT slice: the accurate (settled) curve if we have it, else the instant fast one.
+  const curEdge = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.edge ?? allCurves?.edges[borderSliceIdx]) : null) ?? null;
+  const curFit = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.fit ?? allCurves?.fits[borderSliceIdx]) : null) ?? null;
 
   // Drag the detected border (red) onto where the TRUE surface is → an ABSOLUTE depth ANCHOR for that
   // (slice, frame). Red follows the cursor (WYSIWYG); anchored frames turn PINK. Anchors accumulate across
@@ -380,18 +402,18 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // frame back to its detected depth removes its anchor. (NOT a manual_shift — anchors steer DETECTION.)
   const applyBorderDrag = (clientX: number, clientY: number, svg: SVGSVGElement) => {
     // sagittal-only: anchors are keyed by the sagittal slice index (see the fix-columns orient effect)
-    if (orient !== "sagittal" || !borderEdge || nFrames <= 1 || depthVox <= 1 || borderSliceIdx == null) return;
+    if (orient !== "sagittal" || !curEdge || nFrames <= 1 || depthVox <= 1 || borderSliceIdx == null) return;
     const r = svg.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
     const frame = Math.round(((clientX - r.left) / r.width) * nFrames - 0.5);
-    if (frame < 0 || frame >= nFrames || frame >= borderEdge.length) return;
+    if (frame < 0 || frame >= nFrames || frame >= curEdge.length) return;
     const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
     const s = borderSliceIdx;
     setBorderAnchors((prev) => {
       const mm = cloneAnchors(prev);
       const fm = mm.get(s) ?? new Map<number, number>();
       // dragging onto the detected edge (±0.5) clears the anchor; otherwise set the absolute true depth
-      if (Math.abs(depth - borderEdge[frame]) < 1) fm.delete(frame); else fm.set(frame, depth);
+      if (Math.abs(depth - curEdge[frame]) < 1) fm.delete(frame); else fm.set(frame, depth);
       if (fm.size) mm.set(s, fm); else mm.delete(s);
       return mm;
     });
@@ -763,10 +785,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const edgeY = (f: number): number => {
     const a = curAnchors?.get(f);
     if (a != null && a !== (persistedCur?.get(f) ?? null)) return a;   // un-confirmed drag → WYSIWYG
-    return borderEdge ? borderEdge[f] : 0;                              // detected / band-re-detected
+    return curEdge ? curEdge[f] : 0;                                    // detected / band-re-detected
   };
   const anchoredFrames = useMemo(() => new Set(curAnchors ? curAnchors.keys() : []), [curAnchors]);
-  const borderPanel = (inputSrc && borderEdge && borderFit && nFrames > 1 && depthVox > 1) ? (
+  const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
     <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
       <img src={inputSrc} alt="pass input" draggable={false}
         style={{ display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: enhanceFilter }} />
@@ -774,9 +796,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
         <polyline fill="none" stroke="#5db0ff" strokeWidth={1.2} vectorEffect="non-scaling-stroke" opacity={0.85}
-          points={borderFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
+          points={curFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
         <polyline fill="none" stroke="#ff4d4d" strokeWidth={1.8} vectorEffect="non-scaling-stroke"
-          points={borderEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
+          points={curEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
         {/* anchored frames on this slice → pink (over the red) */}
         {colRuns(anchoredFrames).map(([a, b], i) => a === b
           ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(1, depthVox / 140)} fill="#ff5db0" stroke="none" />
