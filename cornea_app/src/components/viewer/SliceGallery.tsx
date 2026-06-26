@@ -841,9 +841,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
         onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
-        <polyline fill="none" stroke="#5db0ff" strokeWidth={1.2} vectorEffect="non-scaling-stroke" opacity={0.85}
+        <polyline fill="none" stroke="#5db0ff" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.55}
           points={curFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
-        <polyline fill="none" stroke="#ff4d4d" strokeWidth={1.8} vectorEffect="non-scaling-stroke"
+        <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.6}
           points={curEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
         {/* anchored frames on this slice → pink (over the red) */}
         {colRuns(anchoredFrames).map(([a, b], i) => a === b

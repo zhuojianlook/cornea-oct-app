@@ -80,6 +80,10 @@ DEFAULT_PARAMS: dict = {
     # smoothly back to the auto edge across that band (no seam). Drag on more slices to widen the corrected span.
     "redetect_frame_margin": 8,
     "redetect_slice_band": 30,
+    # The user-drawn line is trusted: the seed re-detection only snaps to the nearest gradient within
+    # ±redetect_seed_window depth px of the drag (1-2 px), instead of a generous search that could wander off
+    # the line. The march to neighbouring slices then tracks the surface within ±detect_window.
+    "redetect_seed_window": 2.0,
     # ── clipped-apex handling ── In some scans the cornea sits so high in the acquisition window that the
     # dome APEX rises ABOVE depth 0 across the central frames. Those columns have tissue filling from row 0
     # with NO dark air gap and NO air→epithelium edge, so the detector pins the edge at the top (~5px) and
@@ -732,7 +736,7 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
     surface: auto everywhere, locally corrected around the anchors."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     n, depth, W = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
-    seed_win = float(p.get("detect_seed_window", 45.0))
+    seed_win = float(p.get("redetect_seed_window", 2.0))     # snap tight to the user's drawn line (±1-2 px)
     march_win = float(p.get("detect_window", 10.0))
     fmargin = max(0, int(p.get("redetect_frame_margin", 8)))
     slice_band = max(0, int(p.get("redetect_slice_band", 30)))
@@ -807,8 +811,14 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
         ads = np.array([fm[int(f)] for f in afs], dtype=np.float32)
         pri = np.interp(np.arange(W, dtype=np.float32), afs, ads).astype(np.float32)
         prior = base[s].astype(np.float32).copy(); prior[region] = pri[region]
+        # light=True + tight seed_win: snap to the nearest gradient within ±1-2 px of the user's drawn line
+        # (no robust side-correction/RANSAC that would pull the corrected edge away from where they drew it).
         redet = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), prior, seed_win, p,
-                                    light=False).astype(np.float32)
+                                    light=True).astype(np.float32)
+        # HARD-clamp the region to within ±seed_win of the drawn line — the detector's _correct_surface/median
+        # post-pass can otherwise drift a low-signal frame far from where the user drew. Guarantees the corrected
+        # edge stays 1-2 px from the user's line.
+        redet[region] = np.clip(redet[region], pri[region] - seed_win, pri[region] + seed_win)
         redet_region[s] = redet; _splice(s, redet)
 
     # 2) march the region outward across the BAND only (prior = resolved neighbour's region, small window),
@@ -853,7 +863,7 @@ def _interp_bad_displacement(disp: np.ndarray, bad_cols, good_cols) -> np.ndarra
 
 
 def _slice_displacement(active_edge, residual, corr_factor, bad_cols, good_cols, max_disp,
-                        clip_cols=None, clip_fit=None):
+                        clip_cols=None, clip_fit=None, zero_cols=None):
     """The per-column shift that flattens one sagittal slice's boundary to its quadratic, WITH the
     over-correction guard (#2): a column whose demanded shift |quad-edge| exceeds max_disp is a runaway
     (a garbage low-signal edge the quadratic can't trust), so it is treated as bad and its shift is
@@ -870,17 +880,20 @@ def _slice_displacement(active_edge, residual, corr_factor, bad_cols, good_cols,
     out of the runaway bad-set so their intentional ≈0 shift isn't interpolated away. clip_cols empty →
     byte-identical to the legacy path."""
     clip_cols = np.asarray(clip_cols, dtype=int) if clip_cols is not None else np.array([], dtype=int)
-    if clip_cols.size and clip_fit is not None:
-        quad = np.asarray(clip_fit, dtype=np.float64)            # extrapolating fit from the in-frame flanks
+    zero_cols = np.asarray(zero_cols, dtype=int) if zero_cols is not None else np.array([], dtype=int)
+    if (clip_cols.size or zero_cols.size) and clip_fit is not None:
+        quad = np.asarray(clip_fit, dtype=np.float64)            # extrapolating fit (excludes clip/cut columns)
     else:
         quad = _fit_quadratic_ransac(active_edge, residual)
     disp = (quad - np.asarray(active_edge, dtype=np.float64)) * corr_factor
     if clip_cols.size:
         disp[clip_cols] = np.maximum(disp[clip_cols], 0.0)       # never shift a clipped column UP (lose tissue)
+    if zero_cols.size:
+        disp[zero_cols] = 0.0                                    # user-cut columns: clipped/unusable → leave as-is
     bad = set(int(c) for c in bad_cols)
     if max_disp and max_disp > 0:
         runaway = {int(c) for c in np.where(np.abs(disp) > max_disp)[0]}
-        runaway -= set(int(c) for c in clip_cols)                # keep the intentional clip shift, not a runaway
+        runaway -= set(int(c) for c in clip_cols) | set(int(c) for c in zero_cols)  # keep intentional clip/cut shifts
         bad |= runaway
     disp = _interp_bad_displacement(disp, sorted(bad), good_cols)  # runaway cols → good-neighbour shift
     if max_disp and max_disp > 0:
@@ -889,9 +902,9 @@ def _slice_displacement(active_edge, residual, corr_factor, bad_cols, good_cols,
 
 
 def _disp_worker(packed):
-    sl, active_edge, residual, corr_factor, bad_cols, good_cols, max_disp, clip_cols, clip_fit = packed
+    sl, active_edge, residual, corr_factor, bad_cols, good_cols, max_disp, clip_cols, clip_fit, zero_cols = packed
     return _slice_displacement(active_edge, residual, corr_factor, bad_cols, good_cols, max_disp,
-                               clip_cols=clip_cols, clip_fit=clip_fit)
+                               clip_cols=clip_cols, clip_fit=clip_fit, zero_cols=zero_cols)
 
 
 def _axial_roughness(edges: np.ndarray) -> float:
@@ -988,6 +1001,16 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         edges = np.array(_map_slices(_edge_worker, [(det[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
 
     res = float(p["residual_threshold"])
+    W = int(sag.shape[2])
+    zero_cols_list = [np.array([], dtype=int) for _ in range(n)]
+    # USER SURFACE CUT (re-run option): exclude a clipped surface from the fit so the flattening is robust.
+    #   surface_cut = {"left": frame, "right": frame, "top": depth} — exclude frames < left, frames > right,
+    #   and frames whose detected surface is ABOVE depth `top` (a clipped apex / reflection). Excluded columns
+    #   are dropped from the quadratic fit (which extrapolates across them) and left UNWARPED (disp=0). Takes
+    #   precedence over the auto clip-apex handling (the user is correcting manually). Not for provided_edges.
+    cut = p.get("surface_cut") or {}
+    cut_left = int(cut.get("left", 0) or 0); cut_right = int(cut.get("right", 0) or 0); cut_top = int(cut.get("top", 0) or 0)
+    has_cut = (not use_provided) and (cut_left > 0 or (0 < cut_right < W - 1) or cut_top > 0)
     # 1.5) clipped-apex resolution (per slice): where the dome apex is above the frame, detect the clipped
     #   columns + an EXTRAPOLATING fit from the in-frame flanks. Gated + cheap: _resolve_clip early-exits on
     #   a normal in-frame dome (the overwhelming majority), so a well-detected scan is unchanged.
@@ -996,8 +1019,23 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     #   warp itself manufactures that pattern, so detecting there would false-trigger on a NORMAL scan. Such
     #   passes instead REUSE the pass-0 clip columns via fixed_clip_cols (re-fitting on the current edges).
     #   Skipped entirely for provided_edges (the marched surface is authoritative) and when clip_handling off.
-    clip_on = bool(p.get("clip_handling", True)) and not use_provided and (detect_volume is None)
-    if clip_on:
+    clip_on = bool(p.get("clip_handling", True)) and not use_provided and (detect_volume is None) and not has_cut
+    if has_cut:
+        base_excl = set()
+        if cut_left > 0:
+            base_excl |= set(range(0, min(cut_left, W)))
+        if 0 < cut_right < W - 1:
+            base_excl |= set(range(cut_right + 1, W))
+        clip_cols_list = [np.array([], dtype=int) for _ in range(n)]   # no apex >=0 clamp on a user cut
+        clip_fit_list = []
+        for i in range(n):
+            excl = set(base_excl)
+            if cut_top > 0:
+                excl |= {int(f) for f in range(W) if float(edges[i][f]) < cut_top}
+            cc = np.array(sorted(c for c in excl if 0 <= c < W), dtype=int)
+            zero_cols_list[i] = cc
+            clip_fit_list.append(_extrapolate_fit(edges[i], cc, res) if cc.size else None)
+    elif clip_on:
         clip_resolved = [_resolve_clip(edges[i], det[i], res, p) for i in range(n)]
         clip_cols_list = [cr[0] for cr in clip_resolved]
         clip_fit_list = [cr[1] for cr in clip_resolved]
@@ -1032,9 +1070,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         med = np.median(np.stack(stack), axis=0)
         dev = np.abs(edges[i] - med)
         snap = dev > active_threshold
-        cc = clip_cols_list[i]
+        cc = clip_cols_list[i]; zc = zero_cols_list[i]
         if len(cc):
             snap[cc] = False                 # don't snap a clipped column toward neighbours — it stays extrapolated
+        if len(zc):
+            snap[zc] = False                 # user-cut columns are excluded from detection/fit too
         active[i][snap] = med[snap]
 
     # 3) per-slice displacement that flattens the boundary to its quadratic — parallel — WITH the
@@ -1047,7 +1087,7 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     bad_cols = [] if use_provided else [int(c) for c in (p.get("force_columns") or [])]
     good_cols = [] if use_provided else [int(c) for c in (p.get("good_columns") or [])]
     items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols, max_disp,
-              clip_cols_list[i], clip_fit_list[i]) for i in range(n)]
+              clip_cols_list[i], clip_fit_list[i], zero_cols_list[i]) for i in range(n)]
     disp_field = np.array(_map_slices(_disp_worker, items, progress, 0.5, 0.9, workers))  # (n_slices, n_frames)
     # The per-pass metric is the mean per-column deviation of the boundary from its quadratic fit (the
     # iterative-refinement convergence signal + abs_floor calibration) — measured on the PRE-smoothing
@@ -1190,7 +1230,10 @@ def _axial_smooth_volume(volume: np.ndarray, params: dict | None, workers: int |
     swapping frames<->lateral, correcting, swapping back. Detects on a black-band-filled copy so the
     prior sagittal warp's padding can't fool the detector."""
     vt = np.ascontiguousarray(volume.transpose(*_FRAME_LATERAL_SWAP))
-    out = smooth_volume(vt, params, workers=workers, detect_volume=_fill_black_bands(vt))
+    # surface_cut is defined in the SAGITTAL frame domain; after the frame<->lateral swap its left/right/top
+    # would cut the wrong axis, so strip it from the axial pass (the sagittal pass already applied it).
+    pax = {k: v for k, v in (params or {}).items() if k != "surface_cut"}
+    out = smooth_volume(vt, pax, workers=workers, detect_volume=_fill_black_bands(vt))
     return np.ascontiguousarray(out.transpose(*_FRAME_LATERAL_SWAP))
 
 
