@@ -26,7 +26,32 @@ os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 _CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
-_CKPT = Path(__file__).resolve().parents[1] / "sam2_ckpt" / "sam2.1_hiera_small.pt"
+_CKPT_NAME = "sam2.1_hiera_small.pt"
+
+
+def _ckpt_candidates() -> list[Path]:
+    """Where to look for the SAM2 checkpoint, in priority order. The packaged app's resource dir
+    (parents[1]) is READ-ONLY and does NOT bundle the checkpoint, so it must also be found in a writable
+    user location: CORNEA_SAM2_CKPT (explicit file) → CORNEA_DATA_DIR/sam2_ckpt → the dev/source repo
+    (parents[1]/sam2_ckpt) → the default app data dir. First existing one wins."""
+    c: list[Path] = []
+    env = os.environ.get("CORNEA_SAM2_CKPT")
+    if env:
+        c.append(Path(env).expanduser())
+    dd = os.environ.get("CORNEA_DATA_DIR")
+    if dd:
+        c.append(Path(dd).expanduser() / "sam2_ckpt" / _CKPT_NAME)
+    c.append(Path(__file__).resolve().parents[1] / "sam2_ckpt" / _CKPT_NAME)   # dev/source (and bundle, if ever shipped)
+    c.append(Path.home() / ".local" / "share" / "com.cornea.oct" / "sam2_ckpt" / _CKPT_NAME)  # default app data dir
+    return c
+
+
+def _resolve_ckpt() -> Path | None:
+    for c in _ckpt_candidates():
+        if c.exists():
+            return c
+    return None
+
 
 _PREDICTOR = None
 
@@ -39,12 +64,15 @@ def _device():
 def _predictor():
     global _PREDICTOR
     if _PREDICTOR is None:
-        if not _CKPT.exists():
+        ckpt = _resolve_ckpt()
+        if ckpt is None:
+            searched = "\n  ".join(str(c) for c in _ckpt_candidates())
             raise FileNotFoundError(
-                f"SAM2 checkpoint missing: {_CKPT}. Download sam2.1_hiera_small.pt into "
-                f"cornea_app/sam2_ckpt/ before segmenting.")
+                f"SAM2 checkpoint '{_CKPT_NAME}' not found. The installed app does not bundle it. "
+                f"Place it at ~/.local/share/com.cornea.oct/sam2_ckpt/{_CKPT_NAME} (the app data dir) or set "
+                f"CORNEA_SAM2_CKPT to its path. Searched:\n  {searched}")
         from sam2.build_sam import build_sam2_video_predictor
-        _PREDICTOR = build_sam2_video_predictor(_CFG, str(_CKPT), device=_device())
+        _PREDICTOR = build_sam2_video_predictor(_CFG, str(ckpt), device=_device())
     return _PREDICTOR
 
 
