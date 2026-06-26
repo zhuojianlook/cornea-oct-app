@@ -964,9 +964,12 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           points={curFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
         <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.6}
           points={curEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
-        {/* anchored frames on this slice → pink (over the red) — thin + translucent like the other lines */}
+        {/* anchored frames on this slice → pink (over the red) — thin + translucent. A SINGLE anchor is drawn
+            as a short VERTICAL tick, NOT a <circle>: the SVG viewBox (nFrames×depthVox) is stretched with
+            preserveAspectRatio="none", so a circle squashes into a wide horizontal pink dash ("artifact line"). */}
         {borderMode === "edge" && colRuns(anchoredFrames).map(([a, b], i) => a === b
-          ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(0.8, depthVox / 200)} fill="#ff5db0" stroke="none" opacity={0.7} />
+          ? <line key={`pk${i}`} x1={a + 0.5} y1={edgeY(a) - depthVox / 60} x2={a + 0.5} y2={edgeY(a) + depthVox / 60}
+              stroke="#ff5db0" strokeWidth={1.1} vectorEffect="non-scaling-stroke" opacity={0.8} />
           : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={1.0} vectorEffect="non-scaling-stroke" opacity={0.7}
               points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
         {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through */}
@@ -975,8 +978,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
             points={curPara.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
         )}
         {curPara && [...(curParaPts?.entries() ?? [])].map(([f, d], i) => (
-          <circle key={`pp${i}`} cx={f + 0.5} cy={d} r={Math.max(1.4, depthVox / 110)} fill="#39d98a"
-            stroke="#fff" strokeWidth={0.5} vectorEffect="non-scaling-stroke" />
+          // vertical tick, not <circle> — circles squash to horizontal dashes under the stretched viewBox
+          <line key={`pp${i}`} x1={f + 0.5} y1={d - depthVox / 50} x2={f + 0.5} y2={d + depthVox / 50}
+            stroke="#39d98a" strokeWidth={2} vectorEffect="non-scaling-stroke" opacity={0.95} />
         ))}
         {/* CUT lines (request 1): drag the TOP/LEFT/RIGHT lines marking where the surface leaves the frame */}
         {cutMode && (() => {

@@ -1924,19 +1924,33 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
         sigma = float(p["sigma"]); max_jump = float(p["max_jump"]); mfs = int(p["median_filter_size"])
         xs = np.arange(n_frames, dtype=np.float64)
-        # If the user has CONFIRMED a re-detection (pass 1), serve the cached tilt-aware surface for EVERY
-        # slice (so scrubbing shows the confirmed border, matching oct-border-curve's per-slice cache read);
-        # otherwise the fast auto detector.
+        # If the user has CONFIRMED a re-detection (pass 1), serve the cached re-detected surface for EVERY
+        # slice (so scrubbing shows the confirmed border). Otherwise, on pass 1, serve the cached ROBUST
+        # BASELINE (the SAME _merged_side_edge surface Confirm uses) — NOT a separate fast detector. This is
+        # what makes the scrub preview == the Confirm result: with two different detectors, Confirm replaced
+        # the whole surface with the robust one and un-edited slices visibly changed. First call computes the
+        # baseline (~6s, cached as baseline.npz); later scrubs load it instantly. (pass>1 keeps the fast
+        # detector — no per-pass baseline cache.)
         anc = (m.get("oct_params") or {}).get("border_anchors") or {}
         surf = _redetect_surface_fresh(case_id, anc) if (pass_n <= 1 and anc) else None
         use_surf = surf is not None and surf.shape[0] == n and surf.shape[1] == n_frames
+        base_surf = None
+        if not use_surf and pass_n <= 1:
+            try:
+                base_surf = _baseline_surface(case_id, arr, p)         # cached robust = Confirm's baseline
+                if base_surf is None or base_surf.shape[0] != n or base_surf.shape[1] != n_frames:
+                    base_surf = None
+            except Exception:  # noqa: BLE001 — fall back to the fast detector if the baseline can't be built
+                base_surf = None
         edges: list = []; fits: list = []
         for i in range(n):
             if use_surf:
                 e = np.asarray(surf[i], dtype=np.float64)
+            elif base_surf is not None:
+                e = np.asarray(base_surf[i], dtype=np.float64)
             else:
                 sl = np.ascontiguousarray(arr[i]).astype(np.float32)
-                raw = oct_mod._detect_surface_gradient(sl, sigma)  # fast, no prior, no bilateral
+                raw = oct_mod._detect_surface_gradient(sl, sigma)  # fast, no prior, no bilateral (pass>1 only)
                 e = oct_mod._smooth_median(oct_mod._correct_surface(raw, max_jump), mfs).astype(np.float64)
             try:
                 f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
