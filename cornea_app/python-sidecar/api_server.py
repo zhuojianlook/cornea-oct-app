@@ -73,6 +73,72 @@ def health() -> dict:
     return {"status": "ok", "shell_version": os.environ.get("CORNEA_SHELL_VERSION", "")}
 
 
+def _total_ram_gb() -> float:
+    """Total system RAM in GiB (best-effort, cross-platform). Used to size batch concurrency so the app uses
+    the machine it runs on without oversubscribing memory."""
+    try:
+        # POSIX (Linux): sysconf is exact and dependency-free.
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024.0 ** 3)
+    except (ValueError, AttributeError, OSError):
+        pass
+    try:
+        import psutil  # optional
+        return float(psutil.virtual_memory().total) / (1024.0 ** 3)
+    except Exception:  # noqa: BLE001
+        return 8.0  # conservative fallback
+
+
+def _gpu_info() -> dict:
+    """CUDA GPU name + VRAM via the nvidia-smi SUBPROCESS — deliberately NOT `import torch; torch.cuda...`,
+    because this long-lived sidecar later runs detect_surface_all through an in-process mp 'fork' pool, and
+    initialising a CUDA context here would fork a CUDA-bearing process (the no-CUDA-before-fork invariant the
+    codebase relies on). Returns cuda=False if nvidia-smi is absent or fails."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=4)
+        line = (out.stdout or "").strip().splitlines()
+        if out.returncode == 0 and line:
+            parts = [x.strip() for x in line[0].split(",")]
+            name = parts[0] if parts else None
+            vram = round(float(parts[1]) / 1024.0, 1) if len(parts) > 1 and parts[1] else 0.0  # MiB → GiB
+            return {"cuda": True, "name": name, "vram_gb": vram}
+    except Exception:  # noqa: BLE001 — no GPU / no driver / unparseable → report no CUDA
+        pass
+    return {"cuda": False, "name": None, "vram_gb": 0.0}
+
+
+def _cpu_budget() -> int:
+    """Threads to spread CPU work across — all cores but one (left for the main/IO thread)."""
+    return max(2, (os.cpu_count() or 2) - 1)
+
+
+def _recommend_max_concurrency(ram_gb: float | None = None) -> int:
+    """How many scans to PREPROCESS at once on this machine. Bound by CPU (each concurrent scan still wants a
+    few worker threads for its per-slice parallel phases) AND by RAM (~3 GiB peak per concurrent scan: the
+    sagittal volume + per-pass copies + worker processes), so a big box runs many in parallel and a small one
+    stays safe. The per-scan worker count is then cpu_budget // concurrency (see oct-preprocess)."""
+    cpu = _cpu_budget()
+    ram = _total_ram_gb() if ram_gb is None else float(ram_gb)
+    by_cpu = max(1, cpu // 3)                       # keep >=3 worker threads per concurrent scan
+    by_ram = max(1, int((ram - 4.0) // 3.0))       # ~3 GiB per scan AFTER a 4 GiB OS/app/browser reserve
+    return max(1, min(by_cpu, by_ram, 16))
+
+
+@app.get("/api/system/capabilities")
+def system_capabilities() -> dict:
+    """System resources so the frontend can size batch preprocessing to THIS machine (CPU cores, RAM, GPU).
+    The app aims to use whatever it runs on: max_concurrency scans preprocess at once, each getting
+    cpu_budget // concurrency CPU workers; SAM2/nnU-Net use the GPU (serialised by a lock to fit VRAM)."""
+    ram = round(_total_ram_gb(), 1)
+    return {
+        "cpu_count": os.cpu_count() or 2,
+        "cpu_budget": _cpu_budget(),
+        "ram_gb": ram,
+        "gpu": _gpu_info(),
+        "max_concurrency": _recommend_max_concurrency(ram),
+    }
+
+
 @app.get("/api/config")
 def get_config() -> dict:
     return settings.public_config()
@@ -1568,9 +1634,9 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
         if not anchors:
             raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
-        # ensure a FRESH cache for the persisted anchors (recompute if missing/stale), then feed it to the worker
-        if _redetect_surface_fresh(case_id, anchors) is None:
-            _compute_redetect_cache(case_id, m, anchors)
+        # ensure a FRESH cache for the persisted anchors (recompute if missing/stale incl. an algorithm
+        # upgrade), then feed it to the worker — same surface the scrub display uses (preview == result).
+        _redetect_surface_cached(case_id, m, anchors)
         redetect_npz = _redetect_cache_path(case_id)
         eff_params["border_anchors"] = anchors        # keep them persisted on the case
         # the re-detect warp flattens to EXACTLY the previewed surface — legacy per-frame manual_shifts (which
@@ -1602,7 +1668,7 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # scan overlap the parallel phases of another → fuller CPU use than one-scan-at-a-time. K<=1 → auto (full).
     _k = max(1, int(req.concurrency or 1))
     if _k > 1:
-        _w = max(2, ((os.cpu_count() or 2) - 2) // _k)
+        _w = max(2, _cpu_budget() // _k)   # K scans × _w ≈ all cores → full CPU, no oversubscription
         extra += ["--workers", str(_w)]
     if redetect_npz is not None:
         extra += ["--provided-edges", str(redetect_npz)]   # flatten to the confirmed re-detected surface
@@ -1938,7 +2004,7 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         # baseline (~6s, cached as baseline.npz); later scrubs load it instantly. (pass>1 keeps the fast
         # detector — no per-pass baseline cache.)
         anc = (m.get("oct_params") or {}).get("border_anchors") or {}
-        surf = _redetect_surface_fresh(case_id, anc) if (pass_n <= 1 and anc) else None
+        surf = _redetect_surface_cached(case_id, m, anc) if (pass_n <= 1 and anc) else None
         use_surf = surf is not None and surf.shape[0] == n and surf.shape[1] == n_frames
         base_surf = None
         if not use_surf and pass_n <= 1:
@@ -2034,7 +2100,7 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         # surface as the border instead of the live auto detection — so scrubbing reveals the new detected
         # border the warp will use (preview == result). Falls back to live auto if no/stale cache.
         anc = (m.get("oct_params") or {}).get("border_anchors") or {}
-        surf = _redetect_surface_fresh(case_id, anc) if (pass_n <= 1 and anc) else None
+        surf = _redetect_surface_cached(case_id, m, anc) if (pass_n <= 1 and anc) else None
         if surf is not None and 0 <= idx < surf.shape[0] and surf.shape[1] == sl.shape[1]:
             edge = np.asarray(surf[idx], dtype=np.float32)
         else:
@@ -2071,10 +2137,16 @@ _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColo
                       "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band",
                       "redetect_seed_window")
 
+# Bumped whenever redetect_surface()'s region/march LOGIC changes (not just its params), so an APP UPDATE
+# invalidates surfaces written by the old algorithm. "per-slice-v2" = the per-slice frame-region fix (a
+# redetect.npz from the prior global-union code would otherwise be served unchanged after an update — the
+# detection params are identical — silently keeping the old buggy surface on already-confirmed cases).
+_REDETECT_ALGO_VERSION = "per-slice-v2"
+
 
 def _detect_params_sig(p: dict) -> str:
-    """Canonical signature of the detection-relevant params (for surface-cache freshness)."""
-    return ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS)
+    """Canonical signature of the detection-relevant params + algorithm version (for surface-cache freshness)."""
+    return f"algo={_REDETECT_ALGO_VERSION};" + ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS)
 
 
 def _redetect_cache_path(case_id: str) -> Path:
@@ -2160,6 +2232,22 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
                         params_sig=_detect_params_sig(p))
     os.replace(tmp, cp)
     return surface
+
+
+def _redetect_surface_cached(case_id: str, m: dict, anchors: dict):
+    """The re-detected surface for `anchors`: the fresh cache if valid, else recompute+cache. This makes an
+    ALGORITHM upgrade (or a param change) transparently refresh the surface for BOTH the scrub display and the
+    warp — so a case the user confirmed under the OLD algorithm shows/uses the NEW corrected surface without a
+    manual re-Confirm. Returns None when there are no anchors (→ caller shows the plain auto baseline)."""
+    if not anchors:
+        return None
+    surf = _redetect_surface_fresh(case_id, anchors)
+    if surf is None:
+        try:
+            surf = _compute_redetect_cache(case_id, m, anchors)
+        except Exception:  # noqa: BLE001 — fall back to the baseline display if the recompute fails
+            return None
+    return surf
 
 
 @app.post("/api/case/{case_id}/oct-border-redetect")

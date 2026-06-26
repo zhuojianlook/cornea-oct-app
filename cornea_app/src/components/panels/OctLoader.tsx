@@ -528,9 +528,19 @@ export function OctLoader() {
     let lastIter: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } | null = null;
     let lastOkCase: string | null = null;
     // Process MULTIPLE scans CONCURRENTLY (was one-by-one, leaving cores idle during each scan's serial
-    // phases). Run `conc` at a time and tell the backend so each scan uses (cpu-2)//conc workers — K scans ×
-    // that ≈ all cores, no oversubscription, and one scan's serial phases overlap another's parallel phases.
-    const conc = sel.length > 1 ? Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 8) / 8))) : 1;
+    // phases). Ask the SIDECAR how many to run at once — it knows the REAL machine (CPU cores + RAM), so a
+    // big box (e.g. 24-thread / 64 GB) runs many in parallel and a small one stays safe. Each scan then uses
+    // cpu_budget//conc workers (K × that ≈ all cores), and one scan's serial phases overlap another's parallel
+    // phases → fuller CPU/RAM use. Falls back to a CPU-only heuristic if the capabilities call fails.
+    let conc = 1;
+    if (sel.length > 1) {
+      let maxConc = Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 8) / 4)));
+      try {
+        const caps = await api.json<{ max_concurrency?: number }>("/api/system/capabilities");
+        if (caps?.max_concurrency && caps.max_concurrency > 0) maxConc = caps.max_concurrency;
+      } catch { /* keep the heuristic fallback */ }
+      conc = Math.max(1, Math.min(maxConc, sel.length));
+    }
     try {
       const runOne = async (s: typeof sel[number]) => {
         const g = groups.find((gg) => gg.id === s.groupId);

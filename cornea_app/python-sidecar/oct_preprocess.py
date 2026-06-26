@@ -129,6 +129,14 @@ NIFTI_SPACING = (LATERAL_SPACING, DEPTH_SPACING, SLICE_SPACING)
 NIFTI_DIRECTION = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0)
 
 
+def auto_workers(reserve: int = 1) -> int:
+    """Per-slice parallel worker count for a SINGLE scan's processing — use ALL available cores (leaving
+    `reserve` for the main/IO thread), with NO arbitrary upper cap, so the app scales to whatever machine it
+    runs on (e.g. a 24-thread Ryzen → 23 workers). When several scans run concurrently the caller passes an
+    explicit, smaller `workers` so K scans × workers ≈ all cores (no oversubscription)."""
+    return max(1, (os.cpu_count() or 2) - max(0, int(reserve)))
+
+
 # ── 1) read .OCT ───────────────────────────────────────────────────────────
 class MissingCompanionError(ValueError):
     """The .OCT's companion .txt filespec isn't next to it (POCT can't read without it)."""
@@ -717,7 +725,7 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     p = {**DEFAULT_PARAMS, **(params or {})}
     n = int(sag.shape[0])
     if workers is None:
-        workers = max(1, min(24, (os.cpu_count() or 2) - 2))
+        workers = auto_workers()
     edges = _map_slices(_edge_worker, [(np.ascontiguousarray(sag[i]).astype(np.float32), p) for i in range(n)],
                         progress, 0.0, 1.0, workers)
     return np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
@@ -773,32 +781,37 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
     if not anc:
         return surface  # no anchors → pure baseline (auto everywhere)
 
-    # corrected frame regions = each CONTIGUOUS RUN of anchored frames (NOT one min→max span). This is the
-    # fix for "the uncorrected edge becomes wrong": with a single [first,last] span, two SEPARATED edits
-    # (e.g. frame 30 and frame 70) made everything between them (31..69) part of the region and overwrote the
-    # real edge with a straight interpolation. Per-run regions keep the gap between separate edits at baseline.
-    afr = sorted({f for fm in anc.values() for f in fm})
-    runs: list[tuple[int, int]] = []
-    for f in afr:
-        if runs and f == runs[-1][1] + 1:
-            runs[-1] = (runs[-1][0], f)
-        else:
-            runs.append((f, f))
-    wf = np.zeros(W, dtype=np.float32)                       # per-frame blend weight: 1 inside a run, ramping to
-    for (rs, re) in runs:                                    # 0 over ±fmargin at each run's ends, 0 between runs
-        lo, hi = max(0, rs - fmargin), min(W - 1, re + fmargin)
-        for f in range(lo, hi + 1):
-            if rs <= f <= re:
-                w = 1.0
-            elif f < rs:
-                w = (f - lo + 1) / float(rs - lo + 1)
+    # corrected frame region = the CONTIGUOUS RUNS of THIS SLICE's OWN anchored frames. CRITICAL: the region is
+    # PER-SLICE, never a global union. Two earlier bugs lived here: (a) one [first,last] span bridged separate
+    # edits with a straight line; (b) — the residual one — a SINGLE frame mask built from the UNION of every
+    # slice's anchors (afr = {f for fm in anc.values() for f in fm}) was applied to EVERY anchored slice, so an
+    # edit to frame F on slice A caused frame F to be re-detected (and shifted up to ±seed_win) on slices B,C,…
+    # that the user never touched there ("un-edited parts of the edge become altered"). Now each slice's region
+    # comes ONLY from its own anchored frames, so a frame is re-detected on a slice IFF the user edited it there.
+    def _slice_runs(fm: dict) -> list[tuple[int, int]]:
+        runs: list[tuple[int, int]] = []
+        for f in sorted(fm):
+            if runs and f == runs[-1][1] + 1:
+                runs[-1] = (runs[-1][0], f)
             else:
-                w = (hi - f + 1) / float(hi - re + 1)
-            wf[f] = max(wf[f], w)
-    wf = np.clip(wf, 0.0, 1.0)
-    region_mask = wf > 0                                     # frames touched by ANY run (re-detected); rest = baseline
+                runs.append((f, f))
+        return runs
 
-    def _run_prior(fm: dict, slice_base: np.ndarray) -> np.ndarray:
+    def _frame_weight(runs: list[tuple[int, int]]) -> np.ndarray:
+        wf = np.zeros(W, dtype=np.float32)                  # 1 inside a run, ramping to 0 over ±fmargin, 0 elsewhere
+        for (rs, re) in runs:
+            lo, hi = max(0, rs - fmargin), min(W - 1, re + fmargin)
+            for f in range(lo, hi + 1):
+                if rs <= f <= re:
+                    w = 1.0
+                elif f < rs:
+                    w = (f - lo + 1) / float(rs - lo + 1)
+                else:
+                    w = (hi - f + 1) / float(hi - re + 1)
+                wf[f] = max(wf[f], w)
+        return np.clip(wf, 0.0, 1.0)
+
+    def _run_prior(fm: dict, slice_base: np.ndarray, runs: list[tuple[int, int]]) -> np.ndarray:
         """Prior = the slice's baseline, with each contiguous run's anchors interpolated WITHIN that run only
         (no straight line bridging separate runs). Frames outside the runs keep the baseline."""
         prior = slice_base.astype(np.float32).copy()
@@ -811,10 +824,8 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
                                          np.array([fm[f] for f in rf], float)).astype(np.float32)
         return prior
 
-    # SLICE band = ±slice_band around EACH anchored slice (NOT the [min,max] envelope). The envelope was the
-    # bug behind "Confirm changes un-edited parts": anchors on slice 0 AND slice 504 made [a_lo,a_hi]=[0,504]
-    # = the WHOLE volume full-weight + marched, even with slice_band=0. Now each anchored slice gets its own
-    # band; slices far from every anchored slice keep the baseline. slice_band=0 → ONLY the anchored slices.
+    # SLICE band = ±slice_band around EACH anchored slice (NOT the [min,max] envelope). Each anchored slice gets
+    # its own band; slices far from every anchored slice keep the baseline. slice_band=0 → ONLY anchored slices.
     anchored = sorted(anc.keys())
     ws = np.zeros(n, dtype=np.float32)                       # per-slice weight: 1 at an anchored slice → 0 at ±band
     for sa in anchored:
@@ -826,28 +837,31 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
     def _slice_weight(s: int) -> float:
         return float(ws[s])
 
-    def _splice(s: int, redet: np.ndarray) -> None:
-        w = wf * _slice_weight(s)                            # combined frame×slice blend weight
+    region_wf: dict[int, np.ndarray] = {}                   # slice -> its OWN per-frame region weight (no global union)
+    redet_region: dict[int, np.ndarray] = {}               # slice -> full-W re-detected edge (region meaningful)
+
+    def _splice(s: int, redet: np.ndarray, wf_s: np.ndarray) -> None:
+        w = wf_s * _slice_weight(s)                          # combined frame×slice blend weight (frame weight is per-slice)
         surface[s] = base[s] * (1.0 - w) + redet.astype(np.float32) * w
 
-    redet_region: dict[int, np.ndarray] = {}                # slice -> full-W re-detected edge (region meaningful)
-
-    # 1) seed the anchored slice(s): windowed (±seed_win) around the user's drag, per-run prior (baseline between runs)
+    # 1) seed the anchored slice(s): each re-detects ONLY its own anchored frame-runs, windowed (±seed_win) around
+    #    the user's drag, per-run prior (baseline between runs). Frames the user didn't touch on THIS slice keep base.
     for s, fm in anc.items():
-        prior = _run_prior(fm, base[s])
+        runs = _slice_runs(fm)
+        wf_s = _frame_weight(runs)
+        rmask = wf_s > 0
+        prior = _run_prior(fm, base[s], runs)
         # light=True + tight seed_win: snap to the nearest gradient within ±1-2 px of the user's drawn line
         # (no robust side-correction/RANSAC that would pull the corrected edge away from where they drew it).
         redet = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), prior, seed_win, p,
                                     light=True).astype(np.float32)
-        # HARD-clamp the re-detected region to within ±seed_win of the prior — the detector's _correct_surface/
-        # median post-pass can otherwise drift a low-signal frame far from where the user drew (and the margins
-        # stay within ±seed_win of the baseline). Guarantees the corrected edge stays 1-2 px from the line.
-        redet[region_mask] = np.clip(redet[region_mask], prior[region_mask] - seed_win, prior[region_mask] + seed_win)
-        redet_region[s] = redet; _splice(s, redet)
+        # HARD-clamp the re-detected region to within ±seed_win of the prior so a low-signal frame can't drift.
+        redet[rmask] = np.clip(redet[rmask], prior[rmask] - seed_win, prior[rmask] + seed_win)
+        redet_region[s] = redet; region_wf[s] = wf_s; _splice(s, redet, wf_s)
 
-    # 2) march the region outward to the band slices ONLY (band_mask = within ±slice_band of an anchored slice;
-    #    prior = resolved neighbour's region, small window). Slices outside every anchored slice's band keep the
-    #    baseline exactly. With slice_band=0, band_mask is just the anchored slices → nothing marches.
+    # 2) march each anchored slice's region outward to the band slices ONLY (slice_band>0). A band slice inherits
+    #    the region (frame weight) of the anchored slice it marches from, so the correction stays confined to the
+    #    same frames. With slice_band=0, band_mask is just the anchored slices → nothing marches (strictly local).
     band_slices = [s for s in range(n) if band_mask[s]]
     progressing = True
     while progressing:
@@ -858,10 +872,12 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
             nb = (s - 1) if (s - 1) in redet_region else ((s + 1) if (s + 1) in redet_region else None)
             if nb is None:
                 continue
+            wf_s = region_wf[nb]                             # inherit the source anchored slice's per-frame region
+            rmask = wf_s > 0
             sl = np.ascontiguousarray(sag[s]).astype(np.float32)
-            prior = base[s].astype(np.float32).copy(); prior[region_mask] = redet_region[nb][region_mask]
+            prior = base[s].astype(np.float32).copy(); prior[rmask] = redet_region[nb][rmask]
             redet = _redetect_one_slice(sl, prior, march_win, p).astype(np.float32)
-            redet_region[s] = redet; _splice(s, redet); progressing = True
+            redet_region[s] = redet; region_wf[s] = wf_s; _splice(s, redet, wf_s); progressing = True
         if progress:
             progress(min(1.0, len(redet_region) / max(1, len(band_slices))))
     return surface
@@ -1009,7 +1025,7 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     corr_factor = float(p.get("corr_factor", 1.0))
     active_threshold = float(p.get("active_threshold", 5.0))
     if workers is None:
-        workers = max(1, min(24, (os.cpu_count() or 2) - 2))
+        workers = auto_workers()
 
     use_provided = provided_edges is not None
     if use_provided:
@@ -1287,7 +1303,7 @@ def axial_refine_volume(v_sag: np.ndarray, params: dict | None = None, workers: 
     this can never produce a worse surface than sagittal-only. Returns (volume, info)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     if workers is None:
-        workers = max(1, min(24, (os.cpu_count() or 2) - 2))
+        workers = auto_workers()
     v_ax = _axial_smooth_volume(v_sag, p, workers)
     B_sag = _frame_boundary_surface(v_sag, p, workers)
     B_ax = _frame_boundary_surface(v_ax, p, workers)
