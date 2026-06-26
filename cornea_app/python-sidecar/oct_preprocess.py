@@ -811,20 +811,20 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
                                          np.array([fm[f] for f in rf], float)).astype(np.float32)
         return prior
 
-    # slice band = the anchored span ± slice_band neighbouring slices; the correction is full over the anchored
-    # span and ramps linearly back to the auto edge across the band margin (so the band edges have no seam).
+    # SLICE band = ±slice_band around EACH anchored slice (NOT the [min,max] envelope). The envelope was the
+    # bug behind "Confirm changes un-edited parts": anchors on slice 0 AND slice 504 made [a_lo,a_hi]=[0,504]
+    # = the WHOLE volume full-weight + marched, even with slice_band=0. Now each anchored slice gets its own
+    # band; slices far from every anchored slice keep the baseline. slice_band=0 → ONLY the anchored slices.
     anchored = sorted(anc.keys())
-    a_lo, a_hi = anchored[0], anchored[-1]
-    band_lo, band_hi = max(0, a_lo - slice_band), min(n - 1, a_hi + slice_band)
+    ws = np.zeros(n, dtype=np.float32)                       # per-slice weight: 1 at an anchored slice → 0 at ±band
+    for sa in anchored:
+        for s in range(max(0, sa - slice_band), min(n - 1, sa + slice_band) + 1):
+            d = abs(s - sa)
+            ws[s] = max(ws[s], 1.0 if d == 0 else max(0.0, (slice_band + 1 - d) / float(slice_band + 1)))
+    band_mask = ws > 0
 
     def _slice_weight(s: int) -> float:
-        if a_lo <= s <= a_hi:
-            return 1.0
-        if band_lo <= s < a_lo:
-            return (s - band_lo + 1) / float(a_lo - band_lo + 1)
-        if a_hi < s <= band_hi:
-            return (band_hi - s + 1) / float(band_hi - a_hi + 1)
-        return 0.0
+        return float(ws[s])
 
     def _splice(s: int, redet: np.ndarray) -> None:
         w = wf * _slice_weight(s)                            # combined frame×slice blend weight
@@ -845,13 +845,14 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
         redet[region_mask] = np.clip(redet[region_mask], prior[region_mask] - seed_win, prior[region_mask] + seed_win)
         redet_region[s] = redet; _splice(s, redet)
 
-    # 2) march the region outward across the BAND only (prior = resolved neighbour's region, small window),
-    #    re-detecting each band slice; the slice-weight blend ramps the correction back to the auto edge at the
-    #    band edges. Outside [band_lo, band_hi] the surface stays exactly the auto baseline.
+    # 2) march the region outward to the band slices ONLY (band_mask = within ±slice_band of an anchored slice;
+    #    prior = resolved neighbour's region, small window). Slices outside every anchored slice's band keep the
+    #    baseline exactly. With slice_band=0, band_mask is just the anchored slices → nothing marches.
+    band_slices = [s for s in range(n) if band_mask[s]]
     progressing = True
     while progressing:
         progressing = False
-        for s in range(band_lo, band_hi + 1):
+        for s in band_slices:
             if s in redet_region:
                 continue
             nb = (s - 1) if (s - 1) in redet_region else ((s + 1) if (s + 1) in redet_region else None)
@@ -862,7 +863,7 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
             redet = _redetect_one_slice(sl, prior, march_win, p).astype(np.float32)
             redet_region[s] = redet; _splice(s, redet); progressing = True
         if progress:
-            progress(min(1.0, len(redet_region) / max(1, band_hi - band_lo + 1)))
+            progress(min(1.0, len(redet_region) / max(1, len(band_slices))))
     return surface
 
 

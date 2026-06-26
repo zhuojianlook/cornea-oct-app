@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.0.46"
+version = "0.0.47"
 description = "Cornea OCT"
 authors = ["you"]
 license = ""
