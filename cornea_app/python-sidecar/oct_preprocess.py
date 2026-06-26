@@ -79,11 +79,13 @@ DEFAULT_PARAMS: dict = {
     # = how many neighbouring slices each side of the anchored slice(s) are re-detected, the correction blending
     # smoothly back to the auto edge across that band (no seam). Drag on more slices to widen the corrected span.
     "redetect_frame_margin": 8,
-    # 0 = STRICTLY LOCAL: a correction changes ONLY the slice(s) the user actually edited (+ the per-frame
-    # margin within each), never neighbouring slices. (Raise it to also re-detect ±N neighbour slices around
-    # the edit — useful when the same detector error spans a band — but that changes slices the user didn't
-    # touch, which the user explicitly does NOT want by default.)
-    "redetect_slice_band": 0,
+    # PROPAGATE-TO-NEARBY (user request): a correction also re-detects the SAME corrected frame columns on the
+    # ±N neighbour slices around each anchored slice, seeded by (pulled toward) the drawn surface — so a fix at
+    # a bad cornea edge improves the neighbouring slices' boundary too (the detector error usually spans a band).
+    # Strictly confined to the corrected FRAME columns (the rest of every slice stays the auto baseline) and the
+    # weight ramps to 0 at ±N so there is no seam. 0 = strictly local (only the edited slices). Was 0 in v0.0.50;
+    # re-enabled in v0.0.51 now that the leak (corrections bleeding onto un-edited frames) is fixed.
+    "redetect_slice_band": 20,
     # The user-drawn line is trusted: the seed re-detection only snaps to the nearest gradient within
     # ±redetect_seed_window depth px of the drag (1-2 px), instead of a generous search that could wander off
     # the line. The march to neighbouring slices then tracks the surface within ±detect_window.

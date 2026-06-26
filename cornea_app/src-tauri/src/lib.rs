@@ -173,6 +173,13 @@ fn ulog(app: &tauri::AppHandle, msg: &str) {
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) {
     kill_sidecar(&app);
+    // Persist the current window size/position NOW: the AppImage update path below exec()s a new process,
+    // which never fires Tauri's exit event, so the window-state plugin's save-on-exit would be skipped and an
+    // update would forget a resize made this session.
+    {
+        use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+        let _ = app.save_window_state(StateFlags::all());
+    }
     #[cfg(target_os = "linux")]
     {
         if let Ok(appimage) = std::env::var("APPIMAGE") {
@@ -216,6 +223,19 @@ pub fn run() {
             {
                 app.handle().plugin(tauri_plugin_process::init())?;
                 app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            }
+            // Window size/position persistence. The window-state plugin saves on close, but it does NOT
+            // reliably RESTORE a window declared in tauri.conf.json (it gets created at the config size before
+            // the plugin's auto-restore applies), so the app kept reopening at the default 1400x900 even
+            // though .window-state.json held the user's last size. Restore it EXPLICITLY here, and enforce a
+            // sane MINIMUM so a restored tiny/off-screen size can't make the app unusable.
+            {
+                use tauri_plugin_window_state::{StateFlags, WindowExt};
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.set_min_size(Some(tauri::LogicalSize::new(900.0, 600.0)));
+                    // restore size + position (+maximized/fullscreen); the OS clamps to the min set above.
+                    let _ = win.restore_state(StateFlags::all());
+                }
             }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
