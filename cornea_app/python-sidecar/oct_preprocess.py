@@ -79,7 +79,11 @@ DEFAULT_PARAMS: dict = {
     # = how many neighbouring slices each side of the anchored slice(s) are re-detected, the correction blending
     # smoothly back to the auto edge across that band (no seam). Drag on more slices to widen the corrected span.
     "redetect_frame_margin": 8,
-    "redetect_slice_band": 30,
+    # 0 = STRICTLY LOCAL: a correction changes ONLY the slice(s) the user actually edited (+ the per-frame
+    # margin within each), never neighbouring slices. (Raise it to also re-detect ±N neighbour slices around
+    # the edit — useful when the same detector error spans a band — but that changes slices the user didn't
+    # touch, which the user explicitly does NOT want by default.)
+    "redetect_slice_band": 0,
     # The user-drawn line is trusted: the seed re-detection only snaps to the nearest gradient within
     # ±redetect_seed_window depth px of the drag (1-2 px), instead of a generous search that could wander off
     # the line. The march to neighbouring slices then tracks the surface within ±detect_window.
