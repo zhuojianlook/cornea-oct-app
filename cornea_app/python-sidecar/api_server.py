@@ -1743,7 +1743,13 @@ def set_case_classification(case_id: str, req: ClassificationRequest) -> dict:
     if cls is not None and cls not in ("scar", "control"):
         raise HTTPException(status_code=400, detail="classification must be 'scar', 'control', or null")
     updates: dict = {"scar_classification": cls}     # None clears it
-    if req.scar_range is not None:
+    if cls != "scar":
+        # A scar frame-range is meaningless once the scan is a control (or untagged) — clear it so a
+        # stale range left from an earlier "scar" tag can't confine a later detection. (Mirrors the
+        # frontend's intent of sending scar_range:null on demotion, which the conditional below would
+        # otherwise ignore.)
+        updates["scar_range"] = None
+    elif req.scar_range is not None:
         updates["scar_range"] = [int(x) for x in req.scar_range] or None
     m = orch.write_manifest_value(case_id, updates)
     return {"ok": True, "scar_classification": m.get("scar_classification"),

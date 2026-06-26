@@ -23,7 +23,8 @@ interface OctGroup {
   id: string;
   patient: string;
   eye: string;
-  condition?: Cls;
+  condition?: Cls;  // DEPRECATED — scar/control is now per-SCAN (OctScan.condition). Kept only so the
+                    // group header can offer a "set all in group" bulk shortcut; never read as the source of truth.
   origPatient: string;
   origEye: string;
 }
@@ -35,7 +36,8 @@ interface OctScan {
   nVolumes?: number;
   nFrames: number;
   status: Status;
-  scarRange: [number, number]; // per-scan (only used when the scan's group is tagged "scar")
+  condition?: Cls;             // per-scan scar / control (no scar) tag — individually specified
+  scarRange: [number, number]; // per-scan (only used when this scan is tagged "scar")
   // Replicate set WITHIN the eye group. One eye can hold scans of DIFFERENT scars (e.g. 3
   // posterior + 2 inferior) — those are NOT replicates of each other, so SAM2 + consensus run
   // PER subgroup, not per eye. Assigned after preprocessing; "1" = the default single subgroup.
@@ -192,6 +194,8 @@ export function OctLoader() {
   const scansRef = useRef<OctScan[]>([]);
   scansRef.current = scans;
   const warmedRef = useRef<Set<string>>(new Set());
+  // Per-caseId chain of classification writes → last user action is the last write to land (no out-of-order clobber).
+  const classifyChainRef = useRef<Map<string, Promise<unknown>>>(new Map());
 
   // Pre-warm each scan's raw scrub previews in the BACKGROUND while idle, so clicking a scan to
   // scrub is instantaneous (no per-click .OCT decode + render wait). Pauses during any
@@ -235,11 +239,45 @@ export function OctLoader() {
   const updateGroup = (id: string, p: Partial<OctGroup>) =>
     setGroups((cur) => cur.map((g) => (g.id === id ? { ...g, ...p } : g)));
 
-  // Tagging a group Scar/Control invalidates any already-corrected scans in it (the scar
-  // range is baked into preprocessing, so the corrected result is now stale).
-  const setGroupCondition = (id: string, condition?: Cls) => {
-    updateGroup(id, { condition });
-    setScans((cur) => cur.map((s) => (s.groupId === id && s.status === "done" ? { ...s, status: "ready" } : s)));
+  // Persist a scan's scar/control decision to its manifest RIGHT AWAY (the /classification endpoint is
+  // metadata-only — the geometric OCT correction never used it, so this is NOT a re-preprocess and a
+  // "done" scan stays done). Best-effort: local state is the source of truth for the UI; a failed write
+  // just won't survive a reload. Fire-and-forget so the toggle stays snappy.
+  const persistClassification = (caseId: string | undefined, condition: Cls | undefined, scarRange: [number, number]) => {
+    if (!caseId) return;
+    const body = JSON.stringify({
+      classification: condition ?? null,
+      scar_range: condition === "scar" ? scarRange : null,
+    });
+    // Chain after this case's previous write so rapid toggles (e.g. scar → control) land in the order
+    // the user clicked them; the newest call is always the last to reach the manifest.
+    const prev = classifyChainRef.current.get(caseId) ?? Promise.resolve();
+    const next = prev
+      .catch(() => undefined)
+      .then(() => api.json(`/api/case/${caseId}/classification`, "POST", body).catch(() => undefined));
+    classifyChainRef.current.set(caseId, next);
+  };
+  // Tag ONE scan Scar / Control (no scar). Updates local state + the per-scan lifecycle flag (so the
+  // entry colour / timeline reflect it) and persists. Does NOT invalidate the corrected volume.
+  const withCondition = (s: OctScan, condition?: Cls): OctScan =>
+    ({ ...s, condition, life: s.life ? { ...s.life, scar_classification: condition ?? null } : s.life });
+  const setScanCondition = (scanId: string, condition?: Cls) => {
+    const scan = scans.find((s) => s.id === scanId);
+    setScans((cur) => cur.map((s) => (s.id === scanId ? withCondition(s, condition) : s)));
+    if (scan) persistClassification(scan.caseId, condition, scan.scarRange);
+  };
+  // Group header shortcut: set EVERY (non-errored) scan in the group to the same tag at once.
+  const setGroupCondition = (gid: string, condition?: Cls) => {
+    const groupScans = scans.filter((s) => s.groupId === gid && s.status !== "error");
+    setScans((cur) => cur.map((s) => (s.groupId === gid && s.status !== "error" ? withCondition(s, condition) : s)));
+    groupScans.forEach((s) => persistClassification(s.caseId, condition, s.scarRange));
+  };
+  // The group's displayed tag = the common value when all its scans agree, else null (indeterminate).
+  const groupCondition = (gid: string): Cls | null => {
+    const cs = scans.filter((s) => s.groupId === gid && s.status !== "error");
+    if (!cs.length) return null;
+    const first = cs[0].condition ?? null;
+    return cs.every((s) => (s.condition ?? null) === first) ? first : null;
   };
   // A scan that changes group may now have a different Scar/Control tag than the one baked
   // into its corrected volume — re-mark "done" scans "ready" so they re-run under the new group.
@@ -281,6 +319,7 @@ export function OctLoader() {
         // A scan already corrected in a prior session loads as "done" so it's coloured + skipped on re-run.
         nFrames: 101, status: c.error ? "error" : c.preprocessed ? "done" : "ready",
         error: c.error, scarRange: [1, 101], subgroup: "1", selected: !c.error, passes: c.passes, life: c.life,
+        condition: ((c.life?.scar_classification as Cls | null | undefined) ?? undefined) || undefined,
       });
     }
     setGroups(order);
@@ -495,7 +534,7 @@ export function OctLoader() {
     try {
       const runOne = async (s: typeof sel[number]) => {
         const g = groups.find((gg) => gg.id === s.groupId);
-        const cls = g?.condition ?? null;
+        const cls = s.condition ?? null;   // per-scan scar/control tag (was group-level)
         const edited = g && isEdited(g);
         patchScan(s.id, { status: "preprocessing" });
         try {
@@ -621,9 +660,8 @@ export function OctLoader() {
   const maxScanPasses = Math.max(1, ...scans.filter((s) => s.status === "done" && s.selected).map((s) => s.passes ?? 1));
   // Tagging is the point of this panel: don't let a scan in an untagged group preprocess
   // (it would be committed with no Scar/Control label, silently producing unlabeled data).
-  const runnableInGroup = (gid: string) =>
-    scans.some((s) => s.groupId === gid && s.selected && s.caseId && s.status !== "error" && s.status !== "done");
-  const untaggedGroups = groups.filter((g) => !g.condition && runnableInGroup(g.id));
+  // Any selected scan still missing a scar/control tag → show the (optional) hint.
+  const hasUntaggedRunnable = scans.some((s) => !s.condition && s.selected && s.caseId && s.status !== "error");
 
   return (
     <div className="flex flex-col gap-2">
@@ -701,7 +739,10 @@ export function OctLoader() {
                     </span>
                   )}
                   <div className="flex items-center gap-2">
-                    <ToggleButtonGroup size="small" exclusive value={g.condition ?? null}
+                    {/* "Set all" shortcut — tags EVERY scan in the group at once (each scan also has its own
+                        toggle below). Shows the common tag, or blank when the group's scans disagree. */}
+                    <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>all:</span>
+                    <ToggleButtonGroup size="small" exclusive value={groupCondition(g.id)}
                       onChange={(_, v) => setGroupCondition(g.id, (v as Cls) || undefined)}>
                       <ToggleButton value="scar" sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Scar</ToggleButton>
                       <ToggleButton value="control" sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Control (no scar)</ToggleButton>
@@ -815,12 +856,28 @@ export function OctLoader() {
                           </div>
                         )}
 
-                        {/* Scar frame-range (per scan) — only when the group is tagged Scar. */}
-                        {g.condition === "scar" && s.status !== "error" && (
+                        {/* Per-scan Scar / Control (no scar) tag — individually specified for THIS scan
+                            (not the whole group). Persists immediately; never re-preprocesses. */}
+                        {s.status !== "error" && (
+                          <div className="ml-6 mt-0.5 flex items-center gap-1">
+                            <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>scar?</span>
+                            <ToggleButtonGroup size="small" exclusive value={s.condition ?? null}
+                              onChange={(_, v) => setScanCondition(s.id, (v as Cls) || undefined)}>
+                              <ToggleButton value="scar" disabled={busy} sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Scar</ToggleButton>
+                              <ToggleButton value="control" disabled={busy} sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>No scar</ToggleButton>
+                            </ToggleButtonGroup>
+                          </div>
+                        )}
+
+                        {/* Scar frame-range (per scan) — only when THIS scan is tagged Scar. The range is
+                            scar-detection metadata (not geometry), so changing it never invalidates the
+                            corrected volume; persisted on release. */}
+                        {s.condition === "scar" && s.status !== "error" && (
                           <div className="ml-6 mt-1 pr-2">
                             <div className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>scar frames {s.scarRange[0]}–{s.scarRange[1]}</div>
                             <Slider size="small" min={1} max={s.nFrames} value={s.scarRange} disabled={busy}
-                              onChange={(_, v) => patchScan(s.id, { scarRange: v as [number, number], status: s.status === "done" ? "ready" : s.status })} />
+                              onChange={(_, v) => patchScan(s.id, { scarRange: v as [number, number] })}
+                              onChangeCommitted={(_, v) => persistClassification(s.caseId, "scar", v as [number, number])} />
                           </div>
                         )}
                       </div>
@@ -871,9 +928,9 @@ export function OctLoader() {
           <Button variant="contained" size="small" onClick={runPreprocess} disabled={busy || nToRun < 1}>
             Preprocess selected ({nToRun})
           </Button>
-          {untaggedGroups.length > 0 && (
+          {hasUntaggedRunnable && (
             <Typography variant="caption" sx={{ color: "var(--c-text-dim)", wordBreak: "break-word" }}>
-              Scar/Control is optional here — you can set it after preprocessing in the Scar stage.
+              Scar/Control is optional here — tag each scan now or after preprocessing in the Scar stage.
             </Typography>
           )}
           {nDone > 0 && maxScanPasses > 1 && (
