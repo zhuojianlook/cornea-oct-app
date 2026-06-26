@@ -964,10 +964,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           points={curFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
         <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.6}
           points={curEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
-        {/* anchored frames on this slice → pink (over the red) */}
+        {/* anchored frames on this slice → pink (over the red) — thin + translucent like the other lines */}
         {borderMode === "edge" && colRuns(anchoredFrames).map(([a, b], i) => a === b
-          ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(1, depthVox / 140)} fill="#ff5db0" stroke="none" />
-          : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={2.6} vectorEffect="non-scaling-stroke"
+          ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(0.8, depthVox / 200)} fill="#ff5db0" stroke="none" opacity={0.7} />
+          : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={1.0} vectorEffect="non-scaling-stroke" opacity={0.7}
               points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
         {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through */}
         {curPara && (
