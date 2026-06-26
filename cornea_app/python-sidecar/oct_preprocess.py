@@ -72,6 +72,18 @@ DEFAULT_PARAMS: dict = {
     # unrestricted argmax), so it is byte-for-byte unchanged.
     "detect_window": 10.0,
     "detect_seed_window": 45.0,
+    # ── NATIVE DP surface detector (default) ── A globally-smooth anterior-surface detector that matches a
+    # careful manual trace far better than the per-column gradient-argmax + RANSAC-quadratic legacy path
+    # (which picks wrong layers at low-signal edges and leaves a jagged boundary), so AUTO preprocessing needs
+    # little/no manual fix-columns. Pipeline: anisotropic despeckle (more along depth) → dark→bright vertical
+    # gradient GATED by "bright cornea tissue just below" (locks to the true anterior surface, not internal
+    # layers or top speckle) → dynamic-programming shortest smooth path (per-frame depth step ≤ dp_max_jump),
+    # then sub-voxel refined. detector="dp" (default) | "legacy" (the old _merged_side_edge).
+    "detector": "dp",
+    "dp_sigma_depth": 3.0,        # despeckle Gaussian sigma along DEPTH (heavier — speckle is fine-grained)
+    "dp_sigma_frame": 1.2,        # despeckle Gaussian sigma along FRAMES (lighter — keep real lateral shape)
+    "dp_below": 24,               # depth window (px) just BELOW a candidate used for the "bright tissue below" gate
+    "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
     # ── fix-columns "Confirm" = LOCAL re-detection ── A user correction should change ONLY the corrected
     # ("pink line") region + a BAND of neighbouring slices around it (the detector uses neighbour comparison,
     # so they're re-detected too); the rest of the auto-detected surface is satisfactory and kept untouched.
@@ -115,6 +127,7 @@ DEFAULT_PARAMS: dict = {
     "clip_a_max": 0.05,        # ...rejects the limbus/edge-of-volume false positive (too-steep, not a dome)
     "clip_flank_rms": 8.0,     # ...and the flank-inlier RMS ≤ this (a real dome's flanks fit a parabola well)
     "clip_inlier_frac": 0.6,   # ...and the RANSAC inlier fraction on the valid columns ≥ this
+    "clip_close_gap": 4,       # fill internal gaps ≤ this in the clip mask (DP can fragment a clipped run)
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
@@ -539,8 +552,17 @@ def _clip_mask(sl: np.ndarray, edge: np.ndarray, p: dict) -> np.ndarray:
     # 0 ≤ edge < floor: a clipped apex is pinned just BELOW the frame top. A NEGATIVE edge means the detector
     # already ran OFF-frame (a limbus/edge-of-volume slice where _correct_surface cubic-extrapolated past 0) —
     # that is NOT a central clipped dome and must not be treated as one.
-    return (e >= 0.0) & (e < float(p.get("clip_edge_floor", 8.0))) & \
+    mask = (e >= 0.0) & (e < float(p.get("clip_edge_floor", 8.0))) & \
            (top / colmax > float(p.get("clip_top_frac", 0.5)))
+    # Consolidate small gaps: the DP detector can place 1-3 columns of a clipped apex a few px DEEPER than the
+    # top floor, fragmenting the run (so those columns leak into the dome fit as outliers → the inlier gate
+    # fails and the clip is missed). A binary closing fills internal gaps ≤ clip_close_gap WITHOUT growing the
+    # outer extent — restoring the contiguous central run the gates expect. No-op for the already-contiguous
+    # legacy mask and for a normal scan's (empty/sparse) mask, so it can't create a false clip.
+    gap = int(p.get("clip_close_gap", 4))
+    if gap > 0 and mask.any():
+        mask = ndimage.binary_closing(mask, structure=np.ones(2 * gap + 1, dtype=bool))
+    return mask
 
 
 def _longest_run(mask: np.ndarray) -> int:
@@ -684,10 +706,81 @@ def _fill_black_bands(volume: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(revert_sagittal(sag))
 
 
+def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
+    """NATIVE dynamic-programming anterior-surface detector (see DEFAULT_PARAMS['detector']).
+    slice_img = (depth, frames), depth 0 = TOP. Returns the per-frame surface depth (float, sub-voxel).
+
+    1) Despeckle with an ANISOTROPIC Gaussian (heavier along depth, where OCT speckle is fine-grained;
+       lighter along frames, to keep the real lateral corneal shape).
+    2) Score each (depth, frame) as a candidate anterior surface = a dark→bright vertical gradient GATED by
+       the mean brightness just BELOW it (the cornea is bright tissue under a dark gap), so the score is high
+       only at the true epithelial surface — not at internal layers or random top speckle. Column-normalised
+       so a dim peripheral frame still yields a confident pick.
+    3) Dynamic programming finds the globally-smoothest maximum-score path (depth step ≤ dp_max_jump between
+       adjacent frames) — the speckle-robust, jitter-free surface. Then a 3-point parabolic sub-voxel refine.
+
+    A `prior` (per-frame expected depth) restricts the search to ±detect_window around it (used by the
+    fix-columns marched re-detection); prior=None is the normal global auto detection."""
+    img = ndimage.gaussian_filter(slice_img.astype(np.float32),
+                                  sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
+    D, F = img.shape
+    gy = np.gradient(img, axis=0)                                  # +ve = intensity rises downward (dark→bright)
+    np.clip(gy, 0.0, None, out=gy)
+    med = float(np.median(img))
+    bw = max(2, int(p.get("dp_below", 24)))
+    below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))   # mean of ~bw px BELOW each point
+    score = gy * np.maximum(below - med, 0.0)                      # strong edge AND bright tissue below
+    # restrict to a window around a prior, if supplied (fix-columns tilt-aware re-detection)
+    win = p.get("detect_window") if prior is not None else None
+    if prior is not None and win is not None and float(win) > 0:
+        pr = np.asarray(prior, dtype=np.float32)
+        rows = np.arange(D)[:, None]
+        mask = (rows >= (pr - float(win))[None, :]) & (rows <= (pr + float(win))[None, :])
+        score = np.where(mask, score, 0.0)
+    score = score / (score.max(axis=0, keepdims=True) + 1e-6)     # per-frame normalise → confident dim columns
+    cost = (-score).astype(np.float32)
+    maxj = max(1, min(int(p.get("dp_max_jump", 10)), D - 1))   # clamp to depth so offsets stay in-range (tiny D)
+    offs = np.arange(-maxj, maxj + 1)
+    dp = cost[:, 0].copy()
+    back = np.empty((D, F), dtype=np.int32)
+    for f in range(1, F):
+        cand = np.full((offs.size, D), np.inf, dtype=np.float32)  # cand[k,d] = dp_prev[d+offs[k]]
+        for k, o in enumerate(offs):
+            if o < 0:
+                cand[k, -o:] = dp[:D + o]
+            elif o > 0:
+                cand[k, :D - o] = dp[o:]
+            else:
+                cand[k, :] = dp
+        kbest = np.argmin(cand, axis=0)
+        dp = cand[kbest, np.arange(D)] + cost[:, f]
+        back[:, f] = np.arange(D) + offs[kbest]
+    surf = np.empty(F, dtype=np.int32)
+    surf[F - 1] = int(np.argmin(dp))
+    for f in range(F - 1, 0, -1):
+        surf[f - 1] = back[surf[f], f]
+    # 3-point parabolic sub-voxel refine on the score profile at each frame's chosen depth
+    out = surf.astype(np.float32)
+    fcols = np.arange(F)
+    d0 = surf
+    mid = np.clip(d0, 1, D - 2)
+    a = score[mid - 1, fcols]; b = score[mid, fcols]; c = score[mid + 1, fcols]
+    denom = (a - 2.0 * b + c)
+    safe = np.abs(denom) > 1e-6
+    shift = np.where(safe, 0.5 * (a - c) / np.where(safe, denom, 1.0), 0.0)
+    shift = np.clip(shift, -0.5, 0.5)
+    interior = (d0 >= 1) & (d0 <= D - 2)
+    out[interior] = (mid + shift)[interior]
+    return out
+
+
 def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
-    """The per-slice corrected boundary (process_slice_single_stage → 'Merged Side Edge'),
-    choosing the lower-error edge of {hist-eq, raw} advanced-filtered detections. When a prior surface is
-    supplied (fix-columns marched re-detection) the underlying gradient argmax is windowed around it."""
+    """The per-slice corrected anterior boundary. Default detector = the native DP path (_detect_surface_dp,
+    matches a manual trace so AUTO preprocessing needs minimal correction); set params['detector']='legacy'
+    for the original {hist-eq, raw} gradient-argmax + RANSAC-quadratic choice. When a prior surface is supplied
+    (fix-columns marched re-detection) the underlying detection is windowed around it."""
+    if str(p.get("detector", "dp")).lower() != "legacy":
+        return _detect_surface_dp(slice_img, p, prior=prior)
     edge_h = _advanced_edge(_histeq(slice_img), p, prior=prior)
     edge_r = _advanced_edge(slice_img, p, prior=prior)
     q_h = _fit_quadratic_ransac(edge_h, p["residual_threshold"])
