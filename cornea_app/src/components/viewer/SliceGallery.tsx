@@ -711,7 +711,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         body.manual_shifts = manual_shifts;
       }
       await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify(body));
-      setColSel(false);
+      // In fix-columns, STAY in the border editor after Run so the user can inspect the result and keep
+      // correcting (Confirm/Run stay available) — exiting (colSel=false) dropped those buttons and surfaced
+      // the unrelated "✎ Scar" instead. The legacy column-marking path still exits.
+      if (!fixCols) setColSel(false);
       setBadCols(new Set());
       // Refetch the case so caseInfo.manifest.oct_params.manual_shifts is FRESH — without this,
       // persistedShifts stays stale, the "shifted" badge sticks, and a later re-run would resend a
@@ -952,6 +955,15 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // Parabola mode: the live editable quadratic = fit through the detected edge with the user's points overriding.
   const curParaPts = borderSliceIdx != null ? paraAnchors.get(borderSliceIdx) : undefined;
   const curPara = (borderMode === "parabola" && curEdge) ? fitQuadratic(curEdge, curParaPts) : null;
+  // Draw the curves spanning the FULL slice width: frame f is centred at x=f+0.5, so a plain map leaves a
+  // half-column gap at each end (frame 0 / last frame's outer half un-drawn). Anchor the ends at x=0 and
+  // x=nFrames (repeating the first/last value) so the edge reaches the very first/last pixel columns.
+  const spanPts = (yAt: (f: number) => number): string => {
+    const pts: string[] = [`0,${yAt(0)}`];
+    for (let f = 0; f < nFrames; f++) pts.push(`${f + 0.5},${yAt(f)}`);
+    pts.push(`${nFrames},${yAt(nFrames - 1)}`);
+    return pts.join(" ");
+  };
   const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
     <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%",
                   transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom})`, transformOrigin: "center center" }}>
@@ -961,9 +973,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
         <polyline fill="none" stroke="#5db0ff" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.55}
-          points={curFit.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
+          points={spanPts((f) => curFit[f])} />
         <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.6}
-          points={curEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
+          points={spanPts(edgeY)} />
         {/* anchored frames on this slice → pink (over the red) — thin + translucent. A SINGLE anchor is drawn
             as a short VERTICAL tick, NOT a <circle>: the SVG viewBox (nFrames×depthVox) is stretched with
             preserveAspectRatio="none", so a circle squashes into a wide horizontal pink dash ("artifact line"). */}
@@ -975,7 +987,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through */}
         {curPara && (
           <polyline fill="none" stroke="#39d98a" strokeWidth={1.5} vectorEffect="non-scaling-stroke" opacity={0.95}
-            points={curPara.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
+            points={spanPts((f) => curPara[f])} />
         )}
         {curPara && [...(curParaPts?.entries() ?? [])].map(([f, d], i) => (
           // vertical tick, not <circle> — circles squash to horizontal dashes under the stretched viewBox
