@@ -1248,6 +1248,8 @@ class OctPreprocessRequest(BaseModel):
                                               # (provided_edges) instead of auto-detecting — the fix-columns "Run".
     parabola: bool | None = None              # fix-columns "Confirm" parabola mode: the anchors are a DENSE fitted
                                               # quadratic → use it EXACTLY (seed window 0), don't re-snap per frame.
+    concurrency: int | None = None            # batch preprocess: how many scans the caller runs AT ONCE → each
+                                              # scan uses (cpu-2)//concurrency workers (avoids oversubscription).
     ascan_rate_hz: float | None = None        # eye-motion tab: A-scan (line) rate → frame rate → Hz axis (Avanti ~70000)
     detrend_order: int | None = None          # eye-motion tab: per-A-line shape-removal polynomial order (default 2)
     sinc_correct: bool | None = None          # eye-motion tab: divide out the intra-frame motion-blur boxcar
@@ -1535,6 +1537,11 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         eff_params.pop("good_columns", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
+    # surface_cut (fix-columns "Re-run with cuts") is a PER-RUN override like force_columns, NOT a sticky
+    # param: strip any persisted one unless THIS request supplies it, so a normal auto preprocess can't
+    # silently re-apply a stale cut (which would exclude columns + leave them unwarped → degraded labels).
+    if not (req.params and "surface_cut" in req.params):
+        eff_params.pop("surface_cut", None)
     # #2 drag-to-correct: explicit per-frame manual depth nudges. When provided (non-None), REPLACE the
     # persisted set (an empty {} clears them); when omitted, the persisted nudges carry through so manual
     # ground truth stays applied on every later re-run. Flows to the worker inside eff_params (--params).
@@ -1590,6 +1597,13 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     _sh.rmtree(iter_dir, ignore_errors=True)        # clear stale intermediate pass NIfTIs
     _clear_iter_preview_groups(case_id)             # clear stale per-pass preview groups
     extra = ["--max-iter", str(max_it), "--iter-dir", str(iter_dir)]
+    # Scan-level concurrency: when the caller runs K scans at once (req.concurrency), give each scan
+    # (cpu-2)//K workers so K scans × that ≈ all cores (no oversubscription) and the serial phases of one
+    # scan overlap the parallel phases of another → fuller CPU use than one-scan-at-a-time. K<=1 → auto (full).
+    _k = max(1, int(req.concurrency or 1))
+    if _k > 1:
+        _w = max(2, ((os.cpu_count() or 2) - 2) // _k)
+        extra += ["--workers", str(_w)]
     if redetect_npz is not None:
         extra += ["--provided-edges", str(redetect_npz)]   # flatten to the confirmed re-detected surface
     elif inject_pass is not None:

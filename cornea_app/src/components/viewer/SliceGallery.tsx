@@ -522,7 +522,13 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         setCut((c) => ({ ...c, top: d }));
       } else {
         const f = Math.round(Math.max(0, Math.min(nFrames - 1, ((e.clientX - r.left) / r.width) * nFrames)));
-        setCut((c) => (cutDragRef.current === "left" ? { ...c, left: f } : { ...c, right: f }));
+        setCut((c) => {
+          if (cutDragRef.current === "left") {        // keep left < right with ≥5 in-frame columns between
+            const rightEff = c.right > 0 ? c.right : nFrames - 1;
+            return { ...c, left: Math.min(f, Math.max(0, rightEff - 5)) };
+          }
+          return { ...c, right: Math.max(f, Math.min(nFrames - 1, c.left + 5)) };
+        });
       }
       return;
     }
@@ -642,6 +648,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       } else {
         anchorsApi = anchorsToApi(borderAnchors);
       }
+      // Parabola Confirm with NO buildable anchors (e.g. the edge source was briefly unavailable during a
+      // curves re-fetch) would POST {} → the backend treats empty anchors as REVERT-to-auto and we'd silently
+      // discard the shaped curve. Abort instead (keep the points so the user can re-Confirm).
+      if (parabola && Object.keys(anchorsApi).length === 0) { setRedetectBusy(false); return; }
       await api.json(`/api/case/${caseId}/oct-border-redetect`, "POST",
         JSON.stringify({ border_pass: borderPass, border_anchors: anchorsApi, parabola }));
       if (borderMode === "parabola") setParaAnchors(new Map());   // baked into the cached surface now
@@ -1069,7 +1079,15 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
             {fixCols ? (
               <>
                 <ToggleButtonGroup size="small" exclusive value={cutMode ? "cut" : borderMode}
-                  onChange={(_, v) => { if (!v) return; if (v === "cut") setCutMode(true); else { setCutMode(false); setBorderMode(v); } }}>
+                  onChange={(_, v) => {
+                    if (!v) return;
+                    // Clear the inactive modes' UNCONFIRMED edits on switch so a stray point/drag in one mode
+                    // can't block Run/Confirm in another (paraCount/anchorsDirty are global). Persisted
+                    // (confirmed) anchors are untouched — borderAnchors just re-seeds from them.
+                    if (v !== "parabola") setParaAnchors(new Map());
+                    if (v !== "edge") setBorderAnchors(cloneAnchors(persistedAnchors));
+                    if (v === "cut") setCutMode(true); else { setCutMode(false); setBorderMode(v); }
+                  }}>
                   <ToggleButton value="edge" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
                     title="Drag the noisy detected edge onto the true surface — a LOCAL correction (only the dragged region + nearby slices change)">Edge</ToggleButton>
                   <ToggleButton value="parabola" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
@@ -1121,11 +1139,19 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                       Reset cuts
                     </button>
                   )}
-                  <button onClick={rerunWithCut} disabled={rerunBusy || redetectBusy}
-                    title="Re-run preprocessing excluding the cut surfaces from the fit (which extrapolates across them) — robust on clipped scans"
-                    style={{ background: "var(--c-accent)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || redetectBusy) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || redetectBusy) ? 0.6 : 1 }}>
+                  {(() => {
+                    // an ACTIVE cut = at least one surface is actually cut in (a cut line off at its frame edge
+                    // is not a cut). Disable Re-run otherwise, so it can't run a plain preprocess that would
+                    // silently discard a previously confirmed edge/parabola correction.
+                    const cutActive = cut.top > 0 || cut.left > 0 || (cut.right > 0 && cut.right < nFrames - 1);
+                    return (
+                  <button onClick={rerunWithCut} disabled={rerunBusy || redetectBusy || !cutActive}
+                    title={cutActive ? "Re-run preprocessing excluding the cut surfaces from the fit (which extrapolates across them) — robust on clipped scans" : "Drag a cut line in first"}
+                    style={{ background: cutActive ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || redetectBusy || !cutActive) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || redetectBusy || !cutActive) ? 0.6 : 1 }}>
                     {rerunBusy ? "Running…" : "Re-run with cuts"}
                   </button>
+                    );
+                  })()}
                 </>
               ) : (
               <>

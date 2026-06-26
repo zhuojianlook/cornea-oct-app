@@ -485,15 +485,18 @@ export function OctLoader() {
     }
     setBusy(true);
     setReport(null);
-    let failed = 0;
+    let failed = 0, done = 0;
     let lastIter: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } | null = null;
+    let lastOkCase: string | null = null;
+    // Process MULTIPLE scans CONCURRENTLY (was one-by-one, leaving cores idle during each scan's serial
+    // phases). Run `conc` at a time and tell the backend so each scan uses (cpu-2)//conc workers — K scans ×
+    // that ≈ all cores, no oversubscription, and one scan's serial phases overlap another's parallel phases.
+    const conc = sel.length > 1 ? Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 8) / 8))) : 1;
     try {
-      for (let k = 0; k < sel.length; k++) {
-        const s = sel[k];
+      const runOne = async (s: typeof sel[number]) => {
         const g = groups.find((gg) => gg.id === s.groupId);
         const cls = g?.condition ?? null;
         const edited = g && isEdited(g);
-        setStep(`Preprocessing ${k + 1}/${sel.length} — ${s.filename}${maxPasses > 1 ? ` (iterative ≤${maxPasses} passes)` : ""} (OCT→correct, up to ~20 min if the backend is busy)`);
         patchScan(s.id, { status: "preprocessing" });
         try {
           const r = await api.json<{ oct_iter?: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } }>(
@@ -502,31 +505,36 @@ export function OctLoader() {
               classification: cls,
               scar_range: cls === "scar" ? s.scarRange : null,
               max_iterations: maxPasses,
+              concurrency: conc,
               // Persist a user-corrected identity so the rename reaches consensus/export.
               ...(edited ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
             }));
           lastIter = r.oct_iter ?? null;
           patchScan(s.id, { status: "done", passes: r.oct_iter?.passes ?? 1 });
-          // Show the freshly-corrected scan in the viewer (switch to it even if another was on
-          // screen) so the user immediately sees the preprocessed result. openCase loads the
-          // corrected working volume; initTabs refetches the corrected previews.
-          setActiveId(s.caseId!);
-          setCaseId(s.caseId!);
-          await openCase();
-          initTabs(false);
+          lastOkCase = s.caseId!;
         } catch (e) {
           patchScan(s.id, { status: "error", error: msg(e) });
           failed++;
         }
-      }
+        done++;
+        setStep(`Preprocessing ${done}/${sel.length}${conc > 1 ? ` (${conc} at a time)` : ""}${maxPasses > 1 ? ` · iterative ≤${maxPasses} passes` : ""} — up to ~20 min for a busy batch.`);
+      };
+      // concurrency-limited pool: `conc` worker loops pull from a shared index
+      let next = 0;
+      const pump = async () => { while (next < sel.length) { const i = next++; await runOne(sel[i]); } };
+      await Promise.all(Array.from({ length: Math.min(conc, sel.length) }, () => pump()));
+      // Show the last successfully-corrected scan in the viewer (one switch at the end avoids races between
+      // concurrent openCase calls). openCase loads its corrected working volume; initTabs refetches previews.
+      if (lastOkCase) { setActiveId(lastOkCase); setCaseId(lastOkCase); await openCase(); initTabs(false); }
       // Convergence summary (single scan, iterative): show every pass's boundary deviation (raw +
       // each pass) and WHICH pass was kept (the least-deviant) — so a pass that worsened the boundary
       // is visible and was NOT kept. Step through them in ⇆ Before/after.
       let conv = "";
-      if (sel.length === 1 && lastIter && (lastIter.passes ?? 1) > 1) {
-        const ms = (lastIter.metrics ?? []).map((x) => x.toFixed(2)).join(" → ");
-        const best = lastIter.best_pass ?? lastIter.passes;
-        conv = ` Refined ${lastIter.passes} passes — kept pass ${best} (boundary deviation raw→passes: ${ms} px; lower=flatter${lastIter.stopped ? `, stopped: ${lastIter.stopped}` : ""}). Step through them in ⇆ Before/after.`;
+      const li = lastIter as { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } | null;
+      if (sel.length === 1 && li && (li.passes ?? 1) > 1) {
+        const ms = (li.metrics ?? []).map((x: number) => x.toFixed(2)).join(" → ");
+        const best = li.best_pass ?? li.passes;
+        conv = ` Refined ${li.passes} passes — kept pass ${best} (boundary deviation raw→passes: ${ms} px; lower=flatter${li.stopped ? `, stopped: ${li.stopped}` : ""}). Step through them in ⇆ Before/after.`;
       }
       // Don't claim success when some scans failed — surface the partial result.
       setStep(failed

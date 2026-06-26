@@ -1378,7 +1378,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             max_iterations: int = 1, min_improvement: float = 0.15,
                             abs_floor: float = 0.3, iter_dir: str | Path | None = None,
                             inject_pass: int | None = None, inject_force=None, inject_good=None,
-                            provided_edges: np.ndarray | None = None) -> dict:
+                            provided_edges: np.ndarray | None = None, workers: int | None = None) -> dict:
     """Full pipeline: read .OCT → smoother corrections → NIfTI with correct geometry.
 
     max_iterations<=1 → single pass. max_iterations>1 → iterative refinement (iterate_smooth_volume),
@@ -1397,7 +1397,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         # fix-columns marched re-detection: a SINGLE warp that flattens to the user-validated surface,
         # NO iteration and NO axial-refine (both re-detect with no prior and could deviate from the
         # previewed surface) — so the corrected volume matches the scrub preview exactly.
-        corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges)
+        corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges, workers=workers)
         info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "redetect",
                 "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0}}
         p_all = {**DEFAULT_PARAMS, **(params or {})}
@@ -1414,7 +1414,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             vol, params, max_iter=int(max_iterations),
             min_improvement=min_improvement, abs_floor=abs_floor, progress=progress,
             inject_pass=inject_pass, inject_force=inject_force, inject_good=inject_good,
-            clip_report=clip_report)
+            clip_report=clip_report, workers=workers)
         corrected = chain[best_idx]                 # the BEST pass (least-deviant boundary)
         # Write EVERY corrected pass (V1..Vm) so the UI can step through them all and SEE why the
         # best was chosen (a worse pass is visibly more deviant). chain[0] = raw = context_raw.
@@ -1425,7 +1425,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                 write_volume_nifti(pv, idir / f"pass_{k}.nii.gz", sp)
     else:
         corrected, m, ax = smooth_volume(vol, params, progress=progress, return_metric=True,
-                                         clip_report=clip_report)
+                                         clip_report=clip_report, workers=workers)
         info = {"passes": 1, "best_pass": 1, "metrics": [float(m)], "axial_metrics": [float(ax)], "stopped": "single"}
     info["apex_clipped"] = clip_report.get("apex_clipped", {"slices": {}, "n_slices": 0, "n_frames_total": 0})
     # #2 ping-pong: refine the sagittally-corrected volume with an AXIAL pass, kept per-frame only where
@@ -1433,7 +1433,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # real scans to give the smoothest 3-D corneal surface; never worse than sagittal-only.
     p_all = {**DEFAULT_PARAMS, **(params or {})}
     if p_all.get("axial_refine", True):
-        corrected, ref = axial_refine_volume(corrected, params)
+        corrected, ref = axial_refine_volume(corrected, params, workers=workers)
         info["axial_refine"] = ref
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
@@ -1614,6 +1614,7 @@ if __name__ == "__main__":
     ap.add_argument("--inject-force", default="[]")           # bad frame indices for the injected pass
     ap.add_argument("--inject-good", default="[]")            # good/anchor frame indices for the injected pass
     ap.add_argument("--provided-edges", default="")           # .npz with 'surface' (lateral,frames): fix-columns marched re-detect
+    ap.add_argument("--workers", type=int, default=0)         # per-scan parallel worker cap (0 = auto); set <full when running scans concurrently
     a = ap.parse_args()
     _p = _json.loads(a.params)
     _comp = a.companion_txt or None
@@ -1647,7 +1648,8 @@ if __name__ == "__main__":
             max_iterations=a.max_iter, min_improvement=a.min_improvement, abs_floor=a.abs_floor,
             iter_dir=(a.iter_dir or None),
             inject_pass=(a.inject_pass or None), inject_force=_json.loads(a.inject_force or "[]"),
-            inject_good=_json.loads(a.inject_good or "[]"), provided_edges=_pe)
+            inject_good=_json.loads(a.inject_good or "[]"), provided_edges=_pe,
+            workers=(a.workers if a.workers and a.workers > 0 else None))
         # Single machine-readable line the sidecar parses for the per-pass convergence report.
         print("ITER " + _json.dumps(_info))
     print("OK " + str(a.out_nifti))
