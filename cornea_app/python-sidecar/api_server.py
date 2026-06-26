@@ -1679,6 +1679,13 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     worker_out = _run_oct_worker("preprocess", src, work, eff_params, vi,
                                  companion=m.get("companion_txt"), extra=extra)
     iter_info = _parse_iter_info(worker_out)
+    # NATIVE AUTO-TUNE: the worker tuned the DP detector to this scan; persist the chosen dp_* into the case's
+    # oct_params so the fix-columns baseline + steps re-detect with the SAME params the warp used (preview ==
+    # result). The cache params_sig includes the dp_* keys, so the surface caches recompute accordingly.
+    _tuned = (iter_info.get("auto_tune") or {}).get("params") if isinstance(iter_info, dict) else None
+    if isinstance(_tuned, dict) and _tuned:
+        eff_params.update({k: v for k, v in _tuned.items() if k in
+                           ("dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump")})
     # The corrected volume just changed → drop any segmentation built on the OLD correction so a
     # stale overlay can't show on the re-corrected volume (the user re-runs SAM2 next).
     seg_dir = orch.segmentation_preview_dir(case_id)
@@ -1910,6 +1917,12 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
     # preprocess. These are whole-volume decisions (keep-best iteration, axial ping-pong refine,
     # inter-slice smoothing) that can't be faithfully shown from one slice, so they're reported as
     # the decision + its outcome. (Images for these need an orientation check on a real scan first.)
+    # Number the volume-level nodes CONTIGUOUSLY after the per-slice steps (the DP filmstrip has 7, legacy 8),
+    # so the sequence has no gap regardless of detector.
+    _vn = [len(steps)]
+    def _vlabel(text: str) -> str:
+        _vn[0] += 1
+        return f"{_vn[0]}. {text}"
     oct_iter = m.get("oct_iter") or {}
     passes = int(oct_iter.get("passes", 0) or 0)
     if passes and passes > 0:
@@ -1917,11 +1930,11 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
         best = oct_iter.get("best_pass")
         stopped = oct_iter.get("stopped", "")
         dev = ", ".join(f"{float(x):.2f}" for x in metrics) if metrics else "—"
-        steps.append({"label": f"9. Keep-best iteration — {passes} pass(es), kept pass {best}",
+        steps.append({"label": _vlabel(f"Keep-best iteration — {passes} pass(es), kept pass {best}"),
                       "kind": "decision", "group": "volume",
                       "branch": f"boundary deviation per pass: [{dev}] px · argmin kept · stop: {stopped}"})
     ism = float((eff_params.get("interslice_smooth") or 0) or 0)
-    steps.append({"label": "10. Inter-slice smoothing",
+    steps.append({"label": _vlabel("Inter-slice smoothing"),
                   "kind": "decision", "group": "volume",
                   "branch": (f"displacement field smoothed across slices (σ={ism:.1f})" if ism > 0
                              else "off (interslice_smooth = 0)")})
@@ -1931,9 +1944,9 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
         ax_note = ", ".join(f"{k}={v}" for k, v in ax.items())
     else:
         ax_note = "ping-pong axial pass; per-frame kept only where it lowers lateral roughness (global never-worse guard)"
-    steps.append({"label": "11. Axial ping-pong refine — " + ("applied" if axial_on else "off"),
+    steps.append({"label": _vlabel("Axial ping-pong refine — " + ("applied" if axial_on else "off")),
                   "kind": "decision", "group": "volume", "branch": ax_note})
-    steps.append({"label": "12. Manual depth nudges (Fix-columns)",
+    steps.append({"label": _vlabel("Manual depth nudges (Fix-columns)"),
                   "kind": "decision", "group": "volume",
                   "branch": (f"{len(eff_params.get('manual_shifts') or {})} frame(s) nudged — applied LAST as ground truth"
                              if eff_params.get("manual_shifts") else "none — applied LAST, after all fitting/guards")})

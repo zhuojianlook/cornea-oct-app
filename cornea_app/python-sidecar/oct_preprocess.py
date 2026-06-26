@@ -84,6 +84,12 @@ DEFAULT_PARAMS: dict = {
     "dp_sigma_frame": 1.2,        # despeckle Gaussian sigma along FRAMES (lighter — keep real lateral shape)
     "dp_below": 24,               # depth window (px) just BELOW a candidate used for the "bright tissue below" gate
     "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
+    # ── NATIVE AUTO-TUNE ── The app tunes the DP params to EACH scan (no user input): a coordinate-descent
+    # sweep scored by on-board surface confidence (contrast − weight·roughness) on sampled slices, run at the
+    # start of preprocessing; the chosen dp_* are used for the warp AND persisted so the fix-columns baseline
+    # matches. auto_tune=False keeps the fixed defaults.
+    "auto_tune": True,
+    "autotune_smooth_weight": 18.0,   # roughness penalty vs contrast in the auto-tune objective
     # ── fix-columns "Confirm" = LOCAL re-detection ── A user correction should change ONLY the corrected
     # ("pink line") region + a BAND of neighbouring slices around it (the detector uses neighbour comparison,
     # so they're re-detected too); the rest of the auto-detected surface is satisfactory and kept untouched.
@@ -826,6 +832,73 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     return np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
 
 
+def _surface_confidence(sl_smooth: np.ndarray, edge: np.ndarray):
+    """Score a detected edge WITHOUT ground truth: CONTRAST = bright tissue just below − dark just above (on a
+    fixed-scale smoothed slice; high only on a real anterior boundary, since a deeper layer has bright cornea
+    ABOVE it → low/negative contrast) and ROUGHNESS = mean |2nd difference| (jaggedness). Returns (contrast, roughness)."""
+    D, F = sl_smooth.shape
+    if D < 13:                                     # too shallow to sample ±6 px around the edge (never real OCT)
+        return 0.0, (float(np.mean(np.abs(np.diff(np.asarray(edge, float), 2)))) if F >= 3 else 0.0)
+    ei = np.clip(np.round(np.asarray(edge)).astype(int), 6, D - 7)
+    fc = np.arange(F)
+    below = np.mean([sl_smooth[ei + j, fc] for j in range(1, 7)], axis=0)
+    above = np.mean([sl_smooth[ei - j, fc] for j in range(1, 7)], axis=0)
+    return float(np.mean(below - above)), float(np.mean(np.abs(np.diff(np.asarray(edge, float), 2))))
+
+
+def auto_tune_detector(sag: np.ndarray, params: dict | None = None, n_sample: int = 24):
+    """The app tunes the native DP detector to THIS scan — no ground truth, no user input ('tuning performed
+    by the app itself'). Coordinate-descent over the dp_* params, scoring each candidate on a spread of sampled
+    sagittal slices by surface confidence (contrast − autotune_smooth_weight·roughness), and returns the best
+    dp_* overrides (a dict) + its score. Sampling avoids the extreme periphery (limbus / cornea-out-of-frame)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if str(p.get("detector", "dp")).lower() == "legacy":
+        return {}, 0.0
+    n = int(sag.shape[0])
+    lo, hi = int(0.15 * n), int(0.85 * n)
+    if hi - lo < 3:
+        lo, hi = 0, n - 1
+    idxs = np.unique(np.linspace(lo, hi, min(int(n_sample), max(3, hi - lo))).round().astype(int))
+    slices = [np.ascontiguousarray(sag[i]).astype(np.float32) for i in idxs]
+    # Score contrast on a LIGHTLY-smoothed slice so OVER-smoothing the detector (which drifts the edge off the
+    # sharp boundary) is penalised → the objective has an interior optimum that varies per scan, instead of
+    # monotonically rewarding maximum smoothing. Roughness still penalises an under-smoothed jagged edge.
+    sms = [ndimage.gaussian_filter(s, (1.0, 0.6)) for s in slices]
+    sw = float(p.get("autotune_smooth_weight", 18.0))
+
+    def score(pp: dict) -> float:
+        cs = rs = 0.0
+        for sl, sm in zip(slices, sms):
+            c, r = _surface_confidence(sm, _detect_surface_dp(sl, pp))
+            cs += c; rs += r
+        k = max(1, len(slices))
+        return cs / k - sw * (rs / k)
+
+    grid = {"dp_sigma_depth": [2.0, 3.0, 4.0], "dp_sigma_frame": [0.8, 1.2, 2.0],
+            "dp_below": [16, 24, 32], "dp_max_jump": [6, 10, 16]}
+    # DETERMINISTIC: always start from the fixed DEFAULTS (not any persisted/incoming dp_*) and run coordinate
+    # descent to a STABLE local optimum (idempotent), so the same raw scan always tunes to the same dp_* —
+    # re-running a preprocess (or the steps filmstrip) never silently shifts the surface.
+    best = {k: DEFAULT_PARAMS[k] for k in grid}
+    best_s = score({**p, **best})
+    for _pass in range(4):
+        moved = False
+        for key, vals in grid.items():
+            bv, bs = best[key], best_s
+            for v in vals:
+                if v == best[key]:
+                    continue
+                s = score({**p, **best, key: v})
+                if s > bs:
+                    bs, bv = s, v
+            if bv != best[key]:
+                moved = True
+            best[key], best_s = bv, bs
+        if not moved:
+            break
+    return {k: (float(v) if isinstance(v, float) else int(v)) for k, v in best.items()}, float(best_s)
+
+
 def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
                      baseline: np.ndarray | None = None, progress=None) -> np.ndarray:
     """LOCAL-BAND re-detection seeded by the user's fix-columns anchors.
@@ -1544,6 +1617,19 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         write_volume_nifti(corrected, out_nifti, sp)
         info["out"] = str(out_nifti)
         return info
+    # ── NATIVE AUTO-TUNE: the app tunes the DP detector to THIS scan before correcting (no user input). The
+    # chosen dp_* are merged into params so the warp uses them AND surfaced in info["auto_tune"] so the caller
+    # persists them to the case (→ the fix-columns baseline + steps recompute with the same tuned params).
+    params = dict(params or {})
+    _pa = {**DEFAULT_PARAMS, **params}
+    auto_tune_info: dict = {}
+    if _pa.get("auto_tune", True) and str(_pa.get("detector", "dp")).lower() != "legacy":
+        try:
+            best, sc = auto_tune_detector(reformat_to_sagittal(vol), params)
+            params.update(best)
+            auto_tune_info = {"params": best, "score": round(float(sc), 2)}
+        except Exception:  # noqa: BLE001 — tuning is best-effort; fall back to the fixed defaults
+            auto_tune_info = {}
     clip_report: dict = {}
     if max_iterations and int(max_iterations) > 1:
         chain, best_idx, info = iterate_smooth_volume(
@@ -1564,6 +1650,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                          clip_report=clip_report, workers=workers)
         info = {"passes": 1, "best_pass": 1, "metrics": [float(m)], "axial_metrics": [float(ax)], "stopped": "single"}
     info["apex_clipped"] = clip_report.get("apex_clipped", {"slices": {}, "n_slices": 0, "n_frames_total": 0})
+    if auto_tune_info:
+        info["auto_tune"] = auto_tune_info          # tuned dp_* → caller persists to the case's oct_params
     # #2 ping-pong: refine the sagittally-corrected volume with an AXIAL pass, kept per-frame only where
     # it makes the en-face boundary smoother (and only if the whole 3-D surface improves). Confirmed on
     # real scans to give the smoothest 3-D corneal surface; never worse than sagittal-only.
@@ -1672,25 +1760,52 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     res = float(p["residual_threshold"]); cf = float(p.get("corr_factor", 1.0)); at = float(p.get("active_threshold", 5.0))
     vol = read_oct_zstack(oct_path, volume_index)
     sag = reformat_to_sagittal(vol)                 # (lateral, depth, frames)
+    # Mirror preprocess: auto-tune the DP detector to THIS scan so the filmstrip's detection + warp match what
+    # a real preprocess produces (preview == result), even BEFORE the first preprocess has persisted the dp_*.
+    # Deterministic (auto_tune_detector seeds from defaults), so this yields the same dp_* the warp used.
+    if p.get("auto_tune", True) and str(p.get("detector", "dp")).lower() != "legacy":
+        try:
+            _best, _ = auto_tune_detector(sag, p)
+            p = {**p, **_best}
+        except Exception:  # noqa: BLE001 — best-effort; fall back to the fixed defaults
+            pass
     n = sag.shape[0]
     idx = n // 2 if slice_index is None else max(0, min(n - 1, int(slice_index)))
     sl = sag[idx].astype(np.float32)
     steps = []
+    _si = [0]
 
     def add(label, rgb, kind="stage", branch=""):
-        steps.append((label, _disp_resize(rgb), kind, branch))
+        _si[0] += 1
+        steps.append((f"{_si[0]}. {label}", _disp_resize(rgb), kind, branch))
 
-    add(f"1. Original — sagittal slice {idx}/{n}", _gray_rgb(sl))
-    heq = _histeq(sl)
-    add("2. Histogram equalized", _gray_rgb(heq))
-    filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
-                               int(p["d"]), int(p["sigmaColor"]), int(p["sigmaSpace"]))
-    add("3. Bilateral filtered", _gray_rgb(filt))
-    raw_edge = _detect_surface_gradient(filt, p["sigma"])
-    add("4. Surface edge detected (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED))
-    merged = _merged_side_edge(sl, p)
-    add("5. Side-corrected boundary (green)", _draw_curve(_gray_rgb(sl), merged, _C_GREEN),
-        kind="decision", branch="per side: keep the hist-eq OR raw edge, whichever fits its RANSAC quadratic best")
+    add(f"Original — sagittal slice {idx}/{n}", _gray_rgb(sl))
+    merged = _merged_side_edge(sl, p)                # the detected edge (DP by default, or legacy)
+    if str(p.get("detector", "dp")).lower() != "legacy":
+        # ── NATIVE DP detector filmstrip (matches what auto preprocessing now does) ──
+        img = ndimage.gaussian_filter(sl, sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
+        add("Despeckle — anisotropic Gaussian (heavier along depth)", _gray_rgb(img))
+        gy = np.gradient(img, axis=0); np.clip(gy, 0.0, None, out=gy)
+        bw = max(2, int(p.get("dp_below", 24)))
+        below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))
+        score = gy * np.maximum(below - float(np.median(img)), 0.0)
+        score = score / (score.max(axis=0, keepdims=True) + 1e-6)
+        add("Surface score — dark→bright gradient × bright-tissue-below (brighter = more surface-like)",
+            _gray_rgb(score * 255.0), kind="decision",
+            branch="locks to the anterior epithelium (a real edge AND bright cornea just below), not internal layers or top speckle")
+        add("Detected surface (red) — DP smooth path", _draw_curve(_gray_rgb(sl), merged, _C_RED),
+            kind="decision", branch=f"dynamic-programming shortest smooth MAX-score path (per-frame depth step ≤ {int(p.get('dp_max_jump', 10))}) + 3-point sub-voxel refine")
+    else:
+        # ── legacy {hist-eq, raw} gradient-argmax + RANSAC choice filmstrip ──
+        heq = _histeq(sl)
+        add("Histogram equalized", _gray_rgb(heq))
+        filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+                                   int(p["d"]), int(p["sigmaColor"]), int(p["sigmaSpace"]))
+        add("Bilateral filtered", _gray_rgb(filt))
+        raw_edge = _detect_surface_gradient(filt, p["sigma"])
+        add("Surface edge detected (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED))
+        add("Side-corrected boundary (green)", _draw_curve(_gray_rgb(sl), merged, _C_GREEN),
+            kind="decision", branch="per side: keep the hist-eq OR raw edge, whichever fits its RANSAC quadratic best")
     # clipped-apex: if the dome apex is above the frame, fit/extrapolate from the in-frame flanks so the
     # filmstrip's fit + final warp match a real clip-aware re-run (preview == result).
     clip_cols, clip_fit = (_resolve_clip(merged, sl, res, p) if p.get("clip_handling", True)
@@ -1698,7 +1813,7 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     quad = clip_fit if clip_fit is not None else _fit_quadratic_ransac(merged, res)
     im6 = _draw_curve(_gray_rgb(sl), merged, _C_GREEN)
     _clip_note = f"; apex clipped → extrapolated from in-frame flanks ({len(clip_cols)} cols)" if len(clip_cols) else ""
-    add("6. Quadratic fit — green=edge, blue=fit", _draw_curve(im6, quad, _C_BLUE, dashed=True),
+    add("Quadratic warp-target fit — green=edge, blue=fit", _draw_curve(im6, quad, _C_BLUE, dashed=True),
         kind="decision", branch=f"RANSAC quadratic (residual ≤ {res:.0f}px); degree-2 polyfit fallback if RANSAC fails{_clip_note}")
     nb = [merged]
     if idx > 0:
@@ -1713,7 +1828,7 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     n_snapped = int(np.count_nonzero(snap))
     quad_a = clip_fit if clip_fit is not None else _fit_quadratic_ransac(active_e, res)
     im7 = _draw_curve(_gray_rgb(sl), active_e, _C_MAGENTA)
-    add("7. 3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True),
+    add("3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True),
         kind="decision", branch=f"snap cols deviating > {at:.0f}px from the 3-slice neighbour median → {n_snapped} snapped")
     # Final warp: same logic as smooth_volume — with the over-correction guard (#2) + clipped-apex handling
     # so the filmstrip matches a real re-run (runaway shift interpolated from good neighbours + clamped;
@@ -1724,7 +1839,7 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
                                clip_cols=clip_cols, clip_fit=clip_fit)
     warped = _warp_by_displacement(sag[idx], disp)
     guard = f"over-correction guard: clamp |shift| > {max_disp:.0f}px (interp from good neighbours)" if max_disp > 0 else "no over-correction guard (max_displacement=0)"
-    add("8. Final corrected — column warp", _gray_rgb(warped.astype(np.float32)), kind="decision", branch=guard)
+    add("Final corrected — column warp", _gray_rgb(warped.astype(np.float32)), kind="decision", branch=guard)
     return n, idx, steps
 
 
