@@ -1246,6 +1246,8 @@ class OctPreprocessRequest(BaseModel):
                                               # a tilt-aware re-detection of the whole RAW volume seeded by these.
     use_redetect: bool | None = None          # oct-preprocess: flatten to the confirmed re-detected surface
                                               # (provided_edges) instead of auto-detecting — the fix-columns "Run".
+    parabola: bool | None = None              # fix-columns "Confirm" parabola mode: the anchors are a DENSE fitted
+                                              # quadratic → use it EXACTLY (seed window 0), don't re-snap per frame.
     ascan_rate_hz: float | None = None        # eye-motion tab: A-scan (line) rate → frame rate → Hz axis (Avanti ~70000)
     detrend_order: int | None = None          # eye-motion tab: per-A-line shape-removal polynomial order (default 2)
     sinc_correct: bool | None = None          # eye-motion tab: divide out the intra-frame motion-blur boxcar
@@ -2032,7 +2034,8 @@ def _border_anchors_sig(anchors: dict) -> str:
 # Today every param change already rmtrees border_cache, so this is defence-in-depth against a future writer.
 _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColor", "sigmaSpace",
                       "side_window", "side_threshold_factor", "residual_threshold", "active_threshold",
-                      "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band")
+                      "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band",
+                      "redetect_seed_window")
 
 
 def _detect_params_sig(p: dict) -> str:
@@ -2143,6 +2146,10 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         op = dict(m.get("oct_params") or {})
         op.pop("detect_lo", None); op.pop("detect_hi", None)   # legacy global band — removed
         op["border_anchors"] = anchors
+        # Parabola mode: the anchors are a DENSE fitted quadratic → use it EXACTLY (seed window 0). Edge mode:
+        # the default tight window. Persisted so the cache write/read/run all derive the SAME seed window (and
+        # so params_sig matches — _redetect_surface_fresh reads this back).
+        op["redetect_seed_window"] = 0.0 if req.parabola else float(oct_mod.DEFAULT_PARAMS.get("redetect_seed_window", 2.0))
         orch.write_manifest_value(case_id, {"oct_params": op})
         if anchors:
             _compute_redetect_cache(case_id, {**m, "oct_params": op}, anchors)

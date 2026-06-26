@@ -200,6 +200,26 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   useEffect(() => { setBorderAnchors(cloneAnchors(persistedAnchors)); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [persistedAnchorsSig]);
   const anchorsDirty = anchorsSig(borderAnchors) !== anchorsSig(persistedAnchors);
   const anchorCount = useMemo(() => { let n = 0; borderAnchors.forEach((fm) => { n += fm.size; }); return n; }, [borderAnchors]);
+  // Border edit MODE (2c): drag the noisy per-frame EDGE (red) or the smooth PARABOLA (blue). In parabola mode
+  // a drag adds a point the quadratic must pass through; the curve re-fits live and Confirm uses it EXACTLY.
+  const [borderMode, setBorderMode] = useState<"edge" | "parabola">("edge");
+  // Parabola points (2c): sliceIdx → frame → depth the quadratic must pass through. The displayed parabola
+  // re-fits through (detected edge with these points overriding); Confirm sends it as the EXACT surface.
+  const [paraAnchors, setParaAnchors] = useState<Map<number, Map<number, number>>>(new Map());
+  const paraCount = useMemo(() => { let n = 0; paraAnchors.forEach((fm) => { n += fm.size; }); return n; }, [paraAnchors]);
+  // CUT mode (request 1): drag a TOP (apex/axial) line + LEFT/RIGHT lines marking where the surface leaves the
+  // frame; "Re-run with cuts" excludes those from the fit (which extrapolates) + leaves them unwarped → robust.
+  const persistedCutSig = JSON.stringify(
+    (((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.surface_cut) ?? {});
+  const [cutMode, setCutMode] = useState(false);
+  const [cut, setCut] = useState<{ top: number; left: number; right: number }>({ top: 0, left: 0, right: 0 });
+  useEffect(() => {
+    try { const c = JSON.parse(persistedCutSig) as { top?: number; left?: number; right?: number };
+      setCut({ top: Math.round(c.top || 0), left: Math.round(c.left || 0), right: Math.round(c.right || 0) });
+    } catch { setCut({ top: 0, left: 0, right: 0 }); }
+  }, [persistedCutSig]);
+  const cutDragRef = useRef<null | "top" | "left" | "right">(null);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -444,17 +464,68 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       return mm;
     });
   };
+  // 2c: least-squares degree-2 fit through the detected edge with the user's parabola points overriding their
+  // frames → the "clean quadratic" the user shapes by dragging. Returns the curve sampled per frame.
+  const fitQuadratic = (edge: number[], pts?: Map<number, number>): number[] => {
+    const n = edge.length;
+    if (n < 3) return edge.slice();
+    let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, ty = 0, txy = 0, tx2y = 0;
+    for (let x = 0; x < n; x++) {
+      const y = pts?.get(x) ?? edge[x];
+      const x2 = x * x;
+      s0 += 1; s1 += x; s2 += x2; s3 += x2 * x; s4 += x2 * x2;
+      ty += y; txy += x * y; tx2y += x2 * y;
+    }
+    const M = [[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]];
+    const det3 = (m: number[][]) =>
+      m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const D = det3(M);
+    if (Math.abs(D) < 1e-9) return edge.slice();
+    const col = [tx2y, txy, ty];
+    const repl = (j: number) => M.map((row, i) => row.map((v, k) => (k === j ? col[i] : v)));
+    const a = det3(repl(0)) / D, b = det3(repl(1)) / D, c = det3(repl(2)) / D;
+    return Array.from({ length: n }, (_v, x) => a * x * x + b * x + c);
+  };
+  // Parabola-mode drag: set the depth the quadratic must pass through at this frame (no auto-clear; dragging
+  // a point shapes the smooth curve).
+  const applyParaDrag = (clientX: number, clientY: number, svg: SVGSVGElement) => {
+    if (orient !== "sagittal" || !curEdge || nFrames <= 1 || depthVox <= 1 || borderSliceIdx == null) return;
+    const r = svg.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+    const frame = Math.round(((clientX - r.left) / r.width) * nFrames - 0.5);
+    if (frame < 0 || frame >= nFrames) return;
+    const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
+    setParaAnchors((prev) => {
+      const mm = cloneAnchors(prev);
+      const fm = mm.get(borderSliceIdx) ?? new Map<number, number>();
+      fm.set(frame, depth); mm.set(borderSliceIdx, fm);
+      return mm;
+    });
+  };
   // Anchor ONLY on a deliberate DRAG, never on the press — a click/tap (or sub-threshold jitter) must NOT
   // drop a stray anchor where you merely touched the line. We start anchoring once the pointer moves past a
   // small threshold from the press point; dragging then reshapes the border (and a stretch dragged back onto
   // the detected edge auto-clears, so it merges cleanly).
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
+    if (cutMode) return;   // cut-line elements own their pointerdown; an empty-area press does nothing here
     // middle-button OR shift+left = PAN (so you can move around while zoomed); plain left = edit the border
     const mode: "edit" | "pan" = (e.button === 1 || e.shiftKey) ? "pan" : "edit";
     borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode };
   };
   const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (cutDragRef.current) {   // dragging a cut line
+      const r = e.currentTarget.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      if (cutDragRef.current === "top") {
+        const d = Math.round(Math.max(0, Math.min(depthVox - 1, ((e.clientY - r.top) / r.height) * depthVox)));
+        setCut((c) => ({ ...c, top: d }));
+      } else {
+        const f = Math.round(Math.max(0, Math.min(nFrames - 1, ((e.clientX - r.left) / r.width) * nFrames)));
+        setCut((c) => (cutDragRef.current === "left" ? { ...c, left: f } : { ...c, right: f }));
+      }
+      return;
+    }
     const d = borderDragRef.current;
     if (!d) return;
     if (d.mode === "pan") {
@@ -465,9 +536,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       if (Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;   // ignore click jitter
       d.moved = true;
     }
-    applyBorderDrag(e.clientX, e.clientY, e.currentTarget);
+    if (borderMode === "parabola") applyParaDrag(e.clientX, e.clientY, e.currentTarget);
+    else applyBorderDrag(e.clientX, e.clientY, e.currentTarget);
   };
-  const onBorderUp = () => { borderDragRef.current = null; };
+  const onBorderUp = () => { borderDragRef.current = null; cutDragRef.current = null; };
   const onBorderWheel = (e: React.WheelEvent) => { e.preventDefault(); zoomBorderAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.2 : 1 / 1.2); };
 
   // #2 (merged): once columns are marked BAD, the ARROW KEYS nudge the whole marked set UP/DOWN in depth
@@ -552,14 +624,48 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     if (!caseId) return;
     setRedetectBusy(true);
     try {
+      let anchorsApi: Record<string, Record<string, number>>;
+      let parabola = false;
+      if (borderMode === "parabola") {
+        // parabola mode: send each edited slice's fitted quadratic DENSELY → the backend uses it EXACTLY
+        // (seed window 0) so the warp flattens to the clean curve the user shaped, not a re-snapped edge.
+        parabola = true;
+        anchorsApi = {};
+        paraAnchors.forEach((pts, s) => {
+          const e = accurate.get(s)?.edge ?? allCurves?.edges[s];
+          if (!e || !pts.size) return;
+          const q = fitQuadratic(e, pts);
+          const inner: Record<string, number> = {};
+          for (let f = 0; f < q.length; f++) inner[String(f)] = Math.round(Math.max(0, Math.min(depthVox - 1, q[f])));
+          anchorsApi[String(s)] = inner;
+        });
+      } else {
+        anchorsApi = anchorsToApi(borderAnchors);
+      }
       await api.json(`/api/case/${caseId}/oct-border-redetect`, "POST",
-        JSON.stringify({ border_pass: borderPass, border_anchors: anchorsToApi(borderAnchors) }));
+        JSON.stringify({ border_pass: borderPass, border_anchors: anchorsApi, parabola }));
+      if (borderMode === "parabola") setParaAnchors(new Map());   // baked into the cached surface now
       await openCase();                       // refresh oct_params (persisted anchors → enables Run)
       wfSet("segVersion", segSig + 1);        // re-pull the re-detected border (this slice + on scrub)
     } catch {
       /* surfaced via the spinner stopping; the volume is unchanged on failure */
     } finally {
       setRedetectBusy(false);
+    }
+  };
+  // Request 1: re-run the DEFAULT preprocessing with the clipped surfaces cut off (sent in params.surface_cut).
+  const rerunWithCut = async () => {
+    if (!caseId) return;
+    setRerunBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST",
+        JSON.stringify({ params: { surface_cut: { top: cut.top, left: cut.left, right: cut.right } } }));
+      await openCase();
+      wfSet("segVersion", segSig + 1);
+    } catch {
+      /* surfaced via the spinner stopping */
+    } finally {
+      setRerunBusy(false);
     }
   };
   const rerunColumns = async () => {
@@ -833,6 +939,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     return curEdge ? curEdge[f] : 0;                                    // detected / band-re-detected
   };
   const anchoredFrames = useMemo(() => new Set(curAnchors ? curAnchors.keys() : []), [curAnchors]);
+  // Parabola mode: the live editable quadratic = fit through the detected edge with the user's points overriding.
+  const curParaPts = borderSliceIdx != null ? paraAnchors.get(borderSliceIdx) : undefined;
+  const curPara = (borderMode === "parabola" && curEdge) ? fitQuadratic(curEdge, curParaPts) : null;
   const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
     <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%",
                   transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom})`, transformOrigin: "center center" }}>
@@ -846,10 +955,41 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.6}
           points={curEdge.map((_d, f) => `${f + 0.5},${edgeY(f)}`).join(" ")} />
         {/* anchored frames on this slice → pink (over the red) */}
-        {colRuns(anchoredFrames).map(([a, b], i) => a === b
+        {borderMode === "edge" && colRuns(anchoredFrames).map(([a, b], i) => a === b
           ? <circle key={`pk${i}`} cx={a + 0.5} cy={edgeY(a)} r={Math.max(1, depthVox / 140)} fill="#ff5db0" stroke="none" />
           : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={2.6} vectorEffect="non-scaling-stroke"
               points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
+        {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through */}
+        {curPara && (
+          <polyline fill="none" stroke="#39d98a" strokeWidth={1.5} vectorEffect="non-scaling-stroke" opacity={0.95}
+            points={curPara.map((d, f) => `${f + 0.5},${d}`).join(" ")} />
+        )}
+        {curPara && [...(curParaPts?.entries() ?? [])].map(([f, d], i) => (
+          <circle key={`pp${i}`} cx={f + 0.5} cy={d} r={Math.max(1.4, depthVox / 110)} fill="#39d98a"
+            stroke="#fff" strokeWidth={0.5} vectorEffect="non-scaling-stroke" />
+        ))}
+        {/* CUT lines (request 1): drag the TOP/LEFT/RIGHT lines marking where the surface leaves the frame */}
+        {cutMode && (() => {
+          const topY = cut.top, leftX = cut.left, rightX = cut.right > 0 ? cut.right : nFrames - 1;
+          const onCut = (which: "top" | "left" | "right") => (e: React.PointerEvent) => {
+            // capture on the stable SVG (not the line, which React recreates on setCut → would drop capture)
+            e.stopPropagation(); (e.currentTarget as Element).closest("svg")?.setPointerCapture?.(e.pointerId);
+            cutDragRef.current = which;
+          };
+          const C = "#ffd24d";
+          const hit = { stroke: "transparent", strokeWidth: 12, vectorEffect: "non-scaling-stroke" as const };
+          const ln = (on: boolean) => ({ stroke: C, strokeWidth: 1.3, strokeDasharray: "4 3", vectorEffect: "non-scaling-stroke" as const, opacity: on ? 0.95 : 0.4, pointerEvents: "none" as const });
+          return (
+            <>
+              <line x1={0} y1={topY} x2={nFrames} y2={topY} {...hit} style={{ cursor: "row-resize" }} onPointerDown={onCut("top")} />
+              <line x1={0} y1={topY} x2={nFrames} y2={topY} {...ln(cut.top > 0)} />
+              <line x1={leftX} y1={0} x2={leftX} y2={depthVox} {...hit} style={{ cursor: "col-resize" }} onPointerDown={onCut("left")} />
+              <line x1={leftX} y1={0} x2={leftX} y2={depthVox} {...ln(cut.left > 0)} />
+              <line x1={rightX} y1={0} x2={rightX} y2={depthVox} {...hit} style={{ cursor: "col-resize" }} onPointerDown={onCut("right")} />
+              <line x1={rightX} y1={0} x2={rightX} y2={depthVox} {...ln(cut.right > 0 && cut.right < nFrames - 1)} />
+            </>
+          );
+        })()}
       </svg>
     </div>
   ) : null;
@@ -927,11 +1067,23 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         {colSel && canMarkColumns && (
           <>
             {fixCols ? (
-              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-                {borderBusy || redetectBusy ? (redetectBusy ? "Re-detecting the whole volume…" : "Detecting border…") : (
-                  <>Drag the <b style={{ color: "#ff4d4d" }}>red border</b> onto the true surface, then <b>Confirm</b> to re-detect the whole volume; scrub to check, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>
-                )}
-              </span>
+              <>
+                <ToggleButtonGroup size="small" exclusive value={cutMode ? "cut" : borderMode}
+                  onChange={(_, v) => { if (!v) return; if (v === "cut") setCutMode(true); else { setCutMode(false); setBorderMode(v); } }}>
+                  <ToggleButton value="edge" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
+                    title="Drag the noisy detected edge onto the true surface — a LOCAL correction (only the dragged region + nearby slices change)">Edge</ToggleButton>
+                  <ToggleButton value="parabola" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
+                    title="Drag points to shape a clean quadratic; the warp flattens to it (no fighting the noisy per-frame edge)">Parabola</ToggleButton>
+                  <ToggleButton value="cut" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
+                    title="Mark a clipped surface (top/left/right) to exclude from the fit, then re-run — robust on clipped scans">✂ Cut</ToggleButton>
+                </ToggleButtonGroup>
+                <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+                  {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
+                    cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
+                    borderMode === "parabola" ? (<>Drag points to shape the <b style={{ color: "#39d98a" }}>green parabola</b>, then <b>Confirm</b>; scrub, then <b>Run</b>.{paraCount ? ` · ${paraCount} pt(s)` : ""}</>) :
+                    (<>Drag the <b style={{ color: "#ff4d4d" }}>red border</b> onto the true surface (local), then <b>Confirm</b>; scrub, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>)}
+                </span>
+              </>
             ) : (
               <>
                 <span className="text-[11px]" style={{ color: "#ff6b6b" }}>bad frames: {badCols.size}</span>
@@ -961,32 +1113,50 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
               </span>
             )}
             {fixCols ? (
+              cutMode ? (
+                <>
+                  {(cut.top > 0 || cut.left > 0 || cut.right > 0) && (
+                    <button onClick={() => setCut({ top: 0, left: 0, right: 0 })} disabled={rerunBusy}
+                      style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                      Reset cuts
+                    </button>
+                  )}
+                  <button onClick={rerunWithCut} disabled={rerunBusy || redetectBusy}
+                    title="Re-run preprocessing excluding the cut surfaces from the fit (which extrapolates across them) — robust on clipped scans"
+                    style={{ background: "var(--c-accent)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || redetectBusy) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || redetectBusy) ? 0.6 : 1 }}>
+                    {rerunBusy ? "Running…" : "Re-run with cuts"}
+                  </button>
+                </>
+              ) : (
               <>
-                {(anchorCount > 0 || anchorsDirty) && (
-                  <button onClick={() => setBorderAnchors(new Map())} disabled={redetectBusy || rerunBusy}
+                {(() => { const dirty = borderMode === "parabola" ? paraCount > 0 : (anchorCount > 0 || anchorsDirty); return dirty ? (
+                  <button onClick={() => { if (borderMode === "parabola") setParaAnchors(new Map()); else setBorderAnchors(new Map()); }} disabled={redetectBusy || rerunBusy}
                     style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
                     Clear
                   </button>
-                )}
-                <button onClick={confirmRedetect} disabled={redetectBusy || rerunBusy || !anchorsDirty}
-                  title="Re-detect the corneal border across the WHOLE volume from your anchors — then scrub to verify"
-                  style={{ background: anchorsDirty ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (redetectBusy || rerunBusy || !anchorsDirty) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (redetectBusy || rerunBusy || !anchorsDirty) ? 0.6 : 1 }}>
-                  {redetectBusy ? "Re-detecting…" : "Confirm border"}
-                </button>
+                ) : null; })()}
+                {(() => { const dirty = borderMode === "parabola" ? paraCount > 0 : anchorsDirty; return (
+                  <button onClick={confirmRedetect} disabled={redetectBusy || rerunBusy || !dirty}
+                    title={borderMode === "parabola" ? "Apply the shaped parabola — then scrub to verify" : "Re-detect the corneal border locally around your correction — then scrub to verify"}
+                    style={{ background: dirty ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (redetectBusy || rerunBusy || !dirty) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (redetectBusy || rerunBusy || !dirty) ? 0.6 : 1 }}>
+                    {redetectBusy ? "Applying…" : "Confirm border"}
+                  </button>
+                ); })()}
                 {(() => {
                   // ready ONLY when the case has confirmed anchors PERSISTED (== what the backend has cached
                   // to apply) and there are no un-confirmed drags. This both fixes the reopen deadlock and
                   // prevents enabling Run after a Clear+Confirm revert-to-auto (empty anchors → backend 400).
-                  const ready = !anchorsDirty && persistedAnchors.size > 0;
+                  const ready = !anchorsDirty && paraCount === 0 && persistedAnchors.size > 0;
                   return (
                     <button onClick={rerunColumns} disabled={rerunBusy || redetectBusy || !ready}
-                      title={anchorsDirty ? "Confirm your changes first, then scrub to verify" : "Run preprocessing with the re-detected border — only when you're satisfied"}
+                      title={(anchorsDirty || paraCount > 0) ? "Confirm your changes first, then scrub to verify" : "Run preprocessing with the corrected border — only when you're satisfied"}
                       style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || redetectBusy || !ready) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || redetectBusy || !ready) ? 0.6 : 1 }}>
                       {rerunBusy ? "Running…" : "Run preprocessing"}
                     </button>
                   );
                 })()}
               </>
+              )
             ) : (
               <>
                 {(badCols.size > 0 || shiftsDirty) && (
