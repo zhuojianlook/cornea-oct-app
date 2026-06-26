@@ -769,20 +769,43 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
     if not anc:
         return surface  # no anchors → pure baseline (auto everywhere)
 
-    # corrected frame region = span of all anchored frames; blend over ±fmargin back to the baseline edge
+    # corrected frame regions = each CONTIGUOUS RUN of anchored frames (NOT one min→max span). This is the
+    # fix for "the uncorrected edge becomes wrong": with a single [first,last] span, two SEPARATED edits
+    # (e.g. frame 30 and frame 70) made everything between them (31..69) part of the region and overwrote the
+    # real edge with a straight interpolation. Per-run regions keep the gap between separate edits at baseline.
     afr = sorted({f for fm in anc.values() for f in fm})
-    reg_lo, reg_hi = afr[0], afr[-1]
-    f0, f1 = max(0, reg_lo - fmargin), min(W - 1, reg_hi + fmargin)
-    wf = np.zeros(W, dtype=np.float32)                       # per-frame blend weight (1 in region → 0 at margins)
-    for f in range(f0, f1 + 1):
-        if reg_lo <= f <= reg_hi:
-            wf[f] = 1.0
-        elif f < reg_lo:
-            wf[f] = (f - f0 + 1) / float(reg_lo - f0 + 1)
+    runs: list[tuple[int, int]] = []
+    for f in afr:
+        if runs and f == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], f)
         else:
-            wf[f] = (f1 - f + 1) / float(f1 - reg_hi + 1)
+            runs.append((f, f))
+    wf = np.zeros(W, dtype=np.float32)                       # per-frame blend weight: 1 inside a run, ramping to
+    for (rs, re) in runs:                                    # 0 over ±fmargin at each run's ends, 0 between runs
+        lo, hi = max(0, rs - fmargin), min(W - 1, re + fmargin)
+        for f in range(lo, hi + 1):
+            if rs <= f <= re:
+                w = 1.0
+            elif f < rs:
+                w = (f - lo + 1) / float(rs - lo + 1)
+            else:
+                w = (hi - f + 1) / float(hi - re + 1)
+            wf[f] = max(wf[f], w)
     wf = np.clip(wf, 0.0, 1.0)
-    region = slice(f0, f1 + 1)
+    region_mask = wf > 0                                     # frames touched by ANY run (re-detected); rest = baseline
+
+    def _run_prior(fm: dict, slice_base: np.ndarray) -> np.ndarray:
+        """Prior = the slice's baseline, with each contiguous run's anchors interpolated WITHIN that run only
+        (no straight line bridging separate runs). Frames outside the runs keep the baseline."""
+        prior = slice_base.astype(np.float32).copy()
+        for (rs, re) in runs:
+            rf = sorted(f for f in fm if rs <= f <= re)
+            if not rf:
+                continue
+            seg = np.arange(rs, re + 1)
+            prior[rs:re + 1] = np.interp(seg, np.array(rf, float),
+                                         np.array([fm[f] for f in rf], float)).astype(np.float32)
+        return prior
 
     # slice band = the anchored span ± slice_band neighbouring slices; the correction is full over the anchored
     # span and ramps linearly back to the auto edge across the band margin (so the band edges have no seam).
@@ -805,20 +828,17 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
 
     redet_region: dict[int, np.ndarray] = {}                # slice -> full-W re-detected edge (region meaningful)
 
-    # 1) seed the anchored slice(s): robust detector windowed (±seed_win) around the user's drag in the region
+    # 1) seed the anchored slice(s): windowed (±seed_win) around the user's drag, per-run prior (baseline between runs)
     for s, fm in anc.items():
-        afs = np.array(sorted(fm.keys()), dtype=np.float32)
-        ads = np.array([fm[int(f)] for f in afs], dtype=np.float32)
-        pri = np.interp(np.arange(W, dtype=np.float32), afs, ads).astype(np.float32)
-        prior = base[s].astype(np.float32).copy(); prior[region] = pri[region]
+        prior = _run_prior(fm, base[s])
         # light=True + tight seed_win: snap to the nearest gradient within ±1-2 px of the user's drawn line
         # (no robust side-correction/RANSAC that would pull the corrected edge away from where they drew it).
         redet = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), prior, seed_win, p,
                                     light=True).astype(np.float32)
-        # HARD-clamp the region to within ±seed_win of the drawn line — the detector's _correct_surface/median
-        # post-pass can otherwise drift a low-signal frame far from where the user drew. Guarantees the corrected
-        # edge stays 1-2 px from the user's line.
-        redet[region] = np.clip(redet[region], pri[region] - seed_win, pri[region] + seed_win)
+        # HARD-clamp the re-detected region to within ±seed_win of the prior — the detector's _correct_surface/
+        # median post-pass can otherwise drift a low-signal frame far from where the user drew (and the margins
+        # stay within ±seed_win of the baseline). Guarantees the corrected edge stays 1-2 px from the line.
+        redet[region_mask] = np.clip(redet[region_mask], prior[region_mask] - seed_win, prior[region_mask] + seed_win)
         redet_region[s] = redet; _splice(s, redet)
 
     # 2) march the region outward across the BAND only (prior = resolved neighbour's region, small window),
@@ -834,7 +854,7 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
             if nb is None:
                 continue
             sl = np.ascontiguousarray(sag[s]).astype(np.float32)
-            prior = base[s].astype(np.float32).copy(); prior[region] = redet_region[nb][region]
+            prior = base[s].astype(np.float32).copy(); prior[region_mask] = redet_region[nb][region_mask]
             redet = _redetect_one_slice(sl, prior, march_win, p).astype(np.float32)
             redet_region[s] = redet; _splice(s, redet); progressing = True
         if progress:
