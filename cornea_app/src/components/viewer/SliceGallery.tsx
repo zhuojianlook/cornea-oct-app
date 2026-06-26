@@ -989,16 +989,25 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     pts.push(`${nFrames},${yAt(nFrames - 1)}`);
     return pts.join(" ");
   };
-  // #1 "uniform AND crisp": render the native B-scan at an INTEGER pixels-per-frame (kf) so every frame column
-  // is exactly kf px wide (no non-integer nearest-neighbour artefact). Width = nFrames·kf (the largest integer
-  // that fits the host); height fills the host (depth is the axis the user doesn't measure). The frame axis
-  // (101) ≈ the host width and depth gets the rest → ~the same proportion as before, just even columns. Falls
-  // back to aspect-fit until the host has been measured.
-  const bKf = Math.max(1, Math.floor((hostSize.w || 0) / Math.max(1, nFrames)));
-  const bSized = hostSize.w > 1 && nFrames > 1;
+  // #1 "uniform AND crisp" + morphologically correct: render the native B-scan at an INTEGER pixels-per-frame
+  // (kf) so every frame column is exactly kf px wide (no non-integer nearest-neighbour artefact), AND keep the
+  // PHYSICAL aspect (frames are physically far wider-spaced than depth, so a frame "pixel" is a WIDE rectangle —
+  // the cornea must not be vertically stretched). physAspect = the physically-scaled context preview's display
+  // width/height; dispH = dispW / physAspect. kf is the largest integer fitting BOTH host width and that height.
+  const sagPrev = rawImages.find((i) => i.orientation === "sagittal");
+  const physAspect = (sagPrev?.image_width && sagPrev?.image_height)
+    ? sagPrev.image_width / sagPrev.image_height
+    : nFrames / Math.max(1, depthVox);
+  const bSized = hostSize.w > 1 && hostSize.h > 1 && nFrames > 1 && physAspect > 0;
+  const bKf = Math.max(1, Math.floor(Math.min(
+    (hostSize.w || 0) / Math.max(1, nFrames),
+    ((hostSize.h || 0) * physAspect) / Math.max(1, nFrames),
+  )));
+  const bDispW = nFrames * bKf;
+  const bDispH = Math.max(1, Math.round(bDispW / physAspect));   // depth height for the physical aspect (rectangular px)
   const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
     <div style={{ position: "relative",
-                  ...(bSized ? { width: nFrames * bKf, height: "100%" } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
+                  ...(bSized ? { width: bDispW, height: bDispH } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
                   transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom})`, transformOrigin: "center center" }}>
       <img src={inputSrc} alt="pass input" draggable={false}
         style={bSized
