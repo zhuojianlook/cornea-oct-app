@@ -32,7 +32,7 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
@@ -2112,6 +2112,50 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT border curve failed: {exc}")
+
+
+@app.get("/api/case/{case_id}/oct-border-slice")
+def oct_border_slice_png(case_id: str, slice_index: int = 0, border_pass: int = 1) -> Response:
+    """The fix-columns editor's B-scan at NATIVE voxel resolution (depth rows x frame cols, depth 0 = TOP) as
+    a grayscale PNG — NO physical-aspect upscaling. The normal context preview upscales the 101-frame axis to a
+    physically-correct aspect with nearest-neighbour at a non-integer ratio, which bakes in UNEVEN frame-column
+    widths; the editor instead displays THIS native image at an integer pixels-per-frame so every column is the
+    same width AND pixel-sharp. Coordinates match the border curves (arr[idx] = (depth, frames)) so the SVG
+    overlay aligns exactly. Pass 1 = the raw volume; pass k = pass (k-1)'s output."""
+    import io
+    import numpy as np
+    from PIL import Image
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    pass_n = max(1, int(border_pass))
+    if pass_n <= 1:
+        inp = _ensure_raw_border_nifti(case_id)
+    else:
+        pv = orch.case_root(case_id) / "passes" / f"pass_{pass_n - 1}.nii.gz"
+        inp = pv if pv.exists() else _ensure_raw_border_nifti(case_id)
+    try:
+        arr = _load_border_vol(inp)                              # (lateral, depth, frames), cached
+        n = int(arr.shape[0])
+        idx = max(0, min(n - 1, int(slice_index)))
+        sl = np.ascontiguousarray(arr[idx]).astype(np.float32)  # (depth, frames), depth 0 = TOP
+        # percentile 1-99 contrast stretch → uint8 (same look as the context previews' normalize_gray)
+        finite = sl[np.isfinite(sl)]
+        if finite.size:
+            lo = float(np.percentile(finite, 1)); hi = float(np.percentile(finite, 99))
+            if hi <= lo:
+                hi = lo + 1.0
+            gray = (np.clip((sl - lo) / (hi - lo), 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            gray = np.zeros(sl.shape, dtype=np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(gray, mode="L").save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT border slice failed: {exc}")
 
 
 def _border_anchors_sig(anchors: dict) -> str:

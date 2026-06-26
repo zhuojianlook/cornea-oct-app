@@ -164,6 +164,27 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const [bZoom, setBZoom] = useState(1);
   const [bPan, setBPan] = useState({ x: 0, y: 0 });
   const borderHostRef = useRef<HTMLDivElement | null>(null);
+  const borderRoRef = useRef<ResizeObserver | null>(null);
+  // Live size of the border-editor host → lets us render the B-scan at an INTEGER pixels-per-frame so every
+  // frame column is the same width AND pixel-sharp (#1 "uniform AND crisp"); see borderPanel below. A CALLBACK
+  // ref attaches the observer exactly when the host node mounts (a [fixCols] effect raced the conditional
+  // mount and missed it) and seeds the size synchronously so the first paint is already correctly scaled.
+  const [hostSize, setHostSize] = useState({ w: 0, h: 0 });
+  const measureHost = (el: HTMLDivElement) => {
+    const r = el.getBoundingClientRect();
+    setHostSize((s) => (Math.abs(s.w - r.width) < 0.5 && Math.abs(s.h - r.height) < 0.5 ? s : { w: r.width, h: r.height }));
+  };
+  const setBorderHost = (el: HTMLDivElement | null) => {
+    borderHostRef.current = el;
+    borderRoRef.current?.disconnect();
+    borderRoRef.current = null;
+    if (el && typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => measureHost(el));
+      ro.observe(el);
+      borderRoRef.current = ro;
+      measureHost(el);
+    }
+  };
   const resetBorderView = () => { setBZoom(1); setBPan({ x: 0, y: 0 }); };
   useEffect(() => { resetBorderView(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [caseId, fixCols]);
   const zoomBorderAt = (clientX: number, clientY: number, factor: number) => {
@@ -408,7 +429,11 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       .catch(() => !cancelled && setPassInputImg(null));
     return () => { cancelled = true; };
   }, [fixCols, borderPass, caseId, cur?.slice_index, orient, segSig]);
-  const inputSrc = borderPass > 1 ? passInputImg : (rawCur ? imgSrc(rawCur) : null);
+  // Fix-columns editor: use the NATIVE-resolution B-scan (no physical-aspect nearest-neighbour upscaling) so we
+  // can render uniform, pixel-sharp frame columns (#1). Non-fixCols legacy path keeps the prior pass preview.
+  const inputSrc = fixCols
+    ? (caseId && cur ? resourceUrl(`/api/case/${caseId}/oct-border-slice?slice_index=${cur.slice_index}&border_pass=${borderPass}`) : null)
+    : (borderPass > 1 ? passInputImg : (rawCur ? imgSrc(rawCur) : null));
 
   const borderSliceIdx = cur?.slice_index ?? null;
   // 1) Fetch ALL slices' borders ONCE (fast detector) so scrubbing is instant. Re-fetched on pass change
@@ -964,11 +989,21 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     pts.push(`${nFrames},${yAt(nFrames - 1)}`);
     return pts.join(" ");
   };
+  // #1 "uniform AND crisp": render the native B-scan at an INTEGER pixels-per-frame (kf) so every frame column
+  // is exactly kf px wide (no non-integer nearest-neighbour artefact). Width = nFrames·kf (the largest integer
+  // that fits the host); height fills the host (depth is the axis the user doesn't measure). The frame axis
+  // (101) ≈ the host width and depth gets the rest → ~the same proportion as before, just even columns. Falls
+  // back to aspect-fit until the host has been measured.
+  const bKf = Math.max(1, Math.floor((hostSize.w || 0) / Math.max(1, nFrames)));
+  const bSized = hostSize.w > 1 && nFrames > 1;
   const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
-    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%",
+    <div style={{ position: "relative",
+                  ...(bSized ? { width: nFrames * bKf, height: "100%" } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
                   transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom})`, transformOrigin: "center center" }}>
       <img src={inputSrc} alt="pass input" draggable={false}
-        style={{ display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: enhanceFilter }} />
+        style={bSized
+          ? { display: "block", width: "100%", height: "100%", objectFit: "fill", imageRendering: "pixelated", filter: enhanceFilter }
+          : { display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: enhanceFilter }} />
       <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
         onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
@@ -1349,7 +1384,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
               <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                 {passInputLabel} — drag the red border{bZoom > 1 ? " · shift/middle-drag to pan" : " · scroll to zoom"}
               </span>
-              <div ref={borderHostRef} onWheel={borderPanel ? onBorderWheel : undefined}
+              <div ref={setBorderHost} onWheel={borderPanel ? onBorderWheel : undefined}
                 style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
                 {borderPanel ?? (
                   <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{borderBusy ? "Detecting border…" : "No border for this slice."}</span>
