@@ -204,6 +204,11 @@ export function OctLoader() {
   const warmedRef = useRef<Set<string>>(new Set());
   // Per-caseId chain of classification writes → last user action is the last write to land (no out-of-order clobber).
   const classifyChainRef = useRef<Map<string, Promise<unknown>>>(new Map());
+  // #1 mid-batch interaction: re-entrancy guard for preview() (so opening a finished scan during a batch
+  // doesn't clobber the batch-wide `busy`), and a flag that the user opened a scan DURING a batch (so the
+  // end-of-batch auto-switch doesn't yank them away from what they're correcting).
+  const previewInFlightRef = useRef(false);
+  const manualPreviewRef = useRef(false);
 
   // Pre-warm each scan's raw scrub previews in the BACKGROUND while idle, so clicking a scan to
   // scrub is instantaneous (no per-click .OCT decode + render wait). Pauses during any
@@ -506,10 +511,12 @@ export function OctLoader() {
     }
   };
 
-  // Scrub a scan: materialise its raw z-stack + show grayscale in the viewer.
+  // Scrub a scan: materialise its raw z-stack + show grayscale in the viewer. Re-entrancy-guarded (NOT
+  // gated on the batch `busy`) so a FINISHED scan can be opened for manual correction WHILE a batch runs.
   const preview = async (caseId?: string) => {
-    if (!caseId || busy) return;
-    setBusy(true);
+    if (!caseId || previewInFlightRef.current) return;
+    previewInFlightRef.current = true;
+    if (busyRef.current) manualPreviewRef.current = true;   // opened during a batch → don't auto-switch at the end
     setActiveId(caseId);
     try {
       setCaseId(caseId);
@@ -532,7 +539,7 @@ export function OctLoader() {
     } catch (e) {
       setStep(`Preview failed: ${msg(e)}`);
     } finally {
-      setBusy(false);
+      previewInFlightRef.current = false;
     }
   };
 
@@ -555,6 +562,7 @@ export function OctLoader() {
       return;
     }
     setBusy(true);
+    manualPreviewRef.current = false;   // track whether the user opens a finished scan mid-batch (#1)
     setReport(null);
     let failed = 0, done = 0;
     let lastIter: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } | null = null;
@@ -612,7 +620,8 @@ export function OctLoader() {
       await Promise.all(Array.from({ length: Math.min(conc, sel.length) }, () => pump()));
       // Show the last successfully-corrected scan in the viewer (one switch at the end avoids races between
       // concurrent openCase calls). openCase loads its corrected working volume; initTabs refetches previews.
-      if (lastOkCase) { setActiveId(lastOkCase); setCaseId(lastOkCase); await openCase(); initTabs(false); }
+      // BUT if the user opened a finished scan mid-batch to correct it (#1), don't yank them away from it.
+      if (lastOkCase && !manualPreviewRef.current) { setActiveId(lastOkCase); setCaseId(lastOkCase); await openCase(); initTabs(false); }
       // Convergence summary (single scan, iterative): show every pass's boundary deviation (raw +
       // each pass) and WHICH pass was kept (the least-deviant) — so a pass that worsened the boundary
       // is visible and was NOT kept. Step through them in ⇆ Before/after.
@@ -832,7 +841,9 @@ export function OctLoader() {
                 <div className="flex flex-col gap-1 px-1.5 py-1">
                   {groupScans.map((s) => {
                     const active = !!s.caseId && s.caseId === activeId;
-                    const clickable = !busy && !!s.caseId && s.status !== "error";
+                    // #1: a FINISHED (done) scan stays clickable WHILE a batch runs, so the user can open it
+                    // for manual correction; still-preprocessing/queued scans stay locked (no half-written volume).
+                    const clickable = !!s.caseId && s.status !== "error" && (!busy || s.status === "done");
                     const done = s.status === "done";
                     // Per-scan lifecycle colour (red→orange→yellow→light blue→dark blue→green) from the
                     // timeline step; only from step 2 (preprocessed-auto) onward. The actively-viewed scan

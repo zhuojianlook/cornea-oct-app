@@ -52,6 +52,24 @@ def write_label_nifti(arr_ijk: np.ndarray, base_nifti: Path, dst: Path) -> Path:
     return dst
 
 
+def write_display_labelmap(arr_ijk: np.ndarray, density_vol_ijk, base_nifti: Path, dst: Path) -> Path:
+    """DISPLAY-ONLY labelmap for the 3D viewer: 0=bg, 1=cornea, and scar split into reflectivity
+    tiers 2 (diffuse) / 3 (moderate) / 4 (dense) so the overlay shows density instead of one flat red.
+    The CANONICAL training label stays 0/1/2 (write_label_nifti) — this is a separate file the niivue
+    overlay loads. Falls back to plain scar=2 when there is no scar or no density volume."""
+    import scar as scar_mod
+    arr = np.rint(np.asarray(arr_ijk)).astype(np.uint8)
+    out = np.where(arr == 1, 1, 0).astype(np.uint8)         # cornea
+    scar_mask = arr == 2
+    if scar_mask.any():
+        if density_vol_ijk is not None:
+            tier, _ = scar_mod.density_tiers_absolute(scar_mask, np.asarray(density_vol_ijk), arr == 1)
+            out[scar_mask] = (tier[scar_mask] + 1).astype(np.uint8)   # tiers 1/2/3 → labels 2/3/4
+        else:
+            out[scar_mask] = 2
+    return write_label_nifti(out, base_nifti, dst)
+
+
 def labelmap_counts(arr_ijk: np.ndarray, spacing_mm3: float | None = None) -> dict:
     """Per-class voxel counts (and optional volume) for QA, keyed by class name."""
     out: dict[str, dict] = {}

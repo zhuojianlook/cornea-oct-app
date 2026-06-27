@@ -1718,12 +1718,20 @@ def _draw_curve(rgb: np.ndarray, y_per_x: np.ndarray, color, dashed: bool = Fals
 
 
 def _disp_resize(rgb: np.ndarray, out_h: int = 320, out_w: int = 460) -> np.ndarray:
+    # Integer block-replication so EVERY frame column is exactly the same width (#1 "uniform AND
+    # crisp"). The old np.linspace().round() index map gave some columns 1px more than others (W
+    # rarely divides out_w evenly), which is the column-width irregularity seen in the Steps filmstrip.
+    # Each frame becomes kw px wide, each depth row kh px tall; the viewer scales with image-rendering
+    # pixelated. Overlays (red/blue curves) are drawn at native resolution BEFORE this, so they scale too.
     H, W = rgb.shape[:2]
-    if H == out_h and W == out_w:
+    if H == 0 or W == 0:
         return rgb
-    ri = np.linspace(0, H - 1, out_h).round().astype(int)
-    ci = np.linspace(0, W - 1, out_w).round().astype(int)
-    return np.ascontiguousarray(rgb[ri][:, ci])
+    kw = max(1, round(out_w / W))
+    kh = max(1, round(out_h / H))
+    if kw == 1 and kh == 1:
+        return rgb
+    out = np.repeat(np.repeat(rgb, kh, axis=0), kw, axis=1)
+    return np.ascontiguousarray(out)
 
 
 def border_curves(oct_path, params=None, volume_index=0, companion_txt=None, slice_index=None):

@@ -5,6 +5,11 @@ import type { ScarMetrics } from "../api/types";
 import { useCaseStore } from "./caseStore";
 import * as nv from "../niivue/nvController";
 
+// The read-only overlay loads the DISPLAY labelmap (cornea=1, scar density tiers 2/3/4) so the viewer
+// shows scar reflectivity tiers instead of one flat red. The canonical 0/1/2 training label + the
+// correction drawing are untouched (they go through best_labelmap_nnunet / the drawing round-trip).
+const overlayUrl = (caseId: string) => resourceUrl(`/api/case/${caseId}/segmentation-display.nii.gz?t=${Date.now()}`);
+
 // Pen labels for the correction drawing: 0 erase, 1 cornea, 2 background, 3 scar.
 export type PenLabel = 0 | 1 | 2 | 3;
 // Workflow stages: 1 Segment (SAM2) → 2 Correct → 3 Scar (detect + quantify) → 4 Motion (eye-motion spectrum).
@@ -58,6 +63,9 @@ interface WorkflowState {
   segOpacity: number;
   showSegmentation: boolean;
   segQa: Record<string, unknown> | null;
+  // The case a SAM2 run is currently in flight for (null = none). Lets a case switch NOT look like an
+  // abort: the run keeps going + saves; the timeline shows a background banner instead of clearing.
+  sam2RunningCaseId: string | null;
 
   // correction drawing
   penLabel: PenLabel;
@@ -148,6 +156,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     segOpacity: 0.5,
     showSegmentation: true,
     segQa: null,
+    sam2RunningCaseId: null,
 
     penLabel: 1,
     penSize: 3,
@@ -205,6 +214,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       set((s) => {
         s.stage = 1;
         s.segLoaded = false;
+        s.showSegmentation = false;   // default each newly-opened scan to Slices; runSam2 flips it on (#6a)
         s.segQa = null;
         s.scarMetrics = null;
         s.scarSummaryInfo = null;
@@ -223,7 +233,12 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.scarBusy = false;
         s.motionBusy = false;
         s.motionResult = null;   // motion is per-scan; don't bleed across cases (ascanRateHz/sinc are prefs, kept)
-        s.status = { kind: "idle", title: "Waiting", detail: "Segment the cornea to begin." };
+        // A SAM2 run in flight for another scan is NOT aborted by switching — keep a background banner
+        // instead of clearing to idle (which made it look stopped). The run finishes + saves; reopen to review.
+        s.status = s.sam2RunningCaseId
+          ? { kind: "working", title: "Segmenting in background",
+              detail: `"${s.sam2RunningCaseId}" is still running SAM2 — it will finish and save. Reopen it to review.` }
+          : { kind: "idle", title: "Waiting", detail: "Segment the cornea to begin." };
         s.segVersion += 1;
       });
     },
@@ -263,37 +278,69 @@ export const useWorkflowStore = create<WorkflowState>()(
           detail: "Mark this scan as Scar or Control (and set replicates/controls) before running SAM2." }; });
         return;
       }
+      const isScar = m.scar_classification === "scar";
       set((s) => {
         s.segBusy = true;
-        s.status = { kind: "working", title: "SAM2 segmenting", detail: "Tracking the cornea through axial, coronal and sagittal movies, then fusing in 3D. This takes a few minutes." };
+        s.sam2RunningCaseId = caseId;
+        s.status = { kind: "working", title: "Running SAM2", detail: "Tracking the cornea through axial, coronal and sagittal movies, then fusing in 3D. This takes a few minutes." };
       });
+      const stillHere = () => useCaseStore.getState().caseId === caseId;
+      // Poll live progress (per-plane / fuse) so the user sees phases, not just a spinner; only writes
+      // while THIS case is still open + the run is busy (never overwrites another case's status).
+      const poll = setInterval(() => {
+        api.json<{ phase: string; message: string }>(`/api/case/${caseId}/segment/sam2/status`)
+          .then((p) => {
+            if (!stillHere() || !p?.message) return;
+            if (p.phase === "idle" || p.phase === "done" || p.phase === "error") return;
+            set((s) => { if (s.segBusy && s.sam2RunningCaseId === caseId) s.status = { kind: "working", title: "Running SAM2", detail: p.message }; });
+          })
+          .catch(() => undefined);
+      }, 1200);
       try {
         const res = await api.json<{ qa: Record<string, unknown> }>(
           `/api/case/${caseId}/segment/sam2`,
           "POST",
           JSON.stringify({ vote: 2 }),
         );
-        // The user may switch cases during the multi-minute run (the consensus "focus one scan → correct →
-        // go back" flow does exactly this). If so, don't paint this case's overlay onto / write its metrics
-        // into whatever case is now open — that would mis-attribute one scan's labels to another.
-        if (useCaseStore.getState().caseId !== caseId) return;
-        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
-        if (useCaseStore.getState().caseId !== caseId) return;
+        // ONE-GO pipeline (#6): a scar-labelled scan then runs scar detection with the chosen method
+        // (cornea-vs-scar); a control runs cornea only. A scar failure must NOT blank the saved cornea.
+        let scarRan = false;
+        if (isScar) {
+          if (stillHere()) set((s) => { s.status = { kind: "working", title: "Detecting scar", detail: "Flagging hyper-reflective tissue inside the cornea…" }; });
+          try {
+            const pct = Math.min(99, Math.max(60, 100 - get().scarSensitivity));
+            await api.json(`/api/case/${caseId}/scar/auto`, "POST", JSON.stringify({ percentile: pct, method: get().scarMethod }));
+            scarRan = true;
+          } catch { /* cornea is already saved server-side; the user can re-run scar from the timeline */ }
+        }
+        // The user may switch cases during the multi-minute run (the consensus "focus → correct → back"
+        // flow does this). If so, the result is saved on disk — don't paint it onto whatever case is now
+        // open; instead replace the "still running in background" banner with a "done — reopen" notice.
+        const bgDone = () => set((s) => {
+          if (s.sam2RunningCaseId === caseId)
+            s.status = { kind: "done", title: "Background scan ready",
+              detail: `"${caseId}" finished segmenting${scarRan ? " (cornea + scar)" : ""} — reopen it to review.` };
+        });
+        if (!stillHere()) { bgDone(); return; }
+        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        if (!stillHere()) { bgDone(); return; }
         set((s) => {
           s.segQa = res.qa;
           s.segLoaded = true;
           s.segVersion += 1;
           s.stage = 2;
-          s.status = { kind: "done", title: "Cornea segmented", detail: "Cornea fused from three orthogonal SAM2 passes. Review/correct it, then move to scar." };
+          s.showSegmentation = true;       // #6a: auto-switch the viewer to the segmentation overlay
+          s.status = { kind: "done", title: scarRan ? "Cornea + scar segmented" : "Cornea segmented",
+            detail: isScar
+              ? (scarRan ? "Cornea + scar done. Align this eye's replicates, or correct, then schedule."
+                         : "Cornea done; scar detection failed — re-run scar from the timeline.")
+              : "Cornea done (control — no scar). Align this eye's replicates, or correct, then schedule." };
         });
       } catch (e) {
-        set((s) => {
-          s.status = { kind: "error", title: "SAM2 failed", detail: e instanceof Error ? e.message : String(e) };
-        });
+        if (stillHere()) set((s) => { s.status = { kind: "error", title: "SAM2 failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
-        set((s) => {
-          s.segBusy = false;
-        });
+        clearInterval(poll);
+        set((s) => { s.segBusy = false; if (s.sam2RunningCaseId === caseId) s.sam2RunningCaseId = null; });
       }
     },
 
@@ -368,7 +415,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         const res = await api.upload<{ qa: Record<string, unknown> }>(`/api/case/${caseId}/segmentation/from-drawing`, [file]);
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-save — don't touch the new case
         nv.endDrawing();   // clear the drawing bitmap BEFORE reloading the overlay (else it double-renders)
-        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.segQa = res.qa;
@@ -393,7 +440,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       const caseId = useCaseStore.getState().caseId;
       nv.endDrawing();
       if (caseId) {
-        try { await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity); } catch { /* nothing to restore */ }
+        try { await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity); } catch { /* nothing to restore */ }
       }
       set((s) => {
         s.correcting = false;
@@ -451,7 +498,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           JSON.stringify({ percentile, method: get().scarMethod }),
         );
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
-        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -516,7 +563,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           JSON.stringify({ percentile }),
         );
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
-        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -564,7 +611,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         );
         // case switched mid-run — don't write metrics or wipe the NEW case's freshly-placed hints
         if (useCaseStore.getState().caseId !== caseId) return;
-        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -599,7 +646,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-edit — don't write onto the new case
         // niivue refresh is best-effort (no-op without WebGL); the 2D gallery refetches via segVersion.
         try {
-          await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+          await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
         } catch {
           /* no WebGL — gallery updates from segVersion below */
         }
@@ -650,7 +697,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
       try {
-        await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
         set((s) => {
           s.segLoaded = true;
           s.segVersion += 1;

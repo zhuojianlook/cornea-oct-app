@@ -1,12 +1,14 @@
-import { Button, CircularProgress, MenuItem, Select } from "@mui/material";
+import { useState } from "react";
+import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
 import { LIFECYCLE_STEPS, scanStep, type LifecycleStep } from "../../api/lifecycle";
 
-/* Per-scan lifecycle TIMELINE — replaces the old stage Toolbar + StageStepper. It shows the active
-   scan's progress through 7 colour-coded steps and surfaces ONLY the next action(s) for the current
-   step. Workflow order (reordered): Raw → Preprocessed[auto] → vetted → classified (scar/control) →
-   SAM2[auto] → SAM2[corrected] → scheduled for training. SAM2 is gated until the scan is classified. */
+/* Per-scan lifecycle TIMELINE — the active scan's progress through 8 colour-coded steps, surfacing ONLY
+   the next action(s). Order: Raw → Preprocessed[auto] → Vetted → Classified(scar/control) → SAM2(cornea
+   +scar, one-go) → Aligned(replicates) → Corrected → Scheduled. SAM2 is gated until classified, and for
+   a scar-labelled scan "Run SAM2" also runs scar in one go. Click any REACHED earlier step to roll back
+   to it (clears the later steps). */
 export function TimelineBar() {
   const segBusy = useWorkflowStore((s) => s.segBusy);
   const scarBusy = useWorkflowStore((s) => s.scarBusy);
@@ -37,21 +39,31 @@ export function TimelineBar() {
   const vetPreprocessing = useCaseStore((s) => s.vetPreprocessing);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
+  const resetStep = useCaseStore((s) => s.resetStep);
   const scheduled = Boolean(manifest?.training_scheduled);
+  const isConsensus = Boolean(manifest?.consensus_cases);
 
   const busy = segBusy || scarBusy;
   const step: LifecycleStep = scanStep(manifest);
+  const maxStep = LIFECYCLE_STEPS.length - 1;   // 8
 
-  // ── the step strip ──────────────────────────────────────────────────────────
+  // #9 step regression: which step the user clicked to roll back to (confirm modal).
+  const [resetTo, setResetTo] = useState<number | null>(null);
+  const downstream = resetTo != null ? LIFECYCLE_STEPS.slice(resetTo + 1, step + 1).map((x) => x.short) : [];
+
+  // ── the step strip (click a reached EARLIER step to roll back to it) ──────────
   const strip = (
     <div className="flex items-center gap-1">
-      {([1, 2, 3, 4, 5, 6, 7] as LifecycleStep[]).map((i) => {
+      {([1, 2, 3, 4, 5, 6, 7, 8] as LifecycleStep[]).map((i) => {
         const reached = step >= i;
         const current = step === i;
+        // A built consensus case can't be step-reset (its consensus_cases define it — rebuild instead).
+        const canReset = reached && i < step && !busy && !correcting && !!caseInfo && !isConsensus;
         const meta = LIFECYCLE_STEPS[i];
         return (
-          <div key={i} className="flex items-center gap-1" title={meta.label}>
-            <span style={{
+          <div key={i} className="flex items-center gap-1"
+            title={canReset ? `Roll back to “${meta.short}” — clears the later steps` : meta.label}>
+            <span onClick={() => canReset && setResetTo(i)} style={{
               display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, lineHeight: 1,
               padding: "3px 7px", borderRadius: 11, whiteSpace: "nowrap",
               background: reached ? meta.color : "var(--c-surface2)",
@@ -59,17 +71,18 @@ export function TimelineBar() {
               fontWeight: current ? 700 : 500,
               outline: current ? "2px solid #fff" : "none", outlineOffset: -1,
               opacity: reached ? 1 : 0.7,
+              cursor: canReset ? "pointer" : "default",
             }}>
               <b style={{ opacity: 0.7 }}>{i}</b>{meta.short}
             </span>
-            {i < 7 && <span style={{ color: "var(--c-text-dim)", fontSize: 10 }}>›</span>}
+            {i < maxStep && <span style={{ color: "var(--c-text-dim)", fontSize: 10 }}>›</span>}
           </div>
         );
       })}
     </div>
   );
 
-  // ── correction sub-controls (shared by steps 5/6) ──
+  // ── reusable action sub-controls ──
   const Correct = !correcting ? (
     <Button size="small" variant="outlined" disabled={busy || !segLoaded} onClick={() => loadCorrectionLayer()}
       title="Edit the labelmap with the pen (cornea/scar/erase), then Save">Correct ✎</Button>
@@ -81,12 +94,73 @@ export function TimelineBar() {
     </>
   );
 
+  const ScheduleBtn = (
+    <Button size="small" variant={scheduled ? "outlined" : "contained"} color="success" disabled={busy || correcting}
+      onClick={() => scheduleTraining(!scheduled)} title="Mark this scan ready for nnU-Net training (turns it green).">
+      {scheduled ? "Scheduled ✓ (unschedule)" : "Schedule for training"}
+    </Button>
+  );
+  const ExportBtn = (
+    <Button size="small" variant="outlined" color="success" disabled={busy} onClick={() => exportScarSummary()}
+      title="Recompute scar volume/area/density for every case → scar_summary.csv">Export metrics</Button>
+  );
+  const AlignBtn = (
+    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => buildEyeConsensus()}
+      title="Register + average this eye's repeat scans into one consensus, control-normalised by the tagged control (no-scar) scans. Run SAM2 on the eye's repeats first.">
+      ⌖ Align replicates + normalize
+    </Button>
+  );
+
+  // Scar method + sensitivity (sets what the one-go Run-SAM2 uses, and any re-run). Only meaningful for
+  // a scar-labelled scan (a control runs cornea only).
+  const ScarMethod = (
+    <>
+      <Select size="small" value={scarMethod} onChange={(e) => set("scarMethod", e.target.value)}
+        disabled={busy} sx={{ fontSize: 12, maxWidth: 190, color: "var(--c-text)", ".MuiSelect-select": { py: 0.4 }, "& fieldset": { borderColor: "var(--c-border)" } }}
+        title="Scar detection strategy (used by Run SAM2 and any re-run)">
+        <MenuItem value="hysteresis" sx={{ fontSize: 12 }}>Hysteresis (best reproducibility)</MenuItem>
+        <MenuItem value="depthnorm" sx={{ fontSize: 12 }}>Depth-normalised (uses controls)</MenuItem>
+        <MenuItem value="normal_anchor" sx={{ fontSize: 12 }}>Normal-stroma anchor</MenuItem>
+        <MenuItem value="robust_mad" sx={{ fontSize: 12 }}>Robust MAD</MenuItem>
+        <MenuItem value="morph_lcc" sx={{ fontSize: 12 }}>Morph + largest component</MenuItem>
+        <MenuItem value="brightness" sx={{ fontSize: 12 }}>Brightness percentile</MenuItem>
+      </Select>
+      <label className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }} title="How much hyper-reflectivity to flag">
+        sens<input type="range" min={1} max={40} value={sensitivity} style={{ width: 64 }} onChange={(e) => set("scarSensitivity", Number(e.target.value))} />
+      </label>
+    </>
+  );
+
+  // Re-run scar after SAM2 (iteration): detect/SAM2-scar + click-hints. Non-control only.
+  const ScarReRun = classification !== "control" ? (
+    <>
+      {ScarMethod}
+      <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
+        title="Re-detect scar inside the cornea with the selected method.">Re-run scar</Button>
+      <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
+        title="Re-run scar via SAM2 3-view consensus.">Scar (SAM2)</Button>
+      <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
+        onClick={() => set("hintMode", !hintMode)} title="Click scar areas on the slices to guide SAM2">
+        {hintMode ? "Hinting…" : "Hint"}
+      </Button>
+      {hintMode && (
+        <>
+          <Button size="small" variant={hintPositive ? "contained" : "outlined"} color="error" onClick={() => set("hintPositive", true)}>scar</Button>
+          <Button size="small" variant={!hintPositive ? "contained" : "outlined"} onClick={() => set("hintPositive", false)}>not</Button>
+          <Button size="small" variant="contained" color="warning" disabled={busy || hintCount === 0} onClick={() => applyScarHints()}>Apply ({hintCount})</Button>
+          <Button size="small" variant="outlined" disabled={busy || hintCount === 0} onClick={() => clearScarHints()}>Clear</Button>
+        </>
+      )}
+    </>
+  ) : null;
+
+  const sep = <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />;
+
   // ── actions for the CURRENT step ──
   let actions: React.ReactNode = null;
   if (step <= 1) {
     actions = <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Preprocess this scan in the sidebar ← to begin.</span>;
   } else if (step === 2) {
-    // auto-preprocessed (red) → review + Approve
     actions = (
       <>
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Review the preprocessing (Before/after · Fix-columns), then:</span>
@@ -95,13 +169,12 @@ export function TimelineBar() {
           ✓ Approve preprocessing
         </Button>
         <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => approveRaw()}
-          title="Use the ORIGINAL (raw) scan as the working volume instead of the correction — when the original is already good enough. Drops any segmentation; also marks it vetted.">
+          title="Use the ORIGINAL (raw) scan as the working volume instead of the correction. Drops any segmentation; also marks it vetted.">
           ↩ Use original (raw)
         </Button>
       </>
     );
   } else if (step === 3) {
-    // vetted (orange) → classify scar/control (replicates/controls grouped in the sidebar)
     actions = (
       <div className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
         title="Does this corrected volume have a scar? 'No scar' marks it a control (normal baseline). Replicates/controls are grouped in the sidebar.">
@@ -113,79 +186,41 @@ export function TimelineBar() {
       </div>
     );
   } else if (step === 4) {
-    // classified (yellow) → run SAM2 (now enabled)
+    // classified (yellow) → Run SAM2 = one-go (cornea, + scar for a scar-labelled scan with the chosen method)
     actions = (
       <>
+        {classification === "scar" && ScarMethod}
         <Button size="small" variant="contained" color="primary" disabled={busy} onClick={() => runSam2()}
-          title="Run SAM2 cornea segmentation (axial+coronal+sagittal → 2-of-3 consensus).">
-          ▶ Run SAM2
+          title={classification === "scar"
+            ? "Run SAM2 cornea segmentation, then detect scar (cornea vs scar) with the chosen method — in one go."
+            : "Run SAM2 cornea segmentation (control: no scar)."}>
+          ▶ Run SAM2{classification === "scar" ? " + scar" : ""}
         </Button>
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(classified as {classification})</span>
       </>
     );
-  } else if (step === 5 || step === 6) {
-    // SAM2 done → scar detection (auto), manual correction, then schedule
+  } else if (step === 5) {
+    // SAM2 (cornea+scar) done → align replicates (primary next step), or correct / schedule; re-run scar to iterate
     actions = (
       <>
-        {classification !== "control" && (
-          <>
-            <Select size="small" value={scarMethod} onChange={(e) => set("scarMethod", e.target.value)}
-              disabled={busy} sx={{ fontSize: 12, maxWidth: 180, color: "var(--c-text)", ".MuiSelect-select": { py: 0.4 }, "& fieldset": { borderColor: "var(--c-border)" } }}
-              title="Scar detection strategy">
-              <MenuItem value="hysteresis" sx={{ fontSize: 12 }}>Hysteresis (best reproducibility)</MenuItem>
-              <MenuItem value="depthnorm" sx={{ fontSize: 12 }}>Depth-normalised (uses controls)</MenuItem>
-              <MenuItem value="normal_anchor" sx={{ fontSize: 12 }}>Normal-stroma anchor</MenuItem>
-              <MenuItem value="robust_mad" sx={{ fontSize: 12 }}>Robust MAD</MenuItem>
-              <MenuItem value="morph_lcc" sx={{ fontSize: 12 }}>Morph + largest component</MenuItem>
-              <MenuItem value="brightness" sx={{ fontSize: 12 }}>Brightness percentile</MenuItem>
-            </Select>
-            <Button size="small" variant="contained" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
-              title="Detect scar inside the cornea with the selected method.">Detect scar</Button>
-            <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
-              title="Auto scar via SAM2 3-view consensus.">Scar (SAM2)</Button>
-            <label className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }} title="How much hyper-reflectivity to flag">
-              sens<input type="range" min={1} max={40} value={sensitivity} style={{ width: 64 }} onChange={(e) => set("scarSensitivity", Number(e.target.value))} />
-            </label>
-            <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
-              onClick={() => set("hintMode", !hintMode)} title="Click scar areas on the slices to guide SAM2">
-              {hintMode ? "Hinting…" : "Hint"}
-            </Button>
-            {hintMode && (
-              <>
-                <Button size="small" variant={hintPositive ? "contained" : "outlined"} color="error" onClick={() => set("hintPositive", true)}>scar</Button>
-                <Button size="small" variant={!hintPositive ? "contained" : "outlined"} onClick={() => set("hintPositive", false)}>not</Button>
-                <Button size="small" variant="contained" color="warning" disabled={busy || hintCount === 0} onClick={() => applyScarHints()}>Apply ({hintCount})</Button>
-                <Button size="small" variant="outlined" disabled={busy || hintCount === 0} onClick={() => clearScarHints()}>Clear</Button>
-              </>
-            )}
-            <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
-          </>
-        )}
-        {/* POST-SAM2 next step: align this eye's repeat scans into one consensus, control-normalised. */}
-        <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => buildEyeConsensus()}
-          title="Next step: register + average this eye's repeat scans into one consensus, control-normalised by the tagged control (no-scar) scans. Run SAM2 on the eye's repeats first.">
-          ⌖ Align replicates + normalize
-        </Button>
-        <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
-        {Correct}
-        <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
-        <Button size="small" variant={scheduled ? "outlined" : "contained"} color="success" disabled={busy || correcting}
-          onClick={() => scheduleTraining(!scheduled)}
-          title="Mark this scan ready for nnU-Net training (turns it green).">
-          {scheduled ? "Scheduled ✓ (unschedule)" : "Schedule for training"}
-        </Button>
-        <Button size="small" variant="outlined" color="success" disabled={busy} onClick={() => exportScarSummary()}
-          title="Recompute scar volume/area/density for every case → scar_summary.csv">Export metrics</Button>
+        {AlignBtn}{sep}{Correct}
+        {ScarReRun && <>{sep}{ScarReRun}</>}
+        {sep}{ScheduleBtn}{ExportBtn}
       </>
     );
+  } else if (step === 6) {
+    // aligned (teal) → correct the consensus / schedule
+    actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
+  } else if (step === 7) {
+    // manually corrected (dark blue)
+    actions = <>{ScheduleBtn}{sep}{Correct}{ExportBtn}</>;
   } else {
-    // step 7 — scheduled (green)
+    // step 8 — scheduled (green)
     actions = (
       <>
         <span className="text-xs" style={{ color: "#22c55e" }}>✓ Scheduled for training.</span>
         <Button size="small" variant="outlined" disabled={busy} onClick={() => scheduleTraining(false)}>Unschedule</Button>
-        {Correct}
-        <Button size="small" variant="outlined" color="success" disabled={busy} onClick={() => exportScarSummary()}>Export metrics</Button>
+        {Correct}{ExportBtn}
       </>
     );
   }
@@ -198,6 +233,24 @@ export function TimelineBar() {
       <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
       <div className="flex-1" />
       {busy && <CircularProgress size={16} />}
+
+      <Dialog open={resetTo != null} onClose={() => setResetTo(null)}>
+        <DialogTitle sx={{ fontSize: 16 }}>
+          Roll back to “{resetTo != null ? LIFECYCLE_STEPS[resetTo].short : ""}”?
+        </DialogTitle>
+        <DialogContent sx={{ fontSize: 13 }}>
+          This resets the later steps so you can redo them: <b>{downstream.join(" · ") || "(none)"}</b>.
+          <br />
+          The scan's files are kept on disk — re-running a step overwrites its result. You can re-advance afterwards.
+        </DialogContent>
+        <DialogActions>
+          <Button size="small" onClick={() => setResetTo(null)}>Cancel</Button>
+          <Button size="small" variant="contained" color="warning"
+            onClick={() => { const s = resetTo; setResetTo(null); if (s != null) resetStep(s); }}>
+            Reset to step {resetTo}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </div>
   );
 }

@@ -61,7 +61,10 @@ export function VolumeCanvas() {
     : (view === "axial" || view === "coronal" || view === "sagittal") ? view : "sagittal";
   // Slices | Segmentation overlay toggle (Segmentation greyed until SAM2 has run). On the niivue path it
   // simply shows/hides the cornea/scar overlay by opacity; the 2-D gallery reads the same flag.
-  const [showSeg, setShowSeg] = useState(false); // default to SLICES; Segmentation is opt-in (and greyed until SAM2)
+  // Slices | Segmentation toggle is now the STORE flag (showSegmentation) so runSam2 can auto-switch to
+  // the overlay after a run (#6a) and OverlayControls stays in sync. Defaults to Slices per case (reset
+  // in resetForCase + on case change below); Segmentation is greyed until SAM2 has run.
+  const showSeg = useWorkflowStore((s) => s.showSegmentation);
   useEffect(() => { setSegmentationOpacity(showSeg && segLoaded ? segOpacity : 0); }, [showSeg, segLoaded, segOpacity]);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
   const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
@@ -141,7 +144,7 @@ export function VolumeCanvas() {
 
   // Leave the comparison / fix-columns / steps overlays when switching to a different case, and reset the
   // overlay toggle to SLICES (segmentation is opt-in per scan; it's greyed until that scan has SAM2).
-  useEffect(() => { setCompareView(false); setFixColsView(false); setStepsView(false); setShowSeg(false); }, [caseInfo?.case_id]);
+  useEffect(() => { setCompareView(false); setFixColsView(false); setStepsView(false); wfSet("showSegmentation", false); }, [caseInfo?.case_id]);
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -207,7 +210,7 @@ export function VolumeCanvas() {
         style={{ minHeight: 36, borderColor: "var(--c-border)" }}
       >
         <ToggleButtonGroup size="small" exclusive value={showSeg ? "seg" : "slices"}
-          onChange={(_, v) => { if (v) setShowSeg(v === "seg"); }}
+          onChange={(_, v) => { if (v) wfSet("showSegmentation", v === "seg"); }}
           title={segLoaded ? "" : "Run SAM2 first to view the segmentation overlay"}>
           <ToggleButton value="slices" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Slices</ToggleButton>
           <ToggleButton value="seg" disabled={!segLoaded} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Segmentation</ToggleButton>

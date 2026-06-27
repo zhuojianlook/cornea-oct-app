@@ -1022,10 +1022,13 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
         onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
-        <polyline fill="none" stroke="#5db0ff" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.55}
-          points={spanPts((f) => curFit[f])} />
-        <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.9} vectorEffect="non-scaling-stroke" opacity={0.6}
+        {/* #2: the BLUE line is the surface the correction actually flattens to (the RANSAC fit the warp
+            targets) — make it the PROMINENT "applied" line so what you see == what's used; the RED raw
+            detected edge is demoted to a faint reference (it can carry artifacts the fit already ignores). */}
+        <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.7} vectorEffect="non-scaling-stroke" opacity={0.3}
           points={spanPts(edgeY)} />
+        <polyline fill="none" stroke="#22d3ee" strokeWidth={1.3} vectorEffect="non-scaling-stroke" opacity={0.95}
+          points={spanPts((f) => curFit[f])} />
         {/* anchored frames on this slice → pink (over the red) — thin + translucent. A SINGLE anchor is drawn
             as a short VERTICAL tick, NOT a <circle>: the SVG viewBox (nFrames×depthVox) is stretched with
             preserveAspectRatio="none", so a circle squashes into a wide horizontal pink dash ("artifact line"). */}
@@ -1165,7 +1168,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
                     cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
                     borderMode === "parabola" ? (<>Drag points to shape the <b style={{ color: "#39d98a" }}>green parabola</b>, then <b>Confirm</b>; scrub, then <b>Run</b>.{paraCount ? ` · ${paraCount} pt(s)` : ""}</>) :
-                    (<>Drag the <b style={{ color: "#ff4d4d" }}>red border</b> onto the true surface (local), then <b>Confirm</b>; scrub, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>)}
+                    (<>The <b style={{ color: "#22d3ee" }}>cyan line</b> is the surface the correction applies (the <b style={{ color: "#ff4d4d" }}>red</b> is the raw detection — its artifacts are smoothed out). Drag onto the true surface (local), then <b>Confirm</b>; scrub, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>)}
                 </span>
               </>
             ) : (

@@ -60,14 +60,16 @@ export function attach(canvas: HTMLCanvasElement): Niivue | null {
     // label 1 lands at LUT index ~21 (blue = cornea) and label 2 at ~234 (red = scar); index 0 (bg)
     // is transparent. Matches the 2D viewer's blue-cornea / red-scar convention.
     try {
-      // Cornea (idx 1–120) is semi-transparent so the opaque scar (idx 132–255) shows THROUGH the
-      // cornea shell in the 3D render (otherwise the blue cornea occludes the embedded red scar).
+      // Display labels: 1=cornea (blue, semi-transparent so the opaque scar shows THROUGH the shell in
+      // 3D), 2/3/4 = scar DENSITY tiers diffuse→moderate→dense (warm-orange → orange-red → deep red),
+      // matching the 2D SEGMENT_COLORS. With cal_min 0.5 / cal_max 4.5 (set in loadSegmentation), label
+      // v lands at LUT index (v-0.5)/4·255 → 1→32, 2→96, 3→159, 4→223; control points sit at those.
       nv.addColormap("corneaScar", {
-        R: [0, 50, 50, 255, 255],
-        G: [0, 140, 140, 58, 58],
-        B: [0, 255, 255, 71, 71],
-        A: [0, 90, 90, 255, 255],
-        I: [0, 1, 120, 132, 255],
+        R: [0,  50, 255, 255, 255, 255],
+        G: [0, 140, 180, 110,  30,  30],
+        B: [0, 255, 120,  80,  70,  70],
+        A: [0,  90, 255, 255, 255, 255],
+        I: [0,  32,  96, 159, 223, 255],
       });
     } catch { /* older niivue without addColormap → loadSegmentation falls back to "warm" */ }
     webglError = null;
@@ -186,13 +188,13 @@ export async function loadSegmentation(url: string, opacity: number): Promise<vo
   if (!nv) throw new Error("Niivue not attached");
   // Remove a prior segmentation overlay (any volume past the base).
   while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
-  // Labels are 0=bg (transparent, below cal_min), 1=cornea (blue), 2=scar (red) via "corneaScar"
-  // (falls back to "warm" if the custom colormap wasn't registered).
+  // Display labels: 0=bg (transparent, below cal_min), 1=cornea (blue), 2/3/4=scar density tiers
+  // (diffuse→dense) via "corneaScar" (falls back to "warm" if the custom colormap wasn't registered).
   let cmap = "warm";
   try {
     if ((nv.colormaps?.() ?? []).includes("corneaScar")) cmap = "corneaScar";
   } catch { /* keep warm */ }
-  await nv.addVolumeFromUrl({ url, colormap: cmap, opacity, cal_min: 0.9, cal_max: 2.1 });
+  await nv.addVolumeFromUrl({ url, colormap: cmap, opacity, cal_min: 0.5, cal_max: 4.5 });
   segUrl = url;
   nv.updateGLVolume();
 }

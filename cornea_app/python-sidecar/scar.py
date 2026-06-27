@@ -480,6 +480,33 @@ def density_tiers(scar_mask: np.ndarray, density_vol_ijk: np.ndarray, n_tiers: i
     return out, qs
 
 
+# Absolute scar density tiers, comparable ACROSS eyes/replicates: scar reflectivity is normalised by
+# the eye's OWN normal-cornea reflectivity (median of cornea tissue), then split at FIXED multipliers.
+# Scar is hyper-reflective, so ratios are >1; defaults: diffuse <1.6×, moderate 1.6–2.4×, dense ≥2.4×.
+DENSITY_TIER_RATIOS = (1.6, 2.4)
+
+
+def density_tiers_absolute(scar_mask: np.ndarray, density_vol_ijk: np.ndarray,
+                           cornea_mask: np.ndarray, ratios=DENSITY_TIER_RATIOS):
+    """Scar reflectivity tiers on an ABSOLUTE, cross-eye-comparable scale: each voxel's reflectivity
+    relative to this eye's normal-cornea median, binned at fixed `ratios`. Returns (tier_vol, cutoffs)
+    where tier is 1..len(ratios)+1 inside the scar (diffuse→dense), 0 elsewhere; cutoffs are the
+    absolute reflectivity values the ratios map to (ref × ratio). Falls back to intra-scar quantiles
+    only if the cornea reference is unusable (no cornea tissue)."""
+    out = np.zeros(scar_mask.shape, np.uint8)
+    if not scar_mask.any():
+        return out, []
+    cornea_only = cornea_mask & ~scar_mask
+    ref_vals = density_vol_ijk[cornea_only].astype(np.float32)
+    ref = float(np.median(ref_vals)) if ref_vals.size else 0.0
+    if ref <= 0:                                   # no usable cornea reference → relative fallback
+        return density_tiers(scar_mask, density_vol_ijk, n_tiers=len(ratios) + 1)
+    cutoffs = [ref * r for r in ratios]
+    tier = np.digitize(density_vol_ijk, cutoffs).astype(np.uint8) + 1   # 1..len+1
+    out[scar_mask] = tier[scar_mask]
+    return out, cutoffs
+
+
 def quantify(labelmap_ijk: np.ndarray, spacing_xyz, density_vol_ijk=None) -> dict:
     """Scar/cornea volume (mm³), en-face scar area (mm²), fraction, presence, and —
     when `density_vol_ijk` (raw reflectivity, comparable across eyes) is given —

@@ -412,8 +412,12 @@ def segment_scar_consensus(base_nifti: Path, labelmap_ijk: np.ndarray, seed_ijks
 
 def segment_volume(volume_nifti: Path, work: Path,
                    planes=("axial", "coronal", "sagittal"),
-                   vote: int = 2) -> tuple[np.ndarray, dict]:
-    """SAM2 each plane, majority-vote into a single 3D cornea labelmap (0/1)."""
+                   vote: int = 2, progress=None) -> tuple[np.ndarray, dict]:
+    """SAM2 each plane, majority-vote into a single 3D cornea labelmap (0/1).
+
+    `progress(phase, index, total)` is an optional callback invoked at the start of each plane
+    (phase=the plane name) and before the 3D fuse (phase="fuse"), so a caller can surface live
+    progress. Defaults to None so the standalone/__main__ and other callers are unaffected."""
     raw = np.asarray(nib.load(str(volume_nifti)).dataobj).astype(np.float32)
     vol = gaussian_filter(raw, sigma=(1.0, 1.0, 0.4))
     work = Path(work)
@@ -422,7 +426,12 @@ def segment_volume(volume_nifti: Path, work: Path,
     votes = np.zeros(vol.shape, np.uint8)
     per_plane = {}
     planes_failed = {}
-    for pl in planes:
+    for idx, pl in enumerate(planes):
+        if progress is not None:
+            try:
+                progress(pl, idx, len(planes))
+            except Exception:  # noqa: BLE001 — progress is best-effort, never fail the segmentation
+                pass
         try:
             m, prm = segment_plane(vol, pl, work)
         except Exception as exc:  # noqa: BLE001  (e.g. CUDA OOM): record + keep other planes
@@ -436,6 +445,11 @@ def segment_volume(volume_nifti: Path, work: Path,
         votes += m.astype(np.uint8)
         per_plane[pl] = {"voxels": nvox, "prompt_frame": prm}
 
+    if progress is not None:
+        try:
+            progress("fuse", len(planes), len(planes))
+        except Exception:  # noqa: BLE001
+            pass
     fused = votes >= vote
     # keep the largest connected component, fill holes
     lbl, n = ndimage.label(fused)

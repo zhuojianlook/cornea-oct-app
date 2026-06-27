@@ -726,11 +726,26 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
     base = _ensure_volume_nifti(case_id)            # SAM2 likes natural raw contrast
     work = orch.case_root(case_id) / "sam2_work"
     vote = max(1, min(req.vote, len(req.planes)))   # vote can't exceed #planes (else always empty)
-    with _GPU_LOCK:                                  # one SAM2/CUDA inference at a time
-        label, meta = sam2_segment.segment_volume(
-            base, work, planes=tuple(req.planes), vote=vote)
+    n_planes = len(req.planes)
+
+    def _progress(phase, index, total):
+        if phase == "fuse":
+            _sam2_progress_set(case_id, "fuse", "Fusing planes in 3D", total, total)
+        else:
+            _sam2_progress_set(case_id, phase, f"Tracking cornea — {phase} ({index + 1}/{total})", index, total)
+
+    _sam2_progress_set(case_id, "start", "Starting SAM2…", 0, n_planes)
+    try:
+        with _GPU_LOCK:                              # one SAM2/CUDA inference at a time
+            label, meta = sam2_segment.segment_volume(
+                base, work, planes=tuple(req.planes), vote=vote, progress=_progress)
+    except Exception:
+        _sam2_progress_set(case_id, "error", "SAM2 failed", n_planes, n_planes)
+        raise
     if label.sum() == 0:
+        _sam2_progress_set(case_id, "error", "SAM2 produced an empty mask", n_planes, n_planes)
         raise HTTPException(500, f"SAM2 produced an empty mask: {meta}")
+    _sam2_progress_set(case_id, "done", "Cornea segmented", n_planes, n_planes)
     # Persist as the canonical labelmap so the overlay and nnU-Net export use it.
     backdrop = _working_volume(case_id)
     labels.write_label_nifti(label, base, labels.corrected_path(case_id))
@@ -746,6 +761,13 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
     })
     return {"case_info": orch.current_case_info(case_id), "qa": qa,
             "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
+
+
+@app.get("/api/case/{case_id}/segment/sam2/status")
+def segment_sam2_status(case_id: str) -> dict:
+    """Live SAM2 progress for the front-end poll (served on a separate thread while the POST holds the
+    GPU lock). Returns {phase, index, total, message}; phase 'idle' when nothing is/was running."""
+    return _sam2_progress_get(case_id)
 
 
 # ── Stage 2: interactive correction (niivue drawing round-trip) ─────────────
@@ -800,6 +822,26 @@ def get_segmentation_nifti(case_id: str) -> FileResponse:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"Segmentation conversion failed: {exc}")
     return FileResponse(str(dst), media_type="application/gzip", filename="segmentation.nii.gz")
+
+
+@app.get("/api/case/{case_id}/segmentation-display.nii.gz")
+def get_segmentation_display_nifti(case_id: str) -> FileResponse:
+    """DISPLAY overlay for the 3D viewer: cornea=1, scar split into density tiers 2/3/4 (diffuse→dense)
+    so reflectivity is visible instead of one flat red. The canonical 0/1/2 training label is untouched
+    (see segmentation.nii.gz). Density = the raw reflectivity volume, normalised per-eye to the cornea."""
+    import nibabel as nib
+    arr, _ = labels.best_labelmap_nnunet(case_id)
+    if arr is None:
+        raise HTTPException(404, "No segmentation yet. Run SAM2 first.")
+    base = _ensure_volume_nifti(case_id)
+    dst = orch.case_root(case_id) / "previews" / "segmentation-display.nii.gz"
+    try:
+        density = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
+        labels.write_display_labelmap(arr, density, base, dst)
+    except Exception as exc:  # noqa: BLE001 — never block the viewer; fall back to the plain 0/1/2 overlay
+        print(f"[display-labelmap] tiered overlay failed for {case_id}: {exc}", file=sys.stderr)
+        labels.write_label_nifti(arr, base, dst)
+    return FileResponse(str(dst), media_type="application/gzip", filename="segmentation-display.nii.gz")
 
 
 # ── manual ground-truth import + comparison vs the auto segmentation ───────────
@@ -2095,6 +2137,50 @@ def schedule_training(case_id: str, req: TrainingScheduleRequest) -> dict:
     return {"ok": True, "training_scheduled": bool(m.get("training_scheduled"))}
 
 
+# Per-step manifest flags, in lifecycle order (mirrors api/lifecycle.ts scanStep). Resetting TO step N
+# clears the flags of every step AFTER N, so the scan drops back to N and the user can redo from there.
+# Files on disk are left intact (re-running a step overwrites its artifact) — this is flag-only + reversible.
+_STEP_RESET_FLAGS: dict[int, list[str]] = {
+    2: ["oct_preprocessed", "oct_iter"],          # Preprocessed (auto)
+    3: ["preproc_vetted"],                          # Vetted
+    4: ["scar_classification", "scar_range"],       # Classified (scar/control)
+    5: ["sam2_meta", "qa_json", "segmentation_preview_dir"],  # SAM2 cornea (+scar)
+    6: ["consensus_case"],                          # Aligned (link to the eye's consensus)
+    7: ["corrected_labelmap"],                      # Manually corrected
+    8: ["training_scheduled"],                      # Scheduled for training
+}
+
+
+class ResetStepRequest(BaseModel):
+    step: int   # target step to return to (1-8); everything AFTER it is cleared
+
+
+@app.post("/api/case/{case_id}/reset-step")
+def reset_step(case_id: str, req: ResetStepRequest) -> dict:
+    """Step regression: roll a scan back to `step` by clearing the manifest flags of all later steps
+    (flag-only, non-destructive — re-running a step overwrites its artifact). Refuses on a consensus
+    case (its consensus_cases/report define its identity; rebuild it instead)."""
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, f"No such case: {case_id}")
+    if orch.read_manifest(cid).get("consensus_cases"):
+        raise HTTPException(400, "This is a built consensus case — rebuild it rather than resetting a step.")
+    target = int(req.step)
+    if target < 1 or target > 8:
+        raise HTTPException(400, "step must be 1-8.")
+    updates: dict = {}
+    cleared: list[str] = []
+    for s, keys in _STEP_RESET_FLAGS.items():
+        if s > target:
+            for k in keys:
+                updates[k] = None
+                cleared.append(k)
+    if updates:
+        orch.write_manifest_value(cid, updates)
+    return {"ok": True, "step": target, "cleared": cleared,
+            "case_info": orch.current_case_info(cid)}
+
+
 class ObserverAnalysisRequest(BaseModel):
     root: str   # the annotator's ground-truth OUTPUT folder (contains manifest.json + <stem>/ labelmaps)
 
@@ -2776,6 +2862,25 @@ _COHORT_LOCK = threading.Lock()
 # Serialises all SAM2/CUDA inference (cohort worker thread + user-triggered endpoints
 # run on separate threads and share one predictor + CUDA context).
 _GPU_LOCK = threading.Lock()
+
+# Live SAM2 progress, keyed by safe_case_id, so the UI can poll a meaningful phase ("axial 1/3",
+# "fusing", "scar") instead of an opaque spinner. Written by segment_sam2's callback (under the GPU
+# lock) and read by the status GET (served on a separate threadpool thread, no GPU lock needed).
+_SAM2_PROGRESS: dict[str, dict] = {}
+_SAM2_PROGRESS_GUARD = threading.Lock()
+_PLANE_LABEL = {"axial": "axial", "coronal": "coronal", "sagittal": "sagittal", "fuse": "fusing planes in 3D"}
+
+
+def _sam2_progress_set(case_id: str, phase: str, message: str, index: int = 0, total: int = 3) -> None:
+    with _SAM2_PROGRESS_GUARD:
+        _SAM2_PROGRESS[orch.safe_case_id(case_id)] = {
+            "phase": phase, "index": int(index), "total": int(total), "message": message}
+
+
+def _sam2_progress_get(case_id: str) -> dict:
+    with _SAM2_PROGRESS_GUARD:
+        return dict(_SAM2_PROGRESS.get(orch.safe_case_id(case_id)) or {"phase": "idle", "message": ""})
+
 
 # Per-case lock for the canonical labelmap read-modify-write. scar_auto/scar_edit/
 # scar_sam2_hint/scar_auto_sam2/segmentation_from_drawing each load the corrected

@@ -15,6 +15,7 @@ import settings
 
 sys.path.insert(0, str(settings.SLICER_BRIDGE_DIR))
 import preview_io  # noqa: E402  (pure-numpy; safe outside Slicer)
+import scar as scar_mod  # absolute density-tier helper (shared with the 3D display labelmap)
 
 # nnUNet labels in the canonical labelmap.
 BG, CORNEA, SCAR = 0, 1, 2
@@ -44,11 +45,11 @@ def render_seg_previews(volume_nifti: Path, arr_ijk: np.ndarray, out_dir: Path,
         "background": np.ascontiguousarray((arr_ijk == BG).transpose(2, 1, 0)),
     }
     if density_vol is not None and scar.any():
-        vals = density_vol[scar]
-        lo, hi = np.quantile(vals, 1 / 3), np.quantile(vals, 2 / 3)
-        masks_by_name["scar_diffuse"] = np.ascontiguousarray((scar & (density_vol < lo)).transpose(2, 1, 0))
-        masks_by_name["scar_mod"] = np.ascontiguousarray((scar & (density_vol >= lo) & (density_vol < hi)).transpose(2, 1, 0))
-        masks_by_name["scar"] = np.ascontiguousarray((scar & (density_vol >= hi)).transpose(2, 1, 0))
+        # Absolute, cross-eye-comparable tiers (scar reflectivity vs this eye's normal-cornea median).
+        tier, _ = scar_mod.density_tiers_absolute(scar, density_vol, arr_ijk == CORNEA)
+        masks_by_name["scar_diffuse"] = np.ascontiguousarray((tier == 1).transpose(2, 1, 0))
+        masks_by_name["scar_mod"] = np.ascontiguousarray((tier == 2).transpose(2, 1, 0))
+        masks_by_name["scar"] = np.ascontiguousarray((tier >= 3).transpose(2, 1, 0))
     else:
         masks_by_name["scar"] = np.ascontiguousarray(scar.transpose(2, 1, 0))
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -37,6 +37,9 @@ interface CaseState {
   // Before/after "Use original (raw)": discard the correction, make the raw .OCT the working volume +
   // mark it vetted (drops any segmentation; reloads the volume).
   approveRaw: () => Promise<void>;
+  // Step regression: roll the scan back to `step`, clearing every later step's manifest flag so the
+  // user can redo from there (flag-only on the backend; files remain and are overwritten on re-run).
+  resetStep: (step: number) => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -121,6 +124,22 @@ export const useCaseStore = create<CaseState>()(
         await api.json(`/api/case/${id}/training/schedule`, "POST", JSON.stringify({ scheduled }));
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    resetStep: async (step) => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { s.busy = true; s.apiError = null; });
+      try {
+        await api.json(`/api/case/${id}/reset-step`, "POST", JSON.stringify({ step }));
+        await get().openCase();                  // refresh the manifest so the timeline drops back
+        const wf = useWorkflowStore.getState();  // re-render previews + reflect any dropped segmentation
+        wf.set("segVersion", wf.segVersion + 1);
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      } finally {
+        set((s) => { s.busy = false; });
       }
     },
 
