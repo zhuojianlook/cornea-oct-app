@@ -131,7 +131,8 @@ interface WorkflowState {
   selectStep: (step: number | null) => void;
 
   runSam2: () => Promise<void>;
-  buildEyeConsensus: () => Promise<void>;
+  alignReplicates: () => Promise<void>;
+  normalizeConsensus: () => Promise<void>;
   loadCorrectionLayer: () => Promise<void>;
   saveCorrection: () => Promise<void>;
   cancelCorrection: () => Promise<void>;
@@ -368,29 +369,55 @@ export const useWorkflowStore = create<WorkflowState>()(
     // POST-SAM2 NEXT STEP: align this eye's replicate scans into one consensus, control-normalised by the
     // tagged control (no-scar) scans. The backend builds the control baseline, control-normalises each
     // replicate's scar, registers + votes them, then we open the consensus case to show the result.
-    buildEyeConsensus: async () => {
+    // STEP 7: align this eye+subgroup's segmented replicates into one consensus using the scar AS-IS
+    // (no normalization here). Opens the consensus case to show the result.
+    alignReplicates: async () => {
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
       set((s) => {
         s.segBusy = true;
         s.status = { kind: "working", title: "Aligning replicates",
-          detail: "Building the control baseline, control-normalising scar, and registering + voting this eye's repeat scans into one consensus. This takes a few minutes." };
+          detail: "Registering + voting this eye's repeat scans (same subgroup) into one consensus. This takes a few minutes." };
       });
       try {
-        const r = await api.json<{ consensus_case: string; n_replicates: number; n_controls: number; control_normalized: boolean }>(
-          `/api/case/${caseId}/build-eye-consensus`, "POST", JSON.stringify({}));
-        const norm = r.control_normalized
-          ? `control-normalised by ${r.n_controls} control scan${r.n_controls === 1 ? "" : "s"}`
-          : "no control baseline yet (tag control scans to normalise)";
+        const r = await api.json<{ consensus_case: string; n_replicates: number }>(
+          `/api/case/${caseId}/align-replicates`, "POST", JSON.stringify({}));
         useCaseStore.getState().setCaseId(r.consensus_case);
         await useCaseStore.getState().openCase();
         set((s) => {
-          s.segVersion += 1;
+          s.segVersion += 1; s.selectedStep = null;
           s.status = { kind: "done", title: "Replicates aligned",
-            detail: `Consensus of ${r.n_replicates} replicate${r.n_replicates === 1 ? "" : "s"} — ${norm}. Showing the consensus.` };
+            detail: `Consensus of ${r.n_replicates} replicate${r.n_replicates === 1 ? "" : "s"} (raw scar). Normalize against controls next, or correct.` };
         });
       } catch (e) {
         set((s) => { s.status = { kind: "error", title: "Align replicates failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.segBusy = false; });
+      }
+    },
+
+    // STEP 8: re-derive each member's scar as excess over the tagged control (no-scar) baseline
+    // (control-normalised, reproducible) and rebuild the consensus. Acts on the open consensus case.
+    normalizeConsensus: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => {
+        s.segBusy = true;
+        s.status = { kind: "working", title: "Normalizing against controls",
+          detail: "Re-deriving scar as excess over the normal-cornea baseline from the control scans, then rebuilding the consensus." };
+      });
+      try {
+        const r = await api.json<{ consensus_case: string; n_controls: number; n_replicates: number }>(
+          `/api/case/${caseId}/normalize-consensus`, "POST", JSON.stringify({}));
+        useCaseStore.getState().setCaseId(r.consensus_case);
+        await useCaseStore.getState().openCase();
+        set((s) => {
+          s.segVersion += 1; s.selectedStep = null;
+          s.status = { kind: "done", title: "Normalized",
+            detail: `Consensus control-normalised by ${r.n_controls} control scan${r.n_controls === 1 ? "" : "s"}. Correct it, then schedule.` };
+        });
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Normalize failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
         set((s) => { s.segBusy = false; });
       }

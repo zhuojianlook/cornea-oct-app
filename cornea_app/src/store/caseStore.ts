@@ -40,6 +40,8 @@ interface CaseState {
   // Step regression: roll the scan back to `step`, clearing every later step's manifest flag so the
   // user can redo from there (flag-only on the backend; files remain and are overwritten on re-run).
   resetStep: (step: number) => Promise<void>;
+  // Step 6: set this scan's scar-subgroup AND confirm it (gates align so the right repeats group together).
+  confirmSubgroup: (sub: string) => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -122,6 +124,19 @@ export const useCaseStore = create<CaseState>()(
       set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).training_scheduled = scheduled; });
       try {
         await api.json(`/api/case/${id}/training/schedule`, "POST", JSON.stringify({ scheduled }));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    confirmSubgroup: async (sub) => {
+      const id = get().caseId;
+      if (!id) return;
+      const v = (sub || "1").trim() || "1";
+      set((s) => { if (s.caseInfo) { const mm = s.caseInfo.manifest as Record<string, unknown>; mm.scar_subgroup = v; mm.subgroup_confirmed = true; } });
+      try {
+        await api.json(`/api/case/${id}/subgroup`, "POST", JSON.stringify({ subgroup: v }));
+        await api.json(`/api/case/${id}/subgroup/confirm`, "POST", "{}");
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }

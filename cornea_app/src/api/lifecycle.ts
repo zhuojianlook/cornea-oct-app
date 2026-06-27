@@ -4,7 +4,7 @@
    drops the scan back. Colours per the spec: raw=grey, auto=red, vetted=orange, classified=yellow,
    SAM2-auto=light blue, SAM2-corrected=dark blue, scheduled=green. */
 
-export type LifecycleStep = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+export type LifecycleStep = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
 
 export interface StepMeta { step: LifecycleStep; color: string; label: string; short: string; }
 
@@ -14,36 +14,39 @@ export const LIFECYCLE_STEPS: { color: string; label: string; short: string }[] 
   { color: "#7d8794", label: "Raw image", short: "Raw" },                       // 1 grey
   { color: "#ef4444", label: "Preprocessed · automatic", short: "Auto" },       // 2 red
   { color: "#f59e0b", label: "Preprocessed · manually vetted", short: "Vetted" }, // 3 orange
-  { color: "#eab308", label: "Scar / control + replicates set", short: "Classified" }, // 4 yellow
+  { color: "#eab308", label: "Scar / control classified", short: "Classified" }, // 4 yellow
   { color: "#38bdf8", label: "SAM2 · cornea + scar", short: "SAM2" },           // 5 light blue
-  { color: "#14b8a6", label: "Replicates aligned + normalized", short: "Aligned" }, // 6 teal
-  { color: "#2563eb", label: "SAM2 · manually corrected", short: "Corrected" },  // 7 dark blue
-  { color: "#22c55e", label: "Scheduled for training", short: "Scheduled" },     // 8 green
+  { color: "#a855f7", label: "Subgroup assigned", short: "Subgroup" },          // 6 purple
+  { color: "#14b8a6", label: "Replicates aligned", short: "Aligned" },          // 7 teal
+  { color: "#06b6d4", label: "Normalized against controls", short: "Normalized" }, // 8 cyan
+  { color: "#2563eb", label: "Manually corrected", short: "Corrected" },         // 9 dark blue
+  { color: "#22c55e", label: "Scheduled for training", short: "Scheduled" },     // 10 green
 ];
 
 type Manifest = Record<string, unknown> | null | undefined;
 const set = (m: NonNullable<Manifest>, k: string) => m[k] != null && m[k] !== false && m[k] !== "";
 
-/** The current (highest) lifecycle step a scan's manifest has reached (8-step model: Raw→Auto→Vetted→
- *  Classified→SAM2→Aligned→Corrected→Scheduled). */
+/** The current (highest) lifecycle step a scan's manifest has reached (10-step model: Raw→Auto→Vetted→
+ *  Classified→SAM2→Subgroup→Aligned→Normalized→Corrected→Scheduled). */
 export function scanStep(m: Manifest): LifecycleStep {
   if (!m) return 0;
   if (!set(m, "input_volume") && !set(m, "corrected_volume")) return 0;
-  // A BUILT CONSENSUS case (the aligned average of replicates) IS the "Aligned" artifact (step 6); it
-  // never runs preprocess/vet/classify. It can then advance to corrected (7) / scheduled (8).
+  // A BUILT CONSENSUS case is the ALIGNED artifact (step 7); normalize/correct/schedule act on it.
   if (set(m, "consensus_cases") || set(m, "consensus_report")) {
-    if (set(m, "training_scheduled")) return 8;
-    if (set(m, "corrected_labelmap")) return 7;
-    return 6;
+    if (set(m, "training_scheduled")) return 10;
+    if (set(m, "corrected_labelmap")) return 9;
+    if (set(m, "normalized")) return 8;
+    return 7;
   }
   if (!set(m, "oct_preprocessed")) return 1;                 // raw only
-  // A SEGMENTED scan is past preprocess/vet/classify regardless of a missing preproc_vetted flag (e.g. a
-  // consensus member opened via "Correct"). consensus_case (the link to this eye's built consensus) means
-  // the scan has been ALIGNED → step 6.
+  // A SEGMENTED per-scan scan: SAM2(5) → Subgroup confirmed(6) → linked to a consensus = Aligned(7).
+  // Normalize(8) acts on the consensus case, not the member, so a member tops out at 7 (or 9/10 if its
+  // own labelmap was corrected/scheduled directly).
   if (set(m, "sam2_meta") || set(m, "consensus_case") || set(m, "corrected_labelmap")) {
-    if (set(m, "training_scheduled")) return 8;              // scheduled (green)
-    if (set(m, "corrected_labelmap")) return 7;             // manually corrected (dark blue)
-    if (set(m, "consensus_case")) return 6;                 // aligned to the eye's consensus (teal)
+    if (set(m, "training_scheduled")) return 10;             // scheduled (green)
+    if (set(m, "corrected_labelmap")) return 9;             // manually corrected (dark blue)
+    if (set(m, "consensus_case")) return 7;                 // aligned to the eye's consensus (teal)
+    if (set(m, "subgroup_confirmed")) return 6;             // subgroup assigned (purple)
     return 5;                                                // SAM2 cornea+scar (light blue)
   }
   if (!set(m, "preproc_vetted")) return 2;                   // auto-preprocessed (red)
@@ -68,9 +71,11 @@ export function stepReached(m: Manifest, i: LifecycleStep): boolean {
     case 3: return set(m, "preproc_vetted");
     case 4: return set(m, "scar_classification");
     case 5: return set(m, "sam2_meta") || set(m, "corrected_labelmap") || set(m, "consensus_case");
-    case 6: return set(m, "consensus_case");
-    case 7: return set(m, "corrected_labelmap");
-    case 8: return set(m, "training_scheduled");
+    case 6: return set(m, "subgroup_confirmed") || set(m, "consensus_case");   // aligned implies subgroup done
+    case 7: return set(m, "consensus_case");
+    case 8: return set(m, "normalized");
+    case 9: return set(m, "corrected_labelmap");
+    case 10: return set(m, "training_scheduled");
     default: return false;
   }
 }

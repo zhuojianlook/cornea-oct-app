@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
@@ -20,7 +20,8 @@ export function TimelineBar() {
   const sam2RunningCaseId = useWorkflowStore((s) => s.sam2RunningCaseId);
   const selectedStep = useWorkflowStore((s) => s.selectedStep);
   const selectStep = useWorkflowStore((s) => s.selectStep);
-  const buildEyeConsensus = useWorkflowStore((s) => s.buildEyeConsensus);
+  const alignReplicates = useWorkflowStore((s) => s.alignReplicates);
+  const normalizeConsensus = useWorkflowStore((s) => s.normalizeConsensus);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
@@ -44,12 +45,14 @@ export function TimelineBar() {
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const resetStep = useCaseStore((s) => s.resetStep);
+  const confirmSubgroup = useCaseStore((s) => s.confirmSubgroup);
   const scheduled = Boolean(manifest?.training_scheduled);
   const isConsensus = Boolean(manifest?.consensus_cases);
+  const subgroup = String(manifest?.scar_subgroup ?? "1") || "1";
 
   const busy = segBusy || scarBusy;
   const step: LifecycleStep = scanStep(manifest);
-  const maxStep = LIFECYCLE_STEPS.length - 1;   // 8
+  const maxStep = LIFECYCLE_STEPS.length - 1;   // 10
   // Which step is being VIEWED, and whether that's an inspect (earlier, read-only) vs the live step.
   const viewStep = (selectedStep ?? step) as LifecycleStep;
   const inspecting = selectedStep != null && selectedStep < step;
@@ -57,12 +60,15 @@ export function TimelineBar() {
   // #9 step regression: which step the user chose to roll back to (confirm modal); set by the inspect-mode
   // "Roll back to this step" button (NOT by merely clicking a step — clicking just inspects it).
   const [resetTo, setResetTo] = useState<number | null>(null);
+  // Step-6 subgroup input, re-seeded from the manifest on case/subgroup change.
+  const [subInput, setSubInput] = useState(subgroup);
+  useEffect(() => { setSubInput(subgroup); }, [caseInfo?.case_id, subgroup]);
   const downstream = resetTo != null ? LIFECYCLE_STEPS.slice(resetTo + 1, step + 1).map((x) => x.short) : [];
 
   // ── the step strip: click a REACHED step to VIEW it (earlier = inspect read-only; current = back to live) ──
   const strip = (
     <div className="flex items-center gap-1">
-      {([1, 2, 3, 4, 5, 6, 7, 8] as LifecycleStep[]).map((i) => {
+      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as LifecycleStep[]).map((i) => {
         const reached = stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
         const viewing = viewStep === i;
@@ -117,10 +123,28 @@ export function TimelineBar() {
       title="Recompute scar volume/area/density for every case → scar_summary.csv">Export metrics</Button>
   );
   const AlignBtn = (
-    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => buildEyeConsensus()}
-      title="Register + average this eye's repeat scans into one consensus, control-normalised by the tagged control (no-scar) scans. Run SAM2 on the eye's repeats first.">
-      ⌖ Align replicates + normalize
+    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => alignReplicates()}
+      title="Register + vote this eye's repeat scans (same subgroup) into one consensus, using the scar as-is. Normalization against controls is the next step.">
+      ⌖ Align replicates
     </Button>
+  );
+  const NormalizeBtn = (
+    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => normalizeConsensus()}
+      title="Re-derive scar as excess over the control (no-scar) baseline and rebuild the consensus. Needs tagged + segmented control scans.">
+      ◎ Normalize against controls
+    </Button>
+  );
+  // STEP 6: confirm this scan's subgroup (which lesion set it belongs to → which repeats align together).
+  const SubgroupConfirm = (
+    <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}>
+      subgroup
+      <input value={subInput} disabled={busy} placeholder="1" onChange={(e) => setSubInput(e.target.value)}
+        style={{ fontSize: 11, width: 90, color: "var(--c-text)", background: "var(--c-surface2)", border: "1px solid var(--c-border)", borderRadius: 4, padding: "1px 5px" }} />
+      <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => confirmSubgroup(subInput)}
+        title="Confirm which scar subgroup (lesion set) this scan belongs to, so the right repeats align together.">
+        ✓ Confirm subgroup
+      </Button>
+    </span>
   );
 
   // Scar method + sensitivity (sets what the one-go Run-SAM2 uses, and any re-run). Only meaningful for
@@ -152,13 +176,15 @@ export function TimelineBar() {
       <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
         title="Re-run scar via SAM2 3-view consensus.">Scar (SAM2)</Button>
       <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
-        onClick={() => set("hintMode", !hintMode)} title="Click scar areas on the slices to guide SAM2">
-        {hintMode ? "Hinting…" : "Hint"}
+        onClick={() => set("hintMode", !hintMode)}
+        title="Optional touch-up: click ON a scar region (then 'scar') or on non-scar tissue (then 'not') in the slices to give SAM2 point prompts, then Apply to re-segment the scar from your clicks.">
+        {hintMode ? "Guiding… (click slices)" : "Guide scar (click)"}
       </Button>
       {hintMode && (
         <>
-          <Button size="small" variant={hintPositive ? "contained" : "outlined"} color="error" onClick={() => set("hintPositive", true)}>scar</Button>
-          <Button size="small" variant={!hintPositive ? "contained" : "outlined"} onClick={() => set("hintPositive", false)}>not</Button>
+          <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>click marks:</span>
+          <Button size="small" variant={hintPositive ? "contained" : "outlined"} color="error" onClick={() => set("hintPositive", true)} title="Clicks add scar">scar</Button>
+          <Button size="small" variant={!hintPositive ? "contained" : "outlined"} onClick={() => set("hintPositive", false)} title="Clicks remove scar">not scar</Button>
           <Button size="small" variant="contained" color="warning" disabled={busy || hintCount === 0} onClick={() => applyScarHints()}>Apply ({hintCount})</Button>
           <Button size="small" variant="outlined" disabled={busy || hintCount === 0} onClick={() => clearScarHints()}>Clear</Button>
         </>
@@ -230,22 +256,34 @@ export function TimelineBar() {
       </>
     );
   } else if (step === 5) {
-    // SAM2 (cornea+scar) done → align replicates (primary next step), or correct / schedule; re-run scar to iterate
+    // SAM2 (cornea+scar) done → assign this scan's SUBGROUP (gates align); re-run scar / correct to iterate.
+    // No Schedule/Export here — those belong from the aligned consensus onward.
     actions = (
       <>
-        {AlignBtn}{sep}{Correct}
+        {SubgroupConfirm}{sep}{Correct}
         {ScarReRun && <>{sep}{ScarReRun}</>}
-        {sep}{ScheduleBtn}{ExportBtn}
       </>
     );
   } else if (step === 6) {
-    // aligned (teal) → correct the consensus / schedule
-    actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
+    // subgroup assigned (purple) → align this subgroup's replicates
+    actions = (
+      <>
+        {AlignBtn}
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(subgroup “{subgroup}”)</span>
+        {sep}{SubgroupConfirm}{sep}{Correct}
+      </>
+    );
   } else if (step === 7) {
+    // aligned (teal) → normalize against controls (next), or correct / schedule
+    actions = <>{NormalizeBtn}{sep}{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
+  } else if (step === 8) {
+    // normalized (cyan) → correct / schedule
+    actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
+  } else if (step === 9) {
     // manually corrected (dark blue)
     actions = <>{ScheduleBtn}{sep}{Correct}{ExportBtn}</>;
   } else {
-    // step 8 — scheduled (green)
+    // step 10 — scheduled (green)
     actions = (
       <>
         <span className="text-xs" style={{ color: "#22c55e" }}>✓ Scheduled for training.</span>
