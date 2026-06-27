@@ -89,11 +89,16 @@ export const useCaseStore = create<CaseState>()(
       const id = get().caseId;
       if (!id) return;
       // optimistic: reflect the choice immediately, persist to the manifest in the background
+      const prev = (get().caseInfo?.manifest as Record<string, unknown> | undefined)?.scar_classification;
       set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).scar_classification = cls; });
       try {
         await api.json(`/api/case/${id}/classification`, "POST", JSON.stringify({ classification: cls }));
       } catch (e) {
-        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+        // revert the optimistic write so the SAM2 gate (reads manifest.scar_classification) reflects persisted truth
+        set((s) => {
+          if (s.caseId === id && s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).scar_classification = prev;
+          s.apiError = e instanceof Error ? e.message : String(e);
+        });
       }
     },
 

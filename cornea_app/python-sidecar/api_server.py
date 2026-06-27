@@ -100,6 +100,58 @@ def health() -> dict:
     return {"status": "ok", "shell_version": os.environ.get("CORNEA_SHELL_VERSION", "")}
 
 
+# ── Upload size limits (DoS guard) ─────────────────────────────────────────
+# The sidecar listens on loopback and is reachable by any allowed-origin page, so an upload
+# handler that reads the whole body into memory in one shot can be made to exhaust RAM/disk.
+# Stream uploads to disk (or a bounded buffer) in chunks and reject anything over budget with 413.
+# Generous defaults so legitimate OCT volumes/cohorts never trip them; env-overridable.
+_UPLOAD_CHUNK = 1 << 20  # 1 MiB read granularity
+_MAX_UPLOAD_BYTES = int(os.environ.get("CORNEA_MAX_UPLOAD_BYTES", str(2 * 1024 ** 3)))      # 2 GiB per file
+_MAX_UPLOAD_FILES = int(os.environ.get("CORNEA_MAX_UPLOAD_FILES", "512"))                   # files per request
+_MAX_REQUEST_BYTES = int(os.environ.get("CORNEA_MAX_REQUEST_BYTES", str(16 * 1024 ** 3)))   # total per request
+
+
+def _check_upload_count(files: List[UploadFile]) -> None:
+    """Cap the number of files accepted in one multi-file upload request."""
+    if len(files) > _MAX_UPLOAD_FILES:
+        raise HTTPException(413, f"Too many files in one request (max {_MAX_UPLOAD_FILES}).")
+
+
+async def _read_upload_bytes(up: UploadFile, max_bytes: int = _MAX_UPLOAD_BYTES) -> bytes:
+    """Read an UploadFile fully into memory in bounded chunks, aborting with 413 once max_bytes
+    is exceeded (so an oversized upload can't be buffered in one unbounded read())."""
+    buf = bytearray()
+    while True:
+        chunk = await up.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > max_bytes:
+            raise HTTPException(413, f"Upload exceeds the maximum allowed size ({max_bytes} bytes).")
+    return bytes(buf)
+
+
+async def _stream_upload_to(up: UploadFile, dest: Path, max_bytes: int = _MAX_UPLOAD_BYTES) -> int:
+    """Stream an UploadFile to dest in bounded chunks, aborting with 413 (and removing the partial
+    file) once max_bytes is exceeded. Returns the number of bytes written."""
+    written = 0
+    with open(dest, "wb") as fh:
+        while True:
+            chunk = await up.read(_UPLOAD_CHUNK)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                fh.close()
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(413, f"Upload exceeds the maximum allowed size ({max_bytes} bytes).")
+            fh.write(chunk)
+    return written
+
+
 def _total_ram_gb() -> float:
     """Total system RAM in GiB (best-effort, cross-platform). Used to size batch concurrency so the app uses
     the machine it runs on without oversubscribing memory."""
@@ -211,12 +263,40 @@ def _registered_volume(case_id: str) -> Path:
     return Path(path)
 
 
+def _invalidate_derived_volume(case_id: str) -> None:
+    """Remove the derived NIfTI (previews/volume.nii.gz) and its dependent
+    preprocessed preview so they are rebuilt from the (new) registered source by
+    _ensure_volume_nifti / _working_volume. Needed because those rebuild on an
+    mtime '<' comparison that can wrongly serve a stale conversion when the source
+    is re-pointed at a different (or in-place replaced) file."""
+    previews = orch.case_root(case_id) / "previews"
+    for name in ("volume.nii.gz", "preprocessed.nii.gz"):
+        try:
+            (previews / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _invalidate_derived_volume_if_source_changed(case_id: str, new_src: Path) -> None:
+    """Invalidate the derived volume only when the registered source path actually
+    changes, so re-registering the same path is a no-op (keeps any preprocessing)."""
+    try:
+        prev = orch.read_manifest(case_id).get("input_volume")
+    except Exception:  # noqa: BLE001 — best-effort; on any read failure, rebuild to be safe
+        prev = None
+    if prev is None or str(Path(prev)) != str(new_src):
+        _invalidate_derived_volume(case_id)
+
+
 @app.post("/api/case/{case_id}/volume/register")
 def register_volume(case_id: str, payload: RegisterVolume) -> dict:
     orch.ensure_case_dirs(case_id)
     volume = Path(payload.volume_path)
     if not volume.exists():
         raise HTTPException(400, f"Volume does not exist: {payload.volume_path}")
+    _invalidate_derived_volume_if_source_changed(case_id, volume)
     orch.write_manifest_value(
         case_id, {"input_volume": str(volume), "corrected_volume": str(volume)})
     return orch.current_case_info(case_id)
@@ -229,7 +309,10 @@ async def upload_volume(case_id: str, files: List[UploadFile] = File(...)) -> di
         raise HTTPException(400, "No file uploaded.")
     upload = files[0]
     dest = orch.case_root(case_id) / "input" / Path(upload.filename or "volume").name
-    dest.write_bytes(await upload.read())
+    await _stream_upload_to(upload, dest)
+    # The bytes may have changed even when the path is reused; always rebuild the derived
+    # NIfTI rather than trusting the mtime '<' check in _ensure_volume_nifti.
+    _invalidate_derived_volume(case_id)
     orch.write_manifest_value(
         case_id, {"input_volume": str(dest), "corrected_volume": str(dest)})
     return orch.current_case_info(case_id)
@@ -688,7 +771,7 @@ async def segmentation_from_drawing(case_id: str, files: List[UploadFile] = File
     orch.ensure_case_dirs(case_id)
     if not files:
         raise HTTPException(400, "No drawing uploaded.")
-    data = await files[0].read()
+    data = await _read_upload_bytes(files[0])
     is_gz = len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B
     tmp = orch.case_root(case_id) / "previews" / ("edited-seg.nii.gz" if is_gz else "edited-seg.nii")
     tmp.write_bytes(data)
@@ -730,6 +813,7 @@ async def import_manual_gt(case_id: str, files: List[UploadFile] = File(...)) ->
         raise HTTPException(404, f"No such case: {case_id}")
     if not files:
         raise HTTPException(400, "No file uploaded.")
+    _check_upload_count(files)
     try:
         base = _working_volume(cid)
     except HTTPException:
@@ -739,7 +823,11 @@ async def import_manual_gt(case_id: str, files: List[UploadFile] = File(...)) ->
     imported: list[dict] = []
     errors: list[dict] = []
     for f in files:
-        data = await f.read()
+        try:
+            data = await _read_upload_bytes(f)
+        except HTTPException as exc:
+            errors.append({"file": f.filename or "gt", "error": exc.detail})
+            continue
         try:
             dst = gt_compare.manual_gt_path(cid, Path(f.filename or "gt").name)
             imported.append(gt_compare.validate_and_store(data, f.filename or "gt", base, dst))
@@ -905,7 +993,7 @@ def normal_profile_build(req: NormalProfileRequest) -> dict:
 
 # ── Stage 3: scar detection + quantification ───────────────────────────────
 class ScarAutoRequest(BaseModel):
-    percentile: float = 88.0     # sensitivity: flag the brightest (100−percentile)% of cornea
+    percentile: float = 92.0     # sensitivity: flag the brightest (100−percentile)% of cornea; default = validated hysteresis phi
     min_voxels: int = 500        # continuity: drop connected components smaller than this
     erode_surface: int = 6       # drop the epithelium/Bowman's/endothelium reflective rind
     replace: bool = False        # False: merge candidates with existing scar (keep manual edits)
@@ -1172,29 +1260,6 @@ def metrics_summary(req: MetricsSummaryRequest) -> dict:
 
 
 # ── Multi-scan consensus (repeat acquisitions of one eye) ──────────────────
-@app.post("/api/consensus/upload")
-async def consensus_upload(files: List[UploadFile] = File(...)) -> dict:
-    """Upload several volumes (repeat scans of an eye) → one case per file."""
-    if not files:
-        raise HTTPException(400, "No files uploaded.")
-    cases = []
-    for idx, up in enumerate(files):
-        name = up.filename or f"scan_{idx + 1}"
-        meta = metrics_export.parse_case_meta(name)
-        if meta["patient_id"]:
-            cid = orch.safe_case_id(f"case_{meta['patient_id'].lower()}_{meta['eye'].lower()}_v{meta['variant'] or (idx + 1)}")
-        else:
-            cid = orch.safe_case_id(f"scan_{Path(name).stem}")
-        orch.ensure_case_dirs(cid)
-        dest = orch.case_root(cid) / "input" / Path(name).name
-        dest.write_bytes(await up.read())
-        orch.write_manifest_value(cid, {"input_volume": str(dest), "corrected_volume": str(dest)})
-        seg = labels.best_labelmap_nnunet(cid)[0]
-        has_scar = bool(seg is not None and (seg == 2).any())
-        cases.append({"case_id": cid, "filename": name, "segmented": has_scar, **meta})
-    return {"cases": cases}
-
-
 def _scar_request() -> "ScarAutoRequest":
     """Default scar request, CONTROL-NORMALISED when a control baseline exists: with controls tagged + a normal
     profile built, scar is flagged as EXCESS over the normal corneal reflectivity ("depthnorm"), which is more
@@ -1624,7 +1689,15 @@ async def oct_upload(files: List[UploadFile] = File(...)) -> dict:
     parsed from the filename + companion. No conversion yet — fast for whole directories."""
     if not files:
         raise HTTPException(400, "No files uploaded.")
-    blobs = [(up.filename or "", await up.read()) for up in files]
+    _check_upload_count(files)
+    blobs = []
+    request_total = 0
+    for up in files:
+        data = await _read_upload_bytes(up)
+        request_total += len(data)
+        if request_total > _MAX_REQUEST_BYTES:
+            raise HTTPException(413, f"Upload request exceeds the maximum total size ({_MAX_REQUEST_BYTES} bytes).")
+        blobs.append((up.filename or "", data))
     octs = [(n, b) for n, b in blobs if n.lower().endswith(".oct")]
     txts = {Path(n).stem.lower(): (n, b) for n, b in blobs if n.lower().endswith(".txt")}
     if not octs:
@@ -2127,18 +2200,21 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
 
 _BORDER_VOL_CACHE: dict = {}  # path -> (mtime, ndarray) — last border-input volume, so SCRUBBING a pass's
                               # slices doesn't re-decompress the .nii.gz every request (smooth scrolling).
+_BORDER_VOL_CACHE_LOCK = threading.Lock()  # concurrent scrub requests run on FastAPI's threadpool — guard get/clear/set
 def _load_border_vol(path: Path):
     import os
     import numpy as np
     import nibabel as nib
     key = str(path)
     mt = os.path.getmtime(path)
-    cached = _BORDER_VOL_CACHE.get(key)
-    if cached and cached[0] == mt:
-        return cached[1]
+    with _BORDER_VOL_CACHE_LOCK:
+        cached = _BORDER_VOL_CACHE.get(key)
+        if cached and cached[0] == mt:
+            return cached[1]
     arr = np.ascontiguousarray(np.asanyarray(nib.load(key).dataobj))
-    _BORDER_VOL_CACHE.clear()                       # keep only the most-recent input (bound memory)
-    _BORDER_VOL_CACHE[key] = (mt, arr)
+    with _BORDER_VOL_CACHE_LOCK:
+        _BORDER_VOL_CACHE.clear()                   # keep only the most-recent input (bound memory)
+        _BORDER_VOL_CACHE[key] = (mt, arr)
     return arr
 
 

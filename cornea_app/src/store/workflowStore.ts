@@ -157,7 +157,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     correcting: false,
 
     scarMetrics: null,
-    scarSensitivity: 10,
+    scarSensitivity: 8,
     scarMethod: "hysteresis",
     scarSummaryInfo: null,
 

@@ -108,8 +108,23 @@ def _tol_state(consensus_case_id):
     slc = tuple(slice(max(0, idx[a].min() - margin[a]), min(shape[a], idx[a].max() + margin[a] + 1)) for a in range(3))
     scars = [s[slc] for s in scars_full]
     edts = [ndimage.distance_transform_edt(~s, sampling=sampling) for s in scars]
+    # Reference cornea, ANDed into the vote tiers below so the tolerant core/consensus/union
+    # volumes are clipped to the same region build_consensus persists. Resample the reference
+    # label onto the consensus grid (z,y,x, like build_consensus), then reorder to nibabel
+    # (x,y,z) to match scars_full and crop to the same bbox slice.
+    ref = orch.read_manifest(consensus_case_id).get("reference")
+    cornea = np.ones(scars[0].shape, bool)
+    try:
+        if ref and labels.corrected_path(ref).exists():
+            ref_lab_zyx = reg.resample_label(
+                labels.corrected_path(ref),
+                orch.case_root(consensus_case_id) / "previews" / "volume.nii.gz",
+                reg.identity())
+            cornea = (np.transpose(ref_lab_zyx, (2, 1, 0)) >= REF_CORNEA)[slc]
+    except Exception as exc:  # noqa: BLE001 — fall back to no clip (current behavior) if unavailable
+        print(f"[consensus] tolerant cornea clip unavailable for {consensus_case_id}: {exc}", file=sys.stderr)
     state = {"sig": sig, "n": len(scars), "vmm3": vmm3, "shape": shape, "slc": slc,
-             "scars": scars, "edts": edts}
+             "scars": scars, "edts": edts, "cornea": cornea}
     _TOL_CACHE[consensus_case_id] = state
     return state
 
@@ -118,6 +133,7 @@ def tolerant_agreement(consensus_case_id, tol_mm: float = 0.0):
     """Return (agreement_map_uint8 in nibabel x,y,z, stats dict) at boundary tolerance `tol_mm` (mm)."""
     st = _tol_state(consensus_case_id)
     n, edts, scars, vmm3 = st["n"], st["edts"], st["scars"], st["vmm3"]
+    cornea = st["cornea"]
     tol = max(0.0, float(tol_mm))
     within = [e <= tol for e in edts]               # within tol of each scan's scar
     votes = np.zeros(scars[0].shape, np.uint8)
@@ -133,9 +149,9 @@ def tolerant_agreement(consensus_case_id, tol_mm: float = 0.0):
             if den:
                 dices.append((int((within[j] & scars[i]).sum()) + int((within[i] & scars[j]).sum())) / den)
     stats = {"tol_mm": round(tol, 4), "n": n,
-             "core_mm3": round(int((votes >= n).sum()) * vmm3, 4),
-             "consensus_mm3": round(int((votes >= thr).sum()) * vmm3, 4),
-             "union_mm3": round(int((votes >= 1).sum()) * vmm3, 4),
+             "core_mm3": round(int(((votes >= n) & cornea).sum()) * vmm3, 4),
+             "consensus_mm3": round(int(((votes >= thr) & cornea).sum()) * vmm3, 4),
+             "union_mm3": round(int(((votes >= 1) & cornea).sum()) * vmm3, 4),
              "mean_pairwise_dice": round(float(np.mean(dices)), 3) if dices else None}
     return agr, stats
 
@@ -263,6 +279,7 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
 
     return {
         "n_scans": n, "reference": ref, "reference_overridden": ref_overridden,
+        "reference_requested": reference,
         "agreement_threshold": math.floor(n / 2) + 1,
         "scar_volume_mm3": {"mean": round(mean, 4), "std": round(std, 4),
                             "cv_percent": round(std / mean * 100, 2) if mean else 0.0,

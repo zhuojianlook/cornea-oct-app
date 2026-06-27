@@ -51,7 +51,9 @@ export interface ConsensusScan {
 
 export interface ConsensusReport {
   n_scans: number;
-  reference: string;
+  reference: string; // the reference actually used
+  reference_requested?: string | null; // the reference the user asked for (may differ from `reference`)
+  reference_overridden?: boolean; // true when the requested reference was missing and silently replaced
   agreement_threshold: number;
   scar_volume_mm3: { mean: number; std: number; cv_percent: number; per_scan: number[] };
   consensus_scar_mm3: number;

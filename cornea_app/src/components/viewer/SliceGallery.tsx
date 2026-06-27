@@ -795,8 +795,6 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     if (st != null) out.push([st, pr as number]);
     return out;
   };
-  // Pending depth-nudge runs as [start, end, delta]: maximal CONTIGUOUS frames that share the SAME pending
-  // delta (vs persisted). Splitting on delta (not just contiguity) is required so the ghost + chip show the
   // CSS filter for the display-only enhancement (applied to grayscale OCT images only).
   // In the de-nested fix-columns panel the display filter comes from the top toolbar's sliders (blur is
   // greyed there); otherwise it's driven by this panel's own ◐ Contrast / ◌ Blur toggles.
@@ -806,10 +804,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         .filter(Boolean).join(" ") || undefined);
 
   const onImgClick = (e: React.MouseEvent<HTMLImageElement>) => {
-    // Scar hints must land on the UNROTATED previews (segmentation/consensus). The "context"
-    // slices are display-rotated for review, so their pixel→voxel mapping (pxToIjk) wouldn't
-    // match — ignore clicks there so a hint can't be placed at the wrong voxel.
-    if (!hintMode || !cur || effectiveGroup === "context") return;
+    // Hints may land on ANY preview group: pxToIjk (coords.ts) undoes the display rot90+flipud via
+    // previewToSource — the SAME rotation-aware mapping brushVoxels uses — so a click on a
+    // display-rotated "context" slice maps to the correct voxel, consistent with how paintAt works.
+    if (!hintMode || !cur) return;
     const img = e.currentTarget;
     const rect = img.getBoundingClientRect();
     const fx = (e.clientX - rect.left) / rect.width;
@@ -856,7 +854,12 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     for (const v of brushVoxels(cur, fx, fy, scarBrush)) voxelsRef.current.set(v.join(","), v);
     const ctx = cv?.getContext("2d");
     if (cv && ctx) {
-      const rpx = Math.max(2, scarBrush * (rect.width / (cur.source_width ?? 1)));
+      // The displayed width spans source COLUMNS normally, but rot90(rotate_k) with odd k swaps the
+      // axes so it spans source ROWS (source_height) — size the cursor against the displayed axis so
+      // the circle matches the brushVoxels footprint on rotated views.
+      const rk = (((cur.rotate_k ?? 0) % 4) + 4) % 4;
+      const dispVox = (rk % 2 === 1 ? cur.source_height : cur.source_width) ?? 1;
+      const rpx = Math.max(2, scarBrush * (rect.width / dispVox));
       ctx.fillStyle = scarErase ? "rgba(57,208,255,0.45)" : "rgba(255,46,85,0.45)";
       ctx.beginPath();
       ctx.arc(fx * cv.width, fy * cv.height, rpx, 0, Math.PI * 2);

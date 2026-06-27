@@ -422,13 +422,15 @@ def frame_range_mask(shape, spacing_xyz, scar_range):
     """Boolean volume True only on the frames in `scar_range` ([start,end], 1-based inclusive). The
     frame/B-scan axis is the COARSEST-spacing axis (slice spacing ≫ depth/lateral). None if invalid."""
     if not scar_range or len(scar_range) != 2:
-        return None
+        return None                                          # genuinely no range supplied → whole-volume
     fax = int(np.argmax([float(s) for s in spacing_xyz[:3]]))
-    lo, hi = int(scar_range[0]) - 1, int(scar_range[1])      # 1-based inclusive → 0-based [lo, hi)
+    lo, hi = sorted((int(scar_range[0]), int(scar_range[1])))  # normalize inverted ranges (e.g. [300,200])
+    lo -= 1                                                  # 1-based inclusive → 0-based [lo, hi)
     lo, hi = max(0, lo), min(shape[fax], hi)
-    if lo >= hi:
-        return None
     fm = np.zeros(shape, bool)
+    if lo >= hi:
+        return fm                                            # marked range fell outside the volume → empty
+                                                             # mask (caller errors distinctly, NOT whole-volume)
     sl = [slice(None)] * 3
     sl[fax] = slice(lo, hi)
     fm[tuple(sl)] = True

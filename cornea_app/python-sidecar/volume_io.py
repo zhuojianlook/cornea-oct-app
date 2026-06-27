@@ -81,33 +81,6 @@ def nrrd_to_nifti(src: Path, dst: Path) -> Path:
     return dst
 
 
-def seg_to_label_nifti(seg_src: Path, base_nifti: Path, dst: Path) -> Path:
-    """Convert a Slicer .seg.nrrd labelmap to an integer-label NIfTI on the base
-    volume's grid (so it overlays the grayscale exactly).
-
-    Slicer writes the segmentation as an NRRD whose voxels already hold integer
-    segment label values; we just re-grid them onto the base volume's affine.
-    Handles a possible leading 'list' axis (4D) by collapsing to the max label.
-    """
-    import nrrd
-
-    data, _header = nrrd.read(str(seg_src))
-    data = np.asarray(data)
-    if data.ndim == 4:
-        # Slicer may prepend a layer axis (L, i, j, k) — collapse to one labelmap.
-        axis = int(np.argmin(data.shape))
-        data = data.max(axis=axis)
-    base = nib.load(str(base_nifti))
-    if data.shape != tuple(base.shape[:3]):
-        # Seg grid should match the input volume; if a bounding-box crop shifted
-        # it, fail loudly rather than mis-align the overlay.
-        raise ValueError(f"Segmentation shape {data.shape} != volume shape {base.shape[:3]}")
-    img = nib.Nifti1Image(np.ascontiguousarray(data.astype(np.uint8)), base.affine)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(img, str(dst))
-    return dst
-
-
 def ensure_nifti(src: Path, dst: Path) -> Path:
     """Produce a niivue-ready NIfTI at `dst` from a volume at `src`.
 

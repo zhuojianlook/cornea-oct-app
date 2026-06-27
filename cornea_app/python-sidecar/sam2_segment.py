@@ -21,7 +21,11 @@ import nibabel as nib
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter
 
-# Quiet, deterministic, and friendly to a shared GPU.
+# Quiet and friendly to a shared GPU. NOTE: this path is NOT deterministic/bit-exact:
+# per-frame SAM2 inputs are written as lossy JPEG (quality=95, below) — re-encoded the
+# same way each run but not pixel-exact — and inference uses bf16 autocast on CUDA with
+# no torch/cudnn deterministic seeding, so results may vary slightly run-to-run on GPU.
+# (For exact input reproducibility, switch the frame writes to lossless PNG.)
 os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
