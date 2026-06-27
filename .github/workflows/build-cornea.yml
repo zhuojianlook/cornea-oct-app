@@ -18,18 +18,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # TEMPORARY: LINUX-ONLY for fast update turnaround (user request, 2026-06-26). The in-app updater
-          # manifest then carries only the Linux entries (which is what the user runs). To switch back to a
-          # FULL release, un-comment the macOS-arm64 + Windows entries below.
+          # FULL release (Linux + macOS-arm64 + Windows). Was LINUX-ONLY for fast turnaround (2026-06-26);
+          # re-enabled at the user's request once the detection strategy stabilised.
           - platform: ubuntu-22.04
             args: ""
             label: linux
-          # - platform: macos-latest
-          #   args: "--target aarch64-apple-darwin"
-          #   label: macos-arm64
-          # - platform: windows-latest
-          #   args: ""
-          #   label: windows
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            label: macos-arm64
+          - platform: windows-latest
+            args: ""
+            label: windows
           # macOS-intel (x86_64-apple-darwin) was permanently dropped earlier: its publish step kept failing
           # (the known auto-publish quirk) and a failed matrix job blocks the publish-manifest job.
     runs-on: ${{ matrix.platform }}

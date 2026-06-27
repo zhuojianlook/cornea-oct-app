@@ -174,6 +174,10 @@ export function OctLoader() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParams] = useState<Record<string, number>>(defaultParams());
   const [paramsOpen, setParamsOpen] = useState(false);
+  // Surface-detector strategy: "dp" = the native dynamic-programming detector (default) | "legacy" = the old
+  // gradient-argmax + RANSAC path. Exposed so the legacy strategy stays available (compare / fall back) and
+  // can be retired once DP is proven. Sent in the preprocess params; auto-tune only applies to DP.
+  const [detector, setDetectorState] = useState<"dp" | "legacy">("dp");
   // Iterative refinement: re-apply the correction until the boundary stops improving (auto-stops
   // before it worsens). Default 5 (auto-converge); 1 = the single faithful pass.
   const [maxPasses, setMaxPasses] = useState(5);
@@ -518,6 +522,11 @@ export function OctLoader() {
     setParams((cur) => ({ ...cur, [key]: v }));
     setScans((cur) => cur.map((s) => (s.status === "done" ? { ...s, status: "ready" } : s)));
   };
+  // Switching detector strategy also invalidates corrected scans (the boundary differs).
+  const setDetector = (d: "dp" | "legacy") => {
+    setDetectorState(d);
+    setScans((cur) => cur.map((s) => (s.status === "done" ? { ...s, status: "ready" } : s)));
+  };
 
   const runPreprocess = async () => {
     // Skip already-corrected (non-stale) scans — re-clicking is a no-op for them.
@@ -554,7 +563,7 @@ export function OctLoader() {
         try {
           const r = await api.json<{ oct_iter?: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } }>(
             `/api/case/${s.caseId}/oct-preprocess`, "POST", JSON.stringify({
-              params,
+              params: { ...params, detector },   // detector strategy (dp | legacy) for THIS preprocess
               classification: cls,
               scar_range: cls === "scar" ? s.scarRange : null,
               max_iterations: maxPasses,
@@ -925,17 +934,30 @@ export function OctLoader() {
             </div>
           </Collapse>
 
-          {/* Native AUTO-TUNE control: the app tunes the surface detector to each scan itself. The toggle turns
-              it on/off; the bias slider shifts what it optimises for (sharper vs smoother surface). */}
-          <div className="flex items-center gap-2 px-1" title="When on, the app auto-tunes the corneal-surface detector to EACH scan (no manual params) at preprocess time.">
-            <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Auto-tune detect</span>
-            <ToggleButton size="small" value="at" selected={(params.auto_tune ?? 1) > 0} disabled={busy}
-              onChange={() => setParam("auto_tune", (params.auto_tune ?? 1) > 0 ? 0 : 1)}
-              sx={{ py: 0, px: 1.2, fontSize: 10, textTransform: "none" }}>
-              {(params.auto_tune ?? 1) > 0 ? "On" : "Off"}
-            </ToggleButton>
+          {/* DETECTOR strategy: DP (native dynamic-programming, default) vs Legacy (old gradient-argmax + RANSAC).
+              Kept so legacy stays available to compare/fall back; remove the toggle once DP is proven. */}
+          <div className="flex items-center gap-2 px-1" title="Corneal-surface detector. DP = the native dynamic-programming detector (recommended). Legacy = the old gradient-argmax + RANSAC method.">
+            <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Detector</span>
+            <ToggleButtonGroup size="small" exclusive value={detector} disabled={busy}
+              onChange={(_, v) => v && setDetector(v as "dp" | "legacy")}>
+              <ToggleButton value="dp" sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>DP</ToggleButton>
+              <ToggleButton value="legacy" sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Legacy</ToggleButton>
+            </ToggleButtonGroup>
           </div>
-          {(params.auto_tune ?? 1) > 0 && (
+
+          {/* Native AUTO-TUNE control (DP only): the app tunes the DP detector to each scan itself. The toggle
+              turns it on/off; the bias slider shifts what it optimises for (sharper vs smoother surface). */}
+          {detector === "dp" && (
+            <div className="flex items-center gap-2 px-1" title="When on, the app auto-tunes the corneal-surface detector to EACH scan (no manual params) at preprocess time.">
+              <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Auto-tune detect</span>
+              <ToggleButton size="small" value="at" selected={(params.auto_tune ?? 1) > 0} disabled={busy}
+                onChange={() => setParam("auto_tune", (params.auto_tune ?? 1) > 0 ? 0 : 1)}
+                sx={{ py: 0, px: 1.2, fontSize: 10, textTransform: "none" }}>
+                {(params.auto_tune ?? 1) > 0 ? "On" : "Off"}
+              </ToggleButton>
+            </div>
+          )}
+          {detector === "dp" && (params.auto_tune ?? 1) > 0 && (
             <div className="flex items-center gap-2 px-1" title="Bias the per-scan auto-tune: lower = sharper / tighter to the boundary; higher = smoother surface.">
               <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>· sharper↔smoother</span>
               <Slider size="small" min={6} max={40} step={1} value={params.autotune_smooth_weight ?? 18}
