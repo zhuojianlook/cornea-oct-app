@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
-import { LIFECYCLE_STEPS, scanStep, type LifecycleStep } from "../../api/lifecycle";
+import { LIFECYCLE_STEPS, scanStep, stepReached, type LifecycleStep } from "../../api/lifecycle";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through 8 colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → Classified(scar/control) → SAM2(cornea
@@ -17,6 +17,7 @@ export function TimelineBar() {
   const sensitivity = useWorkflowStore((s) => s.scarSensitivity);
   const scarMethod = useWorkflowStore((s) => s.scarMethod);
   const runSam2 = useWorkflowStore((s) => s.runSam2);
+  const sam2RunningCaseId = useWorkflowStore((s) => s.sam2RunningCaseId);
   const buildEyeConsensus = useWorkflowStore((s) => s.buildEyeConsensus);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
@@ -55,10 +56,11 @@ export function TimelineBar() {
   const strip = (
     <div className="flex items-center gap-1">
       {([1, 2, 3, 4, 5, 6, 7, 8] as LifecycleStep[]).map((i) => {
-        const reached = step >= i;
+        const reached = stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
-        // A built consensus case can't be step-reset (its consensus_cases define it — rebuild instead).
-        const canReset = reached && i < step && !busy && !correcting && !!caseInfo && !isConsensus;
+        // Roll back to a reached EARLIER step. Not to Raw (i>=2 — the working volume is the preprocessed
+        // file, so "Raw" can't be shown). A built consensus case can't be reset (rebuild it instead).
+        const canReset = reached && i >= 2 && i < step && !busy && !correcting && !!caseInfo && !isConsensus;
         const meta = LIFECYCLE_STEPS[i];
         return (
           <div key={i} className="flex items-center gap-1"
@@ -190,7 +192,7 @@ export function TimelineBar() {
     actions = (
       <>
         {classification === "scar" && ScarMethod}
-        <Button size="small" variant="contained" color="primary" disabled={busy} onClick={() => runSam2()}
+        <Button size="small" variant="contained" color="primary" disabled={busy || !!sam2RunningCaseId} onClick={() => runSam2()}
           title={classification === "scar"
             ? "Run SAM2 cornea segmentation, then detect scar (cornea vs scar) with the chosen method — in one go."
             : "Run SAM2 cornea segmentation (control: no scar)."}>

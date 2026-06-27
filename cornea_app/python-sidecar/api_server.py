@@ -835,12 +835,18 @@ def get_segmentation_display_nifti(case_id: str) -> FileResponse:
         raise HTTPException(404, "No segmentation yet. Run SAM2 first.")
     base = _ensure_volume_nifti(case_id)
     dst = orch.case_root(case_id) / "previews" / "segmentation-display.nii.gz"
-    try:
-        density = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
-        labels.write_display_labelmap(arr, density, base, dst)
-    except Exception as exc:  # noqa: BLE001 — never block the viewer; fall back to the plain 0/1/2 overlay
-        print(f"[display-labelmap] tiered overlay failed for {case_id}: {exc}", file=sys.stderr)
-        labels.write_label_nifti(arr, base, dst)
+    with _labelmap_lock(case_id):          # serialise the regenerate (fixed tmp name in write_label_nifti)
+        try:
+            density = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
+            if density.shape[:3] != arr.shape[:3]:
+                density = None             # geometry mismatch → skip tiering rather than raise
+            labels.write_display_labelmap(arr, density, base, dst)
+        except Exception as exc:  # noqa: BLE001 — never block the viewer; fall back to the plain overlay
+            print(f"[display-labelmap] tiered overlay failed for {case_id}: {exc}", file=sys.stderr)
+            try:
+                labels.write_display_labelmap(arr, None, base, dst)   # no density → cornea=1, scar=4 (solid red)
+            except Exception as exc2:  # noqa: BLE001 — last resort
+                raise HTTPException(500, f"Segmentation display conversion failed: {exc2}")
     return FileResponse(str(dst), media_type="application/gzip", filename="segmentation-display.nii.gz")
 
 
@@ -1090,7 +1096,7 @@ def _scar_auto_locked(case_id: str, req: "ScarAutoRequest", nib) -> dict:
         scar_mask = scar_mod.scar_detector(req.method)(raw, arr, req.percentile)
     new_label = scar_mod.apply_scar_to_labelmap(arr, scar_mask, replace=req.replace)
     labels.write_label_nifti(new_label, base, labels.corrected_path(case_id))
-    postprocess.render_seg_previews(work, new_label, orch.segmentation_preview_dir(case_id), density_vol=vol)
+    postprocess.render_seg_previews(work, new_label, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(new_label, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
     metrics["scar_method"] = (req.method or "hysteresis") + profile_note
     orch.write_manifest_value(case_id, {"scar_metrics": metrics,
@@ -1139,7 +1145,7 @@ def _scar_edit_locked(case_id: str, req: "ScarEditRequest", nib) -> dict:
     vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)
     raw = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)
     labels.write_label_nifti(arr, base, labels.corrected_path(case_id))
-    postprocess.render_seg_previews(work, arr, orch.segmentation_preview_dir(case_id), density_vol=vol)
+    postprocess.render_seg_previews(work, arr, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(arr, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
     orch.write_manifest_value(case_id, {"scar_metrics": metrics})
     return {"metrics": metrics,
@@ -1208,7 +1214,7 @@ def _scar_sam2_hint_locked(case_id: str, req: "ScarHintRequest", sam2_segment, n
     new_label = np.where(cornea, 1, 0).astype(np.uint8)
     new_label[new_scar] = 2
     labels.write_label_nifti(new_label, base, labels.corrected_path(case_id))
-    postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=vol)
+    postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(new_label, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
     metrics["sam2_hint"] = meta
     orch.write_manifest_value(case_id, {"scar_metrics": metrics})
@@ -1278,7 +1284,7 @@ def _scar_auto_sam2_locked(case_id: str, req: "ScarAutoSam2Request", sam2_segmen
     new_label = np.where(cornea, 1, 0).astype(np.uint8)
     new_label[new_scar] = 2
     labels.write_label_nifti(new_label, base, labels.corrected_path(case_id))
-    postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=vol)
+    postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(new_label, spacing, density_vol_ijk=raw)
     metrics["scar_auto_sam2"] = meta
     orch.write_manifest_value(case_id, {"scar_metrics": metrics,
@@ -1973,7 +1979,12 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
              # a fresh preprocessing (auto OR a Fix-columns re-run) invalidates the manual-vetting and
              # training-schedule flags → the per-scan timeline drops back to "Preprocessed [Auto]" (red)
              # and the user re-approves. scar_classification is kept (it's scan content, not geometry).
-             "preproc_vetted": False, "training_scheduled": False}
+             "preproc_vetted": False, "training_scheduled": False,
+             # The segmentation files were just deleted above; CLEAR their manifest flags too, else
+             # scanStep (which keys off sam2_meta/corrected_labelmap/consensus_case BEFORE preproc_vetted)
+             # would keep reporting the scan as segmented while its overlay 404s. (Mirrors _STEP_RESET_FLAGS.)
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None,
+             "qa_json": None, "segmentation_preview_dir": None}
     if cls:
         extra["scar_classification"] = cls
     if sr:
@@ -2062,7 +2073,10 @@ def keep_raw_case(case_id: str) -> dict:
              "oct_kept_raw": True,
              # the user explicitly approved the raw as the final preprocessing → vet it (timeline → orange);
              # a later auto re-preprocess clears these as usual.
-             "preproc_vetted": True, "training_scheduled": False}
+             "preproc_vetted": True, "training_scheduled": False,
+             # seg files were deleted above → clear their flags so the timeline drops to Vetted (not SAM2).
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None,
+             "qa_json": None, "segmentation_preview_dir": None}
     if m.get("scar_classification"):
         extra["scar_classification"] = m.get("scar_classification")
     if m.get("scar_range"):
@@ -2175,6 +2189,19 @@ def reset_step(case_id: str, req: ResetStepRequest) -> dict:
             for k in keys:
                 updates[k] = None
                 cleared.append(k)
+    # Rolling back BELOW SAM2 (target < 5) must also remove the on-disk labelmap + QA + previews:
+    # nnU-Net training/export, the metrics summary, and the served overlays all gate on FILE existence
+    # (labels.best_labelmap_nnunet), not the manifest flags. Leaving the file would silently keep a
+    # rolled-back scan in the training cohort and serve a stale overlay (review HIGH #2/#3, MED #16).
+    if target < 5:
+        updates["scar_metrics"] = None
+        labels.corrected_path(cid).unlink(missing_ok=True)
+        orch.case_qa_json(cid).unlink(missing_ok=True)
+        seg_dir = orch.segmentation_preview_dir(cid)
+        if seg_dir.exists():
+            shutil.rmtree(seg_dir, ignore_errors=True)
+        for grp in ("context_seg", "context_cons"):
+            shutil.rmtree(_preview_group_dir(cid, grp), ignore_errors=True)
     if updates:
         orch.write_manifest_value(cid, updates)
     return {"ok": True, "step": target, "cleared": cleared,
@@ -2817,6 +2844,7 @@ def cases_list() -> dict:
                 "scar_range": (list(m.get("scar_range")) if m.get("scar_range") else None),
                 "scar_subgroup": (str(m.get("scar_subgroup")).strip() if m.get("scar_subgroup") else None),
                 "sam2_meta": bool(m.get("sam2_meta")),
+                "consensus_case": bool(m.get("consensus_case")),   # so an ALIGNED member colours as step 6
                 "corrected_labelmap": bool(m.get("corrected_labelmap")),
                 "training_scheduled": bool(m.get("training_scheduled")),
             },

@@ -550,7 +550,10 @@ def quantify(labelmap_ijk: np.ndarray, spacing_xyz, density_vol_ijk=None) -> dic
         metrics["largest_component_fraction"] = round(float(max(sizes)) / scar_vox, 3) if n else 0.0
         if density_vol_ijk is not None:
             d = density_vol_ijk[scar].astype(np.float32)
-            tiers, _ = density_tiers(scar, density_vol_ijk, n_tiers=3)
+            # Use the ABSOLUTE, cross-eye-comparable tiers (cornea-normalised, same as the 2D/3D
+            # display overlays) so the panel's diffuse/moderate/dense volumes match the coloured tiers
+            # the user sees — not the old relative quantiles (which made the three ~equal by construction).
+            tiers, cutoffs = density_tiers_absolute(scar, density_vol_ijk, labelmap_ijk == CORNEA)
             metrics["scar_density"] = {
                 "mean": round(float(d.mean()), 2), "median": round(float(np.median(d)), 2),
                 "std": round(float(d.std()), 2),
@@ -559,5 +562,6 @@ def quantify(labelmap_ijk: np.ndarray, spacing_xyz, density_vol_ijk=None) -> dic
                 # density-weighted volume = ∫ reflectivity dV (opacity burden, mm³·units)
                 "weighted_volume_mm3u": round(float(d.sum()) * voxel_mm3, 4),
                 "tier_volume_mm3": [round(int((tiers == t).sum()) * voxel_mm3, 5) for t in (1, 2, 3)],
+                "tier_cutoffs": [round(float(c), 2) for c in cutoffs],
             }
     return metrics

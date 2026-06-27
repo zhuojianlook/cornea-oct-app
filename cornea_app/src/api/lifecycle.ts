@@ -56,6 +56,25 @@ export function lifecycleMeta(m: Manifest): StepMeta {
   return { step, ...LIFECYCLE_STEPS[step] };
 }
 
+/** Whether step `i` has GENUINELY been reached (its own flag is set) — used to colour the timeline
+ *  strip honestly: a scan scheduled straight from SAM2 must NOT show Aligned/Corrected as done.
+ *  A built consensus case is a finished artifact, so its earlier steps are treated as implicitly done. */
+export function stepReached(m: Manifest, i: LifecycleStep): boolean {
+  if (!m) return false;
+  if (set(m, "consensus_cases") || set(m, "consensus_report")) return i <= scanStep(m);
+  switch (i) {
+    case 1: return set(m, "input_volume") || set(m, "corrected_volume");
+    case 2: return set(m, "oct_preprocessed");
+    case 3: return set(m, "preproc_vetted");
+    case 4: return set(m, "scar_classification");
+    case 5: return set(m, "sam2_meta") || set(m, "corrected_labelmap") || set(m, "consensus_case");
+    case 6: return set(m, "consensus_case");
+    case 7: return set(m, "corrected_labelmap");
+    case 8: return set(m, "training_scheduled");
+    default: return false;
+  }
+}
+
 /** Has SAM2 cornea segmentation been produced? (drives the Segmentation/Slices toggle greying.) */
 export function hasSegmentation(m: Manifest): boolean {
   return !!m && (set(m, "sam2_meta") || set(m, "consensus_case") || set(m, "corrected_labelmap"));

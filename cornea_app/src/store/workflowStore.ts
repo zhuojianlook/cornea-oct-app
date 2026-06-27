@@ -292,7 +292,9 @@ export const useWorkflowStore = create<WorkflowState>()(
           .then((p) => {
             if (!stillHere() || !p?.message) return;
             if (p.phase === "idle" || p.phase === "done" || p.phase === "error") return;
-            set((s) => { if (s.segBusy && s.sam2RunningCaseId === caseId) s.status = { kind: "working", title: "Running SAM2", detail: p.message }; });
+            // Keyed on sam2RunningCaseId (not segBusy) so reopening the still-running case resumes the live
+            // progress text even though the case switch cleared the global segBusy (#8).
+            set((s) => { if (s.sam2RunningCaseId === caseId) s.status = { kind: "working", title: "Running SAM2", detail: p.message }; });
           })
           .catch(() => undefined);
       }, 1200);
@@ -322,8 +324,12 @@ export const useWorkflowStore = create<WorkflowState>()(
               detail: `"${caseId}" finished segmenting${scarRan ? " (cornea + scar)" : ""} — reopen it to review.` };
         });
         if (!stillHere()) { bgDone(); return; }
-        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (!stillHere()) { bgDone(); return; }
+        // Advance the timeline NOW: TimelineBar reads scanStep(caseInfo.manifest), which is only refreshed
+        // by openCase. Optimistically set the segmentation flag (mirrors caseStore.vetPreprocessing) so the
+        // step moves 4→5 without a full reload (the backend already persisted sam2_meta).
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).sam2_meta = true; });
         set((s) => {
           s.segQa = res.qa;
           s.segLoaded = true;
@@ -340,7 +346,9 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (stillHere()) set((s) => { s.status = { kind: "error", title: "SAM2 failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
         clearInterval(poll);
-        set((s) => { s.segBusy = false; if (s.sam2RunningCaseId === caseId) s.sam2RunningCaseId = null; });
+        // Only THIS run's case clears the shared busy/running flags — a second run started on another
+        // case (after a switch cleared segBusy) must not be broken by this one's completion.
+        set((s) => { if (s.sam2RunningCaseId === caseId) { s.segBusy = false; s.sam2RunningCaseId = null; } });
       }
     },
 
@@ -415,8 +423,10 @@ export const useWorkflowStore = create<WorkflowState>()(
         const res = await api.upload<{ qa: Record<string, unknown> }>(`/api/case/${caseId}/segmentation/from-drawing`, [file]);
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-save — don't touch the new case
         nv.endDrawing();   // clear the drawing bitmap BEFORE reloading the overlay (else it double-renders)
-        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
+        // Advance the timeline to "Corrected" (mirrors the runSam2 optimistic manifest refresh).
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).corrected_labelmap = true; });
         set((s) => {
           s.segQa = res.qa;
           s.segLoaded = true;
@@ -440,7 +450,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       const caseId = useCaseStore.getState().caseId;
       nv.endDrawing();
       if (caseId) {
-        try { await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity); } catch { /* nothing to restore */ }
+        try { await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0); } catch { /* nothing to restore */ }
       }
       set((s) => {
         s.correcting = false;
@@ -498,7 +508,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           JSON.stringify({ percentile, method: get().scarMethod }),
         );
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
-        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -563,7 +573,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           JSON.stringify({ percentile }),
         );
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
-        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -611,7 +621,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         );
         // case switched mid-run — don't write metrics or wipe the NEW case's freshly-placed hints
         if (useCaseStore.getState().caseId !== caseId) return;
-        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -646,7 +656,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-edit — don't write onto the new case
         // niivue refresh is best-effort (no-op without WebGL); the 2D gallery refetches via segVersion.
         try {
-          await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+          await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         } catch {
           /* no WebGL — gallery updates from segVersion below */
         }
@@ -697,7 +707,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
       try {
-        await nv.loadSegmentation(overlayUrl(caseId), get().segOpacity);
+        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         set((s) => {
           s.segLoaded = true;
           s.segVersion += 1;

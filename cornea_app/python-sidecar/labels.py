@@ -66,7 +66,7 @@ def write_display_labelmap(arr_ijk: np.ndarray, density_vol_ijk, base_nifti: Pat
             tier, _ = scar_mod.density_tiers_absolute(scar_mask, np.asarray(density_vol_ijk), arr == 1)
             out[scar_mask] = (tier[scar_mask] + 1).astype(np.uint8)   # tiers 1/2/3 → labels 2/3/4
         else:
-            out[scar_mask] = 2
+            out[scar_mask] = 4   # no density → render as solid (dense) red, not the faint diffuse tier
     return write_label_nifti(out, base_nifti, dst)
 
 

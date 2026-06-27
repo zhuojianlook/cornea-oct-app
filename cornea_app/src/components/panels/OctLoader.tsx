@@ -516,13 +516,16 @@ export function OctLoader() {
   const preview = async (caseId?: string) => {
     if (!caseId || previewInFlightRef.current) return;
     previewInFlightRef.current = true;
-    if (busyRef.current) manualPreviewRef.current = true;   // opened during a batch → don't auto-switch at the end
+    const duringBatch = busyRef.current;
     setActiveId(caseId);
     try {
       setCaseId(caseId);
       const r = await api.json<{ n_frames?: number; preprocessed?: boolean }>(
         `/api/case/${caseId}/oct-volume`, "POST", JSON.stringify({}),
       );
+      // Only latch "don't auto-switch at batch end" once the open SUCCEEDS — a failed/transient preview
+      // must not permanently suppress the end-of-batch view switch.
+      if (duringBatch) manualPreviewRef.current = true;
       // Use the scan's REAL frame count for the scar-range slider (not a hardcoded 101).
       const nf = r.n_frames && r.n_frames > 1 ? r.n_frames : 101;
       setScans((cur) => cur.map((s) => (s.caseId === caseId
@@ -666,6 +669,7 @@ export function OctLoader() {
       return;
     }
     setBusy(true);
+    manualPreviewRef.current = false;   // #20: don't yank the view if the user opens a scan mid-run
     setReport(null);
     try {
       let lastResult: string | null = null;
@@ -697,7 +701,7 @@ export function OctLoader() {
           summary.push(`${label}: 1 scan`);
         }
       }
-      if (lastResult) {
+      if (lastResult && !manualPreviewRef.current) {
         setStep("Opening result…");
         setCaseId(lastResult);
         await openCase();
@@ -904,7 +908,7 @@ export function OctLoader() {
                         {s.status !== "error" && (
                           <div className="ml-6 mt-0.5 flex items-center gap-1">
                             <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>subgroup</span>
-                            <input list={`subs-${g.id}`} value={s.subgroup} disabled={busy} placeholder="1"
+                            <input list={`subs-${g.id}`} value={s.subgroup} disabled={busy && s.status !== "done"} placeholder="1"
                               onChange={(e) => patchScan(s.id, { subgroup: e.target.value })}
                               onBlur={(e) => persistSubgroup(s.caseId, e.target.value)}
                               style={{ fontSize: 10, width: 92, color: "var(--c-text)", background: "var(--c-surface2)", border: "1px solid var(--c-border)", borderRadius: 4, padding: "1px 4px" }} />
@@ -923,8 +927,8 @@ export function OctLoader() {
                             <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>scar?</span>
                             <ToggleButtonGroup size="small" exclusive value={s.condition ?? null}
                               onChange={(_, v) => setScanCondition(s.id, (v as Cls) || undefined)}>
-                              <ToggleButton value="scar" disabled={busy} sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Scar</ToggleButton>
-                              <ToggleButton value="control" disabled={busy} sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>No scar</ToggleButton>
+                              <ToggleButton value="scar" disabled={busy && s.status !== "done"} sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Scar</ToggleButton>
+                              <ToggleButton value="control" disabled={busy && s.status !== "done"} sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>No scar</ToggleButton>
                             </ToggleButtonGroup>
                           </div>
                         )}
@@ -935,7 +939,7 @@ export function OctLoader() {
                         {s.condition === "scar" && s.status !== "error" && (
                           <div className="ml-6 mt-1 pr-2">
                             <div className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>scar frames {s.scarRange[0]}–{s.scarRange[1]}</div>
-                            <Slider size="small" min={1} max={s.nFrames} value={s.scarRange} disabled={busy}
+                            <Slider size="small" min={1} max={s.nFrames} value={s.scarRange} disabled={busy && s.status !== "done"}
                               onChange={(_, v) => patchScan(s.id, { scarRange: v as [number, number] })}
                               onChangeCommitted={(_, v) => persistClassification(s.caseId, "scar", v as [number, number])} />
                           </div>

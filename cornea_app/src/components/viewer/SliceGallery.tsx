@@ -1022,12 +1022,15 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
         onPointerDown={onBorderDown} onPointerMove={onBorderMove} onPointerUp={onBorderUp} onPointerLeave={onBorderUp}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "row-resize", touchAction: "none" }}>
-        {/* #2: the BLUE line is the surface the correction actually flattens to (the RANSAC fit the warp
-            targets) — make it the PROMINENT "applied" line so what you see == what's used; the RED raw
-            detected edge is demoted to a faint reference (it can carry artifacts the fit already ignores). */}
-        <polyline fill="none" stroke="#ff4d4d" strokeWidth={0.7} vectorEffect="non-scaling-stroke" opacity={0.3}
+        {/* #2: the CYAN line is the surface the correction actually flattens to (the RANSAC fit the warp
+            targets) — prominent so what you see == what's used. The RED is the raw detected edge AND the
+            one you DRAG; while there are un-confirmed anchors (anchorsDirty) make the RED prominent so the
+            line you're manipulating is the visible one (WYSIWYG), and demote the cyan to a reference. */}
+        <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
+          strokeWidth={anchorsDirty ? 1.3 : 0.7} opacity={anchorsDirty ? 0.9 : 0.3}
           points={spanPts(edgeY)} />
-        <polyline fill="none" stroke="#22d3ee" strokeWidth={1.3} vectorEffect="non-scaling-stroke" opacity={0.95}
+        <polyline fill="none" stroke="#22d3ee" vectorEffect="non-scaling-stroke"
+          strokeWidth={anchorsDirty ? 0.8 : 1.3} opacity={anchorsDirty ? 0.5 : 0.95}
           points={spanPts((f) => curFit[f])} />
         {/* anchored frames on this slice → pink (over the red) — thin + translucent. A SINGLE anchor is drawn
             as a short VERTICAL tick, NOT a <circle>: the SVG viewBox (nFrames×depthVox) is stretched with
