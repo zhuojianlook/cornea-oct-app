@@ -47,6 +47,15 @@ export interface ScarHint {
   fy: number;
 }
 
+// Per-strategy test–retest reproducibility comparison (publication): one row per scar strategy.
+export interface StrategyRow {
+  strategy: string; mean_volume_mm3?: number; cv_percent?: number; rc_mm3?: number;
+  mean_pairwise_dice?: number | null; mean_pairwise_hd95_mm?: number | null; n?: number; error?: string;
+}
+export interface StrategyComparison {
+  rows: StrategyRow[]; members: string[]; n: number; phi_percentile: number; reference?: string; subgroup?: string;
+}
+
 export type StatusKind = "idle" | "working" | "done" | "error";
 export interface WorkflowStatus {
   kind: StatusKind;
@@ -85,6 +94,7 @@ interface WorkflowState {
   scarSensitivity: number; // 1–40; higher highlights more (percentile = 100 − this)
   scarMethod: string; // scar strategy: hysteresis | normal_anchor | robust_mad | morph_lcc | brightness
   scarSummaryInfo: string | null;
+  strategyComparison: StrategyComparison | null;   // last per-strategy reproducibility comparison
 
   // SAM2 scar hints (click to guide)
   hintMode: boolean;
@@ -133,6 +143,7 @@ interface WorkflowState {
   runSam2: () => Promise<void>;
   alignReplicates: () => Promise<void>;
   normalizeConsensus: () => Promise<void>;
+  compareStrategies: () => Promise<void>;
   loadCorrectionLayer: () => Promise<void>;
   saveCorrection: () => Promise<void>;
   cancelCorrection: () => Promise<void>;
@@ -177,6 +188,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     scarSensitivity: 8,
     scarMethod: "hysteresis",
     scarSummaryInfo: null,
+    strategyComparison: null,
 
     hintMode: false,
     hintPositive: true,
@@ -227,6 +239,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.segQa = null;
         s.scarMetrics = null;
         s.scarSummaryInfo = null;
+        s.strategyComparison = null;
         s.correcting = false;
         s.hintMode = false;
         s.scarHints = [];
@@ -420,6 +433,31 @@ export const useWorkflowStore = create<WorkflowState>()(
         set((s) => { s.status = { kind: "error", title: "Normalize failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
         set((s) => { s.segBusy = false; });
+      }
+    },
+
+    // PUBLICATION: run every scar strategy on this eye's replicates + tabulate test–retest reproducibility
+    // (pairwise Dice, HD95, volume CV%, RC). READ-ONLY — does not change the scan's scar.
+    compareStrategies: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => {
+        s.scarBusy = true;
+        s.status = { kind: "working", title: "Comparing scar strategies",
+          detail: "Running each detector on this eye's replicates and computing reproducibility (Dice · HD95 · CV%). A few minutes." };
+      });
+      try {
+        const r = await api.json<StrategyComparison>(`/api/case/${caseId}/compare-strategies`, "POST", JSON.stringify({}));
+        if (useCaseStore.getState().caseId !== caseId) return;
+        set((s) => {
+          s.strategyComparison = r;
+          s.status = { kind: "done", title: "Strategy comparison ready",
+            detail: `${r.rows.length} strategies × ${r.n} replicates — see the table (download CSV for the paper).` };
+        });
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Comparison failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.scarBusy = false; });
       }
     },
 

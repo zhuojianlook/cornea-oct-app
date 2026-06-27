@@ -22,6 +22,8 @@ export function TimelineBar() {
   const selectStep = useWorkflowStore((s) => s.selectStep);
   const alignReplicates = useWorkflowStore((s) => s.alignReplicates);
   const normalizeConsensus = useWorkflowStore((s) => s.normalizeConsensus);
+  const compareStrategies = useWorkflowStore((s) => s.compareStrategies);
+  const strategyComparison = useWorkflowStore((s) => s.strategyComparison);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
@@ -63,6 +65,27 @@ export function TimelineBar() {
   // Step-6 subgroup input, re-seeded from the manifest on case/subgroup change.
   const [subInput, setSubInput] = useState(subgroup);
   useEffect(() => { setSubInput(subgroup); }, [caseInfo?.case_id, subgroup]);
+  // Strategy-comparison results dialog (publication).
+  const [showCompare, setShowCompare] = useState(false);
+  const CMP_COLS: { key: keyof NonNullable<typeof strategyComparison>["rows"][number]; label: string }[] = [
+    { key: "strategy", label: "Strategy" },
+    { key: "mean_pairwise_dice", label: "Pairwise Dice ↑" },
+    { key: "mean_pairwise_hd95_mm", label: "HD95 mm ↓" },
+    { key: "cv_percent", label: "Volume CV% ↓" },
+    { key: "rc_mm3", label: "RC mm³ ↓" },
+    { key: "mean_volume_mm3", label: "Mean vol mm³" },
+  ];
+  const downloadComparisonCsv = () => {
+    if (!strategyComparison) return;
+    const head = CMP_COLS.map((c) => c.label).join(",");
+    const body = strategyComparison.rows.map((r) =>
+      CMP_COLS.map((c) => { const v = (r as unknown as Record<string, unknown>)[c.key as string]; return v == null ? "" : String(v); }).join(",")).join("\n");
+    const csv = `# scar strategy reproducibility · n=${strategyComparison.n} replicates · phi=${strategyComparison.phi_percentile} · subgroup=${strategyComparison.subgroup ?? ""}\n${head}\n${body}\n`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = `scar_strategy_reproducibility_${strategyComparison.reference ?? "eye"}.csv`;
+    a.click(); URL.revokeObjectURL(a.href);
+  };
   const downstream = resetTo != null ? LIFECYCLE_STEPS.slice(resetTo + 1, step + 1).map((x) => x.short) : [];
 
   // ── the step strip: click a REACHED step to VIEW it (earlier = inspect read-only; current = back to live) ──
@@ -300,12 +323,62 @@ export function TimelineBar() {
       <span style={{ width: 1, height: 26, background: "var(--c-border)" }} />
       <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
       <div className="flex-1" />
+      {/* PUBLICATION: compare scar-detection strategies' reproducibility on this eye's replicates. Available
+          once a scan/consensus is segmented (needs ≥2 segmented replicates of the eye+subgroup). */}
+      {caseInfo && (step >= 5 || isConsensus) && (
+        <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
+          onClick={() => { setShowCompare(true); compareStrategies(); }}
+          title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">
+          ⚖ Compare strategies
+        </Button>
+      )}
       {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
       {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
         <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
           title={status.detail}>{status.detail}</span>
       )}
       {(busy || !!sam2RunningCaseId) && <CircularProgress size={16} />}
+
+      {/* PUBLICATION: scar-strategy reproducibility table. */}
+      <Dialog open={showCompare} onClose={() => setShowCompare(false)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ fontSize: 16 }}>Scar strategy reproducibility (test–retest)</DialogTitle>
+        <DialogContent sx={{ fontSize: 13 }}>
+          {!strategyComparison && scarBusy && (
+            <div className="flex items-center gap-2 py-4"><CircularProgress size={18} /> Running each strategy on the eye's replicates…</div>
+          )}
+          {strategyComparison && (
+            <>
+              <div className="text-xs mb-2" style={{ color: "var(--c-text-dim)" }}>
+                {strategyComparison.n} replicates{strategyComparison.subgroup ? ` · subgroup “${strategyComparison.subgroup}”` : ""} · φ={strategyComparison.phi_percentile} ·
+                reproducibility only (no manual GT). Higher Dice / lower HD95·CV·RC = more reproducible; read Dice alongside volume (Dice rises with mask size).
+              </div>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr>{CMP_COLS.map((c) => (
+                    <th key={c.key as string} style={{ textAlign: c.key === "strategy" ? "left" : "right", padding: "4px 8px", borderBottom: "1px solid var(--c-border)", color: "var(--c-text-dim)" }}>{c.label}</th>
+                  ))}</tr>
+                </thead>
+                <tbody>
+                  {strategyComparison.rows.map((r) => (
+                    <tr key={r.strategy}>
+                      {CMP_COLS.map((c) => {
+                        const v = (r as unknown as Record<string, unknown>)[c.key as string];
+                        return <td key={c.key as string} style={{ textAlign: c.key === "strategy" ? "left" : "right", padding: "4px 8px", borderBottom: "1px solid var(--c-border)", fontWeight: c.key === "strategy" ? 600 : 400 }}>
+                          {r.error && c.key === "strategy" ? `${r.strategy} (error)` : (v == null ? "—" : String(v))}
+                        </td>;
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button size="small" disabled={!strategyComparison} onClick={downloadComparisonCsv}>⤓ Download CSV</Button>
+          <Button size="small" variant="contained" onClick={() => setShowCompare(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={resetTo != null} onClose={() => setResetTo(null)}>
         <DialogTitle sx={{ fontSize: 16 }}>

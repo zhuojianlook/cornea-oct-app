@@ -1557,6 +1557,36 @@ def normalize_consensus(case_id: str) -> dict:
             "images": orch.preview_images_from_dir("Segmentation", _preview_group_dir(ccid2, "segmentation"))}
 
 
+class CompareStrategiesRequest(BaseModel):
+    strategies: List[str] | None = None    # None = all production strategies
+    phi_percentile: float = 92.0           # benchmark-validated operating point
+
+
+@app.post("/api/case/{case_id}/compare-strategies")
+def compare_strategies(case_id: str, req: CompareStrategiesRequest) -> dict:
+    """PUBLICATION: test–retest reproducibility of each scar strategy on this eye+subgroup's segmented
+    replicates — pairwise 3D Dice, pairwise HD95 (mm), native scar-volume mean / CV% / repeatability
+    coefficient. READ-ONLY: scar masks are computed in memory and the canonical labelmaps are untouched.
+    Resolve the replicate set (a member or the consensus case), then run scar_bench.compare_strategies."""
+    import scar_bench
+    cid = orch.safe_case_id(case_id)
+    m = orch.read_manifest(cid)
+    if m.get("consensus_cases"):                       # a consensus case → use its members directly
+        members = list(m.get("consensus_cases") or [])
+        key = {"subgroup": str(m.get("scar_subgroup") or "1")}
+    else:
+        members, key = _eye_replicates(cid)
+    if len(members) < 2:
+        raise HTTPException(400, f"Need ≥2 segmented replicate scans of this eye+subgroup to compare "
+                                 f"reproducibility (found {len(members)}).")
+    try:
+        result = scar_bench.compare_strategies(members, req.strategies, req.phi_percentile)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    result["subgroup"] = key.get("subgroup")
+    return result
+
+
 @app.post("/api/case/{case_id}/subgroup/confirm")
 def confirm_subgroup(case_id: str) -> dict:
     """STEP 6 — confirm this scan's scar-subgroup (already set via /subgroup): which lesion set it belongs

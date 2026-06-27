@@ -68,6 +68,82 @@ def _pairwise(masks, fn):
     return [fn(masks[cids[i]], masks[cids[j]]) for i in range(len(cids)) for j in range(i + 1, len(cids))]
 
 
+# Production scar strategies, keyed by the names the UI/method-dropdown uses. Each → a mask in cornea.
+def _strategy_detectors(phi: float):
+    return {
+        "hysteresis": lambda lab, vol: scar_mod.detect_scar_hysteresis(vol, lab, phi_percentile=phi),
+        "depthnorm": lambda lab, vol: scar_mod.detect_scar_depthnorm(vol, lab, phi_percentile=phi),
+        "normal_anchor": lambda lab, vol: scar_mod.detect_scar_normal_anchor(vol, lab),
+        "robust_mad": lambda lab, vol: scar_mod.detect_scar_robust_mad(vol, lab),
+        "morph_lcc": lambda lab, vol: scar_mod.detect_scar_morph_lcc(vol, lab, percentile=phi),
+        "brightness": lambda lab, vol: scar_mod.detect_scar_in_cornea(vol, lab, percentile=phi),
+    }
+
+
+def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0) -> dict:
+    """READ-ONLY test–retest reproducibility of each scar strategy on a set of REPLICATE scans (same eye+
+    subgroup, already cornea-segmented). Aligns the replicates to the reference ONCE (volume-intensity
+    driven, detector-independent), then for each strategy computes the scar mask per replicate IN MEMORY
+    (never persisted — the canonical labelmaps are untouched), warps them into the reference frame, and
+    reports pairwise 3D Dice, pairwise HD95 (mm, boundary), native scar-volume mean / CV% / repeatability
+    coefficient (RC = 2.77·SD). Returns {rows, members, n, phi_percentile, reference}.
+
+    NOTE for interpretation: Dice rises with mask size, so a detector that flags MORE scar can look more
+    reproducible — read pairwise Dice ALONGSIDE the volume + CV. Reproducibility, not accuracy (no GT)."""
+    import tempfile
+    members = [c for c in dict.fromkeys(member_ids)
+               if label_mod.corrected_path(c).exists() and _vol(c).exists()]
+    if len(members) < 2:
+        raise ValueError("Need ≥2 segmented replicate scans to compare reproducibility.")
+    dets = _strategy_detectors(float(phi_percentile))
+    chosen = [s for s in (strategies or list(dets)) if s in dets] or list(dets)
+
+    ref = members[0]; ref_vol = _vol(ref)
+    sp = reg._read_vol(ref_vol).GetSpacing(); vmm3 = sp[0] * sp[1] * sp[2]
+    samp = (sp[2], sp[1], sp[0])   # warped masks are sitk (z,y,x) → reversed spacing for HD95
+    tx = {ref: reg.identity()}
+    for mov in members[1:]:
+        tx[mov] = reg.align_transform(ref_vol, label_mod.corrected_path(ref), _vol(mov), label_mod.corrected_path(mov))[0]
+    data = {c: (np.rint(np.asarray(nib.load(str(label_mod.corrected_path(c))).dataobj)).astype(np.uint8),
+                np.asarray(nib.load(str(_vol(c))).dataobj).astype(np.float32)) for c in members}
+
+    tmpd = Path(tempfile.mkdtemp(prefix="cmp_strat_"))
+
+    def warp(mask, cid):
+        tmp = tmpd / f"{cid}.nii.gz"
+        label_mod.write_label_nifti(mask.astype(np.uint8), _vol(cid), tmp)
+        return reg.resample_label(tmp, ref_vol, tx[cid]) >= 1
+
+    rows = []
+    try:
+        for name in chosen:
+            try:
+                warped, vols = {}, []
+                for cid in members:
+                    lab, vol = data[cid]
+                    m = np.asarray(dets[name](lab, vol)) & ((lab == 1) | (lab == 2))
+                    vols.append(float(m.sum()) * vmm3)
+                    warped[cid] = warp(m, cid)
+                mean = float(np.mean(vols)); sd = float(np.std(vols, ddof=1)) if len(vols) > 1 else 0.0
+                pd = _pairwise(warped, _dice)
+                ph = _pairwise(warped, lambda a, b: _hd95(a, b, samp))
+                rows.append({
+                    "strategy": name,
+                    "mean_volume_mm3": round(mean, 3),
+                    "cv_percent": round(sd / mean * 100, 2) if mean else 0.0,
+                    "rc_mm3": round(2.77 * sd, 3),
+                    "mean_pairwise_dice": round(float(np.mean(pd)), 3) if pd else None,
+                    "mean_pairwise_hd95_mm": round(float(np.nanmean(ph)), 3) if ph and not np.all(np.isnan(ph)) else None,
+                    "n": len(members),
+                })
+            except Exception as exc:  # noqa: BLE001 — one bad strategy shouldn't kill the table
+                rows.append({"strategy": name, "error": str(exc)[:120], "n": len(members)})
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    return {"rows": rows, "members": members, "n": len(members),
+            "phi_percentile": float(phi_percentile), "reference": ref}
+
+
 def main():
     ref = REPLICATES[0]
     ref_vol = _vol(ref)
