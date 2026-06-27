@@ -15,6 +15,7 @@ export function TimelineBar() {
   const sensitivity = useWorkflowStore((s) => s.scarSensitivity);
   const scarMethod = useWorkflowStore((s) => s.scarMethod);
   const runSam2 = useWorkflowStore((s) => s.runSam2);
+  const buildEyeConsensus = useWorkflowStore((s) => s.buildEyeConsensus);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
@@ -160,6 +161,12 @@ export function TimelineBar() {
             <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
           </>
         )}
+        {/* POST-SAM2 next step: align this eye's repeat scans into one consensus, control-normalised. */}
+        <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => buildEyeConsensus()}
+          title="Next step: register + average this eye's repeat scans into one consensus, control-normalised by the tagged control (no-scar) scans. Run SAM2 on the eye's repeats first.">
+          ⌖ Align replicates + normalize
+        </Button>
+        <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         {Correct}
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         <Button size="small" variant={scheduled ? "outlined" : "contained"} color="success" disabled={busy || correcting}

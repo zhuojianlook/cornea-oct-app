@@ -7,10 +7,19 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
 import settings
+
+# Serializes manifest read-modify-write within this process. The sidecar is a single
+# process, so an in-process lock is sufficient to make concurrent endpoint handlers
+# (run in a threadpool by Starlette) safe; combined with the atomic replace below a
+# reader never observes a half-written file. RLock so a future nested write is safe.
+_MANIFEST_LOCK = threading.RLock()
 
 SUBDIRS = ["input", "segmentation", "previews"]
 
@@ -62,14 +71,57 @@ def read_manifest(case_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def write_manifest_value(case_id: str, updates: dict) -> dict:
-    current = read_manifest(case_id)
-    current["case_id"] = safe_case_id(case_id)
-    current.update(updates)
-    path = manifest_path(case_id)
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically: write a sibling temp file, fsync, then
+    os.replace (atomic on POSIX and Windows). A crash mid-write leaves the previous
+    file intact instead of a truncated/empty one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(current, indent=2))
-    return current
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_manifest_value(case_id: str, updates: dict) -> dict:
+    path = manifest_path(case_id)
+    with _MANIFEST_LOCK:
+        # Guard against silently nuking a populated manifest: if the file exists and is
+        # non-empty but fails to parse (corruption / partial earlier write), back up the
+        # bytes rather than overwriting an empty {} merged with the update — that would
+        # destroy oct_source and every prior flag (HIGH-severity data-loss path).
+        if path.exists():
+            try:
+                raw = path.read_text()
+            except Exception:
+                raw = ""
+            if raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    backup = path.with_suffix(path.suffix + ".corrupt")
+                    try:
+                        os.replace(path, backup)
+                    except OSError:
+                        pass
+                    parsed = {}
+                current = parsed if isinstance(parsed, dict) else {}
+            else:
+                current = {}
+        else:
+            current = {}
+        current["case_id"] = safe_case_id(case_id)
+        current.update(updates)
+        _atomic_write_text(path, json.dumps(current, indent=2))
+        return current
 
 
 # ── Preview listing for the 2D slice gallery ───────────────────────────────

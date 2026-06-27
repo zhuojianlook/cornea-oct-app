@@ -27,6 +27,14 @@ const set = (m: NonNullable<Manifest>, k: string) => m[k] != null && m[k] !== fa
 export function scanStep(m: Manifest): LifecycleStep {
   if (!m) return 0;
   if (!set(m, "input_volume") && !set(m, "corrected_volume")) return 0;
+  // A BUILT CONSENSUS case (the aligned average of replicates) is itself a finished segmented result — it
+  // never runs preprocess/vet/classify, so place it at SAM2-done (5) and let it advance to corrected (6) /
+  // scheduled (7). Without this it falls through to "Raw" (step 1) and the timeline says "Preprocess this scan".
+  if (set(m, "consensus_cases") || set(m, "consensus_report")) {
+    if (!set(m, "corrected_labelmap")) return 5;
+    if (!set(m, "training_scheduled")) return 6;
+    return 7;
+  }
   if (!set(m, "oct_preprocessed")) return 1;                 // raw only
   if (!set(m, "preproc_vetted")) return 2;                   // auto-preprocessed (red)
   if (!set(m, "scar_classification")) return 3;              // vetted (orange)

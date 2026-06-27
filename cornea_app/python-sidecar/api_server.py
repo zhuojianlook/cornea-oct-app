@@ -372,6 +372,23 @@ def download_preprocessed_zip(cases: str = "", pass_num: int | None = None) -> F
     )
 
 
+def _reject_protected_dest(dest: Path) -> None:
+    """Native-save destinations are user-chosen (desktop Save dialog), but because CORS is open a
+    request could aim `dest` at the app's own data — refuse to write inside the case store /
+    workspace so these endpoints can never clobber managed case files or the sidecar state."""
+    try:
+        resolved = dest.expanduser().resolve()
+    except Exception:  # noqa: BLE001
+        return
+    for guarded in (settings.CASES_ROOT, settings.WORKSPACE_ROOT):
+        try:
+            groot = Path(guarded).resolve()
+        except Exception:  # noqa: BLE001
+            continue
+        if resolved == groot or groot in resolved.parents:
+            raise HTTPException(400, "Destination is inside the app data directory; choose a path outside it.")
+
+
 class SavePreprocessedRequest(BaseModel):
     dest: str
     pass_num: int | None = None   # 1-based iterative pass to export; None = working/best volume
@@ -393,6 +410,7 @@ def save_preprocessed(case_id: str, req: SavePreprocessedRequest) -> dict:
     if not Path(src).exists():
         raise HTTPException(404, f"No preprocessed volume for {case_id}. Preprocess the scan first.")
     dest = Path(req.dest).expanduser()
+    _reject_protected_dest(dest)
     try:
         if dest.parent:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -416,6 +434,7 @@ def save_preprocessed_zip(req: SaveZipRequest) -> dict:
     if not ids:
         raise HTTPException(400, "No cases specified.")
     dest = Path(req.dest).expanduser()
+    _reject_protected_dest(dest)
     included: list[str] = []
     missing: list[str] = []
     try:
@@ -1127,18 +1146,31 @@ async def consensus_upload(files: List[UploadFile] = File(...)) -> dict:
     return {"cases": cases}
 
 
+def _scar_request() -> "ScarAutoRequest":
+    """Default scar request, CONTROL-NORMALISED when a control baseline exists: with controls tagged + a normal
+    profile built, scar is flagged as EXCESS over the normal corneal reflectivity ("depthnorm"), which is more
+    reproducible than the absolute-brightness hysteresis fallback. No baseline → hysteresis (the default)."""
+    try:
+        if normal_baseline.load_profile() is not None:
+            return ScarAutoRequest(method="depthnorm")
+    except Exception:  # noqa: BLE001
+        pass
+    return ScarAutoRequest()
+
+
 def _ensure_segmented(case_id: str) -> None:
-    """Make sure a case has a cornea+scar labelmap (preprocess → SAM2 → scar/auto)."""
+    """Make sure a case has a cornea+scar labelmap (preprocess → SAM2 → scar/auto). Scar uses the
+    control-normalised method when a control baseline has been built (see _scar_request)."""
     arr, _ = labels.best_labelmap_nnunet(case_id)
     if arr is None:
         if not _preprocessed_path(case_id).exists():
             preprocess_case(case_id, PreprocessRequest(enabled=True))
         segment_sam2(case_id, Sam2Request())
-        scar_auto(case_id, ScarAutoRequest())
+        scar_auto(case_id, _scar_request())
     elif not (arr == 2).any():
         if not _preprocessed_path(case_id).exists():
             preprocess_case(case_id, PreprocessRequest(enabled=True))
-        scar_auto(case_id, ScarAutoRequest())
+        scar_auto(case_id, _scar_request())
 
 
 @app.post("/api/case/{case_id}/consensus-segment")
@@ -1269,6 +1301,78 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
         "scar_subgroup": sub_label,
     })
     return ccid, report
+
+
+def _case_identity(cid: str) -> tuple[str, str, str]:
+    """(patient, eye, subgroup) for a case, lowercased — manifest first, then filename parse; subgroup
+    defaults to '1'. Used to group replicates of the SAME eye."""
+    m = orch.read_manifest(cid)
+    pid = str(m.get("patient_id") or "").strip().lower()
+    eye = str(m.get("eye") or "").strip().lower()
+    sub = (str(m.get("scar_subgroup") or "1").strip() or "1").lower()
+    if not (pid and eye):
+        meta = metrics_export.parse_case_meta(m.get("oct_source") or m.get("input_volume"))
+        pid = pid or str(meta.get("patient_id", "")).strip().lower()
+        eye = eye or str(meta.get("eye", "")).strip().lower()
+    return pid, eye, sub
+
+
+def _eye_replicates(case_id: str) -> tuple[list[str], dict]:
+    """SEGMENTED replicates of this scan's eye + scar-subgroup (same patient_id + eye + scar_subgroup, a cornea
+    labelmap present, not a consensus case). Returns (member_ids incl. case_id first, {patient,eye,subgroup})."""
+    pid, eye, sub = _case_identity(case_id)
+    members: list[str] = []
+    if pid and eye and settings.CASES_ROOT.exists():
+        for d in sorted(settings.CASES_ROOT.iterdir()):
+            if not d.is_dir():
+                continue
+            cid = d.name
+            if orch.read_manifest(cid).get("consensus_cases"):
+                continue
+            if _case_identity(cid) != (pid, eye, sub):
+                continue
+            arr, _ = labels.best_labelmap_nnunet(cid)
+            if arr is not None:
+                members.append(cid)
+    if case_id not in members:
+        members.insert(0, case_id)
+    else:                                            # keep the active scan first (preferred consensus reference)
+        members = [case_id] + [c for c in members if c != case_id]
+    return members, {"patient": pid, "eye": eye, "subgroup": sub}
+
+
+@app.post("/api/case/{case_id}/build-eye-consensus")
+def build_eye_consensus(case_id: str) -> dict:
+    """POST-SAM2 NEXT STEP — align this eye's replicates + control-normalise. (1) Build the control reflectivity
+    baseline from tagged control (no-scar) scans if any exist; (2) find this eye+subgroup's segmented
+    replicates; (3) when a baseline exists, re-derive each replicate's scar as EXCESS over the normal profile
+    (control-normalised, reproducible) replacing the absolute-threshold scar; (4) register + vote them into one
+    consensus. Returns the consensus case + what was used."""
+    n_controls = 0
+    try:
+        if normal_baseline.control_cases():
+            n_controls = int(normal_baseline.build_profile().get("n_controls", 0))
+    except Exception as exc:  # noqa: BLE001 — no/unreadable controls → fall back to non-normalised scar
+        print(f"[eye-consensus] control baseline skipped: {exc}", file=sys.stderr)
+    control_normalized = normal_baseline.load_profile() is not None
+    members, key = _eye_replicates(case_id)
+    if len(members) < 2:
+        raise HTTPException(400, f"Need ≥2 segmented replicate scans of this eye to align (found {len(members)}). "
+                                 "Run SAM2 on the eye's other repeat scans first.")
+    if control_normalized:                            # re-derive scar control-normalised on every replicate
+        for cid in members:
+            try:
+                scar_auto(cid, ScarAutoRequest(method="depthnorm", replace=True))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[eye-consensus] depthnorm scar skipped for {cid}: {exc}", file=sys.stderr)
+    try:
+        ccid, report = _build_consensus_case(members, subgroup=key["subgroup"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"consensus_case": ccid, "replicates": members, "n_replicates": len(members),
+            "n_controls": n_controls, "control_normalized": control_normalized,
+            "subgroup": key["subgroup"], "report": report,
+            "images": orch.preview_images_from_dir("Segmentation", _preview_group_dir(ccid, "segmentation"))}
 
 
 @app.post("/api/consensus/build")

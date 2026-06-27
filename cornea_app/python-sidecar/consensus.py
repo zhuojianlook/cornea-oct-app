@@ -90,7 +90,12 @@ def _tol_state(consensus_case_id):
     scars_full = [np.rint(np.asarray(nib.load(str(p)).dataobj)).astype(np.uint8) == REF_SCAR for _, p in paths]
     vol_img = sitk.ReadImage(str(orch.case_root(consensus_case_id) / "previews" / "volume.nii.gz"))
     sp = vol_img.GetSpacing(); vmm3 = sp[0] * sp[1] * sp[2]
-    sampling = (sp[2], sp[1], sp[0])  # nibabel (x,y,z) array ↔ spacing reversed
+    # `scars_full` is loaded via nibabel, whose array axes (i,j,k) match the file's voxel axes — the
+    # SAME order as SimpleITK's GetSpacing(). So sampling is (sp[0], sp[1], sp[2]); reversing it (the
+    # old code) only made sense for a sitk GetArrayFromImage (z,y,x) array, which this is NOT — the
+    # reversal applied the depth spacing to the lateral axis and vice-versa, so every tol_mm distance
+    # (and the tolerant Dice) was wrong on the anisotropic OCT grid.
+    sampling = (sp[0], sp[1], sp[2])
     shape = scars_full[0].shape
     union = np.zeros(shape, bool)
     for s in scars_full:
