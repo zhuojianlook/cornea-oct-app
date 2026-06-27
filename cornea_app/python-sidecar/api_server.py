@@ -1578,6 +1578,11 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # sticks, so the user's column fix survives later re-runs). A normal preprocess (full params
     # from the loader, no force_columns) keeps its prior behaviour.
     eff_params = {**(m.get("oct_params") or {}), **(req.params or {})}
+    # Auto-tune OFF must mean the FIXED DEFAULTS: drop any dp_* the auto-tuner persisted on a prior run, so the
+    # warp falls back to DEFAULT_PARAMS instead of silently freezing the last auto-tuned surface (review MEDIUM).
+    if not eff_params.get("auto_tune", True):
+        for _k in ("dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump"):
+            eff_params.pop(_k, None)
 
     def _int_list(xs):
         out = []
@@ -2200,7 +2205,7 @@ _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColo
 # invalidates surfaces written by the old algorithm. "per-slice-v2" = the per-slice frame-region fix (a
 # redetect.npz from the prior global-union code would otherwise be served unchanged after an update — the
 # detection params are identical — silently keeping the old buggy surface on already-confirmed cases).
-_REDETECT_ALGO_VERSION = "dp-detector-v3"   # bumped: native DP surface detector is now the default
+_REDETECT_ALGO_VERSION = "dp-detector-v3"   # native DP surface detector (gap-bridge guard reverted — see notes)
 
 
 def _detect_params_sig(p: dict) -> str:

@@ -84,7 +84,11 @@ const PARAMS: Param[] = [
   { key: "active_threshold", label: "3D active thresh", min: 1, max: 20, step: 1, def: 5 },
   { key: "corr_factor", label: "Correction ×", min: 0, max: 1, step: 0.05, def: 1.0 },
 ];
-const defaultParams = (): Record<string, number> => Object.fromEntries(PARAMS.map((p) => [p.key, p.def]));
+const defaultParams = (): Record<string, number> => ({
+  ...Object.fromEntries(PARAMS.map((p) => [p.key, p.def])),
+  auto_tune: 1,                 // app auto-tunes the DP detector per scan (1 = on, 0 = off)
+  autotune_smooth_weight: 18,   // auto-tune bias: lower = sharper/tighter surface, higher = smoother
+});
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -920,6 +924,25 @@ export function OctLoader() {
               ))}
             </div>
           </Collapse>
+
+          {/* Native AUTO-TUNE control: the app tunes the surface detector to each scan itself. The toggle turns
+              it on/off; the bias slider shifts what it optimises for (sharper vs smoother surface). */}
+          <div className="flex items-center gap-2 px-1" title="When on, the app auto-tunes the corneal-surface detector to EACH scan (no manual params) at preprocess time.">
+            <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Auto-tune detect</span>
+            <ToggleButton size="small" value="at" selected={(params.auto_tune ?? 1) > 0} disabled={busy}
+              onChange={() => setParam("auto_tune", (params.auto_tune ?? 1) > 0 ? 0 : 1)}
+              sx={{ py: 0, px: 1.2, fontSize: 10, textTransform: "none" }}>
+              {(params.auto_tune ?? 1) > 0 ? "On" : "Off"}
+            </ToggleButton>
+          </div>
+          {(params.auto_tune ?? 1) > 0 && (
+            <div className="flex items-center gap-2 px-1" title="Bias the per-scan auto-tune: lower = sharper / tighter to the boundary; higher = smoother surface.">
+              <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>· sharper↔smoother</span>
+              <Slider size="small" min={6} max={40} step={1} value={params.autotune_smooth_weight ?? 18}
+                disabled={busy} onChange={(_, v) => setParam("autotune_smooth_weight", v as number)} />
+              <span className="text-[10px]" style={{ width: 28, textAlign: "right" }}>{params.autotune_smooth_weight ?? 18}</span>
+            </div>
+          )}
 
           <div className="flex items-center gap-2 px-1" title="Re-applies the correction until the corneal boundary stops improving toward its curve fit (auto-stops just before it worsens). 1 = a single pass (faithful method).">
             <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Refine passes</span>
