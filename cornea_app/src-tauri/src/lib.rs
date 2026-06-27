@@ -20,6 +20,24 @@ struct Sidecar(Mutex<Option<Child>>);
 /// and the frontend fetches it via get_sidecar_base for direct niivue resource loads.
 struct SidecarBase(Mutex<String>);
 
+/// Per-launch shared secret. The shell generates it, injects it into the sidecar as CORNEA_API_TOKEN,
+/// and attaches it (x-cornea-token) to every proxied API call. A foreign web page that tries to reach
+/// the localhost sidecar never sees this value, so the sidecar rejects its state-changing requests.
+struct SidecarToken(Mutex<String>);
+
+/// A 192-bit unguessable token, hex-encoded. Entropy comes from the OS-seeded RandomState siphash keys
+/// (each RandomState::new advances them) — enough for a local secret that is NEVER exposed to any page,
+/// and avoids pulling in an RNG crate.
+fn gen_token() -> String {
+    fn r() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0x9E3779B97F4A7C15);
+        h.finish()
+    }
+    format!("{:016x}{:016x}{:016x}", r(), r(), r())
+}
+
 /// Pick the sidecar port: prefer the conventional 8765; if it's already taken (a stale/foreign
 /// sidecar), grab any free OS-assigned port so this instance gets its own.
 fn pick_port() -> u16 {
@@ -46,11 +64,12 @@ struct FilePayload {
 
 /// Forward a JSON/text request to the sidecar (frontend: invoke("proxy_request", { method, path, body })).
 #[tauri::command]
-async fn proxy_request(method: String, path: String, body: Option<String>, base: tauri::State<'_, SidecarBase>) -> Result<String, String> {
+async fn proxy_request(method: String, path: String, body: Option<String>, base: tauri::State<'_, SidecarBase>, token: tauri::State<'_, SidecarToken>) -> Result<String, String> {
     let b = base.0.lock().unwrap().clone();
+    let tok = token.0.lock().unwrap().clone();
     let client = reqwest::Client::new();
     let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).map_err(|e| e.to_string())?;
-    let mut req = client.request(m, format!("{b}{path}"));
+    let mut req = client.request(m, format!("{b}{path}")).header("x-cornea-token", tok);
     if let Some(b) = body {
         req = req.header("Content-Type", "application/json").body(b);
     }
@@ -60,9 +79,10 @@ async fn proxy_request(method: String, path: String, body: Option<String>, base:
 
 /// Forward a multipart upload to the sidecar (frontend: invoke("proxy_upload", { path, files, fieldName })).
 #[tauri::command]
-async fn proxy_upload(path: String, files: Vec<FilePayload>, field_name: String, base: tauri::State<'_, SidecarBase>) -> Result<String, String> {
+async fn proxy_upload(path: String, files: Vec<FilePayload>, field_name: String, base: tauri::State<'_, SidecarBase>, token: tauri::State<'_, SidecarToken>) -> Result<String, String> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let b = base.0.lock().unwrap().clone();
+    let tok = token.0.lock().unwrap().clone();
     let mut form = reqwest::multipart::Form::new();
     for f in files {
         let bytes = STANDARD.decode(f.data.as_bytes()).map_err(|e| e.to_string())?;
@@ -72,6 +92,7 @@ async fn proxy_upload(path: String, files: Vec<FilePayload>, field_name: String,
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{b}{path}"))
+        .header("x-cornea-token", tok)
         .multipart(form)
         .send()
         .await
@@ -87,7 +108,7 @@ fn get_sidecar_base(base: tauri::State<'_, SidecarBase>) -> String {
 }
 
 /// Spawn the bundled Python sidecar on `port`. Returns None (and logs) if Python or the script is missing.
-fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Option<Child> {
+fn spawn_sidecar(app: &tauri::AppHandle, port: u16, token: &str) -> Option<Child> {
     let res = app.path().resource_dir().ok()?;
     let sidecar_dir = res.join("python-sidecar");
     let script = sidecar_dir.join("api_server.py");
@@ -106,6 +127,8 @@ fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Option<Child> {
     cmd.env_remove("PYTHONPATH");
     // Stamp the sidecar with this shell's version so /api/health can confirm the right one is up.
     cmd.env("CORNEA_SHELL_VERSION", app.package_info().version.to_string());
+    // Per-launch API token: the sidecar then rejects any mutating /api call that doesn't carry it.
+    cmd.env("CORNEA_API_TOKEN", token);
     // Installed app: write cases/state to the OS app-data dir (not the read-only bundle), and tee the
     // sidecar's stdout/stderr to sidecar.log there so a failed start (missing Python deps, etc.) is
     // diagnosable instead of vanishing into /dev/null.
@@ -217,6 +240,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Sidecar(Mutex::new(None)))
         .manage(SidecarBase(Mutex::new("http://127.0.0.1:8765".to_string())))
+        .manage(SidecarToken(Mutex::new(String::new())))
         .invoke_handler(tauri::generate_handler![proxy_request, proxy_upload, restart_app, get_sidecar_base])
         .setup(|app| {
             #[cfg(desktop)]
@@ -248,7 +272,9 @@ pub fn run() {
             // foreign sidecar already holding 8765 can never be silently reused.
             let port = pick_port();
             *app.state::<SidecarBase>().0.lock().unwrap() = format!("http://127.0.0.1:{port}");
-            let child = spawn_sidecar(&app.handle(), port);
+            let token = gen_token();
+            *app.state::<SidecarToken>().0.lock().unwrap() = token.clone();
+            let child = spawn_sidecar(&app.handle(), port, &token);
             *app.state::<Sidecar>().0.lock().unwrap() = child;
             // Record this launch's version + the $APPIMAGE file size. After a self-update the new
             // launch logs the NEW version/size IFF the AppImage was actually replaced — the single

@@ -724,7 +724,10 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           ? { inject_pass: fixPass, force_columns: forced, good_columns: [] }
           : hasForced
             ? { force_columns: forced, good_columns: [], max_iterations: 1 }
-            : { force_columns: [], good_columns: [] };
+            // Shifts-only re-run (no columns marked this session): OMIT force_columns so the backend's
+            // persisted set carries through unchanged. Sending [] would CLEAR a prior column fix (the
+            // re-run would reprocess without it → a different, degraded volume + wrong labels).
+            : {};
       // ONLY touch manual_shifts when the user actually changed a nudge this session (shiftsDirty).
       // Omitting it makes the backend KEEP the persisted set, so a plain mark-only re-run can never
       // erase prior nudges (the data-loss the review caught). When dirty we send the COMPLETE absolute

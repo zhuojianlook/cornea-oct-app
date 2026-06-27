@@ -63,4 +63,5 @@ def cases_with_segmentation() -> list[str]:
     for case_dir in sorted(settings.CASES_ROOT.iterdir()):
         if label_mod.corrected_path(case_dir.name).exists():
             out.append(case_dir.name)
-    return out
+    # Respect the "Schedule for training" gate: if any corrected case is scheduled, export only those.
+    return orch.filter_scheduled(out)

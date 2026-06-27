@@ -32,7 +32,7 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
@@ -57,13 +57,40 @@ import cohort as cohort_mod
 
 app = FastAPI(title="Cornea OCT Segmentation Sidecar")
 
+# Only OUR OWN frontends may use this sidecar: the Tauri webview (tauri://localhost /
+# https://tauri.localhost), the loopback host on any port (single-port serve.sh mode + direct niivue
+# resource loads), and the Vite dev server. NOT "*", which let any website the user had open issue
+# cross-origin calls to the localhost sidecar and READ the responses (wipe cases / write files /
+# exfiltrate paths). Loopback binding alone does not stop other ORIGINS on the same machine.
+_CORS_ORIGIN_REGEX = r"^(tauri://localhost|https://tauri\.localhost|https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?)$"
+_ORIGIN_RE = re.compile(_CORS_ORIGIN_REGEX)
+# Optional per-launch shared secret. When the Tauri shell injects CORNEA_API_TOKEN at spawn, every
+# state-changing /api call must carry it (the Rust IPC proxy adds the header; a foreign page can never
+# read it). Empty (dev / serve.sh) disables the check so those flows keep working.
+_API_TOKEN = os.environ.get("CORNEA_API_TOKEN", "")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=_CORS_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _origin_and_token_guard(request, call_next):
+    """Defence-in-depth over CORS (which only governs response READABILITY): refuse a request whose
+    Origin is present and not one of ours, and — when a token is configured — require it on mutating
+    /api routes. Requests with NO Origin (same-origin GETs, the Rust proxy's server-to-server calls)
+    are allowed; GET/HEAD are token-exempt so direct niivue resource fetches keep working."""
+    origin = request.headers.get("origin")
+    if origin and not _ORIGIN_RE.match(origin):
+        return JSONResponse({"detail": "Forbidden origin."}, status_code=403)
+    if _API_TOKEN and request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS"):
+        if request.headers.get("x-cornea-token", "") != _API_TOKEN:
+            return JSONResponse({"detail": "Unauthorized."}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/api/health")
@@ -1947,6 +1974,20 @@ def vet_preprocessing(case_id: str) -> dict:
     return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted"))}
 
 
+class SubgroupRequest(BaseModel):
+    subgroup: str | None = None   # e.g. "1" (default), "posterior", "inferior"
+
+
+@app.post("/api/case/{case_id}/subgroup")
+def set_case_subgroup(case_id: str, req: SubgroupRequest) -> dict:
+    """Persist a scan's scar-subgroup label (a replicate SET within one eye — distinct lesions of the
+    same eye that must be voted SEPARATELY, never merged). Without this the loader's per-scan subgroup
+    is client-only and lost on reload, silently collapsing distinct lesions into one consensus."""
+    sub = (req.subgroup or "1").strip() or "1"
+    m = orch.write_manifest_value(case_id, {"scar_subgroup": sub})
+    return {"ok": True, "scar_subgroup": m.get("scar_subgroup")}
+
+
 class TrainingScheduleRequest(BaseModel):
     scheduled: bool = True
 
@@ -2589,6 +2630,7 @@ def cases_list() -> dict:
                 "oct_preprocessed": bool(m.get("oct_preprocessed")),
                 "preproc_vetted": bool(m.get("preproc_vetted")),
                 "scar_classification": m.get("scar_classification") or None,
+                "scar_subgroup": (str(m.get("scar_subgroup")).strip() if m.get("scar_subgroup") else None),
                 "sam2_meta": bool(m.get("sam2_meta")),
                 "corrected_labelmap": bool(m.get("corrected_labelmap")),
                 "training_scheduled": bool(m.get("training_scheduled")),

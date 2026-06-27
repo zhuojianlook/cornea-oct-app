@@ -395,6 +395,8 @@ def start_training(mode: str, config: str, length: str, image_resolver,
             if not cases:
                 raise RuntimeError("None of the selected cases have a per-scan segmentation. "
                                    "Pick at least one segmented scan to include in training.")
+        else:                                   # no explicit subset → respect "Schedule for training"
+            cases = orch.filter_scheduled(cases)
         config = config if config in ("2d", "3d_fullres") else "2d"
         trainer = _resolve_short_trainer() if length == "short" else "nnUNetTrainer"
 

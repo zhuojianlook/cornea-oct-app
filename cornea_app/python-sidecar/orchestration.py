@@ -124,6 +124,14 @@ def write_manifest_value(case_id: str, updates: dict) -> dict:
         return current
 
 
+def filter_scheduled(case_ids: list[str]) -> list[str]:
+    """Honor the timeline's "Schedule for training" gate: if ANY of these cases is flagged
+    training_scheduled, keep ONLY the scheduled ones; if none are flagged, return them all
+    (backward-compatible — scheduling nothing means train/export everything). Order preserved."""
+    scheduled = [c for c in case_ids if read_manifest(c).get("training_scheduled")]
+    return scheduled if scheduled else list(case_ids)
+
+
 # ── Preview listing for the 2D slice gallery ───────────────────────────────
 def preview_metadata_by_file(directory: Path) -> dict:
     manifest = read_json(directory / "preview_manifest.json")

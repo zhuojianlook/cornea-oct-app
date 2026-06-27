@@ -273,7 +273,12 @@ export const useWorkflowStore = create<WorkflowState>()(
           "POST",
           JSON.stringify({ vote: 2 }),
         );
+        // The user may switch cases during the multi-minute run (the consensus "focus one scan → correct →
+        // go back" flow does exactly this). If so, don't paint this case's overlay onto / write its metrics
+        // into whatever case is now open — that would mis-attribute one scan's labels to another.
+        if (useCaseStore.getState().caseId !== caseId) return;
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.segQa = res.qa;
           s.segLoaded = true;
@@ -361,8 +366,10 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (!bytes) throw new Error("Could not export the correction drawing.");
         const file = new File([bytes as unknown as BlobPart], "seg-drawing.nii.gz");
         const res = await api.upload<{ qa: Record<string, unknown> }>(`/api/case/${caseId}/segmentation/from-drawing`, [file]);
+        if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-save — don't touch the new case
         nv.endDrawing();   // clear the drawing bitmap BEFORE reloading the overlay (else it double-renders)
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.segQa = res.qa;
           s.segLoaded = true;
@@ -443,7 +450,9 @@ export const useWorkflowStore = create<WorkflowState>()(
           "POST",
           JSON.stringify({ percentile, method: get().scarMethod }),
         );
+        if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
@@ -475,6 +484,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           `/api/case/${caseId}/oct-motion`, "POST",
           JSON.stringify({ ascan_rate_hz: get().ascanRateHz, sinc_correct: get().motionSinc }),
         );
+        if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         set((s) => {
           s.motionResult = r;
           const top = r.peaks && r.peaks[0];
@@ -505,7 +515,9 @@ export const useWorkflowStore = create<WorkflowState>()(
           "POST",
           JSON.stringify({ percentile }),
         );
+        if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
@@ -550,7 +562,10 @@ export const useWorkflowStore = create<WorkflowState>()(
           "POST",
           JSON.stringify({ points, replace: false }),
         );
+        // case switched mid-run — don't write metrics or wipe the NEW case's freshly-placed hints
+        if (useCaseStore.getState().caseId !== caseId) return;
         await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
+        if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
@@ -581,12 +596,14 @@ export const useWorkflowStore = create<WorkflowState>()(
           "POST",
           JSON.stringify({ voxels, mode }),
         );
+        if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-edit — don't write onto the new case
         // niivue refresh is best-effort (no-op without WebGL); the 2D gallery refetches via segVersion.
         try {
           await nv.loadSegmentation(resourceUrl(`/api/case/${caseId}/segmentation.nii.gz?t=${Date.now()}`), get().segOpacity);
         } catch {
           /* no WebGL — gallery updates from segVersion below */
         }
+        if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;

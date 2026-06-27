@@ -274,6 +274,18 @@ export function OctLoader() {
     setScans((cur) => cur.map((s) => (s.id === scanId ? withCondition(s, condition) : s)));
     if (scan) persistClassification(scan.caseId, condition, scan.scarRange);
   };
+  // Persist a scan's subgroup label to its manifest (metadata-only, like classification) so the
+  // replicate SET it belongs to survives a reload — otherwise distinct lesions of one eye silently
+  // collapse into a single consensus. Chained per-case after any pending classification write.
+  const persistSubgroup = (caseId: string | undefined, subgroup: string) => {
+    if (!caseId) return;
+    const body = JSON.stringify({ subgroup: subgroup.trim() || "1" });
+    const prev = classifyChainRef.current.get(caseId) ?? Promise.resolve();
+    const next = prev
+      .catch(() => undefined)
+      .then(() => api.json(`/api/case/${caseId}/subgroup`, "POST", body).catch(() => undefined));
+    classifyChainRef.current.set(caseId, next);
+  };
   // Group header shortcut: set EVERY (non-errored) scan in the group to the same tag at once.
   const setGroupCondition = (gid: string, condition?: Cls) => {
     const groupScans = scans.filter((s) => s.groupId === gid && s.status !== "error");
@@ -326,7 +338,9 @@ export function OctLoader() {
         id: uid("s"), groupId: g.id, filename: c.filename, caseId: c.case_id, nVolumes: c.n_volumes,
         // A scan already corrected in a prior session loads as "done" so it's coloured + skipped on re-run.
         nFrames: 101, status: c.error ? "error" : c.preprocessed ? "done" : "ready",
-        error: c.error, scarRange: [1, 101], subgroup: "1", selected: !c.error, passes: c.passes, life: c.life,
+        error: c.error, scarRange: [1, 101],
+        subgroup: ((c.life?.scar_subgroup as string | null | undefined)?.trim() || "1"),
+        selected: !c.error, passes: c.passes, life: c.life,
         condition: ((c.life?.scar_classification as Cls | null | undefined) ?? undefined) || undefined,
       });
     }
@@ -870,6 +884,7 @@ export function OctLoader() {
                             <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>subgroup</span>
                             <input list={`subs-${g.id}`} value={s.subgroup} disabled={busy} placeholder="1"
                               onChange={(e) => patchScan(s.id, { subgroup: e.target.value })}
+                              onBlur={(e) => persistSubgroup(s.caseId, e.target.value)}
                               style={{ fontSize: 10, width: 92, color: "var(--c-text)", background: "var(--c-surface2)", border: "1px solid var(--c-border)", borderRadius: 4, padding: "1px 4px" }} />
                             <datalist id={`subs-${g.id}`}>
                               {[...new Set(scans.filter((x) => x.groupId === g.id).map((x) => x.subgroup).filter(Boolean))].map((sv) => (
