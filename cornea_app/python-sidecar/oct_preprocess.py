@@ -995,6 +995,46 @@ def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, work
             "n_slices": n, "depth_vox": depth_vox, "n_frames": F}
 
 
+def _crop_reconstruct_slice(slice_img: np.ndarray, anterior: np.ndarray, crop_frames, p: dict):
+    """POSTERIOR-CONTINUITY reconstruction for ONE sagittal slice. Returns (anterior_out, bottom_edge,
+    adopted_mask):
+      • bottom_edge   — the detected posterior edge (ALWAYS returned, for the UI to display the guidance);
+      • anterior_out  — the detected anterior with the actually-clipped marked frames replaced by
+                        bottom_edge − thickness, thickness interpolated FROM the non-marked frames' gap (can go
+                        ABOVE the frame / negative where the apex is cropped);
+      • adopted_mask  — which frames were reconstructed.
+    Shared by the warp builder (build_surface_crop_edges) and the UI preview endpoint so preview == result."""
+    a = np.asarray(anterior, dtype=np.float64)
+    F = a.size
+    b = _detect_bottom_edge(np.ascontiguousarray(slice_img).astype(np.float32), p).astype(np.float64)
+    out = a.copy()
+    adopted = np.zeros(F, dtype=bool)
+    cfin = [] if crop_frames is None else list(crop_frames)
+    cf = np.array(sorted({int(f) for f in cfin if 0 <= int(f) < F}), dtype=int)
+    if cf.size == 0:
+        return out, b, adopted
+    floor = float(p.get("clip_edge_floor", 8.0))
+    margin = float(p.get("crop_margin", 6.0))
+    marked = np.zeros(F, dtype=bool); marked[cf] = True
+    valid = (~marked) & np.isfinite(a) & (a >= floor)             # NON-marked frames with a trustworthy anterior
+    if int(valid.sum()) < 3:
+        return out, b, adopted
+    t = b - a                                                     # corneal thickness (posterior - anterior)
+    tv = t[valid]
+    med = float(np.median(tv)); mad = float(np.median(np.abs(tv - med))) + 1e-6
+    keep = valid.copy(); keep[valid] = np.abs(tv - med) <= 4.0 * 1.4826 * mad   # drop posterior mis-locks
+    if int(keep.sum()) < 3:
+        keep = valid
+    fk = np.where(keep)[0].astype(np.float64)
+    t_interp = np.interp(cf.astype(np.float64), fk, t[keep])      # thickness from non-marked flanks (held at ends)
+    recon = b[cf] - t_interp
+    clipped_here = recon < (a[cf] - margin)                       # reconstruct only where it sits ABOVE the detected anterior
+    idx = cf[clipped_here]
+    out[idx] = recon[clipped_here]
+    adopted[idx] = True
+    return out, b, adopted
+
+
 def build_surface_crop_edges(sag: np.ndarray, crop_frames, params: dict | None = None,
                              workers: int | None = None) -> np.ndarray:
     """Per-slice anterior-edge array (n_slices, n_frames) to feed the warp as provided_edges, where the
@@ -1019,28 +1059,9 @@ def build_surface_crop_edges(sag: np.ndarray, crop_frames, params: dict | None =
     cf = np.array(sorted({int(f) for f in (crop_frames or []) if 0 <= int(f) < F}), dtype=int)
     if cf.size == 0:
         return edges
-    floor = float(p.get("clip_edge_floor", 8.0))
-    margin = float(p.get("crop_margin", 6.0))
-    marked = np.zeros(F, dtype=bool); marked[cf] = True
     for i in range(int(sag.shape[0])):
-        a = edges[i].astype(np.float64)
-        valid = (~marked) & np.isfinite(a) & (a >= floor)         # NON-marked frames with a trustworthy anterior
-        if int(valid.sum()) < 3:
-            continue
-        b = _detect_bottom_edge(np.ascontiguousarray(sag[i]).astype(np.float32), p).astype(np.float64)
-        t = b - a                                                 # corneal thickness (posterior - anterior)
-        tv = t[valid]
-        # robustly drop non-marked frames where the posterior detector mis-locked (deeper structure)
-        med = float(np.median(tv)); mad = float(np.median(np.abs(tv - med))) + 1e-6
-        keep = valid.copy(); keep[valid] = np.abs(tv - med) <= 4.0 * 1.4826 * mad
-        if int(keep.sum()) < 3:
-            keep = valid
-        fk = np.where(keep)[0].astype(np.float64)
-        t_interp = np.interp(cf.astype(np.float64), fk, t[keep])  # thickness from non-marked flanks (held at ends)
-        recon = b[cf] - t_interp                                  # posterior-continuity surface for the marked frames
-        clipped_here = recon < (a[cf] - margin)                   # reconstruct only where it sits ABOVE the detected anterior
-        idx = cf[clipped_here]
-        edges[i, idx] = recon[clipped_here].astype(np.float32)
+        out, _b, _adopted = _crop_reconstruct_slice(sag[i], edges[i], cf, p)
+        edges[i] = out.astype(np.float32)
     return edges
 
 

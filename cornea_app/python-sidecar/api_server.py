@@ -2550,6 +2550,39 @@ def oct_surface_crop_detect(case_id: str, req: OctPreprocessRequest) -> dict:
         raise HTTPException(500, f"OCT surface-crop detect failed: {exc}")
 
 
+@app.post("/api/case/{case_id}/oct-surface-crop/preview")
+def oct_surface_crop_preview(case_id: str, req: OctPreprocessRequest) -> dict:
+    """PER-SLICE preview for the surface-crop tool so the user SEES what the correction is based on: the
+    detected BOTTOM (posterior) edge — the guidance for cropped frames — and the reconstructed anterior surface
+    (posterior continuity), which can extend ABOVE the frame (negative depth) where the apex is cropped. Body:
+    {slice_index, surface_crop_frames}. Returns {top, bottom, recon, adopted, n_frames, depth_vox} (x=frame,
+    y=depth, depth 0 = TOP). Read-only; computed on the cached raw-border volume with the SAME
+    _crop_reconstruct_slice the warp uses (preview == result)."""
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    try:
+        arr = _load_border_vol(_ensure_raw_border_nifti(case_id))   # (lateral, depth, frames) = sagittal, cached
+        n, depth_vox, n_frames = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+        si = max(0, min(n - 1, int(req.slice_index or 0)))
+        p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        frames = req.surface_crop_frames
+        if frames is None:
+            frames = (m.get("oct_params") or {}).get("surface_crop_frames") or []
+        sl = np.ascontiguousarray(arr[si]).astype(np.float32)
+        top = oct_mod._merged_side_edge(sl, p)                       # detected anterior (DP + scar-guard)
+        recon, bottom, adopted = oct_mod._crop_reconstruct_slice(sl, top, frames, p)
+        r1 = lambda a: [round(float(v), 1) for v in np.asarray(a)]
+        return {"slice_index": si, "n_frames": n_frames, "depth_vox": depth_vox,
+                "top": r1(top), "bottom": r1(bottom), "recon": r1(recon),
+                "adopted": [int(f) for f in np.where(np.asarray(adopted))[0]]}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT surface-crop preview failed: {exc}")
+
+
 @app.post("/api/case/{case_id}/oct-motion")
 def oct_motion_analyze(case_id: str, req: OctPreprocessRequest) -> dict:
     """EYE-MOTION analysis from the detected corneal surface. The 3-D scan's SLOW (frame) axis is a TIME axis

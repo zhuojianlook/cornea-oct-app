@@ -256,7 +256,12 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const [cropCols, setCropCols] = useState<Set<number>>(new Set());
   const [cropBusy, setCropBusy] = useState(false);
   const [cropCounts, setCropCounts] = useState<Record<string, number>>({});
+  // Per-slice surface-crop PREVIEW: the detected bottom (posterior) edge + the reconstructed anterior surface
+  // (posterior continuity) for the slice being viewed — so the user sees the guidance the correction is based
+  // on, not the failing top-edge detection. Fetched (debounced) as the slice / cropCols change.
+  const [cropPreview, setCropPreview] = useState<{ top: number[]; bottom: number[]; recon: number[] } | null>(null);
   const cropPaintRef = useRef<null | "add" | "remove">(null);
+  const cropColsSig = useMemo(() => [...cropCols].sort((a, b) => a - b).join(","), [cropCols]);
   useEffect(() => { setCropCols(new Set(persistedCrop)); }, [persistedCrop]);
   const cropDirty = useMemo(
     () => cropCols.size !== persistedCrop.size || [...cropCols].some((f) => !persistedCrop.has(f)),
@@ -483,6 +488,26 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     }, 250);
     return () => clearTimeout(t);
   }, [fixCols, caseId, borderSliceIdx, borderPass, allCurves]);
+  // Clear any stale preview the instant the SLICE or CASE changes, so the prior slice's orange/green curves
+  // can't paint on the new slice during the 200ms debounce. NOT keyed on cropCols → editing columns keeps the
+  // current preview visible (smooth) until the refetch lands.
+  useEffect(() => { setCropPreview(null); }, [caseId, borderSliceIdx]);
+  // SURFACE-CROP preview: fetch the current slice's bottom (posterior) edge + reconstructed anterior for the
+  // current cropCols (debounced, so dragging columns doesn't spam). The bottom edge is the guidance; the recon
+  // is what the re-run will apply (and can leave the top of the frame where the apex is cropped).
+  useEffect(() => {
+    if (!fixCols || !cropMode || !caseId || borderSliceIdx == null) { setCropPreview(null); return; }
+    const idx = borderSliceIdx;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      api.json<{ top: number[]; bottom: number[]; recon: number[] }>(
+        `/api/case/${caseId}/oct-surface-crop/preview`, "POST",
+        JSON.stringify({ slice_index: idx, surface_crop_frames: cropColsSig ? cropColsSig.split(",").map(Number) : [] }))
+        .then((r) => { if (!cancelled) setCropPreview({ top: r.top || [], bottom: r.bottom || [], recon: r.recon || [] }); })
+        .catch(() => { if (!cancelled) setCropPreview(null); });
+    }, 200);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [fixCols, cropMode, caseId, borderSliceIdx, cropColsSig]);
   // The border for the CURRENT slice: the accurate (settled) curve if we have it, else the instant fast one.
   const curEdge = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.edge ?? allCurves?.edges[borderSliceIdx]) : null) ?? null;
   const curFit = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.fit ?? allCurves?.fits[borderSliceIdx]) : null) ?? null;
@@ -1117,26 +1142,42 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
             targets) — prominent so what you see == what's used. The RED is the raw detected edge AND the
             one you DRAG; while there are un-confirmed anchors (anchorsDirty) make the RED prominent so the
             line you're manipulating is the visible one (WYSIWYG), and demote the cyan to a reference. */}
-        <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
+        {/* In SURFACE-CROP mode the top-edge detection + its quadratic are meaningless where the apex is
+            cropped (they fail / pin at the top), so suppress them and show the bottom-edge-based preview below. */}
+        {!cropMode && <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
           strokeWidth={anchorsDirty ? 1.3 : 0.7} opacity={anchorsDirty ? 0.9 : 0.3}
-          points={spanPts(edgeY)} />
-        <polyline fill="none" stroke="#22d3ee" vectorEffect="non-scaling-stroke"
+          points={spanPts(edgeY)} />}
+        {!cropMode && <polyline fill="none" stroke="#22d3ee" vectorEffect="non-scaling-stroke"
           strokeWidth={anchorsDirty ? 0.8 : 1.3} opacity={anchorsDirty ? 0.5 : 0.95}
-          points={spanPts((f) => curFit[f])} />
+          points={spanPts((f) => curFit[f])} />}
+        {/* SURFACE-CROP preview: the detected BOTTOM (posterior) edge (orange = the guidance) and the
+            RECONSTRUCTED anterior surface (green = what the re-run applies; it ascends OFF the top of the frame
+            where the apex is cropped, instead of pinning at the top edge). The faint red is the raw top
+            detection (which fails in the cropped band). */}
+        {cropMode && cropPreview && cropPreview.top.length === nFrames
+          && cropPreview.bottom.length === nFrames && cropPreview.recon.length === nFrames && (<>
+          <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke" strokeWidth={0.7} opacity={0.3}
+            points={spanPts((f) => cropPreview.top[f])} />
+          <polyline fill="none" stroke="#ffaa28" vectorEffect="non-scaling-stroke" strokeWidth={1.3} opacity={0.95}
+            points={spanPts((f) => cropPreview.bottom[f])} />
+          <polyline fill="none" stroke="#39d98a" vectorEffect="non-scaling-stroke" strokeWidth={1.6} opacity={0.97}
+            points={spanPts((f) => cropPreview.recon[f])} />
+        </>)}
         {/* anchored frames on this slice → pink (over the red) — thin + translucent. A SINGLE anchor is drawn
             as a short VERTICAL tick, NOT a <circle>: the SVG viewBox (nFrames×depthVox) is stretched with
             preserveAspectRatio="none", so a circle squashes into a wide horizontal pink dash ("artifact line"). */}
-        {borderMode === "edge" && colRuns(anchoredFrames).map(([a, b], i) => a === b
+        {!cropMode && borderMode === "edge" && colRuns(anchoredFrames).map(([a, b], i) => a === b
           ? <line key={`pk${i}`} x1={a + 0.5} y1={edgeY(a) - depthVox / 60} x2={a + 0.5} y2={edgeY(a) + depthVox / 60}
               stroke="#ff5db0" strokeWidth={1.1} vectorEffect="non-scaling-stroke" opacity={0.8} />
           : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={1.0} vectorEffect="non-scaling-stroke" opacity={0.7}
               points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
-        {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through */}
-        {curPara && (
+        {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through.
+            Suppressed in crop mode (its green clashes with the crop preview's reconstructed surface). */}
+        {!cropMode && curPara && (
           <polyline fill="none" stroke="#39d98a" strokeWidth={1.5} vectorEffect="non-scaling-stroke" opacity={0.95}
             points={spanPts((f) => curPara[f])} />
         )}
-        {curPara && [...(curParaPts?.entries() ?? [])].map(([f, d], i) => (
+        {!cropMode && curPara && [...(curParaPts?.entries() ?? [])].map(([f, d], i) => (
           // vertical tick, not <circle> — circles squash to horizontal dashes under the stretched viewBox
           <line key={`pp${i}`} x1={f + 0.5} y1={d - depthVox / 50} x2={f + 0.5} y2={d + depthVox / 50}
             stroke="#39d98a" strokeWidth={2} vectorEffect="non-scaling-stroke" opacity={0.95} />
@@ -1280,7 +1321,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                 </ToggleButtonGroup>
                 <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
-                    cropMode ? (cropBusy ? "Detecting surface-cropped frames…" : (<>The <b style={{ color: "#ffaa28" }}>amber</b> columns are surface-cropped (apex above the frame) — they'll be aligned by their <b>bottom edge</b>. Click/drag columns to add/remove, then <b>Confirm &amp; re-run</b>. · {cropCols.size} frame(s)</>)) :
+                    cropMode ? (cropBusy ? "Detecting surface-cropped frames…" : (<>The <b style={{ color: "#ffaa28" }}>amber</b> columns are surface-cropped — aligned by the <b style={{ color: "#ffaa28" }}>orange bottom edge</b> → <b style={{ color: "#39d98a" }}>green reconstructed surface</b> (it leaves the top where the apex is cropped). Click/drag columns to add/remove, then <b>Confirm &amp; re-run</b>. · {cropCols.size} frame(s)</>)) :
                     cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
                     borderMode === "parabola" ? (<>Drag points to shape the <b style={{ color: "#39d98a" }}>green parabola</b>, then <b>Confirm</b>; scrub, then <b>Run</b>.{paraCount ? ` · ${paraCount} pt(s)` : ""}</>) :
                     (<>The <b style={{ color: "#22d3ee" }}>cyan line</b> is the surface the correction applies (the <b style={{ color: "#ff4d4d" }}>red</b> is the raw detection — its artifacts are smoothed out). Drag onto the true surface (local), then <b>Confirm</b>; scrub, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>)}
