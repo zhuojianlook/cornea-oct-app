@@ -57,6 +57,9 @@ export function VolumeCanvas() {
   // Manual "Fix columns" correction (mark bad B-scan frames → re-run preprocessing) lives in the 2D
   // SliceGallery; on the WebGL/3D desktop path it was otherwise unreachable. This opens it.
   const [fixColsView, setFixColsView] = useState(false);
+  // "Detect surface crop" opens the SAME fix-columns overlay but starts it in surface-crop mode (auto-detect
+  // the apex-cropped frames → verify → re-run with bottom-edge guidance). A sibling entry to Fix columns.
+  const [cropStart, setCropStart] = useState(false);
   // Preprocessing-steps filmstrip (per-stage diagnostic) — also otherwise unreachable on the 3D path.
   const [stepsView, setStepsView] = useState(false);
   // Display-only contrast / brightness / gaussian-blur (CSS filter on the viewer — covers BOTH the niivue
@@ -159,7 +162,7 @@ export function VolumeCanvas() {
   // the user inspects Classified+), close the preprocessing overlays so the niivue Slices/Segmentation
   // view shows. (Fixes "after SAM2 the user is still in Fix-columns and can't see the segmentation".)
   useEffect(() => {
-    if (!preprocStep) { setCompareView(false); setFixColsView(false); setStepsView(false); }
+    if (!preprocStep) { setCompareView(false); setFixColsView(false); setCropStart(false); setStepsView(false); }
   }, [preprocStep]);
 
   // Leave the comparison / fix-columns / steps overlays when switching to a different case, and reset the
@@ -289,11 +292,11 @@ export function VolumeCanvas() {
           <ToggleButton
             size="small"
             value="fix"
-            selected={fixColsView}
+            selected={fixColsView && !cropStart}
             onChange={() => {
               // Fix-columns is COMBINABLE with Before/after (it doesn't clear it).
-              const on = !fixColsView;
-              setFixColsView(on); setStepsView(false);
+              const on = !(fixColsView && !cropStart);
+              setFixColsView(on); setCropStart(false); setStepsView(false);
               if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
               else if (!on) void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
             }}
@@ -301,6 +304,25 @@ export function VolumeCanvas() {
             title="Manually fix mis-aligned B-scan frames: mark bad frames on a slice, then re-run preprocessing on them"
           >
             ▥ Fix columns
+          </ToggleButton>
+        )}
+        {hasRaw && preprocStep && (
+          <ToggleButton
+            size="small"
+            value="crop"
+            selected={fixColsView && cropStart}
+            onChange={() => {
+              // Surface-crop opens the same fix-columns overlay but starts in crop mode (auto-detect the
+              // apex-cropped frames). Toggling off closes the overlay (reload in case a re-run changed it).
+              const on = !(fixColsView && cropStart);
+              setFixColsView(on); setCropStart(on); setStepsView(false);
+              if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
+              else if (!on) void openCase();
+            }}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Detect surface-cropped frames (apex above the acquisition window) — verify, then re-run so those frames align by their visible BOTTOM edge (posterior continuity)"
+          >
+            ✛ Detect surface crop
           </ToggleButton>
         )}
         {hasRaw && preprocStep && (
@@ -369,7 +391,7 @@ export function VolumeCanvas() {
         )}
         {fixColsView && volumeUrl && (
           <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
-            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting} />
+            <SliceGallery fixCols cropStart={cropStart} showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting} />
           </div>
         )}
         {stepsView && volumeUrl && (

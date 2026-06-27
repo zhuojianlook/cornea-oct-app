@@ -134,6 +134,13 @@ DEFAULT_PARAMS: dict = {
     "clip_flank_rms": 8.0,     # ...and the flank-inlier RMS ≤ this (a real dome's flanks fit a parabola well)
     "clip_inlier_frac": 0.6,   # ...and the RANSAC inlier fraction on the valid columns ≥ this
     "clip_close_gap": 4,       # fill internal gaps ≤ this in the clip mask (DP can fragment a clipped run)
+    # ── surface-crop (manual, bottom-edge guidance) ── the "Detect surface crop" tool auto-suggests frames
+    # clipped in ≥crop_min_slices sagittal slices; the user confirms the set (surface_crop_frames) and a re-run
+    # reconstructs those frames by POSTERIOR CONTINUITY (build_surface_crop_edges) instead of the auto apex
+    # extrapolation. A sticky oct_param, applied via the provided_edges warp path. 0 frames = feature inactive.
+    "crop_min_slices": 3,
+    "crop_margin": 6.0,        # reconstruct a marked frame only where the posterior-continuity surface sits this
+                               # many px ABOVE the detected anterior (the clip symptom) — a strict no-op elsewhere
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
@@ -712,38 +719,14 @@ def _fill_black_bands(volume: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(revert_sagittal(sag))
 
 
-def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
-    """NATIVE dynamic-programming anterior-surface detector (see DEFAULT_PARAMS['detector']).
-    slice_img = (depth, frames), depth 0 = TOP. Returns the per-frame surface depth (float, sub-voxel).
-
-    1) Despeckle with an ANISOTROPIC Gaussian (heavier along depth, where OCT speckle is fine-grained;
-       lighter along frames, to keep the real lateral corneal shape).
-    2) Score each (depth, frame) as a candidate anterior surface = a dark→bright vertical gradient GATED by
-       the mean brightness just BELOW it (the cornea is bright tissue under a dark gap), so the score is high
-       only at the true epithelial surface — not at internal layers or random top speckle. Column-normalised
-       so a dim peripheral frame still yields a confident pick.
-    3) Dynamic programming finds the globally-smoothest maximum-score path (depth step ≤ dp_max_jump between
-       adjacent frames) — the speckle-robust, jitter-free surface. Then a 3-point parabolic sub-voxel refine.
-
-    A `prior` (per-frame expected depth) restricts the search to ±detect_window around it (used by the
-    fix-columns marched re-detection); prior=None is the normal global auto detection."""
-    img = ndimage.gaussian_filter(slice_img.astype(np.float32),
-                                  sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
-    D, F = img.shape
-    gy = np.gradient(img, axis=0)                                  # +ve = intensity rises downward (dark→bright)
-    np.clip(gy, 0.0, None, out=gy)
-    med = float(np.median(img))
-    bw = max(2, int(p.get("dp_below", 24)))
-    below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))   # mean of ~bw px BELOW each point
-    score = gy * np.maximum(below - med, 0.0)                      # strong edge AND bright tissue below
-    # restrict to a window around a prior, if supplied (fix-columns tilt-aware re-detection)
-    win = p.get("detect_window") if prior is not None else None
-    if prior is not None and win is not None and float(win) > 0:
-        pr = np.asarray(prior, dtype=np.float32)
-        rows = np.arange(D)[:, None]
-        mask = (rows >= (pr - float(win))[None, :]) & (rows <= (pr + float(win))[None, :])
-        score = np.where(mask, score, 0.0)
-    score = score / (score.max(axis=0, keepdims=True) + 1e-6)     # per-frame normalise → confident dim columns
+def _dp_min_cost_path(score: np.ndarray, p: dict) -> np.ndarray:
+    """Given a per-(depth, frame) score (higher = more boundary-like, already per-frame normalised), find the
+    globally-smoothest maximum-score path (depth step ≤ dp_max_jump between adjacent frames) by dynamic
+    programming, then a 3-point parabolic sub-voxel refine on the score profile. Returns the per-frame depth
+    (float). Shared verbatim by the ANTERIOR (_detect_surface_dp) and POSTERIOR (_detect_bottom_edge)
+    detectors so both trace a speckle-robust, jitter-free boundary identically."""
+    score = np.asarray(score, dtype=np.float32)
+    D, F = score.shape
     cost = (-score).astype(np.float32)
     maxj = max(1, min(int(p.get("dp_max_jump", 10)), D - 1))   # clamp to depth so offsets stay in-range (tiny D)
     offs = np.arange(-maxj, maxj + 1)
@@ -778,6 +761,71 @@ def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None 
     interior = (d0 >= 1) & (d0 <= D - 2)
     out[interior] = (mid + shift)[interior]
     return out
+
+
+def _detect_bottom_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
+    """POSTERIOR (bottom) corneal-edge detector for one sagittal slice (depth, frames), depth 0 = TOP — the
+    MIRROR of _detect_surface_dp. Returns the per-frame posterior depth (float, sub-voxel).
+
+    Where the anterior is a dark→bright gradient gated by bright tissue BELOW, the posterior is a BRIGHT→DARK
+    gradient (intensity falls downward, cornea→aqueous) GATED by bright tissue ABOVE it (the corneal stroma
+    sits above the dark anterior chamber). Same anisotropic despeckle, per-frame normalisation and DP smooth
+    path. Used by the surface-crop reconstruction to GUIDE frames whose apex is cropped (no anterior surface)
+    by their still-visible bottom edge. A `prior` restricts the search to ±detect_window around it."""
+    img = ndimage.gaussian_filter(slice_img.astype(np.float32),
+                                  sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
+    D, F = img.shape
+    gy = np.gradient(img, axis=0)
+    grad = np.clip(-gy, 0.0, None)                                 # -ve gradient = intensity falls downward (bright→dark)
+    med = float(np.median(img))
+    bw = max(2, int(p.get("dp_below", 24)))
+    # mean of ~bw px ABOVE each point = the anterior's "below" filter on the depth-reversed slice (origin valid
+    # by construction), flipped back — so the posterior gate mirrors the anterior exactly.
+    above = ndimage.uniform_filter1d(img[::-1], size=bw, axis=0, origin=-(bw // 2))[::-1]
+    score = grad * np.maximum(above - med, 0.0)                    # strong fall AND bright tissue above
+    win = p.get("detect_window") if prior is not None else None
+    if prior is not None and win is not None and float(win) > 0:
+        pr = np.asarray(prior, dtype=np.float32)
+        rows = np.arange(D)[:, None]
+        mask = (rows >= (pr - float(win))[None, :]) & (rows <= (pr + float(win))[None, :])
+        score = np.where(mask, score, 0.0)
+    score = score / (score.max(axis=0, keepdims=True) + 1e-6)
+    return _dp_min_cost_path(score, p)
+
+
+def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
+    """NATIVE dynamic-programming anterior-surface detector (see DEFAULT_PARAMS['detector']).
+    slice_img = (depth, frames), depth 0 = TOP. Returns the per-frame surface depth (float, sub-voxel).
+
+    1) Despeckle with an ANISOTROPIC Gaussian (heavier along depth, where OCT speckle is fine-grained;
+       lighter along frames, to keep the real lateral corneal shape).
+    2) Score each (depth, frame) as a candidate anterior surface = a dark→bright vertical gradient GATED by
+       the mean brightness just BELOW it (the cornea is bright tissue under a dark gap), so the score is high
+       only at the true epithelial surface — not at internal layers or random top speckle. Column-normalised
+       so a dim peripheral frame still yields a confident pick.
+    3) Dynamic programming finds the globally-smoothest maximum-score path (depth step ≤ dp_max_jump between
+       adjacent frames) — the speckle-robust, jitter-free surface. Then a 3-point parabolic sub-voxel refine.
+
+    A `prior` (per-frame expected depth) restricts the search to ±detect_window around it (used by the
+    fix-columns marched re-detection); prior=None is the normal global auto detection."""
+    img = ndimage.gaussian_filter(slice_img.astype(np.float32),
+                                  sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
+    D, F = img.shape
+    gy = np.gradient(img, axis=0)                                  # +ve = intensity rises downward (dark→bright)
+    np.clip(gy, 0.0, None, out=gy)
+    med = float(np.median(img))
+    bw = max(2, int(p.get("dp_below", 24)))
+    below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))   # mean of ~bw px BELOW each point
+    score = gy * np.maximum(below - med, 0.0)                      # strong edge AND bright tissue below
+    # restrict to a window around a prior, if supplied (fix-columns tilt-aware re-detection)
+    win = p.get("detect_window") if prior is not None else None
+    if prior is not None and win is not None and float(win) > 0:
+        pr = np.asarray(prior, dtype=np.float32)
+        rows = np.arange(D)[:, None]
+        mask = (rows >= (pr - float(win))[None, :]) & (rows <= (pr + float(win))[None, :])
+        score = np.where(mask, score, 0.0)
+    score = score / (score.max(axis=0, keepdims=True) + 1e-6)     # per-frame normalise → confident dim columns
+    return _dp_min_cost_path(score, p)
 
 
 def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
@@ -830,6 +878,75 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     edges = _map_slices(_edge_worker, [(np.ascontiguousarray(sag[i]).astype(np.float32), p) for i in range(n)],
                         progress, 0.0, 1.0, workers)
     return np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
+
+
+def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None) -> dict:
+    """AUTO-SUGGEST the surface-CROPPED frames (B-scan columns whose corneal apex rises ABOVE the acquisition
+    window, so the frame has no anterior surface). Runs the validated per-slice clip detector (_clip_mask) over
+    every sagittal slice and counts, per frame, how many slices flag it clipped. Returns
+    {frames:[...], counts:{frame: n_slices}, n_slices, depth_vox}: `frames` = those clipped in ≥crop_min_slices
+    slices (the default selection the user verifies/edits); `counts` drives a per-frame confidence bar. The
+    posterior-continuity reconstruction (build_surface_crop_edges) is what actually corrects the confirmed set."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    edges = detect_surface_all(sag, p, workers=workers)
+    n, depth_vox, F = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
+    counts = np.zeros(F, dtype=int)
+    for i in range(n):
+        cm = _clip_mask(np.ascontiguousarray(sag[i]).astype(np.float32), edges[i], p)
+        counts[np.asarray(cm, dtype=bool)] += 1
+    min_slices = max(1, int(p.get("crop_min_slices", 3)))
+    frames = [int(f) for f in range(F) if counts[f] >= min_slices]
+    return {"frames": frames, "counts": {int(f): int(counts[f]) for f in range(F) if counts[f] > 0},
+            "n_slices": n, "depth_vox": depth_vox, "n_frames": F}
+
+
+def build_surface_crop_edges(sag: np.ndarray, crop_frames, params: dict | None = None,
+                             workers: int | None = None) -> np.ndarray:
+    """Per-slice anterior-edge array (n_slices, n_frames) to feed the warp as provided_edges, where the
+    user-confirmed surface-CROPPED frames are reconstructed by POSTERIOR CONTINUITY.
+
+    A cropped frame has no anterior surface (its apex is above the window), so its placement is taken from its
+    still-visible BOTTOM (posterior) edge: effective_anterior(f) = posterior(f) − thickness(f), where
+    thickness(f) is INTERPOLATED FROM the NON-cropped frames' (posterior − anterior) gap — never measured
+    inside the cropped band. Flattening this array then lands every frame's posterior on ONE smooth curve, so a
+    cropped frame aligns to the non-cropped frames by MATCHING THEIR BOTTOM EDGE (posterior continuity).
+
+    Per slice: the NON-marked frames supply the thickness curve (robustly de-spiked, interpolated across the
+    marked band). A marked frame is reconstructed only where it is ACTUALLY clipped in that slice — i.e. the
+    posterior-continuity surface sits >= crop_margin px ABOVE the detected anterior (the detector pinned below
+    the true, above-frame apex). On a slice where that marked frame's anterior is genuinely in-frame (a
+    peripheral/limbus slice, where detected ~ posterior-thickness) the detected anterior is kept untouched —
+    floor-independent (works whether the clip pins the detector at row ~5 or ~20). Frames not in `crop_frames`
+    are never altered."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    edges = detect_surface_all(sag, p, workers=workers)            # (n_slices, n_frames) anterior
+    F = int(sag.shape[2])
+    cf = np.array(sorted({int(f) for f in (crop_frames or []) if 0 <= int(f) < F}), dtype=int)
+    if cf.size == 0:
+        return edges
+    floor = float(p.get("clip_edge_floor", 8.0))
+    margin = float(p.get("crop_margin", 6.0))
+    marked = np.zeros(F, dtype=bool); marked[cf] = True
+    for i in range(int(sag.shape[0])):
+        a = edges[i].astype(np.float64)
+        valid = (~marked) & np.isfinite(a) & (a >= floor)         # NON-marked frames with a trustworthy anterior
+        if int(valid.sum()) < 3:
+            continue
+        b = _detect_bottom_edge(np.ascontiguousarray(sag[i]).astype(np.float32), p).astype(np.float64)
+        t = b - a                                                 # corneal thickness (posterior - anterior)
+        tv = t[valid]
+        # robustly drop non-marked frames where the posterior detector mis-locked (deeper structure)
+        med = float(np.median(tv)); mad = float(np.median(np.abs(tv - med))) + 1e-6
+        keep = valid.copy(); keep[valid] = np.abs(tv - med) <= 4.0 * 1.4826 * mad
+        if int(keep.sum()) < 3:
+            keep = valid
+        fk = np.where(keep)[0].astype(np.float64)
+        t_interp = np.interp(cf.astype(np.float64), fk, t[keep])  # thickness from non-marked flanks (held at ends)
+        recon = b[cf] - t_interp                                  # posterior-continuity surface for the marked frames
+        clipped_here = recon < (a[cf] - margin)                   # reconstruct only where it sits ABOVE the detected anterior
+        idx = cf[clipped_here]
+        edges[i, idx] = recon[clipped_here].astype(np.float32)
+    return edges
 
 
 def _surface_confidence(sl_smooth: np.ndarray, edge: np.ndarray):
@@ -1298,6 +1415,14 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols, max_disp,
               clip_cols_list[i], clip_fit_list[i], zero_cols_list[i]) for i in range(n)]
     disp_field = np.array(_map_slices(_disp_worker, items, progress, 0.5, 0.9, workers))  # (n_slices, n_frames)
+    # SURFACE-CROP safety (provided_edges only): a reconstructed posterior-continuity column whose apex is
+    # ABOVE the frame (provided edge < 0) must never be shifted UP — there's no acquired tissue above row 0,
+    # so a negative shift would truncate real epithelium off the top. Clamp disp >= 0 exactly at those
+    # above-frame columns. Confined to the provided path so the normal/legacy detect path is byte-unchanged.
+    if use_provided:
+        neg = edges < 0.0
+        if neg.any():
+            disp_field = np.where(neg, np.maximum(disp_field, 0.0), disp_field)
     # The per-pass metric is the mean per-column deviation of the boundary from its quadratic fit (the
     # iterative-refinement convergence signal + abs_floor calibration) — measured on the PRE-smoothing
     # field so its meaning is unchanged by #3's inter-slice smoothing (which only affects the warp).
@@ -1604,13 +1729,39 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
+    # SURFACE-CROP re-run: the user confirmed a set of surface-cropped frames (surface_crop_frames). Build the
+    # per-slice anterior edges with those frames reconstructed by POSTERIOR CONTINUITY (their bottom edge,
+    # matched to the non-cropped frames' bottom edge) and warp via the provided_edges path — a single,
+    # deliberate flatten to that surface. Skipped when an explicit fix-columns re-detect (provided_edges) is
+    # already supplied (that manual surface wins). Auto-tune first so the anterior detection matches the warp.
+    _crop_frames = (params or {}).get("surface_crop_frames") if params else None
+    _crop_tune: dict = {}
+    if provided_edges is None and _crop_frames:
+        params = dict(params or {})
+        _pc = {**DEFAULT_PARAMS, **params}
+        _sagv = reformat_to_sagittal(vol)
+        if _pc.get("auto_tune", True) and str(_pc.get("detector", "dp")).lower() != "legacy":
+            try:
+                _best, _sc = auto_tune_detector(_sagv, params)
+                params.update(_best)
+                _crop_tune = {"params": _best, "score": round(float(_sc), 2)}   # surfaced → caller persists dp_*
+            except Exception:  # noqa: BLE001 — tuning is best-effort
+                pass
+        provided_edges = build_surface_crop_edges(_sagv, _crop_frames, params, workers=workers)
     if provided_edges is not None:
         # fix-columns marched re-detection: a SINGLE warp that flattens to the user-validated surface,
         # NO iteration and NO axial-refine (both re-detect with no prior and could deviate from the
         # previewed surface) — so the corrected volume matches the scrub preview exactly.
         corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges, workers=workers)
-        info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "redetect",
+        info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [],
+                "stopped": "surface_crop" if _crop_frames else "redetect",
                 "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0}}
+        if _crop_frames:
+            info["surface_crop"] = {"n_frames": len([f for f in _crop_frames])}
+            # persist the tuned dp_* (like the normal path) so the fix-columns baseline / border curves —
+            # which re-detect with {**DEFAULT_PARAMS, **oct_params} and NO auto-tune — match this corrected volume.
+            if _crop_tune:
+                info["auto_tune"] = _crop_tune
         p_all = {**DEFAULT_PARAMS, **(params or {})}
         ms = p_all.get("manual_shifts")
         if ms:

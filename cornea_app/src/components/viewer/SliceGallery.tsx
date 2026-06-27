@@ -27,8 +27,9 @@ const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 // VolumeCanvas), `fixCols` auto-enters column-marking and hides this panel's own duplicate toggles
 // (group/orient/before-after/contrast/blur/scar) — orientation + display filter come from props so the
 // ONE top toolbar drives them. Called with NO props on the no-WebGL fallback path (unchanged behaviour).
-export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw = false, readOnly = false }: {
+export function SliceGallery({ fixCols = false, cropStart = false, orientProp, filterCss, showRaw = false, readOnly = false }: {
   fixCols?: boolean;
+  cropStart?: boolean; // open fix-columns directly in surface-crop mode (auto-detect the apex-cropped frames)
   orientProp?: "axial" | "coronal" | "sagittal";
   filterCss?: string;
   showRaw?: boolean; // fix-cols: show the raw "before" beside the markable corrected "after"
@@ -242,6 +243,24 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     } catch { setCut({ top: 0, left: 0, right: 0 }); }
   }, [persistedCutSig]);
   const cutDragRef = useRef<null | "top" | "left" | "right">(null);
+  // SURFACE-CROP mode: mark the B-scan columns whose APEX is cropped (no top surface). "Detect" auto-suggests
+  // them; the user verifies/edits; "Confirm & re-run" reconstructs those frames by POSTERIOR CONTINUITY
+  // (their visible bottom edge, matched to the non-cropped frames' bottom edge). A STICKY oct_param.
+  const persistedCropSig = JSON.stringify(
+    (((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.surface_crop_frames) ?? []);
+  const persistedCrop = useMemo(() => {
+    try { return new Set((JSON.parse(persistedCropSig) as number[]).map(Number)); } catch { return new Set<number>(); }
+  }, [persistedCropSig]);
+  const [cropMode, setCropMode] = useState(false);
+  const [cropCols, setCropCols] = useState<Set<number>>(new Set());
+  const [cropBusy, setCropBusy] = useState(false);
+  const [cropCounts, setCropCounts] = useState<Record<string, number>>({});
+  const cropPaintRef = useRef<null | "add" | "remove">(null);
+  useEffect(() => { setCropCols(new Set(persistedCrop)); }, [persistedCrop]);
+  const cropDirty = useMemo(
+    () => cropCols.size !== persistedCrop.size || [...cropCols].some((f) => !persistedCrop.has(f)),
+    [cropCols, persistedCrop]);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -532,8 +551,31 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   // drop a stray anchor where you merely touched the line. We start anchoring once the pointer moves past a
   // small threshold from the press point; dragging then reshapes the border (and a stretch dragged back onto
   // the detected edge auto-clears, so it merges cleanly).
+  // frame index under the pointer, from the border SVG's on-screen rect (x spans nFrames).
+  const frameAtBorder = (clientX: number, svg: Element): number | null => {
+    const r = svg.getBoundingClientRect();
+    if (r.width <= 0) return null;
+    // viewBox x spans [0, nFrames); frame f occupies the band [f, f+1) → floor maps a screen x to its column.
+    return Math.max(0, Math.min(nFrames - 1, Math.floor(((clientX - r.left) / r.width) * nFrames)));
+  };
+  const paintCrop = (clientX: number, svg: Element) => {
+    const f = frameAtBorder(clientX, svg);
+    if (f == null) return;
+    setCropCols((prev) => {
+      const next = new Set(prev);
+      if (cropPaintRef.current === "remove") next.delete(f); else next.add(f);
+      return next;
+    });
+  };
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
+    if (cropMode) {   // crop mode: drag to add/remove cropped frame-columns (pan with shift/middle or readOnly)
+      if (readOnly || e.button === 1 || e.shiftKey) { borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode: "pan" }; return; }
+      const f = frameAtBorder(e.clientX, e.currentTarget);
+      cropPaintRef.current = (f != null && cropCols.has(f)) ? "remove" : "add";
+      paintCrop(e.clientX, e.currentTarget);
+      return;
+    }
     if (cutMode) return;   // cut-line elements own their pointerdown; an empty-area press does nothing here
     // middle-button OR shift+left = PAN (so you can move around while zoomed); plain left = edit the border.
     // readOnly (inspecting an earlier completed step) → PAN only; the border can't be edited until rollback.
@@ -541,6 +583,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode };
   };
   const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (cropMode && cropPaintRef.current) { paintCrop(e.clientX, e.currentTarget); return; }
     if (cutDragRef.current) {   // dragging a cut line
       const r = e.currentTarget.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) return;
@@ -572,7 +615,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     if (borderMode === "parabola") applyParaDrag(e.clientX, e.clientY, e.currentTarget);
     else applyBorderDrag(e.clientX, e.clientY, e.currentTarget);
   };
-  const onBorderUp = () => { borderDragRef.current = null; cutDragRef.current = null; };
+  const onBorderUp = () => { borderDragRef.current = null; cutDragRef.current = null; cropPaintRef.current = null; };
   const onBorderWheel = (e: React.WheelEvent) => { e.preventDefault(); zoomBorderAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.2 : 1 / 1.2); };
 
   // #2 (merged): once columns are marked BAD, the ARROW KEYS nudge the whole marked set UP/DOWN in depth
@@ -705,6 +748,51 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
       setRerunBusy(false);
     }
   };
+  // Surface-crop: AUTO-DETECT the cropped B-scan columns (apex above the window) for the user to verify/edit.
+  const detectCrop = async () => {
+    if (!caseId) return;
+    setCropBusy(true);
+    try {
+      const r = await api.json<{ frames: number[]; counts: Record<string, number>; selected: number[] }>(
+        `/api/case/${caseId}/oct-surface-crop/detect`, "POST", JSON.stringify({}));
+      setCropCounts(r.counts || {});
+      // union the auto-suggested set with anything already confirmed, so a re-detect never silently drops the
+      // user's persisted/selected frames.
+      setCropCols(new Set([...(r.frames || []).map(Number), ...persistedCrop]));
+    } catch {
+      /* surfaced via the spinner stopping */
+    } finally {
+      setCropBusy(false);
+    }
+  };
+  // Surface-crop: re-run preprocessing reconstructing the marked frames by posterior continuity (bottom-edge
+  // guidance). Sends the confirmed frame set; an empty set clears the crop (plain auto preprocess).
+  const rerunCrop = async () => {
+    if (!caseId) return;
+    setRerunBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST",
+        JSON.stringify({ surface_crop_frames: [...cropCols].sort((a, b) => a - b) }));
+      await openCase();
+      wfSet("segVersion", segSig + 1);
+    } catch {
+      /* surfaced via the spinner stopping; the volume is unchanged on failure */
+    } finally {
+      setRerunBusy(false);
+    }
+  };
+  // Open directly in surface-crop mode when launched from the toolbar's "Detect surface crop" (cropStart),
+  // and auto-detect the cropped frames once. Switching cropStart back off returns to the normal border editor.
+  useEffect(() => {
+    if (!fixCols) return;
+    if (cropStart) {
+      setCropMode(true); setCutMode(false);
+      if (cropCols.size === 0 && Object.keys(cropCounts).length === 0) void detectCrop();
+    } else {
+      setCropMode(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixCols, cropStart]);
   const rerunColumns = async () => {
     // A marked frame the user has NUDGED (in manualShifts) is manually positioned (manual_shifts, applied
     // last) — it must NOT also be auto-interpolated, or the nudge would be relative to a re-interpolated
@@ -1076,6 +1164,19 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
             </>
           );
         })()}
+        {/* SURFACE-CROP: the marked cropped frame-columns (amber bands). Auto-detected (>= crop_min_slices) but
+            not yet selected frames show as a faint outline so the user can see suggestions they removed. */}
+        {cropMode && (<>
+          {Object.keys(cropCounts).filter((k) => !cropCols.has(Number(k))).map((k) => (
+            <rect key={`cs${k}`} x={Number(k)} y={0} width={1} height={depthVox}
+              fill="rgba(255,170,40,0.10)" stroke="#ffaa28" strokeWidth={0.25} strokeDasharray="1 1"
+              vectorEffect="non-scaling-stroke" pointerEvents="none" />
+          ))}
+          {[...cropCols].map((f) => (
+            <rect key={`cc${f}`} x={f} y={0} width={1} height={depthVox}
+              fill="rgba(255,170,40,0.34)" stroke="none" pointerEvents="none" />
+          ))}
+        </>)}
       </svg>
     </div>
   ) : null;
@@ -1154,7 +1255,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
           <>
             {fixCols ? (
               <>
-                <ToggleButtonGroup size="small" exclusive value={cutMode ? "cut" : borderMode}
+                <ToggleButtonGroup size="small" exclusive value={cropMode ? "crop" : cutMode ? "cut" : borderMode}
                   onChange={(_, v) => {
                     if (!v) return;
                     // Clear the inactive modes' UNCONFIRMED edits on switch so a stray point/drag in one mode
@@ -1162,7 +1263,11 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                     // (confirmed) anchors are untouched — borderAnchors just re-seeds from them.
                     if (v !== "parabola") setParaAnchors(new Map());
                     if (v !== "edge") setBorderAnchors(cloneAnchors(persistedAnchors));
-                    if (v === "cut") setCutMode(true); else { setCutMode(false); setBorderMode(v); }
+                    if (v === "crop") {
+                      setCropMode(true); setCutMode(false);
+                      if (cropCols.size === 0 && Object.keys(cropCounts).length === 0) void detectCrop();
+                    } else if (v === "cut") { setCutMode(true); setCropMode(false); }
+                    else { setCutMode(false); setCropMode(false); setBorderMode(v); }
                   }}>
                   <ToggleButton value="edge" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
                     title="Drag the noisy detected edge onto the true surface — a LOCAL correction (only the dragged region + nearby slices change)">Edge</ToggleButton>
@@ -1170,9 +1275,12 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                     title="Drag points to shape a clean quadratic; the warp flattens to it (no fighting the noisy per-frame edge)">Parabola</ToggleButton>
                   <ToggleButton value="cut" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
                     title="Mark a clipped surface (top/left/right) to exclude from the fit, then re-run — robust on clipped scans">✂ Cut</ToggleButton>
+                  <ToggleButton value="crop" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
+                    title="Detect surface-cropped frames (apex above the window) and re-run — those frames are aligned by their visible BOTTOM edge (posterior continuity), not the missing top">✛ Surface crop</ToggleButton>
                 </ToggleButtonGroup>
                 <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
+                    cropMode ? (cropBusy ? "Detecting surface-cropped frames…" : (<>The <b style={{ color: "#ffaa28" }}>amber</b> columns are surface-cropped (apex above the frame) — they'll be aligned by their <b>bottom edge</b>. Click/drag columns to add/remove, then <b>Confirm &amp; re-run</b>. · {cropCols.size} frame(s)</>)) :
                     cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
                     borderMode === "parabola" ? (<>Drag points to shape the <b style={{ color: "#39d98a" }}>green parabola</b>, then <b>Confirm</b>; scrub, then <b>Run</b>.{paraCount ? ` · ${paraCount} pt(s)` : ""}</>) :
                     (<>The <b style={{ color: "#22d3ee" }}>cyan line</b> is the surface the correction applies (the <b style={{ color: "#ff4d4d" }}>red</b> is the raw detection — its artifacts are smoothed out). Drag onto the true surface (local), then <b>Confirm</b>; scrub, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>)}
@@ -1207,7 +1315,26 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
               </span>
             )}
             {fixCols ? (
-              cutMode ? (
+              cropMode ? (
+                <>
+                  <button onClick={detectCrop} disabled={cropBusy || rerunBusy || readOnly}
+                    title="Auto-detect surface-cropped frames (apex above the window) — verify/edit the amber columns, then Confirm & re-run"
+                    style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: (cropBusy || rerunBusy || readOnly) ? "default" : "pointer", fontSize: 11, padding: "2px 6px", opacity: (cropBusy || rerunBusy || readOnly) ? 0.6 : 1 }}>
+                    {cropBusy ? "Detecting…" : "Detect"}
+                  </button>
+                  {cropCols.size > 0 && !readOnly && (
+                    <button onClick={() => setCropCols(new Set())} disabled={cropBusy || rerunBusy}
+                      style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                      Clear
+                    </button>
+                  )}
+                  <button onClick={rerunCrop} disabled={rerunBusy || cropBusy || !cropDirty || readOnly}
+                    title={readOnly ? "Inspecting an earlier step — roll back to it to edit" : cropDirty ? "Re-run preprocessing — the marked frames are reconstructed by their bottom edge (posterior continuity)" : "Mark or detect cropped frames first"}
+                    style={{ background: (cropDirty && !readOnly) ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || cropBusy || !cropDirty || readOnly) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || cropBusy || !cropDirty || readOnly) ? 0.6 : 1 }}>
+                    {rerunBusy ? "Running…" : `Confirm & re-run${cropCols.size ? ` (${cropCols.size})` : ""}`}
+                  </button>
+                </>
+              ) : cutMode ? (
                 <>
                   {(cut.top > 0 || cut.left > 0 || cut.right > 0) && (
                     <button onClick={() => setCut({ top: 0, left: 0, right: 0 })} disabled={rerunBusy}

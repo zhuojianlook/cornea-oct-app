@@ -1663,6 +1663,10 @@ class OctPreprocessRequest(BaseModel):
     force_columns: List[int] | None = None  # BAD frame indices to re-correct ("re-run preprocessing")
     good_columns: List[int] | None = None    # GOOD/anchor frame indices guiding the re-correction
                                              # (all reuse the scan's persisted settings)
+    surface_crop_frames: List[int] | None = None  # "Detect surface crop" Confirm: B-scan columns whose apex is
+                                             # cropped (no top surface). A STICKY oct_param; on re-run those
+                                             # frames are reconstructed by posterior continuity (bottom-edge
+                                             # guidance). None = carry persisted set; [] = clear the crop.
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
     manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
@@ -1977,6 +1981,17 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     else:
         eff_params.pop("force_columns", None)
         eff_params.pop("good_columns", None)
+    # "Detect surface crop" Confirm: the user-verified set of surface-cropped frames is a STICKY oct_param
+    # (carried through the eff_params merge above on later re-runs, so the crop correction persists like a
+    # geometric property of the scan). When THIS request supplies it (non-None), REPLACE the persisted set;
+    # an empty list clears the crop. The worker (preprocess_oct_to_nifti) reconstructs these frames by
+    # posterior continuity via the provided_edges path.
+    if req.surface_crop_frames is not None:
+        scf = sorted(set(_int_list(req.surface_crop_frames)))
+        if scf:
+            eff_params["surface_crop_frames"] = scf
+        else:
+            eff_params.pop("surface_crop_frames", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
     # surface_cut (fix-columns "Re-run with cuts") is a PER-RUN override like force_columns, NOT a sticky
@@ -2510,6 +2525,29 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT border curves(all) failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-surface-crop/detect")
+def oct_surface_crop_detect(case_id: str, req: OctPreprocessRequest) -> dict:
+    """AUTO-DETECT surface-cropped frames (B-scan columns whose corneal apex is above the acquisition window,
+    so they have no anterior surface) for the user to VERIFY/EDIT before a re-run. Read-only: runs the validated
+    per-slice clip detector across the RAW volume and returns {frames, counts, n_slices, n_frames, depth_vox,
+    selected} — `frames` = the auto-suggested set, `selected` = the currently persisted confirmed set (so the
+    UI restores prior edits). The confirmed set is applied (posterior-continuity reconstruction) by the next
+    oct-preprocess with surface_crop_frames."""
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    try:
+        arr = _load_border_vol(_ensure_raw_border_nifti(case_id))   # (lateral, depth, frames) = sagittal, cached
+        p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        res = oct_mod.detect_surface_crop_frames(arr, p)
+        res["selected"] = sorted(int(f) for f in ((m.get("oct_params") or {}).get("surface_crop_frames") or []))
+        return res
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT surface-crop detect failed: {exc}")
 
 
 @app.post("/api/case/{case_id}/oct-motion")
