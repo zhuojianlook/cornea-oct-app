@@ -1099,7 +1099,7 @@ def _scar_auto_locked(case_id: str, req: "ScarAutoRequest", nib) -> dict:
     postprocess.render_seg_previews(work, new_label, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(new_label, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
     metrics["scar_method"] = (req.method or "hysteresis") + profile_note
-    orch.write_manifest_value(case_id, {"scar_metrics": metrics,
+    orch.write_manifest_value(case_id, {"scar_metrics": metrics, "scar_done": True,
                                         "segmentation_preview_dir": str(orch.segmentation_preview_dir(case_id))})
     return {"case_info": orch.current_case_info(case_id), "metrics": metrics,
             "merged_with_existing": had_scar and not req.replace,
@@ -1147,7 +1147,7 @@ def _scar_edit_locked(case_id: str, req: "ScarEditRequest", nib) -> dict:
     labels.write_label_nifti(arr, base, labels.corrected_path(case_id))
     postprocess.render_seg_previews(work, arr, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(arr, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
-    orch.write_manifest_value(case_id, {"scar_metrics": metrics})
+    orch.write_manifest_value(case_id, {"scar_metrics": metrics, "scar_done": True})
     return {"metrics": metrics,
             "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
@@ -1217,7 +1217,7 @@ def _scar_sam2_hint_locked(case_id: str, req: "ScarHintRequest", sam2_segment, n
     postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(new_label, nib.load(str(base)).header.get_zooms(), density_vol_ijk=raw)
     metrics["sam2_hint"] = meta
-    orch.write_manifest_value(case_id, {"scar_metrics": metrics})
+    orch.write_manifest_value(case_id, {"scar_metrics": metrics, "scar_done": True})
     return {"case_info": orch.current_case_info(case_id), "metrics": metrics,
             "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
@@ -1287,7 +1287,7 @@ def _scar_auto_sam2_locked(case_id: str, req: "ScarAutoSam2Request", sam2_segmen
     postprocess.render_seg_previews(work_vol, new_label, orch.segmentation_preview_dir(case_id), density_vol=raw)
     metrics = scar_mod.quantify(new_label, spacing, density_vol_ijk=raw)
     metrics["scar_auto_sam2"] = meta
-    orch.write_manifest_value(case_id, {"scar_metrics": metrics,
+    orch.write_manifest_value(case_id, {"scar_metrics": metrics, "scar_done": True,
                                         "segmentation_preview_dir": str(orch.segmentation_preview_dir(case_id))})
     return {"case_info": orch.current_case_info(case_id), "metrics": metrics,
             "merged_with_existing": bool((arr == 2).any()) and not req.replace,
@@ -1624,6 +1624,14 @@ def confirm_subgroup(case_id: str) -> dict:
     sub = str(orch.read_manifest(cid).get("scar_subgroup") or "1").strip() or "1"
     m = orch.write_manifest_value(cid, {"scar_subgroup": sub, "subgroup_confirmed": True})
     return {"ok": True, "scar_subgroup": m.get("scar_subgroup"), "subgroup_confirmed": True}
+
+
+@app.post("/api/case/{case_id}/scar/skip")
+def skip_scar(case_id: str) -> dict:
+    """STEP 6 for a CONTROL (no-scar) scan: mark the scar step done WITHOUT running a detector (there is no
+    scar to segment), so the timeline advances Cornea → Scar → Subgroup."""
+    m = orch.write_manifest_value(case_id, {"scar_done": True})
+    return {"ok": True, "scar_done": bool(m.get("scar_done"))}
 
 
 @app.post("/api/consensus/build")
@@ -2072,7 +2080,7 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
              # The segmentation files were just deleted above; CLEAR their manifest flags too, else
              # scanStep (which keys off sam2_meta/corrected_labelmap/consensus_case BEFORE preproc_vetted)
              # would keep reporting the scan as segmented while its overlay 404s. (Mirrors _STEP_RESET_FLAGS.)
-             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None,
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if cls:
         extra["scar_classification"] = cls
@@ -2164,7 +2172,7 @@ def keep_raw_case(case_id: str) -> dict:
              # a later auto re-preprocess clears these as usual.
              "preproc_vetted": True, "training_scheduled": False,
              # seg files were deleted above → clear their flags so the timeline drops to Vetted (not SAM2).
-             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None,
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if m.get("scar_classification"):
         extra["scar_classification"] = m.get("scar_classification")
@@ -2247,12 +2255,13 @@ _STEP_RESET_FLAGS: dict[int, list[str]] = {
     2: ["oct_preprocessed", "oct_iter"],          # Preprocessed (auto)
     3: ["preproc_vetted"],                          # Vetted
     4: ["scar_classification", "scar_range"],       # Classified (scar/control)
-    5: ["sam2_meta", "qa_json", "segmentation_preview_dir"],  # SAM2 cornea (+scar)
-    6: ["subgroup_confirmed"],                      # Subgroup assigned
-    7: ["consensus_case"],                          # Aligned (link to the eye's consensus)
-    8: ["normalized"],                              # Normalised against controls
-    9: ["corrected_labelmap"],                      # Manually corrected
-    10: ["training_scheduled"],                     # Scheduled for training
+    5: ["sam2_meta", "qa_json", "segmentation_preview_dir"],  # Cornea (SAM2)
+    6: ["scar_done", "scar_metrics"],               # Scar segmented
+    7: ["subgroup_confirmed"],                      # Subgroup assigned
+    8: ["consensus_case"],                          # Aligned (link to the eye's consensus)
+    9: ["normalized"],                              # Normalised against controls
+    10: ["corrected_labelmap"],                     # Manually corrected
+    11: ["training_scheduled"],                     # Scheduled for training
 }
 
 
@@ -2271,8 +2280,8 @@ def reset_step(case_id: str, req: ResetStepRequest) -> dict:
     if orch.read_manifest(cid).get("consensus_cases"):
         raise HTTPException(400, "This is a built consensus case — rebuild it rather than resetting a step.")
     target = int(req.step)
-    if target < 1 or target > 10:
-        raise HTTPException(400, "step must be 1-10.")
+    if target < 1 or target > 11:
+        raise HTTPException(400, "step must be 1-11.")
     updates: dict = {}
     cleared: list[str] = []
     for s, keys in _STEP_RESET_FLAGS.items():
@@ -2935,6 +2944,7 @@ def cases_list() -> dict:
                 "scar_range": (list(m.get("scar_range")) if m.get("scar_range") else None),
                 "scar_subgroup": (str(m.get("scar_subgroup")).strip() if m.get("scar_subgroup") else None),
                 "sam2_meta": bool(m.get("sam2_meta")),
+                "scar_done": bool(m.get("scar_done")),
                 "subgroup_confirmed": bool(m.get("subgroup_confirmed")),
                 "consensus_case": bool(m.get("consensus_case")),   # so an ALIGNED member colours as step 7
                 "normalized": bool(m.get("normalized")),

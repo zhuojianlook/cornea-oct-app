@@ -42,6 +42,8 @@ interface CaseState {
   resetStep: (step: number) => Promise<void>;
   // Step 6: set this scan's scar-subgroup AND confirm it (gates align so the right repeats group together).
   confirmSubgroup: (sub: string) => Promise<void>;
+  // Step 6 for a control (no-scar) scan: mark the scar step done without running a detector.
+  skipScar: () => Promise<void>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -137,6 +139,17 @@ export const useCaseStore = create<CaseState>()(
       try {
         await api.json(`/api/case/${id}/subgroup`, "POST", JSON.stringify({ subgroup: v }));
         await api.json(`/api/case/${id}/subgroup/confirm`, "POST", "{}");
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    skipScar: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
+      try {
+        await api.json(`/api/case/${id}/scar/skip`, "POST", "{}");
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }

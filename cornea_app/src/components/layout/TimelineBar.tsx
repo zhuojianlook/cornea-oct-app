@@ -48,6 +48,7 @@ export function TimelineBar() {
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const resetStep = useCaseStore((s) => s.resetStep);
   const confirmSubgroup = useCaseStore((s) => s.confirmSubgroup);
+  const skipScar = useCaseStore((s) => s.skipScar);
   const scheduled = Boolean(manifest?.training_scheduled);
   const isConsensus = Boolean(manifest?.consensus_cases);
   const subgroup = String(manifest?.scar_subgroup ?? "1") || "1";
@@ -91,7 +92,7 @@ export function TimelineBar() {
   // ── the step strip: click a REACHED step to VIEW it (earlier = inspect read-only; current = back to live) ──
   const strip = (
     <div className="flex items-center gap-1">
-      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as LifecycleStep[]).map((i) => {
+      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] as LifecycleStep[]).map((i) => {
         const reached = stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
         const viewing = viewStep === i;
@@ -195,7 +196,7 @@ export function TimelineBar() {
     <>
       {ScarMethod}
       <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
-        title="CLASSICAL detector: re-threshold the scar inside the cornea using the selected method (e.g. hysteresis) + sensitivity. Fast (seconds). This is what 'Run SAM2 + scar' uses; re-run it after changing the method/sensitivity.">Re-detect scar (threshold)</Button>
+        title="CLASSICAL detector: threshold the scar inside the cornea using the selected method (e.g. hysteresis) + sensitivity. Fast (seconds). Re-run after changing the method/sensitivity.">Detect scar (threshold)</Button>
       <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
         title="SAM2 (deep-learning) scar: run SAM2 on cornea-vs-scar across axial/coronal/sagittal and take the 2-of-3 vote. Slower (~1–2 min); an alternative to the threshold detector when it struggles.">Scar via SAM2</Button>
       <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
@@ -265,29 +266,41 @@ export function TimelineBar() {
       </div>
     );
   } else if (step === 4) {
-    // classified (yellow) → Run SAM2 = one-go (cornea, + scar for a scar-labelled scan with the chosen method)
+    // classified (yellow) → segment the CORNEA only (SAM2). Scar is the next, separate step.
     actions = (
       <>
-        {classification === "scar" && ScarMethod}
         <Button size="small" variant="contained" color="primary" disabled={busy || !!sam2RunningCaseId} onClick={() => runSam2()}
-          title={classification === "scar"
-            ? "Run SAM2 cornea segmentation, then detect scar (cornea vs scar) with the chosen method — in one go."
-            : "Run SAM2 cornea segmentation (control: no scar)."}>
-          ▶ Run SAM2{classification === "scar" ? " + scar" : ""}
+          title="Run SAM2 cornea-vs-background segmentation. Scar is segmented in the next step.">
+          ▶ Run SAM2 (cornea)
         </Button>
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(classified as {classification})</span>
       </>
     );
   } else if (step === 5) {
-    // SAM2 (cornea+scar) done → assign this scan's SUBGROUP (gates align); re-run scar / correct to iterate.
-    // No Schedule/Export here — those belong from the aligned consensus onward.
+    // cornea segmented → SCAR step. Scar scan: detect / compare strategies. Control: no scar → continue.
+    actions = classification === "control" ? (
+      <>
+        <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => skipScar()}
+          title="This scan is a control (no scar) — mark the scar step done and continue to subgroup assignment.">
+          ✓ No scar (control) — continue
+        </Button>
+        {sep}{Correct}
+      </>
+    ) : (
+      <>
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Segment scar:</span>
+        {ScarReRun}{sep}{Correct}
+      </>
+    );
+  } else if (step === 6) {
+    // scar segmented (rose) → assign this scan's SUBGROUP (gates align); re-run scar / correct to iterate.
     actions = (
       <>
         {SubgroupConfirm}{sep}{Correct}
         {ScarReRun && <>{sep}{ScarReRun}</>}
       </>
     );
-  } else if (step === 6) {
+  } else if (step === 7) {
     // subgroup assigned (purple) → align this subgroup's replicates
     actions = (
       <>
@@ -296,17 +309,17 @@ export function TimelineBar() {
         {sep}{SubgroupConfirm}{sep}{Correct}
       </>
     );
-  } else if (step === 7) {
+  } else if (step === 8) {
     // aligned (teal) → normalize against controls (next), or correct / schedule
     actions = <>{NormalizeBtn}{sep}{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
-  } else if (step === 8) {
+  } else if (step === 9) {
     // normalized (cyan) → correct / schedule
     actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
-  } else if (step === 9) {
+  } else if (step === 10) {
     // manually corrected (dark blue)
     actions = <>{ScheduleBtn}{sep}{Correct}{ExportBtn}</>;
   } else {
-    // step 10 — scheduled (green)
+    // step 11 — scheduled (green)
     actions = (
       <>
         <span className="text-xs" style={{ color: "#22c55e" }}>✓ Scheduled for training.</span>

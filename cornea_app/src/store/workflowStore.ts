@@ -302,11 +302,10 @@ export const useWorkflowStore = create<WorkflowState>()(
           detail: "Mark this scan as Scar or Control (and set replicates/controls) before running SAM2." }; });
         return;
       }
-      const isScar = m.scar_classification === "scar";
       set((s) => {
         s.segBusy = true;
         s.sam2RunningCaseId = caseId;
-        s.status = { kind: "working", title: "Running SAM2", detail: "Tracking the cornea through axial, coronal and sagittal movies, then fusing in 3D. This takes a few minutes." };
+        s.status = { kind: "working", title: "Running SAM2 (cornea)", detail: "Tracking the cornea through axial, coronal and sagittal movies, then fusing in 3D. This takes a few minutes." };
       });
       const stillHere = () => useCaseStore.getState().caseId === caseId;
       // Coarse overall % across the one-go pipeline so the user sees a number, not just a spinner.
@@ -331,43 +330,26 @@ export const useWorkflowStore = create<WorkflowState>()(
           "POST",
           JSON.stringify({ vote: 2 }),
         );
-        // ONE-GO pipeline (#6): a scar-labelled scan then runs scar detection with the chosen method
-        // (cornea-vs-scar); a control runs cornea only. A scar failure must NOT blank the saved cornea.
-        let scarRan = false;
-        if (isScar) {
-          if (stillHere()) set((s) => { s.status = { kind: "working", title: "Running SAM2", detail: "Detecting scar inside the cornea (cornea vs scar)… · 85%" }; });
-          try {
-            const pct = Math.min(99, Math.max(60, 100 - get().scarSensitivity));
-            await api.json(`/api/case/${caseId}/scar/auto`, "POST", JSON.stringify({ percentile: pct, method: get().scarMethod }));
-            scarRan = true;
-          } catch { /* cornea is already saved server-side; the user can re-run scar from the timeline */ }
-        }
-        // The user may switch cases during the multi-minute run (the consensus "focus → correct → back"
-        // flow does this). If so, the result is saved on disk — don't paint it onto whatever case is now
-        // open; instead replace the "still running in background" banner with a "done — reopen" notice.
+        // CORNEA ONLY now — scar is a SEPARATE step (the user runs / compares scar strategies next).
+        // If the user switched cases mid-run, the cornea is saved on disk; don't paint it onto the new case.
         const bgDone = () => set((s) => {
           if (s.sam2RunningCaseId === caseId)
-            s.status = { kind: "done", title: "Background scan ready",
-              detail: `"${caseId}" finished segmenting${scarRan ? " (cornea + scar)" : ""} — reopen it to review.` };
+            s.status = { kind: "done", title: "Background scan ready", detail: `"${caseId}" finished cornea segmentation — reopen it to review.` };
         });
         if (!stillHere()) { bgDone(); return; }
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (!stillHere()) { bgDone(); return; }
-        // Advance the timeline NOW: TimelineBar reads scanStep(caseInfo.manifest), which is only refreshed
-        // by openCase. Optimistically set the segmentation flag (mirrors caseStore.vetPreprocessing) so the
-        // step moves 4→5 without a full reload (the backend already persisted sam2_meta).
+        // Advance the timeline NOW: TimelineBar reads scanStep(caseInfo.manifest), only refreshed by openCase.
+        // Optimistically set sam2_meta (mirrors caseStore.vetPreprocessing) so the step moves 4→5 (Cornea).
         useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).sam2_meta = true; });
         set((s) => {
           s.segQa = res.qa;
           s.segLoaded = true;
           s.segVersion += 1;
           s.stage = 2;
-          s.showSegmentation = true;       // #6a: auto-switch the viewer to the segmentation overlay
-          s.status = { kind: "done", title: scarRan ? "Cornea + scar segmented" : "Cornea segmented",
-            detail: isScar
-              ? (scarRan ? "Cornea + scar done. Align this eye's replicates, or correct, then schedule."
-                         : "Cornea done; scar detection failed — re-run scar from the timeline.")
-              : "Cornea done (control — no scar). Align this eye's replicates, or correct, then schedule." };
+          s.showSegmentation = true;       // auto-switch the viewer to the segmentation overlay
+          s.status = { kind: "done", title: "Cornea segmented",
+            detail: "Cornea done. Next: segment scar (and compare strategies), then assign subgroup." };
         });
       } catch (e) {
         if (stillHere()) set((s) => { s.status = { kind: "error", title: "SAM2 failed", detail: e instanceof Error ? e.message : String(e) }; });
@@ -588,6 +570,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
+        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
@@ -653,6 +637,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
+        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
@@ -701,6 +687,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
+        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
@@ -739,6 +727,8 @@ export const useWorkflowStore = create<WorkflowState>()(
           /* no WebGL — gallery updates from segVersion below */
         }
         if (useCaseStore.getState().caseId !== caseId) return;
+        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
           s.segLoaded = true;
