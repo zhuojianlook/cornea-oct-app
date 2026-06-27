@@ -141,6 +141,16 @@ DEFAULT_PARAMS: dict = {
     "crop_min_slices": 3,
     "crop_margin": 6.0,        # reconstruct a marked frame only where the posterior-continuity surface sits this
                                # many px ABOVE the detected anterior (the clip symptom) — a strict no-op elsewhere
+    # ── DP scar-guard ── cross-check the DP anterior edge against the legacy ('old method') RANSAC-quadratic
+    # surface, which is robust to a bright internal scar. Where DP dives >dp_scar_tol px DEEPER than legacy over
+    # a run of >=dp_scar_min_run frames (the scar-lock signature), re-run DP confined to +/-dp_scar_window of the
+    # legacy surface so it tracks the true (first) boundary. One-sided + run-gated → no-op on a clean scan.
+    "dp_scar_guard": True,
+    "dp_scar_tol": 18.0,       # DP must not sit more than this many px DEEPER than the legacy surface
+    "dp_scar_window": 12.0,    # when it does, re-detect DP within +/- this of the legacy surface (excludes the scar)
+    "dp_scar_min_run": 6,      # min contiguous run of deeper-than-tol frames to trigger (ignore isolated noise)
+    "dp_scar_darker_margin": 0.05,  # adopt a pulled-back frame only if its above-band is this much DARKER (normalised)
+                               # than the deep DP edge — confirms it's a true air->tissue surface, not a wrong fit
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
@@ -819,22 +829,29 @@ def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None 
     score = gy * np.maximum(below - med, 0.0)                      # strong edge AND bright tissue below
     # restrict to a window around a prior, if supplied (fix-columns tilt-aware re-detection)
     win = p.get("detect_window") if prior is not None else None
+    no_signal = None
     if prior is not None and win is not None and float(win) > 0:
         pr = np.asarray(prior, dtype=np.float32)
         rows = np.arange(D)[:, None]
         mask = (rows >= (pr - float(win))[None, :]) & (rows <= (pr + float(win))[None, :])
         score = np.where(mask, score, 0.0)
+        no_signal = score.max(axis=0) <= 0.0                      # window holds NO boundary signal → keep the prior
     score = score / (score.max(axis=0, keepdims=True) + 1e-6)     # per-frame normalise → confident dim columns
-    return _dp_min_cost_path(score, p)
+    out = _dp_min_cost_path(score, p)
+    if no_signal is not None and no_signal.any():
+        # without a boundary in the window the DP cost is all-zero and argmin ties to row 0 (a false top-edge);
+        # fall back to the prior there instead of collapsing the frame to the top.
+        out = np.asarray(out, dtype=np.float32).copy()
+        out[no_signal] = np.asarray(prior, dtype=np.float32)[no_signal]
+    return out
 
 
-def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
-    """The per-slice corrected anterior boundary. Default detector = the native DP path (_detect_surface_dp,
-    matches a manual trace so AUTO preprocessing needs minimal correction); set params['detector']='legacy'
-    for the original {hist-eq, raw} gradient-argmax + RANSAC-quadratic choice. When a prior surface is supplied
-    (fix-columns marched re-detection) the underlying detection is windowed around it."""
-    if str(p.get("detector", "dp")).lower() != "legacy":
-        return _detect_surface_dp(slice_img, p, prior=prior)
+def _legacy_surface(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
+    """The ORIGINAL ('old method') per-slice anterior surface: {hist-eq, raw} gradient-argmax, the better
+    RANSAC-quadratic of the two, then a side-correction bias. RANSAC fits a smooth corneal dome and rejects a
+    localized internal bright region (e.g. a hyper-reflective scar) as outliers, so it reliably holds the TRUE
+    first surface where the DP path can be lured DEEPER onto the scar. Used both as the legacy detector and as
+    the DP scar-guard's robust vicinity anchor."""
     edge_h = _advanced_edge(_histeq(slice_img), p, prior=prior)
     edge_r = _advanced_edge(slice_img, p, prior=prior)
     q_h = _fit_quadratic_ransac(edge_h, p["residual_threshold"])
@@ -843,6 +860,84 @@ def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None =
     quad_prelim = _fit_quadratic_ransac(chosen, p["residual_threshold"])
     return _side_correction_quadratic_bias(chosen, quad_prelim,
                                            window=int(p["side_window"]), thresh=p["side_threshold_factor"])
+
+
+def _above_brightness(img: np.ndarray, edge: np.ndarray) -> np.ndarray:
+    """Mean brightness in the ~8px band just ABOVE each frame's edge, normalised by the column max. LOW = dark
+    air above (a true anterior epithelial surface); HIGH = bright tissue above (the edge sits under cornea / on
+    an internal scar). The DP scar-guard uses this to confirm a pull-back actually lands on a true surface."""
+    D, F = img.shape
+    e = np.clip(np.round(np.asarray(edge)).astype(int), 0, D - 1)
+    fc = np.arange(F)
+    band = np.mean([img[np.clip(e - k, 0, D - 1), fc] for k in range(2, 10)], axis=0)
+    cmax = np.maximum(img.max(axis=0), 1.0)
+    return band / cmax
+
+
+def _dp_scar_guard(slice_img: np.ndarray, dp_edge: np.ndarray, p: dict) -> np.ndarray:
+    """Keep the DP anterior edge in the VICINITY of the legacy ('old method') surface so it can't lock onto a
+    bright internal structure (a hyper-reflective SCAR) DEEPER than the true epithelial boundary.
+
+    The DP score = dark->bright gradient x bright-tissue-below; when the true surface is dim and a scar inside
+    the cornea is very bright, the scar's upper boundary outscores the surface and the DP smooth path follows it
+    (verified on CS021 OD: DP sat ~30px deeper, onto the scar; legacy held the surface). The legacy RANSAC-
+    quadratic is robust to this (rejects the scar as outliers). So: where the DP edge sits >dp_scar_tol px
+    DEEPER than the legacy edge over a contiguous run (the scar-lock signature), RE-RUN the DP CONFINED to
+    +/-dp_scar_window of the legacy surface — it then tracks the true (first) surface within the band, keeping
+    DP's sub-voxel/smoothness strengths but excluding the out-of-band scar.
+
+    ONE-SIDED (only catches DP diving DEEPER) and run-GATED, so on a normal scan — where the validated DP edge
+    already sits at/above legacy — it is a strict no-op (returns dp_edge unchanged). dp_scar_guard=False disables.
+
+    CLIP-SAFE: the trigger requires the legacy edge to be a VALID IN-FRAME surface (leg > clip_edge_floor). On a
+    clipped-apex scan the legacy RANSAC-quadratic EXTRAPOLATES the apex ABOVE the frame (leg < 0), so a DP edge
+    pinned near the top would otherwise read as ">tol deeper than legacy" and fire spuriously — fighting the
+    clip-handling. Excluding leg<=floor frames makes the guard a no-op on clipped apexes (confirmed on
+    CS005/CS008/CS020) while still firing on a genuine scar (true surface in-frame, DP dives onto the bright
+    scar below it). Only the genuine scar frames are replaced (free DP kept everywhere else → no slice-wide
+    side-effects on clip/limbus columns)."""
+    leg = _legacy_surface(slice_img, p).astype(np.float64)
+    dp = np.asarray(dp_edge, dtype=np.float64)
+    D = int(slice_img.shape[0])
+    floor = float(p.get("clip_edge_floor", 8.0))
+    # genuine scar-lock: DP sits >tol DEEPER than a VALID IN-FRAME legacy surface (clip apexes have leg<=floor)
+    stray = (dp - leg > float(p.get("dp_scar_tol", 18.0))) & (leg > floor)
+    if _longest_run(stray) < int(p.get("dp_scar_min_run", 6)):
+        return dp_edge                                    # no contiguous scar-lock run → DP is trusted (no-op)
+    win = float(p.get("dp_scar_window", 12.0))
+    prior = np.clip(leg, 0.0, D - 1).astype(np.float32)   # clamp so the windowed search box stays in-frame
+    windowed = np.asarray(_detect_surface_dp(slice_img, {**p, "detect_window": win}, prior=prior), dtype=np.float64)
+    # SELF-VALIDATE before adopting: only pull a frame back if the windowed (shallower) position genuinely has
+    # DARKER tissue ABOVE it (dark air over the epithelium = the true anterior surface) than the current deep DP
+    # edge (which sits UNDER bright cornea / on a scar). This keeps the guard from moving a genuinely irregular-
+    # but-correct DP edge onto a wrong legacy fit, and removes the residual non-corrective changes seen on
+    # clipped scans (the windowed position there is not darker-above, so it is not adopted).
+    smooth = ndimage.gaussian_filter(slice_img.astype(np.float32),
+                                     sigma=(float(p.get("dp_sigma_depth", 3.0)), 0.6))
+    darker = _above_brightness(smooth, windowed) < _above_brightness(smooth, dp) - float(p.get("dp_scar_darker_margin", 0.05))
+    adopt = stray & darker
+    if not adopt.any():
+        return dp_edge
+    out = dp.copy()
+    out[adopt] = windowed[adopt]                          # pull back ONLY the confirmed scar-lock frames
+    return out.astype(np.float32)
+
+
+def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
+    """The per-slice corrected anterior boundary. Default detector = the native DP path (_detect_surface_dp,
+    matches a manual trace so AUTO preprocessing needs minimal correction); set params['detector']='legacy'
+    for the original {hist-eq, raw} gradient-argmax + RANSAC-quadratic choice. When a prior surface is supplied
+    (fix-columns marched re-detection) the underlying detection is windowed around it.
+
+    The DP path is wrapped by the SCAR-GUARD (_dp_scar_guard): a cross-check against the legacy surface that
+    pulls the DP edge back into the legacy's vicinity wherever DP has dived DEEPER onto a bright internal scar.
+    Skipped when an external prior is supplied (the fix-columns re-detect carries its own user-seeded surface)."""
+    if str(p.get("detector", "dp")).lower() != "legacy":
+        dp = _detect_surface_dp(slice_img, p, prior=prior)
+        if prior is None and bool(p.get("dp_scar_guard", True)):
+            dp = _dp_scar_guard(slice_img, dp, p)
+        return dp
+    return _legacy_surface(slice_img, p, prior=prior)
 
 
 def _edge_worker(packed):
@@ -1324,7 +1419,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     else:
         # 1) per-slice corrected boundary (the expensive bilateral+edge+RANSAC) — parallel. Detected on
         #    `det` (the filled copy when iterating) so the warp's black padding can't fool the detector.
-        edges = np.array(_map_slices(_edge_worker, [(det[i], p) for i in range(n)], progress, 0.0, 0.5, workers))
+        #    The DP scar-guard (legacy cross-check) runs only on the RAW pass-0 detection (detect_volume is
+        #    None) — the scar-lock is a raw-image phenomenon; later passes detect on a warped+filled volume
+        #    where the surface is already flattened, so skipping the (costly) per-slice legacy there is safe.
+        pe = {**p, "dp_scar_guard": False} if detect_volume is not None else p
+        edges = np.array(_map_slices(_edge_worker, [(det[i], pe) for i in range(n)], progress, 0.0, 0.5, workers))
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
