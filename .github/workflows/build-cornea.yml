@@ -18,19 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # FULL release (Linux + macOS-arm64 + Windows). Was LINUX-ONLY for fast turnaround (2026-06-26);
-          # re-enabled at the user's request once the detection strategy stabilised.
+          # LINUX-ONLY for fast turnaround during active Linux testing (2026-06-27, user request) — avoids
+          # Windows/macOS build time + the flaky crates.io fetch on Windows that blocked publish. Re-add
+          # macOS-arm64 / windows here when shipping a cross-platform release again.
           - platform: ubuntu-22.04
             args: ""
             label: linux
-          - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-            label: macos-arm64
-          - platform: windows-latest
-            args: ""
-            label: windows
-          # macOS-intel (x86_64-apple-darwin) was permanently dropped earlier: its publish step kept failing
-          # (the known auto-publish quirk) and a failed matrix job blocks the publish-manifest job.
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
