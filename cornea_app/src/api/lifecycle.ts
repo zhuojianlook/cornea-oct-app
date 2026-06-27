@@ -15,7 +15,7 @@ export const LIFECYCLE_STEPS: { color: string; label: string; short: string }[] 
   { color: "#ef4444", label: "Preprocessed · automatic", short: "Auto" },       // 2 red
   { color: "#f59e0b", label: "Preprocessed · manually vetted", short: "Vetted" }, // 3 orange
   { color: "#eab308", label: "Scar / control classified", short: "Classified" }, // 4 yellow
-  { color: "#38bdf8", label: "SAM2 · cornea + scar", short: "SAM2" },           // 5 light blue
+  { color: "#38bdf8", label: "Cornea + scar segmented", short: "Segmented" },    // 5 light blue
   { color: "#a855f7", label: "Subgroup assigned", short: "Subgroup" },          // 6 purple
   { color: "#14b8a6", label: "Replicates aligned", short: "Aligned" },          // 7 teal
   { color: "#06b6d4", label: "Normalized against controls", short: "Normalized" }, // 8 cyan

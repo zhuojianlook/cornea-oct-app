@@ -1579,8 +1579,36 @@ def compare_strategies(case_id: str, req: CompareStrategiesRequest) -> dict:
     if len(members) < 2:
         raise HTTPException(400, f"Need ≥2 segmented replicate scans of this eye+subgroup to compare "
                                  f"reproducibility (found {len(members)}).")
+
+    # Injected SAM2-scar (deep-learning) mask per replicate so the comparison includes SAM2 too — computed
+    # READ-ONLY (mirrors _scar_auto_sam2_locked WITHOUT writing the canonical labelmap): auto-seed the
+    # brightest in-cornea tissue, run the 3-view SAM2 consensus under the GPU lock, constrain to bright +
+    # coherent components. Returns a native scar mask in the scan's grid; raises → that strategy row errors.
+    import nibabel as nib
+    from scipy import ndimage as _ndi
+
+    def _sam2_scar_mask(mc: str):
+        import sam2_segment
+        arr, _ = labels.best_labelmap_nnunet(mc)
+        if arr is None:
+            raise ValueError("no cornea segmentation")
+        base = _ensure_volume_nifti(mc)
+        vol = np.asarray(nib.load(str(_working_volume(mc))).dataobj).astype(np.float32)
+        seeds, bright = scar_mod.auto_scar_seeds(vol, arr, percentile=float(req.phi_percentile),
+                                                 erode_surface=6, smooth=2.5, max_seeds=5)
+        if not seeds:
+            return np.zeros(arr.shape, bool)
+        with _GPU_LOCK:
+            fused, _meta = sam2_segment.segment_scar_consensus(base, arr, seeds, orch.case_root(mc) / "sam2_work", vote=2)
+        scar_c = fused & bright
+        lbl, n = _ndi.label(scar_c)
+        if n:
+            sizes = _ndi.sum(np.ones_like(lbl), lbl, range(1, n + 1))
+            scar_c = np.isin(lbl, [i + 1 for i, s in enumerate(sizes) if s >= 200])
+        return scar_c & ((arr == 1) | (arr == 2))
+
     try:
-        result = scar_bench.compare_strategies(members, req.strategies, req.phi_percentile)
+        result = scar_bench.compare_strategies(members, req.strategies, req.phi_percentile, sam2_scar_fn=_sam2_scar_mask)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     result["subgroup"] = key.get("subgroup")

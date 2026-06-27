@@ -80,7 +80,7 @@ def _strategy_detectors(phi: float):
     }
 
 
-def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0) -> dict:
+def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0, sam2_scar_fn=None) -> dict:
     """READ-ONLY test–retest reproducibility of each scar strategy on a set of REPLICATE scans (same eye+
     subgroup, already cornea-segmented). Aligns the replicates to the reference ONCE (volume-intensity
     driven, detector-independent), then for each strategy computes the scar mask per replicate IN MEMORY
@@ -96,7 +96,11 @@ def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0
     if len(members) < 2:
         raise ValueError("Need ≥2 segmented replicate scans to compare reproducibility.")
     dets = _strategy_detectors(float(phi_percentile))
-    chosen = [s for s in (strategies or list(dets)) if s in dets] or list(dets)
+    # "sam2" is the deep-learning scar (3-view consensus) — only available when the caller injects the
+    # GPU function (the API does); it's SLOWER (runs SAM2 per replicate). Default includes it when present.
+    default_list = list(dets) + (["sam2"] if sam2_scar_fn is not None else [])
+    valid = set(dets) | {"sam2"}
+    chosen = [s for s in (strategies or default_list) if s in valid] or default_list
 
     ref = members[0]; ref_vol = _vol(ref)
     sp = reg._read_vol(ref_vol).GetSpacing(); vmm3 = sp[0] * sp[1] * sp[2]
@@ -121,7 +125,12 @@ def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0
                 warped, vols = {}, []
                 for cid in members:
                     lab, vol = data[cid]
-                    m = np.asarray(dets[name](lab, vol)) & ((lab == 1) | (lab == 2))
+                    if name == "sam2":
+                        if sam2_scar_fn is None:
+                            raise ValueError("SAM2 scar not available in this context")
+                        m = np.asarray(sam2_scar_fn(cid)).astype(bool) & ((lab == 1) | (lab == 2))
+                    else:
+                        m = np.asarray(dets[name](lab, vol)) & ((lab == 1) | (lab == 2))
                     vols.append(float(m.sum()) * vmm3)
                     warped[cid] = warp(m, cid)
                 mean = float(np.mean(vols)); sd = float(np.std(vols, ddof=1)) if len(vols) > 1 else 0.0

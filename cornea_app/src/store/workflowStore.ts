@@ -444,7 +444,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       set((s) => {
         s.scarBusy = true;
         s.status = { kind: "working", title: "Comparing scar strategies",
-          detail: "Running each detector on this eye's replicates and computing reproducibility (Dice · HD95 · CV%). A few minutes." };
+          detail: "Running each detector (incl. SAM2) on this eye's replicates and computing reproducibility (Dice · HD95 · CV%). SAM2 runs per replicate, so this can take several minutes." };
       });
       try {
         const r = await api.json<StrategyComparison>(`/api/case/${caseId}/compare-strategies`, "POST", JSON.stringify({}));
