@@ -19,25 +19,40 @@ _AXIS_SIGN = {
     "superior": ("z", +1), "inferior": ("z", -1),
 }
 _RAS_INDEX = {"x": 0, "y": 1, "z": 2}
+# NRRD also allows the abbreviated 3-letter anatomical space codes (e.g. "LPS", "RAS", "RAI"),
+# which pynrrd returns verbatim — expand each letter to its full token before parsing.
+_ABBREV = {"r": "right", "l": "left", "a": "anterior", "p": "posterior", "s": "superior", "i": "inferior"}
 
 
-def _lps_to_ras_diag(space: str | None) -> np.ndarray:
-    """Diagonal sign matrix mapping the NRRD world frame to RAS.
+def _lps_to_ras_world(space: str | None) -> np.ndarray:
+    """World-frame transform mapping the NRRD space frame to RAS (R+,A+,S+).
 
-    Defaults to LPS→RAS = diag(-1,-1,1) when the space string is missing/odd.
+    Builds a real permutation+sign matrix: each NRRD world axis is placed into
+    its correct RAS row (right/left->x, anterior/posterior->y, superior/inferior
+    ->z) with the sign that points it the RAS-positive way. This is correct even
+    when the space axes are permuted (e.g. "posterior-left-superior"); a plain
+    diagonal could not swap axes. Defaults to LPS→RAS = diag(-1,-1,1) when the
+    space string is missing; an unrecognised string is rejected rather than
+    silently treated as LPS.
     """
-    signs = [-1.0, -1.0, 1.0]
-    if space:
-        tokens = space.replace("-", " ").lower().split()
-        if len(tokens) == 3 and all(t in _AXIS_SIGN for t in tokens):
-            tmp = [1.0, 1.0, 1.0]
-            for world_pos, tok in enumerate(tokens):
-                axis, sign = _AXIS_SIGN[tok]
-                # world axis `world_pos` corresponds to RAS axis `axis`; its sign
-                # tells whether +voxel-direction already points the RAS-positive way.
-                tmp[world_pos] = float(sign)
-            signs = tmp
-    return np.diag(signs + [1.0])
+    if not space:
+        return np.diag([-1.0, -1.0, 1.0, 1.0])
+    tokens = space.replace("-", " ").lower().split()
+    if len(tokens) == 1 and len(tokens[0]) == 3 and all(ch in _ABBREV for ch in tokens[0]):
+        tokens = [_ABBREV[ch] for ch in tokens[0]]   # abbreviated code, e.g. "LPS" -> [left, posterior, superior]
+    if len(tokens) != 3 or not all(t in _AXIS_SIGN for t in tokens):
+        raise ValueError(f"Unrecognised NRRD space {space!r}; expected 3 "
+                         "right/left/anterior/posterior/superior/inferior axes")
+    if len({_AXIS_SIGN[t][0] for t in tokens}) != 3:
+        raise ValueError(f"Degenerate NRRD space {space!r}; axes must be distinct")
+    m = np.zeros((4, 4))
+    m[3, 3] = 1.0
+    for world_pos, tok in enumerate(tokens):
+        axis, sign = _AXIS_SIGN[tok]
+        # world axis `world_pos` maps to RAS row `axis`; `sign` tells whether its
+        # +direction already points the RAS-positive way.
+        m[_RAS_INDEX[axis], world_pos] = float(sign)
+    return m
 
 
 def _nrrd_affine(header: dict) -> np.ndarray:
@@ -51,7 +66,7 @@ def _nrrd_affine(header: dict) -> np.ndarray:
     aff = np.eye(4)
     aff[:3, :3] = sd.T  # columns = axis vectors
     aff[:3, 3] = origin
-    return _lps_to_ras_diag(header.get("space")) @ aff
+    return _lps_to_ras_world(header.get("space")) @ aff
 
 
 def nrrd_to_nifti(src: Path, dst: Path) -> Path:

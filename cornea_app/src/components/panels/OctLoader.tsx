@@ -338,7 +338,12 @@ export function OctLoader() {
         id: uid("s"), groupId: g.id, filename: c.filename, caseId: c.case_id, nVolumes: c.n_volumes,
         // A scan already corrected in a prior session loads as "done" so it's coloured + skipped on re-run.
         nFrames: 101, status: c.error ? "error" : c.preprocessed ? "done" : "ready",
-        error: c.error, scarRange: [1, 101],
+        error: c.error,
+        // Restore the persisted per-scan scar frame-range (cases/list life) so a reload + re-preprocess
+        // doesn't silently overwrite it with the full [1,nFrames]; clamped to the real frame count in preview.
+        scarRange: (Array.isArray(c.life?.scar_range) && (c.life!.scar_range as unknown[]).length === 2
+          ? [Number((c.life!.scar_range as unknown[])[0]), Number((c.life!.scar_range as unknown[])[1])] as [number, number]
+          : [1, 101]),
         subgroup: ((c.life?.scar_subgroup as string | null | undefined)?.trim() || "1"),
         selected: !c.error, passes: c.passes, life: c.life,
         condition: ((c.life?.scar_classification as Cls | null | undefined) ?? undefined) || undefined,
@@ -572,7 +577,13 @@ export function OctLoader() {
       const runOne = async (s: typeof sel[number]) => {
         const g = groups.find((gg) => gg.id === s.groupId);
         const cls = s.condition ?? null;   // per-scan scar/control tag (was group-level)
-        const edited = g && isEdited(g);
+        // Persist the scan's RESOLVED group identity whenever the group has a determinate eye —
+        // not only when the header was hand-edited. A scan MOVED/merged into another group keeps
+        // its own filename-parsed identity otherwise, so its manifest (and thus the consensus id)
+        // would silently disagree with the grouping the user sees. The backend re-normalizes/
+        // ignores a "?"/blank eye, so sending an unedited determinate identity is an idempotent
+        // no-op for scans that were never moved.
+        const sendIdentity = !!g && (isEdited(g) || (g.eye.trim() !== "" && g.eye.trim() !== "?"));
         patchScan(s.id, { status: "preprocessing" });
         try {
           const r = await api.json<{ oct_iter?: { passes?: number; metrics?: number[]; best_pass?: number; stopped?: string } }>(
@@ -582,8 +593,8 @@ export function OctLoader() {
               scar_range: cls === "scar" ? s.scarRange : null,
               max_iterations: maxPasses,
               concurrency: conc,
-              // Persist a user-corrected identity so the rename reaches consensus/export.
-              ...(edited ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
+              // Persist the resolved group identity so a rename OR a cross-group move reaches consensus/export.
+              ...(sendIdentity ? { patient: g!.patient.trim(), eye: g!.eye.trim() } : {}),
             }));
           lastIter = r.oct_iter ?? null;
           patchScan(s.id, { status: "done", passes: r.oct_iter?.passes ?? 1 });

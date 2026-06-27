@@ -352,6 +352,22 @@ def detect_scar_depthnorm(vol_ijk: np.ndarray, labelmap_ijk: np.ndarray, profile
                        gap=gap, min_voxels=min_voxels, open_iter=open_iter, close_iter=close_iter)
 
 
+# The module-default percentile (== hyper_reflective_mask / detect_scar_in_cornea default). Used as the
+# anchor point where the percentile→k map reproduces a detector's benchmarked default k, so threading the
+# slider through normal_anchor/robust_mad doesn't shift their tuned default behaviour.
+_DEFAULT_PCT = 88.0
+
+
+def _k_from_percentile(default_k: float, pct: float) -> float:
+    """Map the sensitivity slider's percentile to a sigma-multiplier `k` for the threshold detectors
+    (normal_anchor μ+k·σ, robust_mad median+k·MAD). The slider sends percentile = 100 − sensitivity, so a
+    HIGHER sensitivity → LOWER percentile → LOWER k (a more inclusive, lower threshold). Anchored so pct ==
+    _DEFAULT_PCT (88) reproduces the detector's tuned default k; scaled linearly off the population midpoint
+    (50) and floored so k stays positive. Monotone in pct."""
+    k = default_k * (float(pct) - 50.0) / (_DEFAULT_PCT - 50.0)
+    return max(0.1, k)
+
+
 # Strategy registry — name → detector(vol, lab, percentile). Used by /scar/auto's `method` selector
 # so the strategies can be A/B-compared in the viewer.
 def scar_detector(method: str):
@@ -362,9 +378,9 @@ def scar_detector(method: str):
     if m in ("tta", "hysteresis_tta"):
         return lambda vol, lab, pct: detect_scar_hysteresis_tta(vol, lab, phi_percentile=pct)
     if m == "normal_anchor":
-        return lambda vol, lab, pct: detect_scar_normal_anchor(vol, lab)
+        return lambda vol, lab, pct: detect_scar_normal_anchor(vol, lab, k=_k_from_percentile(2.0, pct))
     if m == "robust_mad":
-        return lambda vol, lab, pct: detect_scar_robust_mad(vol, lab)
+        return lambda vol, lab, pct: detect_scar_robust_mad(vol, lab, k=_k_from_percentile(0.6, pct))
     if m == "morph_lcc":
         return lambda vol, lab, pct: detect_scar_morph_lcc(vol, lab, percentile=pct)
     if m == "brightness":

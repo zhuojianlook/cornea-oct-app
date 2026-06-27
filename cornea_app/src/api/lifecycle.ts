@@ -36,12 +36,19 @@ export function scanStep(m: Manifest): LifecycleStep {
     return 7;
   }
   if (!set(m, "oct_preprocessed")) return 1;                 // raw only
+  // A SEGMENTED scan is already past preprocess/vet/classify — e.g. a consensus MEMBER opened via
+  // SubgroupGrid "Correct" was auto-preprocessed (preproc_vetted=False) then SAM2-segmented but never
+  // re-vetted, so the contiguous checks below would wrongly drop it to step 2/3 and hide the scar/Correct
+  // controls. If any segmentation artefact is present, place it at SAM2-done (5) and let it advance to
+  // corrected (6) / scheduled (7), regardless of a missing preproc_vetted/scar_classification.
+  if (set(m, "sam2_meta") || set(m, "consensus_case") || set(m, "corrected_labelmap")) {
+    if (!set(m, "corrected_labelmap")) return 5;             // SAM2 auto (light blue)
+    if (!set(m, "training_scheduled")) return 6;             // manually corrected (dark blue)
+    return 7;                                                // scheduled (green)
+  }
   if (!set(m, "preproc_vetted")) return 2;                   // auto-preprocessed (red)
   if (!set(m, "scar_classification")) return 3;              // vetted (orange)
-  if (!set(m, "sam2_meta") && !set(m, "consensus_case")) return 4; // classified (yellow)
-  if (!set(m, "corrected_labelmap")) return 5;              // SAM2 auto (light blue)
-  if (!set(m, "training_scheduled")) return 6;             // manually corrected (dark blue)
-  return 7;                                                  // scheduled (green)
+  return 4;                                                  // classified (yellow)
 }
 
 export function lifecycleMeta(m: Manifest): StepMeta {

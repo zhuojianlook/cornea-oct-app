@@ -1439,9 +1439,11 @@ def _axial_smooth_volume(volume: np.ndarray, params: dict | None, workers: int |
     swapping frames<->lateral, correcting, swapping back. Detects on a black-band-filled copy so the
     prior sagittal warp's padding can't fool the detector."""
     vt = np.ascontiguousarray(volume.transpose(*_FRAME_LATERAL_SWAP))
-    # surface_cut is defined in the SAGITTAL frame domain; after the frame<->lateral swap its left/right/top
-    # would cut the wrong axis, so strip it from the axial pass (the sagittal pass already applied it).
-    pax = {k: v for k, v in (params or {}).items() if k != "surface_cut"}
+    # surface_cut / force_columns / good_columns / border_anchors are all defined in the SAGITTAL frame
+    # domain; after the frame<->lateral swap their indices address the wrong axis, so strip them from the
+    # axial pass (the sagittal pass already applied them). The axial pass runs a clean auto correction.
+    _SAG_DOMAIN_KEYS = ("surface_cut", "force_columns", "good_columns", "border_anchors")
+    pax = {k: v for k, v in (params or {}).items() if k not in _SAG_DOMAIN_KEYS}
     out = smooth_volume(vt, pax, workers=workers, detect_volume=_fill_black_bands(vt))
     return np.ascontiguousarray(out.transpose(*_FRAME_LATERAL_SWAP))
 
@@ -1515,8 +1517,8 @@ def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
             fi, s = int(f), int(round(fpx))
         except (TypeError, ValueError, OverflowError):
             continue
-        if not (0 <= fi < nz) or s == 0:
-            continue
+        if not (0 <= fi < nz) or s == 0 or abs(s) >= depth:
+            continue        # out-of-range shift = no-op (never erase the whole frame)
         b = out[fi]                      # (depth, lateral)
         shifted = np.zeros_like(b)       # vacated rows stay 0 (background)
         if s > 0 and s < depth:          # move pixels DOWN (toward larger depth index)

@@ -189,10 +189,18 @@ def segment_plane(vol: np.ndarray, plane: str, work: Path) -> tuple[np.ndarray, 
         Image.fromarray(np.repeat(_norm8(get(f))[:, :, None], 3, axis=2)).save(
             fdir / f"{f:05d}.jpg", quality=95)
 
-    # Prompt on the middle frame (most reliable corneal band).
+    # Prompt on the middle frame (most reliable corneal band). If the centre
+    # frame is unusable, search the immediately adjacent frames first with a
+    # fine step before widening to a coarse fallback, so one bad central frame
+    # doesn't force the prompt tens of slices away.
     mid = nframes // 2
+    half = nframes // 2
+    fine = min(5, half)
+    coarse = max(1, nframes // 20)
+    offsets = list(range(0, fine + 1))                       # 0,1,2,... fine (step 1)
+    offsets += [o for o in range(fine + coarse, half, coarse) if o > fine]
     prm = None
-    for off in range(0, nframes // 2, max(1, nframes // 20)):
+    for off in offsets:
         for cand in (mid + off, mid - off):
             if 0 <= cand < nframes:
                 prm = _auto_prompt(get(cand))

@@ -184,6 +184,9 @@ export const useCaseStore = create<CaseState>()(
     clearCase: () => {
       // Empty the viewer right away (wipe-all): no open case → VolumeCanvas drops the volume + overlays.
       useWorkflowStore.getState().resetForCase();
+      // Forget the last-opened case so the next openCase of ANY id (including the same one) is treated as a
+      // genuine switch and runs the full reset + ascanRateHz re-seed (otherwise a re-opened case inherits stale state).
+      _lastOpenedCase = null;
       set((s) => { s.caseId = null; s.caseInfo = null; s.volumeUrl = null; });
     },
 

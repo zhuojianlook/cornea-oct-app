@@ -74,12 +74,36 @@ def hd95(a, b, spacing):
     return float(np.percentile(d, 95)) if d.size else float("nan")
 
 
-def quantify(mask, img, spacing):
-    """Scar volume (mm³), en-face area (mm², projecting out the depth=smallest-spacing axis), and
-    density (mean OCT intensity in the mask)."""
+def _depth_axis(cornea_mask):
+    """The A-scan/depth axis = the one whose face-on projection fills the cornea
+    into the densest disc (the cornea is a thin curved shell — collapsing its thin
+    direction yields the largest footprint). Returns 0, 1, or 2.
+
+    Copied VERBATIM from scar._depth_axis so the report's en-face area uses the SAME
+    depth-axis rule as the canonical quantifier (scar.quantify -> scar_summary.csv).
+    A plain argmin(spacing) disagrees on anisotropic OCT geometry where depth is not
+    the smallest-spacing axis. nnunet_report runs in a separate venv, so this is a
+    copy rather than an import (no sys.path / cross-venv fragility)."""
+    shape = cornea_mask.shape
+    best_axis, best_score = 0, -1.0
+    for a in range(3):
+        footprint = int(cornea_mask.any(axis=a).sum())
+        plane_area = shape[(a + 1) % 3] * shape[(a + 2) % 3]
+        score = footprint / max(plane_area, 1)      # how fully the en-face disc fills
+        if score > best_score:
+            best_axis, best_score = a, score
+    return best_axis
+
+
+def quantify(mask, img, spacing, cornea=None):
+    """Scar volume (mm³), en-face area (mm², projecting out the morphological depth axis — the same
+    rule scar.quantify uses so report numbers match scar_summary.csv), and density (mean OCT
+    intensity in the mask). `cornea` (cornea∪scar) defines the depth axis when given; falls back to
+    the scar mask itself for empty/legacy calls."""
     mask = mask.astype(bool)
     vol = float(mask.sum() * float(np.prod(spacing)))
-    depth_axis = int(np.argmin(spacing))
+    ref = cornea.astype(bool) if cornea is not None else mask
+    depth_axis = _depth_axis(ref) if ref.any() else int(np.argmin(spacing))
     enface = mask.max(axis=depth_axis)
     others = [s for i, s in enumerate(spacing) if i != depth_axis]
     area = float(enface.sum() * others[0] * others[1])
@@ -194,7 +218,8 @@ def compute_metrics(spec, preds):
         pr = preds[cid]
         gt_cor, pr_cor = gt > 0, pr > 0
         gt_sc, pr_sc = gt == 2, pr == 2
-        gq, pq = quantify(gt_sc, img, sp), quantify(pr_sc, img, sp)
+        # Depth axis from the CORNEA mask (cornea∪scar) so en-face area matches scar.quantify.
+        gq, pq = quantify(gt_sc, img, sp, cornea=gt_cor), quantify(pr_sc, img, sp, cornea=pr_cor)
         rows.append({
             "case": cid, "patient": tc.get("patient"), "eye": tc.get("eye"), "subgroup": tc.get("subgroup"),
             "dice_cornea": dice(pr_cor, gt_cor), "dice_scar": dice(pr_sc, gt_sc),
@@ -232,7 +257,7 @@ def fig_study_flow(spec, path):
     boxes = [
         (f"All scan folders\nn = {c['total']}", 0.9),
         (f"Excluded\n consensus cases: {c['excluded_consensus']}\n non-OCT: {c['excluded_non_oct']}\n no expert label: {c['excluded_no_label']}", 0.66),
-        (f"Included scans\nn = {c['included']}", 0.42),
+        (f"Included scans\nn = {c.get('included_used', c['included'])}", 0.42),
         (f"Train/val: {c['trainval']}   ·   Test (held-out patients): {c['test']}", 0.18),
     ]
     for txt, y in boxes:
@@ -294,7 +319,10 @@ def fig_enface(spec, preds, path):
         return False
     tc = test[0]
     gt, sp = load(tc["label"]); gt = np.rint(gt).astype(np.uint8); pr = preds[tc["case"]]
-    da = int(np.argmin(sp))
+    # En-face depth axis via the SAME morphological rule as scar.quantify (not argmin(spacing)), from
+    # the cornea (label>0); fall back to argmin only if the case has no cornea.
+    cornea_ref = (gt > 0) | (pr > 0)
+    da = _depth_axis(cornea_ref) if cornea_ref.any() else int(np.argmin(sp))
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
     axes[0].imshow((gt == 2).max(axis=da).T, cmap="autumn", origin="lower", aspect="auto"); axes[0].set_title("expert scar (en-face)", fontsize=9); axes[0].axis("off")
     axes[1].imshow((pr == 2).max(axis=da).T, cmap="winter", origin="lower", aspect="auto"); axes[1].set_title("predicted scar (en-face)", fontsize=9); axes[1].axis("off")
@@ -544,6 +572,8 @@ def _generate(spec, run, dirs, work):
 
     # splits.json (train/val from the nnUNet split file + held-out test)
     splits = {"test": [t.get("case") for t in spec.get("test_cases", [])]}
+    if spec.get("unresolved_patient_warning"):
+        splits["unresolved_patient_warning"] = spec["unresolved_patient_warning"]
     for m in spec["models"].values():
         sf = Path(spec["nn_pre"]) / m["name"] / "splits_final.json"
         if sf.exists():
@@ -595,19 +625,24 @@ def _generate(spec, run, dirs, work):
     c = spec["counts"]
     pd.DataFrame([{"total_scans": c["total"], "excluded_consensus": c["excluded_consensus"],
                    "excluded_non_oct": c["excluded_non_oct"], "excluded_no_label": c["excluded_no_label"],
-                   "included": c["included"], "train_val": c["trainval"], "test": c["test"],
+                   "included": c.get("included_used", c["included"]), "included_eligible": c["included"],
+                   "train_val": c["trainval"], "test": c["test"],
                    "annotation": "per-scan SAM2 + expert correction (0/1/2)"}]).to_csv(T / "table2_split_annotation.csv", index=False)
     ok("tables/table2_split_annotation.csv")
     # table3 model performance + table4 agreement
     if len(df):
         perf = []
+        cascade = spec.get("mode") == "cascade"
         for cls in ("cornea", "scar"):
             d_ = df[f"dice_{cls}"].dropna(); h_ = df[f"hd95_{cls}_mm"].dropna()
             perf.append({"class": cls, "n": int(len(d_)),
                          "dice_mean": round(float(d_.mean()), 4) if len(d_) else None,
                          "dice_std": round(float(d_.std(ddof=1)), 4) if len(d_) > 1 else None,
                          "hd95_mm_mean": round(float(h_.mean()), 4) if len(h_) else None,
-                         "hd95_mm_std": round(float(h_.std(ddof=1)), 4) if len(h_) > 1 else None})
+                         "hd95_mm_std": round(float(h_.std(ddof=1)), 4) if len(h_) > 1 else None,
+                         "note": ("OPTIMISTIC/upper-bound: stage-B scar model was TRAINED on the "
+                                  "ground-truth cornea prior but INFERRED on the predicted cornea")
+                                 if (cascade and cls == "scar") else ""})
         pd.DataFrame(perf).to_csv(T / "table3_model_performance.csv", index=False); ok("tables/table3_model_performance.csv")
         agree = []
         for title, gc, pc in (("scar_volume_mm3", "scar_vol_mm3_gt", "scar_vol_mm3_pred"),
@@ -645,6 +680,7 @@ def _generate(spec, run, dirs, work):
 
 nnU-Net **{spec['mode']}** model, config **{spec['config']}**, trainer **{spec['trainer']}**.
 Trained on PER-SCAN expert labels (not consensus), patient-grouped split.
+{('> ⚠ ' + spec['unresolved_patient_warning'] + chr(10)) if spec.get('unresolved_patient_warning') else ''}
 
 ## Contents
 - `models/` trained weights + nnU-Net plans (per dataset)
@@ -662,7 +698,10 @@ Trained on PER-SCAN expert labels (not consensus), patient-grouped split.
 Fill `clinical_metadata_TEMPLATE.csv` (severity, visual acuity, scanner, image quality) and
 `tables/table1_demographics_TEMPLATE.csv` / `table5_inter_rater_TEMPLATE.csv`, then regenerate the
 severity/subgroup/demographics/inter-rater artifacts. Cascade inference uses the PREDICTED cornea as
-the stage-B prior (a train/inference prior difference — note as a limitation).
+the stage-B prior, but stage-B was TRAINED on the GROUND-TRUTH cornea prior (which exactly encloses
+the scar) — so the reported SCAR Dice/HD95 (table3_model_performance.csv, aggregate_metrics.csv) are
+OPTIMISTIC, upper-bound estimates and must be reported as such (note this train/inference prior
+asymmetry as a limitation).
 
 See `generation_report.json` for exactly what was produced vs skipped.
 """)

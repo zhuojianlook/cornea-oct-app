@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -136,9 +137,33 @@ def per_scan_segmented_cases() -> list[str]:
     return out
 
 
+def _eye_group_key(src: str | None, cid: str) -> str:
+    """Stable per-eye grouping key from the SOURCE filename, used ONLY when the patient id is
+    unresolved. Replicates of one physical eye differ only by a '(N)' suffix (and a trailing
+    channel/index like '_0'); stripping those + the file extension collapses them to one key, so
+    sibling repeats share a group instead of each becoming a leak-prone singleton 'patient'. Falls
+    back to the case id when there is no source filename at all."""
+    if not src:
+        return cid.upper()
+    stem = Path(src).name
+    for _ in range(2):                          # peel double extensions (.nii.gz) too
+        new = Path(stem).stem
+        if new == stem:
+            break
+        stem = new
+    stem = re.sub(r"\s*\(\d+\)", "", stem)       # drop the '(N)' replicate marker
+    stem = re.sub(r"_\d+$", "", stem)            # drop a trailing channel/index suffix (e.g. '_0')
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return ("STEM:" + stem).upper() if stem else cid.upper()
+
+
 def case_meta(cid: str) -> dict:
     """Patient / eye / subgroup for a scan (manifest first, then filename parse) — used for
-    patient-grouped splits (no repeat-of-the-same-eye leakage) and subgroup analyses."""
+    patient-grouped splits (no repeat-of-the-same-eye leakage) and subgroup analyses.
+
+    `group` is the deterministic key the splits group on: the resolved patient id when available,
+    else a per-eye key from the source filename stem (replicate '(N)' stripped) so replicates of
+    one eye stay together. `patient_resolved` is False when we had to fall back to the filename."""
     m = orch.read_manifest(cid)
     patient = m.get("patient_id")
     eye = m.get("eye")
@@ -150,7 +175,11 @@ def case_meta(cid: str) -> dict:
             eye = eye or meta.get("eye") or meta.get("laterality")
         except Exception:  # noqa: BLE001
             pass
+    patient_resolved = bool(patient)
+    group = patient.upper() if patient_resolved else _eye_group_key(
+        m.get("oct_source") or m.get("input_volume"), cid)
     return {"case": cid, "patient": (patient or cid).upper(), "eye": (eye or "?"),
+            "group": group, "patient_resolved": patient_resolved,
             "subgroup": str(m.get("scar_subgroup") or "1")}
 
 
@@ -160,7 +189,7 @@ def split_patient_grouped(cases: list[str], test_frac: float = 0.2):
     meta = {c: case_meta(c) for c in cases}
     by_pat: dict[str, list[str]] = {}
     for c in cases:
-        by_pat.setdefault(meta[c]["patient"], []).append(c)
+        by_pat.setdefault(meta[c]["group"], []).append(c)
     patients = sorted(by_pat)
     n_test_pat = 0 if len(patients) < 3 else max(1, round(len(patients) * test_frac))
     test_patients = set(patients[:n_test_pat])         # deterministic slice
@@ -289,7 +318,10 @@ def build_scar(cases: list[str], image_resolver) -> dict:
         scar_any = scar_any or bool((arr == 2).any())
         n += 1
     _dataset_json(d, {"0": "OCT", "1": "corneaprior"}, {"background": 0, "scar": 1}, n,
-                  "Cornea OCT cascade B — scar within cornea (OCT + cornea-prior channel)")
+                  "Cornea OCT cascade B — scar within cornea (OCT + cornea-prior channel). "
+                  "NOTE: the stage-B cornea-prior channel is the GROUND-TRUTH cornea here (it "
+                  "exactly encloses the scar), whereas inference uses the PREDICTED cornea — so "
+                  "reported scar metrics from this cascade are OPTIMISTIC (upper-bound) estimates.")
     return {"id": DS_SCAR[0], "name": DS_SCAR[1], "n": n, "scar_present": scar_any, "skipped": skipped}
 
 
@@ -327,7 +359,7 @@ def _write_splits(name: str) -> dict:
     meta = {c: case_meta(c) for c in ids}
     by_pat: dict[str, list[str]] = {}
     for c in ids:
-        by_pat.setdefault(meta[c]["patient"], []).append(c)
+        by_pat.setdefault(meta[c]["group"], []).append(c)
     pats = sorted(by_pat)
     folds = []
     for i in range(min(5, len(pats))):
@@ -529,11 +561,21 @@ def _first_run_folder(mode, config, trainer, models, datasets, trainval, test, m
         "test_cases": resolved_test,
         "trainval_cases": [meta.get(c, {"case": c}) for c in trainval],
         # counts.test reflects the cases the report can actually score (resolved images), not the raw split.
+        # included_used = the cases that actually fed the split (= len(trainval)+len(test) = len(cases)
+        # = trainval + counts.test + test_dropped_no_image); flow_counts()['included'] stays as the
+        # separate ELIGIBLE-cohort number. The CONSORT figure's split-feeding box must use included_used.
         "counts": {**flow_counts(), "trainval": len(trainval), "test": len(resolved_test),
-                   "test_dropped_no_image": len(dropped)},
+                   "test_dropped_no_image": len(dropped),
+                   "included_used": len(trainval) + len(test)},
         "oct_params": rep_oct_params,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    n_unresolved = sum(1 for c in (trainval + test) if not meta.get(c, {}).get("patient_resolved", True))
+    if n_unresolved:
+        spec["unresolved_patient_warning"] = (
+            f"{n_unresolved} scan(s) had an unresolved patient id and were grouped by a per-eye "
+            f"filename key (replicate '(N)' stripped) to avoid same-eye train/test leakage. Verify "
+            f"the grouping is correct for these scans.")
     (run_dir / "run_spec.json").write_text(json.dumps(spec, indent=2, default=str))
 
     report_py = Path(__file__).resolve().parent / "nnunet_report.py"
@@ -547,9 +589,9 @@ def _first_run_folder(mode, config, trainer, models, datasets, trainval, test, m
 def _worker(mode: str, config: str, trainer: str, cases: list[str], image_resolver) -> None:
     try:
         trainval, test, meta = split_patient_grouped(cases)
-        # A scan whose patient id couldn't be resolved falls back to its own id → it becomes its own
-        # "patient", which can let sibling repeats of one eye straddle the split. Surface that count.
-        unident = sum(1 for c in cases if meta[c]["patient"] == c.upper())
+        # A scan whose patient id couldn't be resolved is grouped by a per-eye filename key (so
+        # sibling repeats of one eye stay together) rather than its own id. Surface that count.
+        unident = sum(1 for c in cases if not meta[c].get("patient_resolved", True))
         _push_step(f"Patient-grouped split: {len(trainval)} train/val · {len(test)} test"
                    + (f" · ⚠ {unident} scan(s) with unresolved patient id (check grouping)" if unident else ""))
         _set(n_trainval=len(trainval), n_test=len(test), n_unidentified_patient=unident)

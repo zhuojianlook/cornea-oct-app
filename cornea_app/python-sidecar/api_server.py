@@ -693,15 +693,16 @@ async def segmentation_from_drawing(case_id: str, files: List[UploadFile] = File
     tmp = orch.case_root(case_id) / "previews" / ("edited-seg.nii.gz" if is_gz else "edited-seg.nii")
     tmp.write_bytes(data)
     base = _ensure_volume_nifti(case_id)
-    try:
-        arr = masks.corrected_labelmap_from_drawing(tmp, base, labels.corrected_path(case_id))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"Could not parse corrected drawing: {exc}")
-    postprocess.render_seg_previews(_working_volume(case_id), arr, orch.segmentation_preview_dir(case_id))
-    qa = {"segments": labels.labelmap_counts(arr), "source": "corrected"}
-    orch.write_manifest_value(case_id, {"corrected_labelmap": str(labels.corrected_path(case_id))})
-    return {"case_info": orch.current_case_info(case_id), "qa": qa,
-            "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
+    with _labelmap_lock(case_id):
+        try:
+            arr = masks.corrected_labelmap_from_drawing(tmp, base, labels.corrected_path(case_id))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"Could not parse corrected drawing: {exc}")
+        postprocess.render_seg_previews(_working_volume(case_id), arr, orch.segmentation_preview_dir(case_id))
+        qa = {"segments": labels.labelmap_counts(arr), "source": "corrected"}
+        orch.write_manifest_value(case_id, {"corrected_labelmap": str(labels.corrected_path(case_id))})
+        return {"case_info": orch.current_case_info(case_id), "qa": qa,
+                "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
 
 @app.get("/api/case/{case_id}/segmentation.nii.gz")
@@ -921,6 +922,11 @@ def scar_auto(case_id: str, req: ScarAutoRequest) -> dict:
     in the drawing layer. Requires a cornea labelmap (run SAM2 first)."""
     import nibabel as nib
     orch.ensure_case_dirs(case_id)
+    with _labelmap_lock(case_id):
+        return _scar_auto_locked(case_id, req, nib)
+
+
+def _scar_auto_locked(case_id: str, req: "ScarAutoRequest", nib) -> dict:
     arr, _ = labels.best_labelmap_nnunet(case_id)
     if arr is None or not ((arr == 1) | (arr == 2)).any():
         raise HTTPException(400, "No cornea segmentation yet. Run SAM2 first.")
@@ -977,6 +983,11 @@ def scar_edit(case_id: str, req: ScarEditRequest) -> dict:
     Paint only promotes cornea→scar and erase only demotes scar→cornea, so scar ⊆ cornea
     is preserved and the cornea boundary is never touched."""
     import nibabel as nib
+    with _labelmap_lock(case_id):
+        return _scar_edit_locked(case_id, req, nib)
+
+
+def _scar_edit_locked(case_id: str, req: "ScarEditRequest", nib) -> dict:
     arr, _ = labels.best_labelmap_nnunet(case_id)
     if arr is None:
         raise HTTPException(400, "No segmentation to edit — segment the cornea first.")
@@ -1025,6 +1036,11 @@ def scar_sam2_hint(case_id: str, req: ScarHintRequest) -> dict:
     import sam2_segment
     import nibabel as nib
     orch.ensure_case_dirs(case_id)
+    with _labelmap_lock(case_id):
+        return _scar_sam2_hint_locked(case_id, req, sam2_segment, nib)
+
+
+def _scar_sam2_hint_locked(case_id: str, req: "ScarHintRequest", sam2_segment, nib) -> dict:
     arr, _ = labels.best_labelmap_nnunet(case_id)
     if arr is None or not ((arr == 1) | (arr == 2)).any():
         raise HTTPException(400, "No cornea segmentation yet. Run SAM2 first.")
@@ -1086,8 +1102,14 @@ def scar_auto_sam2(case_id: str, req: ScarAutoSam2Request) -> dict:
     """Automatic scar via the cornea-style strategy: auto-seed from the brightest in-cornea region
     (optionally within the marked scar frame-range), run SAM2 on axial+coronal+sagittal as videos,
     keep the ≥`vote`-of-3 CONSENSUS, then constrain to hyper-reflective tissue. No clicks needed."""
+    import sam2_segment
     import nibabel as nib
     orch.ensure_case_dirs(case_id)
+    with _labelmap_lock(case_id):
+        return _scar_auto_sam2_locked(case_id, req, sam2_segment, nib)
+
+
+def _scar_auto_sam2_locked(case_id: str, req: "ScarAutoSam2Request", sam2_segment, nib) -> dict:
     arr, _ = labels.best_labelmap_nnunet(case_id)
     if arr is None or not ((arr == 1) | (arr == 2)).any():
         raise HTTPException(400, "No cornea segmentation yet. Run SAM2 first.")
@@ -2630,6 +2652,7 @@ def cases_list() -> dict:
                 "oct_preprocessed": bool(m.get("oct_preprocessed")),
                 "preproc_vetted": bool(m.get("preproc_vetted")),
                 "scar_classification": m.get("scar_classification") or None,
+                "scar_range": (list(m.get("scar_range")) if m.get("scar_range") else None),
                 "scar_subgroup": (str(m.get("scar_subgroup")).strip() if m.get("scar_subgroup") else None),
                 "sam2_meta": bool(m.get("sam2_meta")),
                 "corrected_labelmap": bool(m.get("corrected_labelmap")),
@@ -2677,6 +2700,26 @@ _COHORT_LOCK = threading.Lock()
 # Serialises all SAM2/CUDA inference (cohort worker thread + user-triggered endpoints
 # run on separate threads and share one predictor + CUDA context).
 _GPU_LOCK = threading.Lock()
+
+# Per-case lock for the canonical labelmap read-modify-write. scar_auto/scar_edit/
+# scar_sam2_hint/scar_auto_sam2/segmentation_from_drawing each load the corrected
+# labelmap, mutate it, and write it back; without this two concurrent corrections
+# (e.g. a brush edit racing an auto run, or worker threads) would clobber each
+# other's voxels. RLock so a future nested labelmap op on the same case is safe.
+_LABELMAP_LOCKS: dict[str, threading.RLock] = {}
+_LABELMAP_LOCKS_GUARD = threading.Lock()
+
+
+def _labelmap_lock(case_id: str) -> threading.RLock:
+    """Return the (lazily-created) RLock guarding this case's canonical labelmap,
+    keyed on safe_case_id so two inputs that normalise to the same case share one lock."""
+    cid = orch.safe_case_id(case_id)
+    with _LABELMAP_LOCKS_GUARD:
+        lk = _LABELMAP_LOCKS.get(cid)
+        if lk is None:
+            lk = threading.RLock()
+            _LABELMAP_LOCKS[cid] = lk
+        return lk
 
 
 def _cohort_case_conflict(cid: str, full_path: str) -> bool:

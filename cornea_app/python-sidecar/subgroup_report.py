@@ -26,8 +26,11 @@ def _dice(a, b):
     return 2.0 * int((a & b).sum()) / s if s else float("nan")
 
 
-def _fov_dice(sa, ca, sb, cb):
+def _fov_dice(sa, ca, sb, cb, da=None, db=None):
+    # FOV = image-data overlap (consensus.py / subgroups.py), AND-ed with the cornea masks.
     c = ca & cb
+    if da is not None and db is not None:
+        c = c & da & db
     a, b = sa & c, sb & c
     s = int(a.sum()) + int(b.sum())
     return 2.0 * int((a & b).sum()) / s if s else 0.0
@@ -62,10 +65,14 @@ def main():
         members = orch.read_manifest(ccid).get("consensus_cases") or []
         cls = "control" if any(str(orch.read_manifest(c).get("scar_classification")) == "control" for c in members) else "scar"
         labs = {}
+        data = {}
         for c in members:
             p = d / "scans" / c / "label.nii.gz"
             if p.exists():
                 labs[c] = np.rint(np.asarray(nib.load(str(p)).dataobj)).astype(np.uint8)
+                vp = d / "scans" / c / "volume.nii.gz"   # warped per-scan image-data FOV (consensus.py)
+                if vp.exists():
+                    data[c] = np.asarray(nib.load(str(vp)).dataobj) > 0
         cids = list(labs)
         if len(cids) < 2:
             continue
@@ -79,7 +86,8 @@ def main():
         for i in range(len(scarred)):
             for j in range(i + 1, len(scarred)):
                 sim[(scarred[i], scarred[j])] = _fov_dice(scar[scarred[i]], cornea[scarred[i]],
-                                                          scar[scarred[j]], cornea[scarred[j]])
+                                                          scar[scarred[j]], cornea[scarred[j]],
+                                                          data.get(scarred[i]), data.get(scarred[j]))
         comps = _components(scarred, sim, THRESH)
         if len(comps) > 1:
             n_split += 1

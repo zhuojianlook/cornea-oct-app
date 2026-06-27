@@ -21,6 +21,10 @@ def build_correction_drawing(base_nifti: Path, labelmap_ijk, dst: Path) -> Path:
     """
     base = nib.load(str(base_nifti))
     arr = np.asarray(labelmap_ijk)
+    if tuple(arr.shape[:3]) != tuple(base.shape[:3]):
+        raise ValueError(
+            f"Label shape {tuple(arr.shape[:3])} != base volume shape {tuple(base.shape[:3])}; "
+            f"refusing to stamp a mismatched affine onto {dst.name}.")
     pen = np.zeros(arr.shape, dtype=np.uint8)
     pen[arr == 1] = PEN_BY_NAME["cornea"]  # 1
     pen[arr == 2] = PEN_BY_NAME["scar"]    # 3
@@ -36,12 +40,11 @@ def corrected_labelmap_from_drawing(drawing_nifti: Path, base_nifti: Path, dst: 
     pen 1 (cornea) → 1, pen 3 (scar) → 2, everything else (pen 2 background and
     erase) → 0. Writes the labelmap and returns the array.
     """
+    import labels  # local import avoids any import-order coupling at module load
     img = nib.load(str(drawing_nifti))
     pen = np.rint(np.asarray(img.dataobj)).astype(np.int32)
     out = np.zeros(pen.shape, dtype=np.uint8)
     out[pen == PEN_BY_NAME["cornea"]] = 1
     out[pen == PEN_BY_NAME["scar"]] = 2
-    base = nib.load(str(base_nifti))
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(np.ascontiguousarray(out), base.affine), str(dst))
+    labels.write_label_nifti(out, base_nifti, dst)  # shape-guarded + atomic + base affine
     return out

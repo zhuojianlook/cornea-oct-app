@@ -57,8 +57,16 @@ def _build_atlas(pool):
     br = np.clip((r * NR).astype(int), 0, NR - 1)
     bp = np.clip((rho * NRHO).astype(int), 0, NRHO - 1)
     bt = np.clip((th / (2 * np.pi) * NTH).astype(int), 0, NTH - 1)
-    g = float(np.median(vn))
-    m2 = np.full((NR, NRHO), g); s2 = np.ones((NR, NRHO))
+    g, gs = _robust(vn)   # global robust mean + scale (1.4826*MAD) of all normalised samples
+    # Per-depth (r) marginal robust median: anterior vs posterior depths differ a lot, so empty
+    # cells inherit their own depth's median rather than a single global median.
+    gm = np.full(NR, g)
+    for i in range(NR):
+        si = vn[br == i]
+        if si.size:
+            gm[i] = _robust(si)[0]
+    # Scale-consistent fallback: mean from the per-depth marginal, scale from the global robust scale.
+    m2 = np.repeat(gm.reshape(NR, 1), NRHO, axis=1); s2 = np.full((NR, NRHO), gs)
     for i in range(NR):
         for j in range(NRHO):
             s = vn[(br == i) & (bp == j)]
