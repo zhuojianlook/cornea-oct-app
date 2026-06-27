@@ -172,9 +172,9 @@ export function TimelineBar() {
     <>
       {ScarMethod}
       <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
-        title="Re-detect scar inside the cornea with the selected method.">Re-run scar</Button>
+        title="CLASSICAL detector: re-threshold the scar inside the cornea using the selected method (e.g. hysteresis) + sensitivity. Fast (seconds). This is what 'Run SAM2 + scar' uses; re-run it after changing the method/sensitivity.">Re-detect scar (threshold)</Button>
       <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
-        title="Re-run scar via SAM2 3-view consensus.">Scar (SAM2)</Button>
+        title="SAM2 (deep-learning) scar: run SAM2 on cornea-vs-scar across axial/coronal/sagittal and take the 2-of-3 vote. Slower (~1–2 min); an alternative to the threshold detector when it struggles.">Scar via SAM2</Button>
       <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
         onClick={() => set("hintMode", !hintMode)}
         title="Optional touch-up: click ON a scar region (then 'scar') or on non-scar tissue (then 'not') in the slices to give SAM2 point prompts, then Apply to re-segment the scar from your clicks.">

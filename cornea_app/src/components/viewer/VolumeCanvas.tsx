@@ -6,7 +6,7 @@ import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, type ViewName } from "../../niivue/nvController";
-import { scanStep } from "../../api/lifecycle";
+import { scanStep, hasSegmentation } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
@@ -30,10 +30,14 @@ export function VolumeCanvas() {
   // (Before/after, Fix-columns, Steps) belong to the Auto→Vetted steps (2–3); from Classified (4) on, the
   // viewer is Slices/Segmentation. Inspecting an earlier step is read-only (no border edits until rollback).
   const selectedStep = useWorkflowStore((s) => s.selectedStep);
-  const manifestStep = scanStep((caseInfo?.manifest ?? null) as Record<string, unknown> | null);
+  const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
+  const manifestStep = scanStep(manifest);
   const effStep = selectedStep ?? manifestStep;
   const inspecting = selectedStep != null && selectedStep < manifestStep;
   const preprocStep = effStep >= 1 && effStep <= 3;   // Raw/Auto/Vetted → preprocessing tools belong here
+  // The Segmentation toggle should enable as soon as the scan HAS a segmentation (per the manifest), not
+  // only after the overlay finishes (re)loading — otherwise it greys on open then ungreys "after a while".
+  const hasSeg = hasSegmentation(manifest);
   const correcting = useWorkflowStore((s) => s.correcting);
   const stage = useWorkflowStore((s) => s.stage);
   const segLoaded = useWorkflowStore((s) => s.segLoaded);
@@ -226,10 +230,13 @@ export function VolumeCanvas() {
         style={{ minHeight: 36, borderColor: "var(--c-border)" }}
       >
         <ToggleButtonGroup size="small" exclusive value={showSeg ? "seg" : "slices"}
-          onChange={(_, v) => { if (v) wfSet("showSegmentation", v === "seg"); }}
-          title={segLoaded ? "" : "Run SAM2 first to view the segmentation overlay"}>
+          onChange={(_, v) => { if (!v) return; wfSet("showSegmentation", v === "seg");
+            // If enabling Segmentation before the overlay has finished loading (toggle now enabled from the
+            // manifest, not the load), kick off a load so it appears without waiting for the open effect.
+            if (v === "seg" && !segLoaded) void useWorkflowStore.getState().tryLoadExistingSegmentation(); }}
+          title={(segLoaded || hasSeg) ? "" : "Run SAM2 first to view the segmentation overlay"}>
           <ToggleButton value="slices" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Slices</ToggleButton>
-          <ToggleButton value="seg" disabled={!segLoaded} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Segmentation</ToggleButton>
+          <ToggleButton value="seg" disabled={!segLoaded && !hasSeg} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Segmentation</ToggleButton>
         </ToggleButtonGroup>
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         <ToggleButtonGroup size="small" exclusive value={overlay2d ? orient2d : view} onChange={onView}>
