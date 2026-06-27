@@ -66,6 +66,11 @@ interface WorkflowState {
   // The case a SAM2 run is currently in flight for (null = none). Lets a case switch NOT look like an
   // abort: the run keeps going + saves; the timeline shows a background banner instead of clearing.
   sam2RunningCaseId: string | null;
+  // Timeline navigation: which step the user is VIEWING (null = follow the live/current step). Clicking an
+  // earlier reached step inspects it READ-ONLY (its own viewer tools show, but consequential edits are
+  // disabled until "Roll back to this step"). Drives the viewer mode (fix-columns/steps at Auto→Vetted,
+  // segmentation at SAM2+) so e.g. after SAM2 the view follows to the segmentation automatically.
+  selectedStep: number | null;
 
   // correction drawing
   penLabel: PenLabel;
@@ -123,6 +128,7 @@ interface WorkflowState {
   initTabs: (isConsensus: boolean) => void;
   selectTab: (tab: string) => void;
   setOverlayMode: (mode: OverlayMode) => void;
+  selectStep: (step: number | null) => void;
 
   runSam2: () => Promise<void>;
   buildEyeConsensus: () => Promise<void>;
@@ -157,6 +163,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     showSegmentation: true,
     segQa: null,
     sam2RunningCaseId: null,
+    selectedStep: null,
 
     penLabel: 1,
     penSize: 3,
@@ -214,6 +221,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       set((s) => {
         s.stage = 1;
         s.segLoaded = false;
+        s.selectedStep = null;        // a new case follows its live step (no stale inspect selection)
         s.showSegmentation = false;   // default each newly-opened scan to Slices; runSam2 flips it on (#6a)
         s.segQa = null;
         s.scarMetrics = null;
@@ -267,6 +275,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.segVersion += 1;
       }),
 
+    selectStep: (stepN) => set((s) => { s.selectedStep = stepN; }),
+
     runSam2: async () => {
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
@@ -285,16 +295,19 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.status = { kind: "working", title: "Running SAM2", detail: "Tracking the cornea through axial, coronal and sagittal movies, then fusing in 3D. This takes a few minutes." };
       });
       const stillHere = () => useCaseStore.getState().caseId === caseId;
-      // Poll live progress (per-plane / fuse) so the user sees phases, not just a spinner; only writes
-      // while THIS case is still open + the run is busy (never overwrites another case's status).
+      // Coarse overall % across the one-go pipeline so the user sees a number, not just a spinner.
+      // Cornea SAM2 = 3 plane passes + a 3D fuse (~0→80%); the chained scar phase is ~85%; done = 100%.
+      const PHASE_PCT: Record<string, number> = { start: 3, axial: 12, coronal: 35, sagittal: 58, fuse: 78 };
       const poll = setInterval(() => {
         api.json<{ phase: string; message: string }>(`/api/case/${caseId}/segment/sam2/status`)
           .then((p) => {
             if (!stillHere() || !p?.message) return;
             if (p.phase === "idle" || p.phase === "done" || p.phase === "error") return;
+            const pct = PHASE_PCT[p.phase];
+            const detail = pct != null ? `${p.message} · ${pct}%` : p.message;
             // Keyed on sam2RunningCaseId (not segBusy) so reopening the still-running case resumes the live
             // progress text even though the case switch cleared the global segBusy (#8).
-            set((s) => { if (s.sam2RunningCaseId === caseId) s.status = { kind: "working", title: "Running SAM2", detail: p.message }; });
+            set((s) => { if (s.sam2RunningCaseId === caseId) s.status = { kind: "working", title: "Running SAM2", detail }; });
           })
           .catch(() => undefined);
       }, 1200);
@@ -308,7 +321,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         // (cornea-vs-scar); a control runs cornea only. A scar failure must NOT blank the saved cornea.
         let scarRan = false;
         if (isScar) {
-          if (stillHere()) set((s) => { s.status = { kind: "working", title: "Detecting scar", detail: "Flagging hyper-reflective tissue inside the cornea…" }; });
+          if (stillHere()) set((s) => { s.status = { kind: "working", title: "Running SAM2", detail: "Detecting scar inside the cornea (cornea vs scar)… · 85%" }; });
           try {
             const pct = Math.min(99, Math.max(60, 100 - get().scarSensitivity));
             await api.json(`/api/case/${caseId}/scar/auto`, "POST", JSON.stringify({ percentile: pct, method: get().scarMethod }));

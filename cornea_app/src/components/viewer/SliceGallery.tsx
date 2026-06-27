@@ -27,11 +27,12 @@ const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 // VolumeCanvas), `fixCols` auto-enters column-marking and hides this panel's own duplicate toggles
 // (group/orient/before-after/contrast/blur/scar) — orientation + display filter come from props so the
 // ONE top toolbar drives them. Called with NO props on the no-WebGL fallback path (unchanged behaviour).
-export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw = false }: {
+export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw = false, readOnly = false }: {
   fixCols?: boolean;
   orientProp?: "axial" | "coronal" | "sagittal";
   filterCss?: string;
   showRaw?: boolean; // fix-cols: show the raw "before" beside the markable corrected "after"
+  readOnly?: boolean; // inspecting an earlier (completed) step → view only; no border edits until rollback
 } = {}) {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
@@ -534,8 +535,9 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
     if (cutMode) return;   // cut-line elements own their pointerdown; an empty-area press does nothing here
-    // middle-button OR shift+left = PAN (so you can move around while zoomed); plain left = edit the border
-    const mode: "edit" | "pan" = (e.button === 1 || e.shiftKey) ? "pan" : "edit";
+    // middle-button OR shift+left = PAN (so you can move around while zoomed); plain left = edit the border.
+    // readOnly (inspecting an earlier completed step) → PAN only; the border can't be edited until rollback.
+    const mode: "edit" | "pan" = (readOnly || e.button === 1 || e.shiftKey) ? "pan" : "edit";
     borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode };
   };
   const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -826,7 +828,8 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
     : [];
 
   // ── 2D scar brush (paint cornea→scar / erase scar→cornea on the current slice) ──
-  const editing = scarEditMode && !!cur && !scarBusy;
+  // readOnly (inspecting an earlier completed step) blocks the brush — roll back to edit.
+  const editing = scarEditMode && !!cur && !scarBusy && !readOnly;
 
   useEffect(() => {
     const img = imgRef.current, cv = canvasRef.current;
@@ -1054,6 +1057,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
         {cutMode && (() => {
           const topY = cut.top, leftX = cut.left, rightX = cut.right > 0 ? cut.right : nFrames - 1;
           const onCut = (which: "top" | "left" | "right") => (e: React.PointerEvent) => {
+            if (readOnly) return;   // inspecting an earlier step → cut lines are view-only until rollback
             // capture on the stable SVG (not the line, which React recreates on setCut → would drop capture)
             e.stopPropagation(); (e.currentTarget as Element).closest("svg")?.setPointerCapture?.(e.pointerId);
             cutDragRef.current = which;
@@ -1227,15 +1231,15 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                 </>
               ) : (
               <>
-                {(() => { const dirty = borderMode === "parabola" ? paraCount > 0 : (anchorCount > 0 || anchorsDirty); return dirty ? (
-                  <button onClick={() => { if (borderMode === "parabola") setParaAnchors(new Map()); else setBorderAnchors(new Map()); }} disabled={redetectBusy || rerunBusy}
+                {(() => { const dirty = borderMode === "parabola" ? paraCount > 0 : (anchorCount > 0 || anchorsDirty); return dirty && !readOnly ? (
+                  <button onClick={() => { if (borderMode === "parabola") setParaAnchors(new Map()); else setBorderAnchors(new Map()); }} disabled={redetectBusy || rerunBusy || readOnly}
                     style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
                     Clear
                   </button>
                 ) : null; })()}
                 {(() => { const dirty = borderMode === "parabola" ? paraCount > 0 : anchorsDirty; return (
-                  <button onClick={confirmRedetect} disabled={redetectBusy || rerunBusy || !dirty}
-                    title={borderMode === "parabola" ? "Apply the shaped parabola — then scrub to verify" : "Re-detect the corneal border locally around your correction — then scrub to verify"}
+                  <button onClick={confirmRedetect} disabled={redetectBusy || rerunBusy || !dirty || readOnly}
+                    title={readOnly ? "Inspecting an earlier step — roll back to it to edit" : borderMode === "parabola" ? "Apply the shaped parabola — then scrub to verify" : "Re-detect the corneal border locally around your correction — then scrub to verify"}
                     style={{ background: dirty ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (redetectBusy || rerunBusy || !dirty) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (redetectBusy || rerunBusy || !dirty) ? 0.6 : 1 }}>
                     {redetectBusy ? "Applying…" : "Confirm border"}
                   </button>
@@ -1246,8 +1250,8 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                   // prevents enabling Run after a Clear+Confirm revert-to-auto (empty anchors → backend 400).
                   const ready = !anchorsDirty && paraCount === 0 && persistedAnchors.size > 0;
                   return (
-                    <button onClick={rerunColumns} disabled={rerunBusy || redetectBusy || !ready}
-                      title={(anchorsDirty || paraCount > 0) ? "Confirm your changes first, then scrub to verify" : "Run preprocessing with the corrected border — only when you're satisfied"}
+                    <button onClick={rerunColumns} disabled={rerunBusy || redetectBusy || !ready || readOnly}
+                      title={readOnly ? "Inspecting an earlier step — roll back to it to edit" : (anchorsDirty || paraCount > 0) ? "Confirm your changes first, then scrub to verify" : "Run preprocessing with the corrected border — only when you're satisfied"}
                       style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (rerunBusy || redetectBusy || !ready) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (rerunBusy || redetectBusy || !ready) ? 0.6 : 1 }}>
                       {rerunBusy ? "Running…" : "Run preprocessing"}
                     </button>
@@ -1266,7 +1270,7 @@ export function SliceGallery({ fixCols = false, orientProp, filterCss, showRaw =
                 {(() => {
                   const ready = badCols.size > 0 || shiftsDirty;
                   return (
-                    <button onClick={rerunColumns} disabled={rerunBusy || !ready}
+                    <button onClick={rerunColumns} disabled={rerunBusy || !ready || readOnly}
                       style={{ background: ready ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: rerunBusy || !ready ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: rerunBusy || !ready ? 0.6 : 1 }}>
                       {rerunBusy ? "Re-running…" : (passCount > 1 && fixPass && badCols.size > 0 ? `Re-run (fix at pass ${fixPass})` : "Re-run preprocessing")}
                     </button>

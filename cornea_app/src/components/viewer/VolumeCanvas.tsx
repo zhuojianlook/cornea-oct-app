@@ -6,6 +6,7 @@ import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, type ViewName } from "../../niivue/nvController";
+import { scanStep } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
@@ -25,6 +26,14 @@ export function VolumeCanvas() {
   const gtViewerName = useWorkflowStore((s) => s.gtViewerName);
   const gtViewerClass = useWorkflowStore((s) => s.gtViewerClass);
   const wfSet = useWorkflowStore((s) => s.set);
+  // #2/#3: the timeline step being viewed drives which viewer tools are available. The preprocessing tools
+  // (Before/after, Fix-columns, Steps) belong to the Auto→Vetted steps (2–3); from Classified (4) on, the
+  // viewer is Slices/Segmentation. Inspecting an earlier step is read-only (no border edits until rollback).
+  const selectedStep = useWorkflowStore((s) => s.selectedStep);
+  const manifestStep = scanStep((caseInfo?.manifest ?? null) as Record<string, unknown> | null);
+  const effStep = selectedStep ?? manifestStep;
+  const inspecting = selectedStep != null && selectedStep < manifestStep;
+  const preprocStep = effStep >= 1 && effStep <= 3;   // Raw/Auto/Vetted → preprocessing tools belong here
   const correcting = useWorkflowStore((s) => s.correcting);
   const stage = useWorkflowStore((s) => s.stage);
   const segLoaded = useWorkflowStore((s) => s.segLoaded);
@@ -142,6 +151,13 @@ export function VolumeCanvas() {
     return () => { cancelled = true; };
   }, [caseInfo?.case_id, volumeUrl]);
 
+  // #2/#3: when the VIEWED step is no longer a preprocessing step (e.g. after SAM2 advances it to 5, or
+  // the user inspects Classified+), close the preprocessing overlays so the niivue Slices/Segmentation
+  // view shows. (Fixes "after SAM2 the user is still in Fix-columns and can't see the segmentation".)
+  useEffect(() => {
+    if (!preprocStep) { setCompareView(false); setFixColsView(false); setStepsView(false); }
+  }, [preprocStep]);
+
   // Leave the comparison / fix-columns / steps overlays when switching to a different case, and reset the
   // overlay toggle to SLICES (segmentation is opt-in per scan; it's greyed until that scan has SAM2).
   useEffect(() => { setCompareView(false); setFixColsView(false); setStepsView(false); wfSet("showSegmentation", false); }, [caseInfo?.case_id]);
@@ -190,7 +206,7 @@ export function VolumeCanvas() {
           3D viewer needs WebGL2 (unavailable here) — showing 2D slices instead.
         </div>
         <div className="flex-1 min-h-0">
-          <SliceGallery />
+          <SliceGallery readOnly={inspecting} />
         </div>
       </div>
     );
@@ -244,7 +260,7 @@ export function VolumeCanvas() {
           reset
         </button>
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
-        {hasRaw && (
+        {hasRaw && preprocStep && (
           <ToggleButton
             size="small"
             value="ba"
@@ -262,7 +278,7 @@ export function VolumeCanvas() {
             ⇆ Before/after
           </ToggleButton>
         )}
-        {hasRaw && (
+        {hasRaw && preprocStep && (
           <ToggleButton
             size="small"
             value="fix"
@@ -280,7 +296,7 @@ export function VolumeCanvas() {
             ▥ Fix columns
           </ToggleButton>
         )}
-        {hasRaw && (
+        {hasRaw && preprocStep && (
           <ToggleButton
             size="small"
             value="steps"
@@ -346,7 +362,7 @@ export function VolumeCanvas() {
         )}
         {fixColsView && volumeUrl && (
           <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
-            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} />
+            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting} />
           </div>
         )}
         {stepsView && volumeUrl && (

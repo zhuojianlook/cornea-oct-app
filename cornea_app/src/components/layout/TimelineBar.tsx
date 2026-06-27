@@ -18,6 +18,8 @@ export function TimelineBar() {
   const scarMethod = useWorkflowStore((s) => s.scarMethod);
   const runSam2 = useWorkflowStore((s) => s.runSam2);
   const sam2RunningCaseId = useWorkflowStore((s) => s.sam2RunningCaseId);
+  const selectedStep = useWorkflowStore((s) => s.selectedStep);
+  const selectStep = useWorkflowStore((s) => s.selectStep);
   const buildEyeConsensus = useWorkflowStore((s) => s.buildEyeConsensus);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
@@ -32,6 +34,7 @@ export function TimelineBar() {
   const hintCount = useWorkflowStore((s) => s.scarHints?.length ?? 0);
   const applyScarHints = useWorkflowStore((s) => s.applyScarHints);
   const clearScarHints = useWorkflowStore((s) => s.clearScarHints);
+  const status = useWorkflowStore((s) => s.status);
 
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
@@ -47,33 +50,40 @@ export function TimelineBar() {
   const busy = segBusy || scarBusy;
   const step: LifecycleStep = scanStep(manifest);
   const maxStep = LIFECYCLE_STEPS.length - 1;   // 8
+  // Which step is being VIEWED, and whether that's an inspect (earlier, read-only) vs the live step.
+  const viewStep = (selectedStep ?? step) as LifecycleStep;
+  const inspecting = selectedStep != null && selectedStep < step;
 
-  // #9 step regression: which step the user clicked to roll back to (confirm modal).
+  // #9 step regression: which step the user chose to roll back to (confirm modal); set by the inspect-mode
+  // "Roll back to this step" button (NOT by merely clicking a step — clicking just inspects it).
   const [resetTo, setResetTo] = useState<number | null>(null);
   const downstream = resetTo != null ? LIFECYCLE_STEPS.slice(resetTo + 1, step + 1).map((x) => x.short) : [];
 
-  // ── the step strip (click a reached EARLIER step to roll back to it) ──────────
+  // ── the step strip: click a REACHED step to VIEW it (earlier = inspect read-only; current = back to live) ──
   const strip = (
     <div className="flex items-center gap-1">
       {([1, 2, 3, 4, 5, 6, 7, 8] as LifecycleStep[]).map((i) => {
         const reached = stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
-        // Roll back to a reached EARLIER step. Not to Raw (i>=2 — the working volume is the preprocessed
-        // file, so "Raw" can't be shown). A built consensus case can't be reset (rebuild it instead).
-        const canReset = reached && i >= 2 && i < step && !busy && !correcting && !!caseInfo && !isConsensus;
+        const viewing = viewStep === i;
+        // Any reached step is clickable to inspect; NOT while a correction is in progress (switching the
+        // action bar to inspect would strip Save/Undo/Cancel and leave the niivue pen live); a consensus
+        // case isn't step-navigable.
+        const canView = reached && !!caseInfo && !isConsensus && !correcting;
         const meta = LIFECYCLE_STEPS[i];
         return (
           <div key={i} className="flex items-center gap-1"
-            title={canReset ? `Roll back to “${meta.short}” — clears the later steps` : meta.label}>
-            <span onClick={() => canReset && setResetTo(i)} style={{
+            title={canView ? (current ? `“${meta.short}” (current step)` : `Inspect “${meta.short}” (read-only; roll back to edit)`) : meta.label}>
+            <span onClick={() => canView && selectStep(i === step ? null : i)} style={{
               display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, lineHeight: 1,
               padding: "3px 7px", borderRadius: 11, whiteSpace: "nowrap",
               background: reached ? meta.color : "var(--c-surface2)",
               color: reached ? "#08121f" : "var(--c-text-dim)",
               fontWeight: current ? 700 : 500,
-              outline: current ? "2px solid #fff" : "none", outlineOffset: -1,
+              // solid white outline = the LIVE current step; dashed = the step you're inspecting.
+              outline: current ? "2px solid #fff" : (viewing ? "2px dashed #fff" : "none"), outlineOffset: -1,
               opacity: reached ? 1 : 0.7,
-              cursor: canReset ? "pointer" : "default",
+              cursor: canView ? "pointer" : "default",
             }}>
               <b style={{ opacity: 0.7 }}>{i}</b>{meta.short}
             </span>
@@ -158,9 +168,27 @@ export function TimelineBar() {
 
   const sep = <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />;
 
-  // ── actions for the CURRENT step ──
+  // ── actions ──
   let actions: React.ReactNode = null;
-  if (step <= 1) {
+  if (inspecting) {
+    // Viewing an earlier completed step: its own tools show in the viewer (read-only). Consequential
+    // edits are disabled until the user explicitly rolls back to it (which clears the later steps).
+    const vm = LIFECYCLE_STEPS[viewStep];
+    actions = (
+      <>
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
+          Inspecting <b style={{ color: vm.color }}>{vm.short}</b> (read-only) ·
+        </span>
+        <Button size="small" variant="contained" color="warning" disabled={busy || correcting} onClick={() => setResetTo(viewStep)}
+          title={`Roll back to “${vm.short}” to edit it — this clears the later steps.`}>
+          ↩ Roll back to this step to edit
+        </Button>
+        <Button size="small" variant="text" disabled={busy} onClick={() => selectStep(null)} title="Return to the current step">
+          ✕ Back to current ({LIFECYCLE_STEPS[step].short})
+        </Button>
+      </>
+    );
+  } else if (step <= 1) {
     actions = <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Preprocess this scan in the sidebar ← to begin.</span>;
   } else if (step === 2) {
     actions = (
@@ -234,7 +262,12 @@ export function TimelineBar() {
       <span style={{ width: 1, height: 26, background: "var(--c-border)" }} />
       <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
       <div className="flex-1" />
-      {busy && <CircularProgress size={16} />}
+      {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
+      {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
+        <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+          title={status.detail}>{status.detail}</span>
+      )}
+      {(busy || !!sam2RunningCaseId) && <CircularProgress size={16} />}
 
       <Dialog open={resetTo != null} onClose={() => setResetTo(null)}>
         <DialogTitle sx={{ fontSize: 16 }}>
@@ -243,12 +276,12 @@ export function TimelineBar() {
         <DialogContent sx={{ fontSize: 13 }}>
           This resets the later steps so you can redo them: <b>{downstream.join(" · ") || "(none)"}</b>.
           <br />
-          The scan's files are kept on disk — re-running a step overwrites its result. You can re-advance afterwards.
+          The segmentation for those steps is dropped (re-running re-creates it); the preprocessed volume is kept.
         </DialogContent>
         <DialogActions>
           <Button size="small" onClick={() => setResetTo(null)}>Cancel</Button>
           <Button size="small" variant="contained" color="warning"
-            onClick={() => { const s = resetTo; setResetTo(null); if (s != null) resetStep(s); }}>
+            onClick={() => { const s = resetTo; setResetTo(null); selectStep(null); if (s != null) resetStep(s); }}>
             Reset to step {resetTo}
           </Button>
         </DialogActions>
