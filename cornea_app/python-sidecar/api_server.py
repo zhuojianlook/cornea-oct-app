@@ -1503,6 +1503,82 @@ def _eye_replicates(case_id: str) -> tuple[list[str], dict]:
     return members, {"patient": pid, "eye": eye, "subgroup": sub}
 
 
+def _eye_all_segmented(case_id: str) -> tuple[list[str], dict]:
+    """ALL cornea-segmented SCAR scans of this scan's eye (same patient + eye, ANY subgroup, not a consensus
+    case, NOT a control) — the candidate pool for AUTOMATIC subgroup assignment, which DECIDES the subgroups
+    and so must not pre-filter by the current subgroup. CONTROLS are excluded: they carry no scar, so they'd
+    cluster as meaningless empty singletons (subgrouping is about lesions). Active scan first (overlay ref)."""
+    pid, eye, _sub = _case_identity(case_id)
+    members: list[str] = []
+    if pid and eye and settings.CASES_ROOT.exists():
+        for d in sorted(settings.CASES_ROOT.iterdir()):
+            if not d.is_dir():
+                continue
+            cid = d.name
+            mm = orch.read_manifest(cid)
+            if mm.get("consensus_cases"):
+                continue
+            if str(mm.get("scar_classification") or "").strip().lower() == "control":
+                continue
+            p2, e2, _ = _case_identity(cid)
+            if (p2, e2) != (pid, eye):
+                continue
+            arr, _ = labels.best_labelmap_nnunet(cid)
+            if arr is not None:
+                members.append(cid)
+    if case_id not in members:
+        members.insert(0, case_id)
+    else:
+        members = [case_id] + [c for c in members if c != case_id]
+    return members, {"patient": pid, "eye": eye}
+
+
+@app.post("/api/case/{case_id}/subgroup/auto")
+def subgroup_auto(case_id: str, req: SubgroupAutoRequest) -> dict:
+    """AUTO-ASSIGN subgroups for this scan's eye by PURE bright-spot (hysteresis scar) alignment: cluster the
+    eye's cornea-segmented scans so the SAME lesion's replicates group together and a different/displaced lesion
+    splits off (subgroup.auto_subgroups), plus an en-face OVERLAY (coloured by proposed subgroup) to verify.
+    READ-ONLY — proposes only; the user applies via /subgroup/auto/apply. CPU (SimpleITK), no GPU."""
+    import subgroup as sg
+    members, key = _eye_all_segmented(case_id)
+    if len(members) < 2:
+        raise HTTPException(400, f"Need ≥2 cornea-segmented scans of this eye to auto-assign subgroups (found "
+                                 f"{len(members)}). Run SAM2 cornea on the eye's other repeats first.")
+    try:
+        res = sg.auto_subgroups(members, req.params)
+        res["overlay"] = sg.overlay_png(members, res.get("subgroups") or {}, req.params)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    res["patient"] = key["patient"]; res["eye"] = key["eye"]
+    return res
+
+
+@app.post("/api/case/{case_id}/subgroup/auto/apply")
+def subgroup_auto_apply(case_id: str, req: SubgroupApplyRequest) -> dict:
+    """Persist the user-verified auto subgroup labels: write scar_subgroup for each scan in `assignments`
+    ({case_id: label}). Optionally confirm the ACTIVE scan's subgroup so the timeline advances. The members
+    are all the same eye (from /subgroup/auto), so this only relabels that eye's scans."""
+    # SAFETY: only relabel scans that ARE this eye's auto-subgroup members — never write to arbitrary cases an
+    # untrusted/stale `assignments` map might name (the only mutating path in the feature).
+    allowed, _key = _eye_all_segmented(case_id)
+    allowed_set = set(allowed)
+    written, rejected = {}, []
+    for cid, lab in (req.assignments or {}).items():
+        c = orch.safe_case_id(cid)
+        if c not in allowed_set or not orch.case_root(c).exists():
+            rejected.append(cid)
+            continue
+        sub = str(lab).strip() or "1"
+        upd = {"scar_subgroup": sub}
+        # The user verified the WHOLE grouping, so confirm each member — but ONLY one that has finished the scar
+        # step (scar_done): confirming a scar-pending member would jump it past step 6 into align with no scar.
+        if req.confirm and bool(orch.read_manifest(c).get("scar_done")):
+            upd["subgroup_confirmed"] = True
+        orch.write_manifest_value(c, upd)
+        written[c] = sub
+    return {"ok": True, "written": written, "rejected": rejected, "confirmed": bool(req.confirm)}
+
+
 @app.post("/api/case/{case_id}/align-replicates")
 def align_replicates(case_id: str) -> dict:
     """STEP 7 — ALIGN this eye+subgroup's segmented replicates into one consensus using their scar AS-IS
@@ -1560,6 +1636,15 @@ def normalize_consensus(case_id: str) -> dict:
 class CompareStrategiesRequest(BaseModel):
     strategies: List[str] | None = None    # None = all production strategies
     phi_percentile: float = 92.0           # benchmark-validated operating point
+
+
+class SubgroupAutoRequest(BaseModel):
+    params: dict | None = None             # optional subgroup.DEFAULT overrides (tolerances/threshold)
+
+
+class SubgroupApplyRequest(BaseModel):
+    assignments: dict                      # {case_id: subgroup_label} to persist (the user-verified grouping)
+    confirm: bool | None = None            # also confirm the active scan's subgroup (advance the timeline)
 
 
 @app.post("/api/case/{case_id}/compare-strategies")

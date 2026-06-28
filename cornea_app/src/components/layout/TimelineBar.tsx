@@ -24,6 +24,10 @@ export function TimelineBar() {
   const normalizeConsensus = useWorkflowStore((s) => s.normalizeConsensus);
   const compareStrategies = useWorkflowStore((s) => s.compareStrategies);
   const strategyComparison = useWorkflowStore((s) => s.strategyComparison);
+  const autoSubgroups = useWorkflowStore((s) => s.autoSubgroups);
+  const applySubgroups = useWorkflowStore((s) => s.applySubgroups);
+  const subgroupProposal = useWorkflowStore((s) => s.subgroupProposal);
+  const subgroupBusy = useWorkflowStore((s) => s.subgroupBusy);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
@@ -68,6 +72,17 @@ export function TimelineBar() {
   useEffect(() => { setSubInput(subgroup); }, [caseInfo?.case_id, subgroup]);
   // Strategy-comparison results dialog (publication).
   const [showCompare, setShowCompare] = useState(false);
+  // Auto subgroup-assignment dialog (bright-spot alignment + overlay → editable grouping → apply).
+  const [showSubgroup, setShowSubgroup] = useState(false);
+  const [editAssign, setEditAssign] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (subgroupProposal) {
+      setEditAssign(Object.fromEntries(Object.entries(subgroupProposal.subgroups).map(([k, v]) => [k, String(v)])));
+    }
+  }, [subgroupProposal]);
+  // Subgroup swatch colours — must mirror subgroup._SUBGROUP_RGB so the table legend matches the overlay.
+  const SUBGROUP_RGB = ["#ff5050", "#5ac86e", "#5a96ff", "#ebc846", "#d26eeb", "#5adcdc"];
+  const subColor = (label: string) => SUBGROUP_RGB[(Math.max(1, parseInt(label || "1", 10) || 1) - 1) % SUBGROUP_RGB.length];
   const CMP_COLS: { key: keyof NonNullable<typeof strategyComparison>["rows"][number]; label: string }[] = [
     { key: "strategy", label: "Strategy" },
     { key: "mean_pairwise_dice", label: "Pairwise Dice ↑" },
@@ -345,6 +360,16 @@ export function TimelineBar() {
           ⚖ Compare strategies
         </Button>
       )}
+      {/* AUTO SUBGROUP assignment: cluster this eye's repeat scans by aligning their hysteresis bright spots
+          (robust to partial scar cutoff), with an overlay to verify. Needs ≥2 cornea-segmented scans (the
+          endpoint 400s otherwise). Per-scan workflow (not for a built consensus). */}
+      {caseInfo && step >= 5 && !isConsensus && (
+        <Button size="small" variant="outlined" color="secondary" disabled={busy || subgroupBusy || correcting}
+          onClick={() => { setShowSubgroup(true); autoSubgroups(); }}
+          title="Automatically group this eye's repeat scans into subgroups by aligning their hysteresis bright spots (each lesion's replicates cluster together; a displaced lesion splits off), with an overlay to verify before applying.">
+          ⊞ Auto subgroups
+        </Button>
+      )}
       {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
       {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
         <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
@@ -390,6 +415,74 @@ export function TimelineBar() {
         <DialogActions>
           <Button size="small" disabled={!strategyComparison} onClick={downloadComparisonCsv}>⤓ Download CSV</Button>
           <Button size="small" variant="contained" onClick={() => setShowCompare(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* AUTO SUBGROUP assignment: overlay + editable proposed grouping. */}
+      <Dialog open={showSubgroup} onClose={() => setShowSubgroup(false)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ fontSize: 16 }}>Auto subgroup assignment (bright-spot alignment)</DialogTitle>
+        <DialogContent sx={{ fontSize: 13 }}>
+          {!subgroupProposal && subgroupBusy && (
+            <div className="flex items-center gap-2 py-4"><CircularProgress size={18} /> Aligning hysteresis bright spots across the eye's scans…</div>
+          )}
+          {!subgroupProposal && !subgroupBusy && (
+            <div className="py-4 text-sm" style={{ color: status.kind === "error" ? "var(--c-red)" : "var(--c-text-dim)" }}>
+              {status.kind === "error" ? status.detail : "Need ≥2 cornea-segmented scar scans of this eye to auto-assign subgroups."}
+            </div>
+          )}
+          {subgroupProposal && (
+            <>
+              <div className="text-xs mb-2" style={{ color: "var(--c-text-dim)" }}>
+                {subgroupProposal.members.length} scans → <b>{subgroupProposal.n_subgroups}</b> proposed subgroup(s)
+                {subgroupProposal.patient ? ` · ${String(subgroupProposal.patient).toUpperCase()} ${String(subgroupProposal.eye).toUpperCase()}` : ""}.
+                Overlay = each scan's scar footprint in a common cornea frame, coloured by proposed subgroup: same
+                lesion piles up (white where replicates agree); a displaced lesion shows its colour apart. Edit a
+                label if the grouping is wrong, then Apply.
+              </div>
+              {subgroupProposal.overlay && (
+                <img src={subgroupProposal.overlay} alt="subgroup overlay"
+                  style={{ display: "block", width: "100%", maxHeight: 220, objectFit: "contain", imageRendering: "pixelated",
+                           border: "1px solid var(--c-border)", borderRadius: 4, marginBottom: 8, background: "#000" }} />
+              )}
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr>{["scan", "scar mm³", "blobs", "subgroup"].map((h, i) => (
+                    <th key={h} style={{ textAlign: i === 0 ? "left" : i === 3 ? "left" : "right", padding: "4px 8px",
+                      borderBottom: "1px solid var(--c-border)", color: "var(--c-text-dim)" }}>{h}</th>
+                  ))}</tr>
+                </thead>
+                <tbody>
+                  {subgroupProposal.members.map((cid) => {
+                    const b = subgroupProposal.blobs[cid] || { scar_mm3: 0, n_blobs: 0 };
+                    const lab = editAssign[cid] ?? String(subgroupProposal.subgroups[cid] ?? 1);
+                    return (
+                      <tr key={cid}>
+                        <td style={{ padding: "4px 8px", borderBottom: "1px solid var(--c-border)", fontWeight: 600 }}>{cid.split("_").pop()}</td>
+                        <td style={{ textAlign: "right", padding: "4px 8px", borderBottom: "1px solid var(--c-border)" }}>{b.scar_mm3?.toFixed?.(3) ?? "—"}</td>
+                        <td style={{ textAlign: "right", padding: "4px 8px", borderBottom: "1px solid var(--c-border)" }}>{b.n_blobs}</td>
+                        <td style={{ padding: "4px 8px", borderBottom: "1px solid var(--c-border)" }}>
+                          <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, marginRight: 6, background: subColor(lab), verticalAlign: "middle" }} />
+                          <input value={lab} onChange={(e) => setEditAssign((m) => ({ ...m, [cid]: e.target.value }))}
+                            style={{ width: 54, fontSize: 12, padding: "2px 4px", background: "var(--c-surface2)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 3 }} />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div className="text-[11px] mt-2" style={{ color: "var(--c-text-dim)" }}>
+                pairwise: {subgroupProposal.pairs.map((p) => `${p.a.split("_").pop()}~${p.b.split("_").pop()} sim=${p.sim} (Δ=${p.centroid_dist_mm ?? "∞"}mm)`).join("  ·  ")}
+              </div>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button size="small" disabled={subgroupBusy} onClick={() => autoSubgroups()}>↻ Re-run</Button>
+          <Button size="small" variant="contained" disabled={!subgroupProposal || subgroupBusy}
+            onClick={async () => { await applySubgroups(editAssign); setShowSubgroup(false); }}>
+            Apply &amp; confirm
+          </Button>
+          <Button size="small" onClick={() => setShowSubgroup(false)}>Close</Button>
         </DialogActions>
       </Dialog>
 

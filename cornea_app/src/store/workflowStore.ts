@@ -56,6 +56,18 @@ export interface StrategyComparison {
   rows: StrategyRow[]; members: string[]; n: number; phi_percentile: number; reference?: string; subgroup?: string;
 }
 
+export interface SubgroupPair { a: string; b: string; dice: number; centroid_dist_mm: number | null; sim: number; }
+export interface SubgroupProposal {
+  members: string[];
+  subgroups: Record<string, number>;          // case_id → proposed subgroup label (1..k)
+  n_subgroups: number;
+  similarity: number[][];
+  pairs: SubgroupPair[];
+  blobs: Record<string, { n_blobs: number; scar_mm3: number; empty: boolean }>;
+  overlay?: string;                            // base64 en-face overlay PNG (coloured by subgroup)
+  patient?: string; eye?: string;
+}
+
 export type StatusKind = "idle" | "working" | "done" | "error";
 export interface WorkflowStatus {
   kind: StatusKind;
@@ -95,6 +107,8 @@ interface WorkflowState {
   scarMethod: string; // scar strategy: hysteresis | normal_anchor | robust_mad | morph_lcc | brightness
   scarSummaryInfo: string | null;
   strategyComparison: StrategyComparison | null;   // last per-strategy reproducibility comparison
+  subgroupProposal: SubgroupProposal | null;       // last auto subgroup-assignment proposal (bright-spot)
+  subgroupBusy: boolean;
 
   // SAM2 scar hints (click to guide)
   hintMode: boolean;
@@ -144,6 +158,8 @@ interface WorkflowState {
   alignReplicates: () => Promise<void>;
   normalizeConsensus: () => Promise<void>;
   compareStrategies: () => Promise<void>;
+  autoSubgroups: () => Promise<void>;
+  applySubgroups: (assignments: Record<string, string>) => Promise<void>;
   loadCorrectionLayer: () => Promise<void>;
   saveCorrection: () => Promise<void>;
   cancelCorrection: () => Promise<void>;
@@ -189,6 +205,8 @@ export const useWorkflowStore = create<WorkflowState>()(
     scarMethod: "hysteresis",
     scarSummaryInfo: null,
     strategyComparison: null,
+    subgroupProposal: null,
+    subgroupBusy: false,
 
     hintMode: false,
     hintPositive: true,
@@ -240,6 +258,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.scarMetrics = null;
         s.scarSummaryInfo = null;
         s.strategyComparison = null;
+        s.subgroupProposal = null;
         s.correcting = false;
         s.hintMode = false;
         s.scarHints = [];
@@ -440,6 +459,46 @@ export const useWorkflowStore = create<WorkflowState>()(
         set((s) => { s.status = { kind: "error", title: "Comparison failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
         set((s) => { s.scarBusy = false; });
+      }
+    },
+    autoSubgroups: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => {
+        s.subgroupBusy = true; s.subgroupProposal = null;
+        s.status = { kind: "working", title: "Auto-assigning subgroups",
+          detail: "Aligning each scan's hysteresis bright spots across the eye's replicates (pure bright-spot fit) and clustering by lesion — robust to partial scar cutoff." };
+      });
+      try {
+        const r = await api.json<SubgroupProposal>(`/api/case/${caseId}/subgroup/auto`, "POST", JSON.stringify({}));
+        if (useCaseStore.getState().caseId !== caseId) return;
+        set((s) => {
+          s.subgroupProposal = r;
+          s.status = { kind: "done", title: "Subgroup proposal ready",
+            detail: `${r.members.length} scans → ${r.n_subgroups} subgroup(s). Verify the overlay, then Apply.` };
+        });
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Auto-subgroup failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.subgroupBusy = false; });
+      }
+    },
+    applySubgroups: async (assignments) => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => { s.subgroupBusy = true; });
+      try {
+        await api.json(`/api/case/${caseId}/subgroup/auto/apply`, "POST",
+          JSON.stringify({ assignments, confirm: true }));
+        set((s) => {
+          s.subgroupProposal = null;
+          s.status = { kind: "done", title: "Subgroups applied", detail: "Each scan's subgroup was set; the active scan is confirmed." };
+        });
+        await useCaseStore.getState().openCase();   // refresh manifest (scar_subgroup / subgroup_confirmed)
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Apply failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.subgroupBusy = false; });
       }
     },
 
