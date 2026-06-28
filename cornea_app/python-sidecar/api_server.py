@@ -1545,8 +1545,7 @@ def subgroup_auto(case_id: str, req: SubgroupAutoRequest) -> dict:
         raise HTTPException(400, f"Need ≥2 cornea-segmented scans of this eye to auto-assign subgroups (found "
                                  f"{len(members)}). Run SAM2 cornea on the eye's other repeats first.")
     try:
-        res = sg.auto_subgroups(members, req.params)
-        res["overlay"] = sg.overlay_png(members, res.get("subgroups") or {}, req.params)
+        res = sg.auto_subgroups(members, req.params)   # includes the cornea-aligned en-face overlay
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     res["patient"] = key["patient"]; res["eye"] = key["eye"]
