@@ -492,7 +492,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           JSON.stringify({ assignments, confirm: true }));
         set((s) => {
           s.subgroupProposal = null;
-          s.status = { kind: "done", title: "Subgroups applied", detail: "Each scan's subgroup was set; the active scan is confirmed." };
+          s.status = { kind: "done", title: "Subgroups applied", detail: "Each scan's subgroup was set; members that have finished the scar step were confirmed." };
         });
         await useCaseStore.getState().openCase();   // refresh manifest (scar_subgroup / subgroup_confirmed)
       } catch (e) {

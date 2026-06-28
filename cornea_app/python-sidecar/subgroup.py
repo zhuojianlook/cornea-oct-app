@@ -33,32 +33,21 @@ import registration as reg
 DEFAULT = {
     "phi_percentile": 92.0,
     "min_blob_mm3": 0.02,     # drop hysteresis noise specks (real scar dominant blob is ~1-2 mm³)
-    "centroid_tol_mm": 0.5,   # bright-spot centroid distance (mm) at which the magnitude gate = 0.5 (replicate
-                              # jitter ~0.2 mm << this << a different-lesion separation of mm-scale)
+    "centroid_tol_mm": 0.4,   # relative-centroid distance (mm) at which the gate = 0.5 (replicate jitter ~0.1-
+                              # 0.36 mm validated << this << a different-lesion mm-scale separation). 0.4 keeps a
+                              # clear margin from link_threshold so a high single-blob Dice can't merge at the boundary.
+    "centroid_hardsplit_mm": 0.8,  # beyond this relative-centroid distance → DIFFERENT lesion, sim forced 0 (the
+                              # cornea-ignored config Dice can't override a clearly-displaced lesion)
     "link_threshold": 0.45,   # two scans are same-subgroup when gated similarity ≥ this (single-link cluster)
     "smooth_mm": 0.12,        # gaussian on the mask for a continuous registration metric
+    "gate_cornea_frame": True,  # gate on the scar centroid RELATIVE TO the scan's own CORNEA centroid (scar
+                              # position within the cornea) — removes between-scan EYE MOTION (cornea+scar shift
+                              # together), registration-free. False = raw native scar-centroid distance.
 }
 
 
 def _vol(cid: str) -> Path:
     return orch.case_root(cid) / "previews" / "volume.nii.gz"
-
-
-def _scar_mask_np(cid: str, phi: float, min_mm3: float):
-    """Hysteresis bright-spot mask (nibabel i,j,k order) with noise specks removed, + (n_blobs, total_mm3)."""
-    lab = np.rint(np.asarray(nib.load(str(label_mod.corrected_path(cid))).dataobj)).astype(np.uint8)
-    vol = np.asarray(nib.load(str(_vol(cid))).dataobj).astype(np.float32)
-    scar = np.asarray(scar_mod.detect_scar_hysteresis(vol, lab, phi_percentile=phi)) & ((lab == 1) | (lab == 2))
-    img = sitk.ReadImage(str(_vol(cid))); sp = img.GetSpacing(); vmm3 = sp[0] * sp[1] * sp[2]
-    lbl, n = ndimage.label(scar)
-    if n:
-        sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
-        keep = [i + 1 for i, s in enumerate(sizes) if s * vmm3 >= min_mm3]
-        scar = np.isin(lbl, keep) if keep else np.zeros_like(scar)
-        n_keep = len(keep)
-    else:
-        n_keep = 0
-    return scar.astype(np.uint8), n_keep, float(scar.sum()) * vmm3
 
 
 def _to_sitk_mask(mask_np: np.ndarray, cid: str, tmpd: Path) -> sitk.Image:
@@ -73,17 +62,6 @@ def _dice(a: sitk.Image, b: sitk.Image) -> float:
     aa = sitk.GetArrayViewFromImage(a).astype(bool); bb = sitk.GetArrayViewFromImage(b).astype(bool)
     s = int(aa.sum()) + int(bb.sum())
     return 2.0 * int((aa & bb).sum()) / s if s else 0.0
-
-
-def _centroid_mm(mask: sitk.Image):
-    """Physical-space (mm) centroid of a bright-spot mask, or None if empty. Robust to partial cutoff (a cut
-    blob shifts the centroid only slightly) — the basis of the same-vs-different-lesion magnitude gate."""
-    arr = sitk.GetArrayViewFromImage(mask)            # (z,y,x)
-    idx = np.argwhere(arr > 0)
-    if not len(idx):
-        return None
-    cz, cy, cx = idx.mean(axis=0)
-    return np.array(mask.TransformContinuousIndexToPhysicalPoint((float(cx), float(cy), float(cz))), dtype=float)
 
 
 def fit_bright_spots(fixed: sitk.Image, moving: sitk.Image, smooth_mm: float = 0.12):
@@ -158,70 +136,78 @@ def _cluster(sim: np.ndarray, thr: float) -> list[int]:
 _SUBGROUP_RGB = [(255, 80, 80), (90, 200, 110), (90, 150, 255), (235, 200, 70), (210, 110, 235), (90, 220, 220)]
 
 
-def overlay_png(member_ids: list[str], subgroups: dict, params: dict | None = None) -> str:
-    """En-face OVERLAY (base64 PNG data-URL) of the eye's bright spots in a common ANATOMICAL frame, coloured
-    by assigned subgroup, so the user can VERIFY the auto-assignment: same-subgroup scars pile into one bright
-    blob; a scan placed in a different subgroup (a displaced lesion) shows its own colour off to the side.
+def _scan_masks(cid: str, p: dict):
+    """Per-scan (nibabel i,j,k) masks + geometry for subgrouping: (scar_mask, cornea_mask, zooms_mm, n_blobs,
+    scar_mm3). Hysteresis bright spots with noise specks dropped; cornea = labels 1|2."""
+    lab = np.rint(np.asarray(nib.load(str(label_mod.corrected_path(cid))).dataobj)).astype(np.uint8)
+    vol = np.asarray(nib.load(str(_vol(cid))).dataobj).astype(np.float32)
+    zooms = np.array(nib.load(str(_vol(cid))).header.get_zooms()[:3], dtype=float)
+    vmm3 = float(np.prod(zooms))
+    scar = np.asarray(scar_mod.detect_scar_hysteresis(vol, lab, phi_percentile=float(p["phi_percentile"]))) & ((lab == 1) | (lab == 2))
+    lbl, nlb = ndimage.label(scar); nb = 0
+    if nlb:
+        sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, nlb + 1))
+        keep = [k + 1 for k, s in enumerate(sizes) if s * vmm3 >= float(p["min_blob_mm3"])]
+        scar = np.isin(lbl, keep) if keep else np.zeros_like(scar); nb = len(keep)
+    return scar.astype(np.uint8), (lab >= 1), zooms, nb, float(scar.sum()) * vmm3
 
-    The CLUSTERING uses the pure bright-spot fit (auto_subgroups); this overlay instead warps each scan into
-    the reference's CORNEA frame (so lesions appear in their true relative positions — a fit-to-ref would hide
-    the very displacement we want to show). Reference = first member."""
-    import base64
-    import oct_preprocess as _oct
-    p = {**DEFAULT, **(params or {})}
-    members = [c for c in member_ids if label_mod.corrected_path(c).exists() and _vol(c).exists()]
-    if not members:
-        return ""
-    ref = members[0]; ref_vol = _vol(ref)
-    tmpd = Path(tempfile.mkdtemp(prefix="subovl_"))
-    try:
-        # depth axis on the WARPED (sitk z,y,x) ref cornea — the SAME array order the warped masks below use
-        # (computing it on the nibabel i,j,k mask collapses the wrong axis → a B-scan sliver, not en-face).
-        ref_cornea_w = reg.resample_label(label_mod.corrected_path(ref), ref_vol, reg.identity()) >= 1  # (z,y,x)
-        dax = scar_mod._depth_axis(ref_cornea_w)
-        acc = None  # (H,W,3) float accumulation
-        for c in members:
-            mnp, _nb, _mm3 = _scar_mask_np(c, float(p["phi_percentile"]), float(p["min_blob_mm3"]))
-            pth = tmpd / f"{c}.nii.gz"; label_mod.write_label_nifti(mnp.astype(np.uint8), _vol(c), pth)
-            tx = reg.identity() if c == ref else reg.align_transform(
-                ref_vol, label_mod.corrected_path(ref), _vol(c), label_mod.corrected_path(c))[0]
-            warped = reg.resample_label(pth, ref_vol, tx) >= 1                 # (z,y,x) in ref frame
-            enf = warped.max(axis=dax).astype(np.float32)                      # en-face footprint (correct axis)
-            if acc is None:
-                acc = np.zeros((*enf.shape, 3), np.float32)
-            col = _SUBGROUP_RGB[(int(subgroups.get(c, 1)) - 1) % len(_SUBGROUP_RGB)]
-            for ch in range(3):
-                acc[..., ch] += enf * col[ch]
-        if acc is None:
-            return ""
-        rgb = np.clip(acc, 0, 255).astype(np.uint8)
-        H, W = rgb.shape[:2]
-        scl = max(1, int(480 / max(H, W)))
-        rgb = np.repeat(np.repeat(rgb, scl, 0), scl, 1)
-        png = _oct._png_bytes(rgb)
-        return "data:image/png;base64," + base64.b64encode(png).decode()
-    finally:
-        import shutil
-        shutil.rmtree(tmpd, ignore_errors=True)
+
+def _int_shift(mask: np.ndarray, shift) -> np.ndarray:
+    """Translate a 3-D mask by an integer (i,j,k) voxel offset, zero-padded (no wrap) — the overlay's
+    cornea-centroid alignment (a pure translation, registration-free)."""
+    out = np.zeros_like(mask)
+    src, dst = [slice(None)] * 3, [slice(None)] * 3
+    for ax in range(3):
+        s = int(round(shift[ax])); n = mask.shape[ax]
+        if s >= 0:
+            dst[ax] = slice(min(s, n), n); src[ax] = slice(0, max(0, n - s))
+        else:
+            dst[ax] = slice(0, max(0, n + s)); src[ax] = slice(min(-s, n), n)
+    out[tuple(dst)] = mask[tuple(src)]
+    return out
 
 
 def auto_subgroups(member_ids: list[str], params: dict | None = None) -> dict:
-    """Cluster an eye's cornea-segmented replicates into subgroups by pure bright-spot fit. Returns
-    {members, subgroups:{cid:label}, similarity:[[..]], pairs:[{a,b,dice,trans_mm,rot_deg,sim}], blobs:{cid:..},
-    n_subgroups}. READ-ONLY (masks built in a tempdir, cleaned up)."""
+    """Cluster an eye's cornea-segmented SCAR scans into subgroups (same lesion → together).
+
+    The bright-spot CONFIGURATION match (post-fit Dice) is a PURE bright-spot fit (cornea-ignored, robust to
+    partial cutoff). The same-vs-different-lesion GATE is the distance between each scan's scar centroid measured
+    RELATIVE TO ITS OWN CORNEA centroid (scar position WITHIN the cornea): between-scan EYE MOTION shifts cornea
+    and scar together so the relative vector is unchanged (no false split), while a lesion in a different place
+    changes it. Registration-free + robust to cutoff (centroids of the VISIBLE cornea/scar) — gate_cornea_frame
+    =False reverts to the raw scar-centroid distance. sim = post-fit Dice × gate(dist); single-link cluster ≥
+    link_threshold. The overlay translates each scan's footprint so its cornea centroid coincides with the
+    reference's (the SAME alignment the gate uses → overlay and clustering are consistent). Returns {members,
+    subgroups, n_subgroups, similarity, pairs[{a,b,dice,centroid_dist_mm,centroid_dist_native_mm,sim}], blobs,
+    overlay, gate_frame, params}. READ-ONLY (temp masks cleaned up); CPU."""
+    import base64
+    import oct_preprocess as _oct
     p = {**DEFAULT, **(params or {})}
     members = [c for c in dict.fromkeys(member_ids)
                if label_mod.corrected_path(c).exists() and _vol(c).exists()]
     if len(members) < 2:
         raise ValueError("Need ≥2 cornea-segmented replicate scans to auto-assign subgroups.")
+    cornea_gate = bool(p.get("gate_cornea_frame", True))
+    ref = members[0]
     tmpd = Path(tempfile.mkdtemp(prefix="subgrp_"))
     try:
-        masks, blobs, cents = {}, {}, {}
+        masks, blobs, scar_np, corn_idx, scar_mm, relvec = {}, {}, {}, {}, {}, {}
+        dax = 0
         for c in members:
-            mnp, nb, mm3 = _scar_mask_np(c, float(p["phi_percentile"]), float(p["min_blob_mm3"]))
-            masks[c] = _to_sitk_mask(mnp, c, tmpd)
-            cents[c] = _centroid_mm(masks[c])
-            blobs[c] = {"n_blobs": nb, "scar_mm3": round(mm3, 3), "empty": cents[c] is None}
+            scar, cornea, zooms, nb, mm3 = _scan_masks(c, p)
+            scar_np[c] = scar
+            masks[c] = _to_sitk_mask(scar, c, tmpd)                  # native mask → the pure-fit Dice
+            cidx = np.argwhere(cornea); corn_idx[c] = cidx.mean(0) if len(cidx) else None
+            sidx = np.argwhere(scar); scent = sidx.mean(0) if len(sidx) else None
+            scar_mm[c] = (scent * zooms) if scent is not None else None
+            relvec[c] = ((scent - corn_idx[c]) * zooms) if (scent is not None and corn_idx[c] is not None) else None
+            blobs[c] = {"n_blobs": nb, "scar_mm3": round(mm3, 3), "empty": scent is None}
+            if c == ref:
+                dax = scar_mod._depth_axis(cornea)
+
+        def _dist(a, b, table):
+            return (float(np.linalg.norm(table[a] - table[b])) if (table[a] is not None and table[b] is not None) else float("inf"))
+
         n = len(members)
         sim = np.eye(n, dtype=float)
         pairs = []
@@ -229,17 +215,48 @@ def auto_subgroups(member_ids: list[str], params: dict | None = None) -> dict:
             for j in range(i + 1, n):
                 a, b = members[i], members[j]
                 _tx, _w, d = fit_bright_spots(masks[a], masks[b], float(p["smooth_mm"]))
-                cd = (float(np.linalg.norm(cents[a] - cents[b]))
-                      if (cents[a] is not None and cents[b] is not None) else float("inf"))
-                s = d * _gate(cd, p)
+                cd_nat = _dist(a, b, scar_mm); cd_rel = _dist(a, b, relvec)
+                cd = cd_rel if cornea_gate else cd_nat
+                # HARD SPLIT: beyond this separation it is a different lesion regardless of the (cornea-ignored)
+                # configuration Dice — stops a high single-blob Dice from merging a clearly-displaced lesion.
+                s = 0.0 if cd > float(p["centroid_hardsplit_mm"]) else d * _gate(cd, p)
                 sim[i, j] = sim[j, i] = s
                 pairs.append({"a": a, "b": b, "dice": round(d, 3),
-                              "centroid_dist_mm": round(cd, 3) if math.isfinite(cd) else None, "sim": round(s, 3)})
+                              "centroid_dist_mm": round(cd, 3) if math.isfinite(cd) else None,
+                              "centroid_dist_native_mm": round(cd_nat, 3) if math.isfinite(cd_nat) else None,
+                              "sim": round(s, 3)})
         labels_out = _cluster(sim, float(p["link_threshold"]))
         subgroups = {members[i]: labels_out[i] for i in range(n)}
+
+        # OVERLAY: translate each footprint so its cornea centroid lands on the reference's (cornea-centroid
+        # alignment — the same eye-motion removal the gate does), en-face MIP, coloured by subgroup. Each MIP is
+        # padded/cropped into ONE reference-sized canvas (replicates may differ in frame count / lateral extent
+        # — never broadcast directly), and the whole render is best-effort: a hiccup yields an empty overlay,
+        # NEVER a failed proposal (the cluster decision is already made above).
+        overlay = ""
+        try:
+            enfs = {}
+            for c in members:
+                sh = (corn_idx[ref] - corn_idx[c]) if (corn_idx[ref] is not None and corn_idx[c] is not None) else np.zeros(3)
+                enfs[c] = _int_shift(scar_np[c], sh).max(axis=dax).astype(np.float32)
+            Hc = max(e.shape[0] for e in enfs.values()); Wc = max(e.shape[1] for e in enfs.values())
+            acc = np.zeros((Hc, Wc, 3), np.float32)
+            for c in members:
+                e = enfs[c]; h, w = min(e.shape[0], Hc), min(e.shape[1], Wc)
+                col = _SUBGROUP_RGB[(int(subgroups.get(c, 1)) - 1) % len(_SUBGROUP_RGB)]
+                for ch in range(3):
+                    acc[:h, :w, ch] += e[:h, :w] * col[ch]
+            rgb = np.clip(acc, 0, 255).astype(np.uint8)
+            scl = max(1, int(480 / max(Hc, Wc)))
+            rgb = np.repeat(np.repeat(rgb, scl, 0), scl, 1)
+            overlay = "data:image/png;base64," + base64.b64encode(_oct._png_bytes(rgb)).decode()
+        except Exception:  # noqa: BLE001 — the overlay is a verification aid; never sink the proposal
+            overlay = ""
+
         return {"members": members, "subgroups": subgroups, "n_subgroups": len(set(labels_out)),
                 "similarity": [[round(float(sim[i, j]), 3) for j in range(n)] for i in range(n)],
-                "pairs": pairs, "blobs": blobs, "params": {k: p[k] for k in DEFAULT}}
+                "pairs": pairs, "blobs": blobs, "overlay": overlay,
+                "gate_frame": "cornea-relative" if cornea_gate else "native", "params": {k: p[k] for k in DEFAULT}}
     finally:
         import shutil
         shutil.rmtree(tmpd, ignore_errors=True)
