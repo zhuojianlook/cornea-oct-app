@@ -107,7 +107,9 @@ def quantify(mask, img, spacing, cornea=None):
     enface = mask.max(axis=depth_axis)
     others = [s for i, s in enumerate(spacing) if i != depth_axis]
     area = float(enface.sum() * others[0] * others[1])
-    density = float(img[mask].mean()) if mask.any() else 0.0
+    # Empty scar mask → density is UNDEFINED (NaN), not 0.0: a fabricated (0,0) point would inflate the
+    # density agreement Pearson r / Bland-Altman. Volume/area stay 0 (legitimate true-negative measures).
+    density = float(img[mask].mean()) if mask.any() else float("nan")
     return {"volume_mm3": round(vol, 4), "enface_area_mm2": round(area, 4), "density": round(density, 3)}
 
 
@@ -363,18 +365,21 @@ def fig_bland_altman(df, path):
     pairs = [("scar volume (mm³)", "scar_vol_mm3_gt", "scar_vol_mm3_pred"),
              ("en-face area (mm²)", "enface_area_mm2_gt", "enface_area_mm2_pred"),
              ("density", "density_gt", "density_pred")]
+    # Restrict quantification agreement to SCAR-PRESENT cases: pooling scar-absent control eyes (both
+    # measures ≈0) would inflate the correlation and shrink the Bland-Altman bias/LoA. n is shown per panel.
+    dfp = df[df["gt_has_scar"]] if "gt_has_scar" in df.columns else df
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     any_pts = False
     for ax, (title, gc, pc) in zip(axes, pairs):
-        d = df[[gc, pc]].dropna()
+        d = dfp[[gc, pc]].dropna()
         if len(d) >= 1:
             mean = (d[gc] + d[pc]) / 2.0; diff = d[pc] - d[gc]
             ax.scatter(mean, diff, s=20)
             bias = float(diff.mean()); sd = float(diff.std(ddof=1)) if len(diff) > 1 else 0.0
             ax.axhline(bias, color="k"); ax.axhline(bias + 1.96 * sd, color="r", ls="--"); ax.axhline(bias - 1.96 * sd, color="r", ls="--")
             any_pts = True
-        ax.set_title(title, fontsize=9); ax.set_xlabel("mean(expert, pred)", fontsize=8); ax.set_ylabel("pred − expert", fontsize=8)
-    fig.suptitle("Figure 6. Bland–Altman: quantification agreement (test set)", fontsize=10)
+        ax.set_title(f"{title}\n(scar-present n={len(d)})", fontsize=9); ax.set_xlabel("mean(expert, pred)", fontsize=8); ax.set_ylabel("pred − expert", fontsize=8)
+    fig.suptitle("Figure 6. Bland–Altman: quantification agreement (scar-present test cases)", fontsize=10)
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     return any_pts
 
@@ -544,10 +549,32 @@ def _generate(spec, run, dirs, work):
     if len(df):
         df.to_csv(dirs["metrics"] / "per_case_metrics.csv", index=False); ok("metrics/per_case_metrics.csv")
         agg = {}
-        for col in ("dice_cornea", "dice_scar", "hd95_cornea_mm", "hd95_scar_mm"):
+        cascade = spec.get("mode") == "cascade"
+        # Scar Dice/HD95 aggregates pool over SCAR-PRESENT cases only (scar-absent control eyes score 0
+        # on any false positive, dragging a single pooled mean down); the per-case dice_scar still lives
+        # in per_case_metrics.csv. Cornea aggregates are unchanged (every eye has a cornea).
+        scar_present = df["gt_has_scar"] if "gt_has_scar" in df.columns else df.index == df.index
+        for col in ("dice_cornea", "hd95_cornea_mm"):
             v = df[col].dropna()
             agg[col] = {"mean": round(float(v.mean()), 4) if len(v) else None,
-                        "std": round(float(v.std(ddof=1)), 4) if len(v) > 1 else None, "n": int(len(v))}
+                        "std": round(float(v.std(ddof=1)), 4) if len(v) > 1 else None, "n": int(len(v)),
+                        "note": ""}
+        for col, label in (("dice_scar", "dice_scar_present"), ("hd95_scar_mm", "hd95_scar_mm_present")):
+            v = df.loc[scar_present, col].dropna()
+            agg[label] = {"mean": round(float(v.mean()), 4) if len(v) else None,
+                          "std": round(float(v.std(ddof=1)), 4) if len(v) > 1 else None, "n": int(len(v)),
+                          "note": ("OPTIMISTIC/upper-bound: stage-B scar model was TRAINED on the "
+                                   "ground-truth cornea prior but INFERRED on the predicted cornea")
+                                  if cascade else ""}
+        # Control-eye (scar-ABSENT) false-positive behaviour, reported separately rather than folded into
+        # the scar-Dice mean: fraction of scar-absent cases where the model predicted ANY scar (pred vol > 0).
+        absent = df[~scar_present] if "gt_has_scar" in df.columns else df.iloc[0:0]
+        if len(absent):
+            fp = (absent["scar_vol_mm3_pred"].fillna(0) > 0)
+            agg["scar_fp_rate_controls"] = {"mean": round(float(fp.mean()), 4), "std": None,
+                                            "n": int(len(absent)),
+                                            "note": "false-positive rate on scar-ABSENT control eyes "
+                                                    "(fraction with any predicted scar)"}
         pd.DataFrame(agg).T.to_csv(dirs["metrics"] / "aggregate_metrics.csv"); ok("metrics/aggregate_metrics.csv")
     else:
         skip("metrics", "no test predictions to score")
@@ -633,9 +660,14 @@ def _generate(spec, run, dirs, work):
     if len(df):
         perf = []
         cascade = spec.get("mode") == "cascade"
+        scar_present = df["gt_has_scar"] if "gt_has_scar" in df.columns else df.index == df.index
         for cls in ("cornea", "scar"):
-            d_ = df[f"dice_{cls}"].dropna(); h_ = df[f"hd95_{cls}_mm"].dropna()
-            perf.append({"class": cls, "n": int(len(d_)),
+            # Scar Dice/HD95 pool over SCAR-PRESENT cases only (scar-absent control eyes score 0 on any
+            # false positive); cornea uses every case. Per-case dice_scar stays in per_case_metrics.csv.
+            sub = df[scar_present] if cls == "scar" else df
+            row_class = "scar_present" if cls == "scar" else cls
+            d_ = sub[f"dice_{cls}"].dropna(); h_ = sub[f"hd95_{cls}_mm"].dropna()
+            perf.append({"class": row_class, "n": int(len(d_)),
                          "dice_mean": round(float(d_.mean()), 4) if len(d_) else None,
                          "dice_std": round(float(d_.std(ddof=1)), 4) if len(d_) > 1 else None,
                          "hd95_mm_mean": round(float(h_.mean()), 4) if len(h_) else None,
@@ -643,16 +675,31 @@ def _generate(spec, run, dirs, work):
                          "note": ("OPTIMISTIC/upper-bound: stage-B scar model was TRAINED on the "
                                   "ground-truth cornea prior but INFERRED on the predicted cornea")
                                  if (cascade and cls == "scar") else ""})
+        # Control-eye (scar-ABSENT) false-positive row: fraction of scar-absent cases with any predicted
+        # scar — reported separately rather than folded into the scar-Dice mean.
+        absent = df[~scar_present] if "gt_has_scar" in df.columns else df.iloc[0:0]
+        if len(absent):
+            fp = (absent["scar_vol_mm3_pred"].fillna(0) > 0)
+            perf.append({"class": "scar_absent_controls", "n": int(len(absent)),
+                         "dice_mean": None, "dice_std": None, "hd95_mm_mean": None, "hd95_mm_std": None,
+                         "note": f"scar_fp_rate={round(float(fp.mean()), 4)} "
+                                 "(fraction of control eyes with any predicted scar)"})
         pd.DataFrame(perf).to_csv(T / "table3_model_performance.csv", index=False); ok("tables/table3_model_performance.csv")
         agree = []
+        # Quantification agreement is computed over SCAR-PRESENT cases only (dfp): pooling scar-absent
+        # control eyes (vol/area ≈0, density NaN/excluded) would inflate Pearson r and shrink bias/LoA.
+        # n_scar_present states how many cases the headline numbers rest on; n is the per-measure non-NaN count.
+        dfp = df[df["gt_has_scar"]] if "gt_has_scar" in df.columns else df
+        n_scar_present = int(len(dfp))
         for title, gc, pc in (("scar_volume_mm3", "scar_vol_mm3_gt", "scar_vol_mm3_pred"),
                               ("enface_area_mm2", "enface_area_mm2_gt", "enface_area_mm2_pred"),
                               ("density", "density_gt", "density_pred")):
-            dd = df[[gc, pc]].dropna()
+            dd = dfp[[gc, pc]].dropna()
             if len(dd):
                 diff = dd[pc] - dd[gc]
                 r = dd[gc].corr(dd[pc]) if len(dd) > 1 else None
-                agree.append({"measure": title, "n": int(len(dd)), "bias_mean_diff": round(float(diff.mean()), 4),
+                agree.append({"measure": title, "n": int(len(dd)), "n_scar_present": n_scar_present,
+                              "cohort": "scar_present_only", "bias_mean_diff": round(float(diff.mean()), 4),
                               "loa_lower": round(float(diff.mean() - 1.96 * diff.std(ddof=1)), 4) if len(diff) > 1 else None,
                               "loa_upper": round(float(diff.mean() + 1.96 * diff.std(ddof=1)), 4) if len(diff) > 1 else None,
                               "pearson_r": round(float(r), 4) if r is not None else None})

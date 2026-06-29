@@ -380,3 +380,16 @@ def test_flag_endpoints_still_work_for_existing_case(client, make_case):
     cid = make_case("case_guard_ok", manifest={"oct_preprocessed": True})
     r = client.post("/api/case/%s/vet-preprocessing" % cid, json={})
     assert r.status_code == 200 and r.json()["preproc_vetted"] is True
+
+
+def test_export_nnunet_dedups_duplicate_case_ids(client, make_case):
+    # numTraining must equal the count of DISTINCT pairs written: export_case is an idempotent overwrite,
+    # so a duplicated id in an explicit cases list must not be counted twice (v0.0.96 dedup guard).
+    a = make_case("case_exp_a", manifest={"sam2_meta": True})
+    b = make_case("case_exp_b", manifest={"sam2_meta": True})
+    r = client.post("/api/export/nnunet", json={"dataset_name": "Dataset999_test", "cases": [a, a, b]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["num_training"] == 2          # duplicate "a" collapsed (was 3)
+    assert len(body["results"]) == 2
+    assert {x["case_id"] for x in body["results"]} == {a, b}

@@ -119,18 +119,41 @@ def analyze(root: str | Path) -> dict:
                 "dice_scar": _dice(A, B, 2), "dice_cornea": _dice(A, B, 1),
             })
 
-        # ── VOLUME reproducibility: CV of scar mm³ across ALL annotations of this scan ──
-        vols = []
-        for r in rs:
-            L = lab_of(r)
-            if L is None:
-                continue
-            vols.append(_scar_vol_mm3(L, _voxvol_mm3(r.get("spacing"))))
-        if len(vols) >= 2:
-            v = np.array(vols, float)
+        # ── VOLUME reproducibility: split INTRA (test-retest, per rater across replicates) vs INTER (between
+        #    raters), mirroring the Dice split, so a single CV doesn't conflate the two regimes. A pooled CV
+        #    (every annotation) is kept too for backward compatibility. ──
+        per_user_vols: dict[str, list[float]] = {}
+        all_vols: list[float] = []
+        for user, urs in by_user.items():
+            uvs = []
+            for r in sorted(urs, key=lambda r: int(r.get("replicate", 1) or 1)):
+                L = lab_of(r)
+                if L is None:
+                    continue
+                uvs.append(_scar_vol_mm3(L, _voxvol_mm3(r.get("spacing"))))
+            if uvs:
+                per_user_vols[user] = uvs       # replicate-sorted (lowest first)
+                all_vols.extend(uvs)
+
+        def _cv(vs: list[float]) -> float | None:
+            if len(vs) < 2:
+                return None
+            a = np.array(vs, float); m = float(a.mean())
+            return round(float(a.std(ddof=1) / m), 4) if m > 0 else None
+
+        # INTRA = mean of each rater's OWN across-replicate CV (raters with >=2 replicates of this scan).
+        intra_cvs = [c for c in (_cv(vs) for vs in per_user_vols.values()) if c is not None]
+        cv_intra = round(float(np.mean(intra_cvs)), 4) if intra_cvs else None
+        # INTER = CV across ONE representative volume per rater (lowest replicate, matching the Dice `reps`).
+        rep_vols = [vs[0] for vs in per_user_vols.values() if vs]
+        cv_inter = _cv(rep_vols)
+        if len(all_vols) >= 2:
+            v = np.array(all_vols, float)
             mean = float(v.mean())
-            volume.append({"volume_stem": stem, "n": len(vols), "scar_mm3_mean": round(mean, 4),
-                           "scar_mm3_cv": round(float(v.std(ddof=1) / mean), 4) if mean > 0 else None,
+            volume.append({"volume_stem": stem, "n": len(all_vols), "scar_mm3_mean": round(mean, 4),
+                           "scar_mm3_cv": round(float(v.std(ddof=1) / mean), 4) if mean > 0 else None,  # pooled (legacy)
+                           "scar_mm3_cv_intra": cv_intra, "scar_mm3_cv_intra_n_users": len(intra_cvs),
+                           "scar_mm3_cv_inter": cv_inter, "scar_mm3_cv_inter_n_users": len(rep_vols),
                            "scar_mm3_min": round(float(v.min()), 4), "scar_mm3_max": round(float(v.max()), 4)})
 
     def _mean(rows_: list[dict], key: str) -> float | None:
@@ -142,7 +165,9 @@ def analyze(root: str | Path) -> dict:
         "n_annotations": len(rows), "n_intra_pairs": len(intra), "n_inter_pairs": len(inter),
         "intra_dice_scar_mean": _mean(intra, "dice_scar"), "intra_dice_cornea_mean": _mean(intra, "dice_cornea"),
         "inter_dice_scar_mean": _mean(inter, "dice_scar"), "inter_dice_cornea_mean": _mean(inter, "dice_cornea"),
-        "scar_volume_cv_mean": _mean(volume, "scar_mm3_cv"),
+        "scar_volume_cv_mean": _mean(volume, "scar_mm3_cv"),                       # pooled (legacy)
+        "intra_scar_volume_cv_mean": _mean(volume, "scar_mm3_cv_intra"),          # test-retest, per rater
+        "inter_scar_volume_cv_mean": _mean(volume, "scar_mm3_cv_inter"),          # between raters
     }
     return {"ok": True, "root": str(root), "summary": summary, "intra": intra, "inter": inter, "volume": volume}
 

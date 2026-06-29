@@ -3747,6 +3747,11 @@ def export_nnunet(req: ExportRequest) -> dict:
     cases = req.cases if req.cases else export_mod.cases_with_segmentation()
     if not cases:
         raise HTTPException(400, "No cases with a segmentation to export. Run SAM2 first.")
+    # De-duplicate (keyed on the normalized id) so numTraining == distinct pairs written: export_case is an
+    # idempotent overwrite, so a duplicated id in an explicit req.cases list would otherwise be counted twice
+    # while only one image/label pair exists on disk — overstating dataset.json's numTraining.
+    seen: set = set()
+    cases = [c for c in cases if not (orch.safe_case_id(c) in seen or seen.add(orch.safe_case_id(c)))]
     dataset_dir = export_mod.DATASET_ROOT / req.dataset_name
     export_mod.clean_dataset(dataset_dir)           # drop orphans from a prior export
     # Leakage guard: warn if both a consensus case and its own member repeats are in the
