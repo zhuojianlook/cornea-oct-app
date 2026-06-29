@@ -165,8 +165,26 @@ export const useCaseStore = create<CaseState>()(
       try {
         await api.json(`/api/case/${id}/reset-step`, "POST", JSON.stringify({ step }));
         await get().openCase();                  // refresh the manifest so the timeline drops back
-        const wf = useWorkflowStore.getState();  // re-render previews + reflect any dropped segmentation
-        wf.set("segVersion", wf.segVersion + 1);
+        const wf = useWorkflowStore.getState();
+        // #5 — a rollback is a SAME-case openCase, so resetForCase() never ran; explicitly restore the
+        // per-step editing state so the rolled-back step behaves EXACTLY like reaching it fresh: leave any
+        // paint/correction mode and clear the inspect selection. segLoaded is reset to false here and then
+        // RESTORED by VolumeCanvas's reload (openCase cache-busts volumeUrl → it reloads the volume and
+        // calls tryLoadExistingSegmentation, which sets segLoaded true again IF the step still has a
+        // labelmap). Rolling back below Cornea deletes the labelmap, so it correctly stays false.
+        wf.set("correcting", false);
+        wf.set("corneaOnlyPaint", false);
+        wf.set("selectedStep", null);
+        wf.set("segLoaded", false);
+        // Clear the same per-step state resetForCase() would on a fresh load, so a rolled-back step doesn't
+        // carry stale overlay/scar/hint state from the step we rolled back FROM.
+        wf.set("showSegmentation", false);
+        wf.set("scarMetrics", null);
+        wf.set("hintMode", false);
+        wf.set("scarHints", []);
+        wf.set("scarEditMode", false);
+        wf.set("scarErase", false);
+        wf.set("segVersion", wf.segVersion + 1);   // re-render previews + reflect any dropped segmentation
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       } finally {

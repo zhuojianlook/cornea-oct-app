@@ -1,7 +1,7 @@
 /* Pen controls for the correction drawing layer (cornea / background / scar / erase) + brush size,
    filled-region pen, and the Smart fill (3-D GrowCut) that propagates scribbles across all slices. */
 
-import { ToggleButton, ToggleButtonGroup, Slider, Tooltip, Button } from "@mui/material";
+import { ToggleButton, ToggleButtonGroup, Slider, Tooltip, Button, CircularProgress } from "@mui/material";
 import { useWorkflowStore, type PenLabel } from "../../store/workflowStore";
 import { setDrawOpacity } from "../../niivue/nvController";
 
@@ -13,11 +13,16 @@ const PENS: { value: PenLabel; label: string; color: string }[] = [
 ];
 
 export function PaintToolbar() {
-  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint,
+  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint, smartFillBusy,
           setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, set } = useWorkflowStore();
   if (!correcting) return null;
-  // #11 cornea/background vet step exposes ONLY the cornea/background/erase pens (no scar).
-  const pens = corneaOnlyPaint ? PENS.filter((p) => p.value !== 3) : PENS;
+  // #3/#11 cornea/background vet step exposes only TWO clear pens: Cornea (paints label 1, blue) and
+  // Background (the Erase pen value 0, grey — painting it removes cornea → canonical background). The old
+  // orange "Background" pen (value 2) was confusing: it looked like scar and vanished on save (it remaps to
+  // background 0 anyway). So here we surface Cornea(blue) + a grey "Background" eraser only.
+  const pens = corneaOnlyPaint
+    ? [PENS[0], { ...PENS[3], label: "Background" }]   // [Cornea(1,blue), Erase(0,grey) shown as "Background"]
+    : PENS;
 
   return (
     <div className="flex items-center gap-3 px-3 border-b overflow-x-auto [&>*]:shrink-0" style={{ minHeight: 36, borderColor: "var(--c-border)" }}>
@@ -53,11 +58,14 @@ export function PaintToolbar() {
           ▣ Fill region
         </ToggleButton>
       </Tooltip>
-      <Tooltip title="Smart fill (GrowCut): after scribbling a little Cornea, Background AND Scar on a few slices, this propagates those labels through the whole 3-D volume by intensity similarity — so you don't paint every slice/view. Review and correct, then Apply.">
-        <Button size="small" variant="contained" onClick={() => runSmartFill()}
-          sx={{ py: 0.25, px: 1.2, fontSize: 12, textTransform: "none" }}>
-          ✨ Smart fill
-        </Button>
+      <Tooltip title="Smart fill (GrowCut): after scribbling a little Cornea, Background AND Scar on a few slices, this propagates those labels through the whole 3-D volume by intensity similarity — so you don't paint every slice/view. Runs on the full volume (a few seconds). Review and correct, then Apply.">
+        <span>
+          <Button size="small" variant="contained" onClick={() => runSmartFill()} disabled={smartFillBusy}
+            startIcon={smartFillBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+            sx={{ py: 0.25, px: 1.2, fontSize: 12, textTransform: "none" }}>
+            {smartFillBusy ? "Filling…" : "✨ Smart fill"}
+          </Button>
+        </span>
       </Tooltip>
       <Tooltip title="Drawing opacity">
         <div className="flex items-center gap-2" style={{ width: 140 }}>

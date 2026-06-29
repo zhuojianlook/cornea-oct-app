@@ -33,6 +33,7 @@ export function TimelineBar() {
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
   const startCorneaVetPaint = useWorkflowStore((s) => s.startCorneaVetPaint);
   const confirmCorneaVet = useWorkflowStore((s) => s.confirmCorneaVet);
+  const corneaVetBusy = useWorkflowStore((s) => s.corneaVetBusy);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
   const undoCorrection = useWorkflowStore((s) => s.undoCorrection);
   const runScarAuto = useWorkflowStore((s) => s.runScarAuto);
@@ -169,8 +170,9 @@ export function TimelineBar() {
   const CorneaVet = !correcting ? (
     <>
       <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Vet the cornea/background segmentation, then:</span>
-      <Button size="small" variant="outlined" disabled={busy || !segLoaded} onClick={() => startCorneaVetPaint()}
-        title="Paint to correct the SAM2 cornea/background (cornea/background/erase pens only — no scar yet).">✎ Paint cornea/background</Button>
+      <Button size="small" variant="outlined" disabled={busy || !segLoaded || corneaVetBusy} onClick={() => startCorneaVetPaint()}
+        startIcon={corneaVetBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title="Paint to correct the SAM2 cornea/background: Cornea (blue) to add, Background (grey) to remove. No scar yet.">{corneaVetBusy ? "Loading…" : "✎ Paint cornea/background"}</Button>
       <Button size="small" variant="contained" color="secondary" disabled={busy || !segLoaded} onClick={() => confirmCorneaVet()}
         title="Confirm the cornea/background is correct — unlocks scar detection/editing.">✓ Confirm cornea/background</Button>
     </>
@@ -189,6 +191,14 @@ export function TimelineBar() {
       {scheduled ? "Scheduled ✓ (unschedule)" : "Schedule for training"}
     </Button>
   );
+  // #6 — Auto subgroup assignment lives WITH the subgroup controls (steps 7/8), not in the global top-right.
+  const AutoSubgroupBtn = !isConsensus ? (
+    <Button size="small" variant="outlined" color="secondary" disabled={busy || subgroupBusy || correcting}
+      onClick={() => { setShowSubgroup(true); autoSubgroups(); }}
+      title="Automatically group this eye's repeat scans into subgroups by aligning their hysteresis bright spots (each lesion's replicates cluster together; a displaced lesion splits off), with an overlay to verify before applying.">
+      ⊞ Auto subgroups
+    </Button>
+  ) : null;
   const ExportBtn = (
     <Button size="small" variant="outlined" color="success" disabled={busy} onClick={() => exportScarSummary()}
       title="Recompute scar volume/area/density for every case → scar_summary.csv">Export metrics</Button>
@@ -377,7 +387,7 @@ export function TimelineBar() {
     // scar segmented (rose) → assign this scan's SUBGROUP (gates align); re-run scar / correct to iterate.
     actions = (
       <>
-        {SubgroupConfirm}{sep}{Correct}
+        {SubgroupConfirm}{sep}{AutoSubgroupBtn}{sep}{Correct}
         {ScarReRun && <>{sep}{ScarReRun}</>}
       </>
     );
@@ -387,7 +397,7 @@ export function TimelineBar() {
       <>
         {AlignBtn}
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(subgroup “{subgroup}”)</span>
-        {sep}{SubgroupConfirm}{sep}{Correct}
+        {sep}{SubgroupConfirm}{sep}{AutoSubgroupBtn}{sep}{Correct}
       </>
     );
   } else if (step === 9) {
@@ -426,16 +436,8 @@ export function TimelineBar() {
           ⚖ Compare strategies
         </Button>
       )}
-      {/* AUTO SUBGROUP assignment: cluster this eye's repeat scans by aligning their hysteresis bright spots
-          (robust to partial scar cutoff), with an overlay to verify. Needs ≥2 cornea-segmented scans (the
-          endpoint 400s otherwise). Per-scan workflow (not for a built consensus). */}
-      {caseInfo && step >= 5 && !isConsensus && (
-        <Button size="small" variant="outlined" color="secondary" disabled={busy || subgroupBusy || correcting}
-          onClick={() => { setShowSubgroup(true); autoSubgroups(); }}
-          title="Automatically group this eye's repeat scans into subgroups by aligning their hysteresis bright spots (each lesion's replicates cluster together; a displaced lesion splits off), with an overlay to verify before applying.">
-          ⊞ Auto subgroups
-        </Button>
-      )}
+      {/* #6 — the "⊞ Auto subgroups" button moved OUT of this global top-right into the Subgroup steps (7/8)
+          actions (AutoSubgroupBtn), next to the subgroup-assignment controls. */}
       {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
       {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
         <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}

@@ -1,11 +1,11 @@
 /* Niivue volume viewer — base grayscale OCT volume with view controls. */
 
 import { useEffect, useRef, useState } from "react";
-import { ToggleButton, ToggleButtonGroup } from "@mui/material";
+import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, type ViewName } from "../../niivue/nvController";
 import { scanStep, hasSegmentation } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
@@ -46,6 +46,9 @@ export function VolumeCanvas() {
   const penLabel = useWorkflowStore((s) => s.penLabel);
   const penSize = useWorkflowStore((s) => s.penSize);
   const [view, setViewState] = useState<ViewName>("multi");
+  // #2 — visible slice scrollbar for the single-plane (axial/coronal/sagittal) niivue views.
+  const [sliceIdx, setSliceIdx] = useState(0);
+  const [sliceMax, setSliceMax] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
@@ -172,6 +175,24 @@ export function VolumeCanvas() {
     wfSet("showSegmentation", hasSegmentation(manifest));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseInfo?.case_id]);
+
+  // #2 — keep the slice scrollbar in sync with niivue while a single-plane view is active (also catches the
+  // user scrubbing by mouse-wheel/click). Polls niivue's crosshair position + per-axis slice count.
+  const singlePlane = (view === "axial" || view === "coronal" || view === "sagittal") && !overlay2d && !noWebgl && !!volumeUrl;
+  const lastSliderRef = useRef<number>(0);   // #2 — suppress poll sync briefly after a user drag (no snap-back)
+  useEffect(() => {
+    if (!singlePlane) { setSliceMax(0); return; }
+    const id = window.setInterval(() => {
+      const n = sliceCount(view);
+      setSliceMax(n > 1 ? n - 1 : 0);
+      // Don't overwrite the slider while the user is actively dragging it (setSliceIndex already moved
+      // niivue synchronously); only adopt niivue's position when the user scrubs by other means.
+      if (n > 1 && Date.now() - lastSliderRef.current >= 250) {
+        const live = getSliceIndex(view); setSliceIdx((cur) => (live !== cur ? live : cur));
+      }
+    }, 160);
+    return () => window.clearInterval(id);
+  }, [singlePlane, view, volumeUrl, loading]);
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -391,6 +412,18 @@ export function VolumeCanvas() {
           </div>
         )}
       </div>
+
+      {/* #2 — slice scrollbar for the single-plane (axial/coronal/sagittal) niivue views (works in BOTH
+          normal and paint modes). The 2-D overlays (before/after, fix-columns) carry their own slider. */}
+      {singlePlane && sliceMax > 0 && (
+        <div className="flex items-center gap-3 px-4 py-2 border-t" style={{ borderColor: "var(--c-border)", backgroundColor: "var(--c-surface)" }}>
+          <span className="text-xs whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
+            {view} slice {sliceIdx + 1} / {sliceMax + 1}
+          </span>
+          <Slider size="small" min={0} max={sliceMax} value={Math.min(sliceIdx, sliceMax)}
+            onChange={(_, v) => { const n = v as number; lastSliderRef.current = Date.now(); setSliceIdx(n); setSliceIndex(view, n); }} />
+        </div>
+      )}
     </div>
   );
 }

@@ -168,6 +168,8 @@ interface WorkflowState {
   // #11 cornea/background vet step: paint cornea/background only (scar pen hidden), then confirm → sets
   // cornea_vetted (gates the Scar step). corneaOnlyPaint hides the Scar pen in the PaintToolbar.
   corneaOnlyPaint: boolean;
+  corneaVetBusy: boolean;   // #1 — loading the cornea/background paint layer (spinner on the Paint button)
+  smartFillBusy: boolean;   // #4 — GrowCut smart-fill running (spinner + disable, avoids the "hung" look)
   startCorneaVetPaint: () => Promise<void>;
   confirmCorneaVet: () => Promise<void>;
   cancelCorrection: () => Promise<void>;
@@ -176,7 +178,7 @@ interface WorkflowState {
   setPenSize: (n: number) => void;
   setPenFilled: (f: boolean) => void;
   setPaintMode: (on: boolean) => void;
-  runSmartFill: () => void;
+  runSmartFill: () => Promise<void>;
   runScarAuto: () => Promise<void>;
   runScarAutoSam2: () => Promise<void>;
   runMotionAnalysis: () => Promise<void>;
@@ -208,6 +210,8 @@ export const useWorkflowStore = create<WorkflowState>()(
     selectedStep: null,
 
     corneaOnlyPaint: false,
+    corneaVetBusy: false,
+    smartFillBusy: false,
     penLabel: 1,
     penSize: 3,
     penFilled: false,
@@ -615,10 +619,20 @@ export const useWorkflowStore = create<WorkflowState>()(
     // #11 — enter cornea/background paint mode: same drawing layer as Correct, but the PaintToolbar hides
     // the Scar pen (corneaOnlyPaint) and the pen defaults to Cornea. Confirm goes through confirmCorneaVet.
     startCorneaVetPaint: async () => {
-      set((s) => { s.corneaOnlyPaint = true; if (s.penLabel === 3) s.penLabel = 1; });
-      await get().loadCorrectionLayer();
-      set((s) => { if (s.penLabel === 3) s.penLabel = 1; });
-      nv.setPen(get().penLabel === 3 ? 1 : get().penLabel, get().penFilled);
+      // cornea-vet exposes only Cornea(1) + Background/erase(0); force the pen into that set (a carried-over
+      // Scar(3) or old Background(2) pen would leave the toolbar with nothing selected).
+      set((s) => { s.corneaVetBusy = true; s.corneaOnlyPaint = true; if (s.penLabel !== 0 && s.penLabel !== 1) s.penLabel = 1; });
+      try {
+        await get().loadCorrectionLayer();
+        set((s) => {
+          if (s.penLabel !== 0 && s.penLabel !== 1) s.penLabel = 1;
+          s.status = { kind: "working", title: "Vetting cornea/background",
+            detail: "Paint CORNEA (blue) where it's missing; paint BACKGROUND (grey) to remove over-segmentation. Brush size + Smart fill available. Then Confirm." };
+        });
+        nv.setPen(get().penLabel === 3 ? 1 : get().penLabel, get().penFilled);
+      } finally {
+        set((s) => { s.corneaVetBusy = false; });
+      }
     },
 
     // #11 — confirm cornea/background: if the user painted (correcting), save the drawing with cornea_vet=true
@@ -682,10 +696,31 @@ export const useWorkflowStore = create<WorkflowState>()(
       set((s) => { s.paintMode = on; });
     },
 
-    runSmartFill: () => {
-      // GrowCut propagates the scribbled bg/cornea/scar labels through the whole 3-D volume.
-      nv.smartFill();
-      set((s) => { s.segVersion = s.segVersion + 1; });
+    runSmartFill: async () => {
+      // GrowCut propagates the scribbled bg/cornea/scar labels through the whole 3-D volume. It runs
+      // SYNCHRONOUSLY on the main thread (~seconds on a full OCT volume), which previously looked "hung".
+      // #4: set a busy flag + yield once (setTimeout 0) so React paints the spinner BEFORE the blocking
+      // call, then clear it. Re-entrancy guarded by the disabled button (smartFillBusy).
+      if (get().smartFillBusy) return;
+      set((s) => {
+        s.smartFillBusy = true;
+        s.status = { kind: "working", title: "Smart fill (GrowCut)",
+          detail: "Propagating your scribbles through the whole 3-D volume by intensity similarity — a few seconds…" };
+      });
+      // Wait for an actual browser PAINT (double rAF) so the spinner is on-screen before the synchronous
+      // GrowCut blocks the main thread — setTimeout(0) can fire before React flushes/paints.
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(undefined))));
+      try {
+        nv.smartFill();
+        set((s) => {
+          s.segVersion = s.segVersion + 1;
+          s.status = { kind: "done", title: "Smart fill complete", detail: "Labels propagated — review/correct, then Confirm or Save." };
+        });
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Smart fill failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.smartFillBusy = false; });
+      }
     },
 
     runScarAuto: async () => {

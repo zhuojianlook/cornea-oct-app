@@ -92,6 +92,42 @@ export function setView(view: ViewName): void {
   nv.setSliceType(SLICE[view]);
 }
 
+// ── Single-plane slice navigation (#2 — a visible slice scrollbar) ──────────────────────────────────
+// niivue keeps the slice position as scene.crosshairPos (a vec3 of 0..1 fractions, one per niivue axis:
+// 0=sagittal/L-R, 1=coronal/A-P, 2=axial/I-S) and the per-axis slice COUNT as volumes[0].dimsRAS
+// ([n,x,y,z]). We read/set the SAME axis for both, so this is orientation-safe despite the OCT direction
+// swap. The user-facing view maps to a niivue axis (matching the SLICE map's axial↔coronal swap):
+//   user "sagittal" → niivue sagittal → axis 0 ; "axial" → niivue coronal → axis 1 ; "coronal" → niivue axial → axis 2
+const VIEW_AXIS: Record<ViewName, number> = { sagittal: 0, axial: 1, coronal: 2, multi: -1, render: -1 };
+
+/** Number of slices along the active single-plane view's axis (0 for multi/3D or no volume). */
+export function sliceCount(view: ViewName): number {
+  const ax = VIEW_AXIS[view];
+  if (!nv || ax < 0 || nv.volumes.length === 0) return 0;
+  const d = (nv.volumes[0] as unknown as { dimsRAS?: number[] }).dimsRAS;
+  if (d && d.length >= 4) return Math.max(0, Math.round(d[ax + 1]));
+  const dd = (nv.volumes[0] as unknown as { dims?: number[] }).dims;   // fallback: raw NIfTI dims
+  return dd && dd.length >= 4 ? Math.max(0, Math.round(dd[ax + 1])) : 0;
+}
+
+/** Current slice index (0-based) for the active single-plane view. */
+export function getSliceIndex(view: ViewName): number {
+  const ax = VIEW_AXIS[view];
+  const n = sliceCount(view);
+  if (!nv || ax < 0 || n <= 1) return 0;
+  const frac = nv.scene.crosshairPos[ax];
+  return Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
+}
+
+/** Move the active single-plane view to slice `idx` (clamped) and redraw. */
+export function setSliceIndex(view: ViewName, idx: number): void {
+  const ax = VIEW_AXIS[view];
+  const n = sliceCount(view);
+  if (!nv || ax < 0 || n <= 1) return;
+  nv.scene.crosshairPos[ax] = Math.max(0, Math.min(1, idx / (n - 1)));   // mutate in place (keeps the vec3 type)
+  nv.drawScene();
+}
+
 export function hasVolume(): boolean {
   return !!nv && nv.volumes.length > 0;
 }
