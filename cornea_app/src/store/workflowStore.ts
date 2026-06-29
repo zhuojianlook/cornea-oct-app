@@ -552,7 +552,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           s.correcting = true;
           s.paintMode = true;   // start in paint mode (loadDrawing enabled the pen)
           if (s.penLabel == null) s.penLabel = 1;
-          s.status = { kind: "working", title: "Correcting segmentation", detail: "Paint/Navigate toggle in the pen bar. Pen: cornea=blue, scar=red, background=orange (erase). Brush size, Fill region, Smart fill, Undo; then Save or Cancel." };
+          s.status = { kind: "working", title: "Correcting segmentation", detail: "Paint/Navigate toggle in the pen bar. Pen: cornea=blue, scar=red, background=grey (remove over-seg; also a Smart-fill seed), Erase=grey. Brush size, Fill region, Smart fill, Undo; then Save or Cancel." };
         });
       } catch (e) {
         nv.endDrawing();
@@ -619,17 +619,17 @@ export const useWorkflowStore = create<WorkflowState>()(
     // #11 — enter cornea/background paint mode: same drawing layer as Correct, but the PaintToolbar hides
     // the Scar pen (corneaOnlyPaint) and the pen defaults to Cornea. Confirm goes through confirmCorneaVet.
     startCorneaVetPaint: async () => {
-      // cornea-vet exposes only Cornea(1) + Background/erase(0); force the pen into that set (a carried-over
-      // Scar(3) or old Background(2) pen would leave the toolbar with nothing selected).
-      set((s) => { s.corneaVetBusy = true; s.corneaOnlyPaint = true; if (s.penLabel !== 0 && s.penLabel !== 1) s.penLabel = 1; });
+      // cornea-vet exposes Cornea(1) + Background(2, grey); force the pen into that set (a carried-over
+      // Scar(3) or Erase(0) pen would leave the toolbar with nothing selected).
+      set((s) => { s.corneaVetBusy = true; s.corneaOnlyPaint = true; if (s.penLabel !== 1 && s.penLabel !== 2) s.penLabel = 1; });
       try {
         await get().loadCorrectionLayer();
         set((s) => {
-          if (s.penLabel !== 0 && s.penLabel !== 1) s.penLabel = 1;
+          if (s.penLabel !== 1 && s.penLabel !== 2) s.penLabel = 1;
           s.status = { kind: "working", title: "Vetting cornea/background",
-            detail: "Paint CORNEA (blue) where it's missing; paint BACKGROUND (grey) to remove over-segmentation. Brush size + Smart fill available. Then Confirm." };
+            detail: "Paint CORNEA (blue) where it's missing; paint BACKGROUND (grey) over wrong cornea to remove it. Smart fill needs a little of BOTH. Then Confirm." };
         });
-        nv.setPen(get().penLabel === 3 ? 1 : get().penLabel, get().penFilled);
+        nv.setPen(get().penLabel, get().penFilled);
       } finally {
         set((s) => { s.corneaVetBusy = false; });
       }
@@ -702,6 +702,14 @@ export const useWorkflowStore = create<WorkflowState>()(
       // #4: set a busy flag + yield once (setTimeout 0) so React paints the spinner BEFORE the blocking
       // call, then clear it. Re-entrancy guarded by the disabled button (smartFillBusy).
       if (get().smartFillBusy) return;
+      // #2 — GrowCut needs ≥2 distinct seed labels. After SAM2 the drawing has ONLY cornea (background is
+      // unpainted/0, not a seed), so a naive fill grows cornea over the whole volume and stalls on per-slice
+      // readPixels (the "hang"). Refuse + tell the user to scribble some Background (grey) first.
+      if (nv.drawingSeedCount() < 2) {
+        set((s) => { s.status = { kind: "error", title: "Smart fill needs a background seed",
+          detail: "Scribble a little BACKGROUND (grey) on a few slices (and Cornea where missing), then Smart fill — it needs both labels to grow between them." }; });
+        return;
+      }
       set((s) => {
         s.smartFillBusy = true;
         s.status = { kind: "working", title: "Smart fill (GrowCut)",

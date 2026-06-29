@@ -85,7 +85,7 @@ export function VolumeCanvas() {
   const showSeg = useWorkflowStore((s) => s.showSegmentation);
   useEffect(() => { setSegmentationOpacity(showSeg && segLoaded ? segOpacity : 0); }, [showSeg, segLoaded, segOpacity]);
   // brush-cursor colour per pen (0 erase, 1 cornea, 2 background, 3 scar)
-  const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#ff8c1a", 3: "#ff453a" };
+  const PEN_COLOR: Record<number, string> = { 0: "#c7c7cc", 1: "#1ab2ff", 2: "#8e8e93", 3: "#ff453a" };
   const painting = correcting && paintMode && view !== "render";
   const showBrush = painting && brush;
 
@@ -199,6 +199,15 @@ export function VolumeCanvas() {
     setViewState(v);
     setView(v);
   };
+
+  // #1 — correction (cornea/background vet AND full correct) is 2-D slice work: the editable cornea is
+  // drawn over the grayscale slice, and you paint per B-scan. If we enter correction from a 3-D/multiplanar
+  // view the user can't see a single slice + the slice scrollbar, so drop to the B-scan (axial) plane on the
+  // transition into correcting (doesn't fight a later manual view change).
+  useEffect(() => {
+    if (correcting && (view === "multi" || view === "render")) { setViewState("axial"); setView("axial"); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [correcting]);
 
   // Manual-GT comparison: swap in the auto-vs-GT agreement overlay viewer (its own niivue).
   if (gtViewerActive && gtViewerName && caseInfo?.case_id) {

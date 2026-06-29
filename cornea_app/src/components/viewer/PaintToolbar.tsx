@@ -7,7 +7,7 @@ import { setDrawOpacity } from "../../niivue/nvController";
 
 const PENS: { value: PenLabel; label: string; color: string }[] = [
   { value: 1, label: "Cornea", color: "#1ab2ff" },
-  { value: 2, label: "Background", color: "#ff8c1a" },
+  { value: 2, label: "Background", color: "#8e8e93" },   // grey: a real seed (Smart fill) that → canonical 0 on save
   { value: 3, label: "Scar", color: "#ff453a" },
   { value: 0, label: "Erase", color: "#8e8e93" },
 ];
@@ -16,13 +16,11 @@ export function PaintToolbar() {
   const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint, smartFillBusy,
           setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, set } = useWorkflowStore();
   if (!correcting) return null;
-  // #3/#11 cornea/background vet step exposes only TWO clear pens: Cornea (paints label 1, blue) and
-  // Background (the Erase pen value 0, grey — painting it removes cornea → canonical background). The old
-  // orange "Background" pen (value 2) was confusing: it looked like scar and vanished on save (it remaps to
-  // background 0 anyway). So here we surface Cornea(blue) + a grey "Background" eraser only.
-  const pens = corneaOnlyPaint
-    ? [PENS[0], { ...PENS[3], label: "Background" }]   // [Cornea(1,blue), Erase(0,grey) shown as "Background"]
-    : PENS;
+  // #3/#11 cornea/background vet step exposes two clear pens: Cornea (label 1, blue) and Background (label 2,
+  // GREY). Background is a real non-zero SEED (so Smart fill/GrowCut has a background seed — fixes the hang)
+  // that maps to canonical 0 on save; painting it over cornea removes that cornea → background. (No separate
+  // Erase needed here — Background grey IS the "remove cornea" tool.)
+  const pens = corneaOnlyPaint ? [PENS[0], PENS[1]] : PENS;   // [Cornea(1,blue), Background(2,grey)]
 
   return (
     <div className="flex items-center gap-3 px-3 border-b overflow-x-auto [&>*]:shrink-0" style={{ minHeight: 36, borderColor: "var(--c-border)" }}>

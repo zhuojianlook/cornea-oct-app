@@ -134,12 +134,14 @@ export function hasVolume(): boolean {
 
 // ── Drawing layer (interactive seed editing) ───────────────────────────────
 // Drawing-layer colours per pen label, matching the segmentation convention so painting shows the
-// RIGHT colour (1 cornea=blue, 2 background=orange, 3 scar=red). Slightly muted + drawn translucent
-// (drawOpacity) so the editable layer reads as "in progress". Index 0 (unpainted) is transparent.
+// RIGHT colour (1 cornea=blue, 2 background=GREY, 3 scar=red). Background is a real non-zero SEED label
+// (needed for Smart-fill/GrowCut) that maps to canonical 0 on save — it's drawn GREY (not the old orange,
+// which read like scar and vanished on save). Slightly muted + drawn translucent (drawOpacity). Index 0
+// (unpainted) is transparent.
 const DRAW_CMAP = {
-  R: [0, 70, 230, 235],
-  G: [0, 160, 150, 95],
-  B: [0, 235, 70, 95],
+  R: [0, 70, 142, 235],
+  G: [0, 160, 142, 95],
+  B: [0, 235, 147, 95],
   A: [0, 255, 255, 255],
   I: [0, 1, 2, 3],
   labels: ["", "cornea", "background", "scar"],
@@ -197,6 +199,20 @@ export function smartFill(): void {
 export function setDrawingEnabled(on: boolean): void {
   if (!nv) return;
   nv.setDrawingEnabled(on);
+}
+
+/** Count of DISTINCT non-zero seed labels in the drawing bitmap (early-exits at 2). GrowCut/Smart-fill
+ *  needs ≥2 (e.g. cornea AND background) to be well-posed — with a single seed it grows that label over
+ *  the whole volume and stalls on per-slice readPixels. Used to guard Smart fill (#2). */
+export function drawingSeedCount(): number {
+  if (!nv || !nv.drawBitmap) return 0;
+  const b = nv.drawBitmap as Uint8Array;
+  const seen = new Set<number>();
+  for (let i = 0; i < b.length; i++) {
+    const v = b[i];
+    if (v > 0) { seen.add(v); if (seen.size >= 2) return 2; }
+  }
+  return seen.size;
 }
 
 export function setDrawOpacity(opacity: number): void {
