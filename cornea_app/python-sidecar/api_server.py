@@ -1651,9 +1651,10 @@ def subgroup_auto_apply(case_id: str, req: SubgroupApplyRequest) -> dict:
             continue
         sub = str(lab).strip() or "1"
         upd = {"scar_subgroup": sub}
-        # The user verified the WHOLE grouping, so confirm each member — but ONLY one that has finished the scar
-        # step (scar_done): confirming a scar-pending member would jump it past step 6 into align with no scar.
-        if req.confirm and bool(orch.read_manifest(c).get("scar_done")):
+        # The user verified the WHOLE grouping, so confirm each member. Subgroup is now assigned BEFORE scar
+        # (cornea✓ → subgroup → scar → align), so confirming does NOT need scar_done — it advances each member
+        # to the Scar step. (Align stays after scar and re-segments any member missing scar via _ensure_segmented.)
+        if req.confirm:
             upd["subgroup_confirmed"] = True
         orch.write_manifest_value(c, upd)
         written[c] = sub
@@ -1805,9 +1806,9 @@ def compare_strategies_cancel(case_id: str) -> dict:
 
 @app.post("/api/case/{case_id}/subgroup/confirm")
 def confirm_subgroup(case_id: str) -> dict:
-    """STEP 6 — confirm this scan's scar-subgroup (already set via /subgroup): which lesion set it belongs
-    to, so the right repeats align together. Sets subgroup_confirmed so the timeline advances SAM2 →
-    Subgroup → Align."""
+    """Confirm this scan's scar-subgroup (already set via /subgroup): which lesion set it belongs to, so the
+    right repeats align together. Sets subgroup_confirmed so the timeline advances Cornea✓ → Subgroup → Scar
+    (subgroup is assigned BEFORE scar so the strategy comparison at the Scar step is per-subgroup)."""
     cid = orch.safe_case_id(case_id)
     sub = str(orch.read_manifest(cid).get("scar_subgroup") or "1").strip() or "1"
     m = orch.write_manifest_value(cid, {"scar_subgroup": sub, "subgroup_confirmed": True})
@@ -1816,8 +1817,9 @@ def confirm_subgroup(case_id: str) -> dict:
 
 @app.post("/api/case/{case_id}/scar/skip")
 def skip_scar(case_id: str) -> dict:
-    """STEP 6 for a CONTROL (no-scar) scan: mark the scar step done WITHOUT running a detector (there is no
-    scar to segment), so the timeline advances Cornea → Scar → Subgroup."""
+    """For a CONTROL (no-scar) scan: mark the scar step done WITHOUT running a detector (there is no scar to
+    segment). Controls are an eye-wide normal baseline with no lesion subgroup, so they skip the Subgroup step
+    and go Cornea✓ → (no scar) → align/correct."""
     m = orch.write_manifest_value(case_id, {"scar_done": True})
     return {"ok": True, "scar_done": bool(m.get("scar_done"))}
 
@@ -2308,7 +2310,10 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
              # The segmentation files were just deleted above; CLEAR their manifest flags too, else
              # scanStep (which keys off sam2_meta/corrected_labelmap/consensus_case BEFORE preproc_vetted)
              # would keep reporting the scan as segmented while its overlay 404s. (Mirrors _STEP_RESET_FLAGS.)
-             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None, "cornea_vetted": None,
+             # subgroup_confirmed is cleared as well: a leftover would make the re-segmented scan jump straight
+             # to the Subgroup step (subgroup is now before scar), skipping the cornea/background vet step.
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
+             "cornea_vetted": None, "subgroup_confirmed": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if cls:
         extra["scar_classification"] = cls
@@ -2485,8 +2490,8 @@ _STEP_RESET_FLAGS: dict[int, list[str]] = {
     4: ["scar_classification", "scar_range"],       # Classified (scar/control)
     5: ["sam2_meta", "qa_json", "segmentation_preview_dir"],  # Cornea (SAM2)
     6: ["cornea_vetted"],                           # Cornea/background paint-vetted
-    7: ["scar_done", "scar_metrics"],               # Scar segmented
-    8: ["subgroup_confirmed"],                      # Subgroup assigned
+    7: ["subgroup_confirmed"],                      # Subgroup assigned (now BEFORE scar)
+    8: ["scar_done", "scar_metrics"],               # Scar segmented (now AFTER subgroup)
     9: ["consensus_case"],                          # Aligned (link to the eye's consensus)
     10: ["normalized"],                             # Normalised against controls
     11: ["corrected_labelmap"],                     # Manually corrected

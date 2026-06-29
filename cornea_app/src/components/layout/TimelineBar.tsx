@@ -377,13 +377,30 @@ export function TimelineBar() {
     // → unlocks the Scar step. Scar detection is NOT shown here until cornea/background is confirmed.
     actions = <>{CorneaVet}</>;
   } else if (step === 6) {
-    // cornea/background vetted (indigo) → SCAR step. Scar scan: detect. Control: no scar → continue.
+    // cornea/background vetted (indigo) → SUBGROUP step (moved BEFORE scar so the strategy comparison at the
+    // Scar step is per-subgroup). Scar scan: assign which lesion set it belongs to. Control: no lesion subgroup
+    // is needed (the control baseline is eye-wide, control_cases() ignores subgroup) → skip straight to "no scar".
     actions = classification === "control" ? (
       <>
         <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => skipScar()}
-          title="This scan is a control (no scar) — mark the scar step done and continue to subgroup assignment.">
+          title="This scan is a control (no scar). Controls are an eye-wide normal baseline (no lesion subgroup), so mark the scar step done and continue.">
           ✓ No scar (control) — continue
         </Button>
+        {sep}{Correct}
+      </>
+    ) : (
+      <>
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Assign this scan's scar subgroup (which lesion set — groups the repeats that align together), then detect scar:</span>
+        {SubgroupConfirm}{sep}{AutoSubgroupBtn}
+      </>
+    );
+  } else if (step === 7) {
+    // subgroup assigned (purple) → SCAR DETECTION. Subgroup is confirmed, so "⚖ Compare strategies" (right
+    // bar) is now PER-SUBGROUP. A control normally skips this step; a fallback skip is shown just in case.
+    actions = classification === "control" ? (
+      <>
+        <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => skipScar()}
+          title="Control (no scar) — mark the scar step done and continue.">✓ No scar (control) — continue</Button>
         {sep}{Correct}
       </>
     ) : (
@@ -392,21 +409,14 @@ export function TimelineBar() {
         {ScarDetect}
       </>
     );
-  } else if (step === 7) {
-    // scar segmented (rose) → assign this scan's SUBGROUP (gates align); re-run scar / correct to iterate.
-    actions = (
-      <>
-        {SubgroupConfirm}{sep}{AutoSubgroupBtn}{sep}{Correct}
-        {ScarReRun && <>{sep}{ScarReRun}</>}
-      </>
-    );
   } else if (step === 8) {
-    // subgroup assigned (purple) → align this subgroup's replicates
+    // scar segmented (rose) → refine/correct the scar, then align this subgroup's replicates.
     actions = (
       <>
-        {AlignBtn}
-        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(subgroup “{subgroup}”)</span>
-        {sep}{SubgroupConfirm}{sep}{AutoSubgroupBtn}{sep}{Correct}
+        {ScarReRun && <>{ScarReRun}{sep}</>}{Correct}{sep}{AlignBtn}
+        {classification !== "control" && (
+          <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(subgroup “{subgroup}”)</span>
+        )}
       </>
     );
   } else if (step === 9) {
@@ -440,9 +450,10 @@ export function TimelineBar() {
         <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
         <div className="flex-1" />
         {/* PUBLICATION: compare scar-detection strategies' reproducibility across the eye's replicates. Lives in
-            the Scar step (6) — where you pick a detector — and on a consensus case (subgroup-specific). Needs ≥2
-            cornea-segmented replicates of the eye+subgroup; a control has no scar so it's hidden there. */}
-        {caseInfo && ((step === 6 && classification !== "control") || isConsensus) && (
+            the Scar-detection step (7) — where you pick a detector, AFTER subgroup is assigned, so the comparison
+            is PER-SUBGROUP — and on a consensus case. Needs ≥2 cornea-segmented replicates of the eye+subgroup;
+            a control has no scar so it's hidden. */}
+        {caseInfo && ((step === 7 && classification !== "control") || isConsensus) && (
           <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
             onClick={() => { setShowCompare(true); compareStrategies(); }}
             title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">
