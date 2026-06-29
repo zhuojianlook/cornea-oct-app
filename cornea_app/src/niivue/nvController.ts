@@ -177,6 +177,7 @@ export function endDrawing(): void {
   try { nv.closeDrawing(); } catch { /* no-op if no drawing */ }
   nv.drawScene();
   renderDrawOverlay();   // drawBitmap is gone now → clears the 2-D overlay
+  vetBaseline = null;    // leaving the paint session → drop the auto-partition snapshot (don't leak into another step)
 }
 
 /** Undo the last brush stroke / smart fill (niivue keeps a drawing undo stack). */
@@ -243,6 +244,13 @@ export function brushScreenSize(xCss: number, yCss: number): { w: number; h: num
 // the worker runs a multi-source geodesic flood (Dijkstra/Dial buckets, O(N), off the main thread, with
 // progress) so the UI stays responsive. Seeds = the current drawBitmap labels (1 cornea, 2 background, 3
 // scar); every unlabelled voxel is assigned the geodesically-nearest seed's label.
+// Snapshot of the drawing taken right after fillBackgroundSeed = the AUTO cornea/background partition
+// (SAM2 cornea = 1, every other voxel flooded to background = 2). Smart fill uses it to tell the user's
+// EDITS apart from that auto-fill, so a painted cornea correction can re-grow ACROSS slices instead of
+// being trapped by the wall-to-wall background labelling (see smartFill). Invariant: set ONLY here, cleared
+// ONLY in endDrawing (every exit from a paint session calls endDrawing) → never leaks into another step.
+let vetBaseline: Uint8Array | null = null;
+
 /** Fill every UNPAINTED (0) voxel in the drawing with the BACKGROUND seed (pen 2) — used after SAM2 so the
  *  cornea-vet step shows a COMPLETE cornea/background partition to correct (and gives Smart fill a background
  *  seed). On save pen 2 → canonical background 0, so the labelmap is unchanged. */
@@ -250,6 +258,7 @@ export function fillBackgroundSeed(): void {
   if (!nv || !nv.drawBitmap) return;
   const b = nv.drawBitmap as Uint8Array;
   for (let i = 0; i < b.length; i++) if (b[i] === 0) b[i] = 2;
+  vetBaseline = b.slice();   // remember the auto partition so Smart fill can re-grow user cornea edits across slices
   try { nv.refreshDrawing(true); } catch { /* */ }
   nv.drawScene();
   renderDrawOverlay();
@@ -272,14 +281,46 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
   // a mismatch (e.g. a stale drawing from a differently-sized volume) would corrupt drawBitmap on set().
   if (draw.length !== N || ras.length !== N) return { ok: false, reason: "size-mismatch" };
   const seeds = draw.slice();
-  let hasFg = false;
-  for (let i = 0; i < seeds.length; i++) { const s = seeds[i]; if (s === 1 || s === 3) { hasFg = true; break; } }
-  if (!hasFg) return { ok: false, reason: "no-seeds" };   // need ≥1 cornea/scar seed to grow from
+  // intensity quantised to 8-bit over the display window — needed BOTH for the flood and the cornea-vet dark cut.
   let lo = vol.cal_min ?? 0, hi = vol.cal_max ?? 0;
   if (!(hi > lo)) { lo = vol.global_min ?? 0; hi = vol.global_max ?? 1; }
   const scale = hi > lo ? 255 / (hi - lo) : 0;   // flat volume → 0 = spatial-only flood (no crash)
   const q = new Uint8Array(ras.length);
   for (let i = 0; i < ras.length; i++) { const t = (ras[i] - lo) * scale; q[i] = t <= 0 ? 0 : t >= 255 ? 255 : t | 0; }
+  // ── Cornea-vet propagation ────────────────────────────────────────────────────────────────────────────
+  // After SAM2 the WHOLE volume is labelled (SAM2 cornea = 1, every other voxel flooded to background = 2 by
+  // fillBackgroundSeed). The geodesic flood only fills UNLABELLED (0) voxels, so with no 0-voxels Smart fill
+  // would be a no-op: a cornea stroke the user painted over a region SAM2 wrongly called background would NOT
+  // spread to neighbouring slices, forcing slice-by-slice correction. Fix: SOFTEN the BRIGHT untouched
+  // auto-background (still 2 AND was 2 in the baseline) back to 0 so the flood can re-grow it, while keeping
+  // every USER edit and the SAM2 cornea as HARD seeds. A background stroke the user painted over baseline-cornea
+  // (seeds 2, baseline 1) is NOT softened → stays a hard background seed, so over-segmentation removals also
+  // propagate. The "definitely background" level is data-driven = the SAM2 cornea's own 10th-percentile
+  // intensity: auto-background DARKER than (almost) all cornea is air/shadow → kept as a HARD background seed
+  // (gives the flood a well-posed background source and stops dark regions bloating to cornea); brighter
+  // auto-background is the candidate the correction grows into. NO geometric-face anchors — the cornea can reach
+  // the scan edge, so anchoring faces would CLIP it; the abundant dark air/shadow provides the seeds instead.
+  // Net: painted cornea grows from BOTH SAM2's region and the user's stroke into intensity-similar tissue across
+  // slices, bounded by intensity edges and the dark seeds; cornea only grows (SAM2 stays hard) unless removed.
+  if (vetBaseline && vetBaseline.length === seeds.length) {
+    const hist = new Int32Array(256);
+    let cN = 0;
+    for (let i = 0; i < seeds.length; i++) if (vetBaseline[i] === 1) { hist[q[i]]++; cN++; }
+    let darkCut = 0;
+    if (cN > 0) { const target = cN * 0.10; let acc = 0; for (let b = 0; b < 256; b++) { acc += hist[b]; if (acc >= target) { darkCut = b; break; } } }
+    let softened = 0, bgLeft = 0;
+    for (let i = 0; i < seeds.length; i++) {
+      if (seeds[i] !== 2) continue;
+      if (vetBaseline[i] === 2 && q[i] >= darkCut) { seeds[i] = 0; softened++; }   // bright untouched auto-bg → re-growable
+      else bgLeft++;                                                               // dark auto-bg or user-painted bg → hard seed
+    }
+    // Safety: if softening left NO background seed (degenerate — e.g. no dark air), revert so the single-label
+    // flood can't run away / hang. Only the voxels we just softened are 0 here, so restore them to background.
+    if (bgLeft === 0 && softened > 0) for (let i = 0; i < seeds.length; i++) if (seeds[i] === 0) seeds[i] = 2;
+  }
+  let hasFg = false;
+  for (let i = 0; i < seeds.length; i++) { const s = seeds[i]; if (s === 1 || s === 3) { hasFg = true; break; } }
+  if (!hasFg) return { ok: false, reason: "no-seeds" };   // need ≥1 cornea/scar seed to grow from
   // A FRESH worker per run, terminated in finally — no listener accumulation / no reuse of a hung worker.
   const worker = new Worker(new URL("./growcut.worker.ts", import.meta.url), { type: "module" });
   try {
