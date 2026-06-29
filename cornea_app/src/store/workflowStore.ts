@@ -627,10 +627,14 @@ export const useWorkflowStore = create<WorkflowState>()(
       set((s) => { s.corneaVetBusy = true; s.corneaOnlyPaint = true; if (s.penLabel !== 1 && s.penLabel !== 2) s.penLabel = 1; });
       try {
         await get().loadCorrectionLayer();
+        // #2 — after SAM2 the cornea is complete but the BACKGROUND is unpainted/invisible. Fill every
+        // non-cornea voxel as the background seed (pen 2, grey) so the user sees + edits a COMPLETE
+        // cornea/background partition (on save pen 2 → canonical background 0, so the labelmap is unchanged).
+        nv.fillBackgroundSeed();
         set((s) => {
           if (s.penLabel !== 1 && s.penLabel !== 2) s.penLabel = 1;
           s.status = { kind: "working", title: "Vetting cornea/background",
-            detail: "Paint CORNEA (blue) where it's missing; paint BACKGROUND (grey) over wrong cornea to remove it. Smart fill needs a little of BOTH. Then Confirm." };
+            detail: "Cornea (blue) + background (grey) shown. Paint CORNEA where missing; paint BACKGROUND over wrong cornea to remove it. Then Confirm." };
         });
         nv.setPen(get().penLabel, get().penFilled);
       } finally {
@@ -700,33 +704,31 @@ export const useWorkflowStore = create<WorkflowState>()(
     },
 
     runSmartFill: async () => {
-      // GrowCut propagates the scribbled bg/cornea/scar labels through the whole 3-D volume. It runs
-      // SYNCHRONOUSLY on the main thread (~seconds on a full OCT volume), which previously looked "hung".
-      // #4: set a busy flag + yield once (setTimeout 0) so React paints the spinner BEFORE the blocking
-      // call, then clear it. Re-entrancy guarded by the disabled button (smartFillBusy).
+      // CPU geodesic flood in a Web Worker (ported from the annotator) — niivue's GPU drawGrowCut hangs on
+      // the WebKitGTK/NVIDIA stack. The worker runs off the main thread (UI stays responsive) and reports
+      // progress. Needs ≥1 cornea/scar seed; it assigns every unlabelled voxel the nearest seed's label.
       if (get().smartFillBusy) return;
-      // #2 — GrowCut needs ≥2 distinct seed labels. After SAM2 the drawing has ONLY cornea (background is
-      // unpainted/0, not a seed), so a naive fill grows cornea over the whole volume and stalls on per-slice
-      // readPixels (the "hang"). Refuse + tell the user to scribble some Background (grey) first.
-      if (nv.drawingSeedCount() < 2) {
-        set((s) => { s.status = { kind: "error", title: "Smart fill needs a background seed",
-          detail: "Scribble a little BACKGROUND (grey) on a few slices (and Cornea where missing), then Smart fill — it needs both labels to grow between them." }; });
-        return;
-      }
       set((s) => {
         s.smartFillBusy = true;
-        s.status = { kind: "working", title: "Smart fill (GrowCut)",
-          detail: "Propagating your scribbles through the whole 3-D volume by intensity similarity — a few seconds…" };
+        s.status = { kind: "working", title: "Smart fill", detail: "Growing labels from your scribbles (CPU, off the main thread)…" };
       });
-      // Wait for an actual browser PAINT (double rAF) so the spinner is on-screen before the synchronous
-      // GrowCut blocks the main thread — setTimeout(0) can fire before React flushes/paints.
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(undefined))));
       try {
-        nv.smartFill();
-        set((s) => {
-          s.segVersion = s.segVersion + 1;
-          s.status = { kind: "done", title: "Smart fill complete", detail: "Labels propagated — review/correct, then Confirm or Save." };
-        });
+        const res = await nv.smartFill((pct) => set((s) => {
+          if (s.smartFillBusy) s.status = { kind: "working", title: "Smart fill", detail: `Growing labels from your scribbles… ${pct}%` };
+        }));
+        if (!res.ok) {
+          set((s) => { s.status = { kind: "error", title: "Smart fill",
+            detail: res.reason === "no-seeds"
+              ? "Paint a little Cornea (and Background) on a few slices first — Smart fill grows outward from your scribbles."
+              : res.reason === "size-mismatch"
+                ? "The drawing and volume sizes don't match — reopen the scan and try again."
+                : "No volume loaded." }; });
+        } else {
+          set((s) => {
+            s.segVersion = s.segVersion + 1;
+            s.status = { kind: "done", title: "Smart fill complete", detail: "Labels propagated — review/correct, then Confirm or Save." };
+          });
+        }
       } catch (e) {
         set((s) => { s.status = { kind: "error", title: "Smart fill failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {

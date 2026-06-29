@@ -201,13 +201,72 @@ export function setPenSize(size: number): void {
   nv.opts.penSize = Math.max(1, Math.round(size));
 }
 
-/** Smart 3-D fill: GrowCut propagates the scribbled labels (bg/cornea/scar) through the whole volume by
- *  intensity similarity, so the user seeds a few slices and the rest of every view is filled in. */
-export function smartFill(): void {
-  if (!nv) return;
-  nv.drawGrowCut();
+// Smart fill = CPU "Grow from seeds" in a WEB WORKER (ported from the annotator). niivue's GPU drawGrowCut
+// is unusably slow / hangs on the WebKitGTK + NVIDIA desktop stack (128 iterations × per-slice readPixels);
+// the worker runs a multi-source geodesic flood (Dijkstra/Dial buckets, O(N), off the main thread, with
+// progress) so the UI stays responsive. Seeds = the current drawBitmap labels (1 cornea, 2 background, 3
+// scar); every unlabelled voxel is assigned the geodesically-nearest seed's label.
+/** Fill every UNPAINTED (0) voxel in the drawing with the BACKGROUND seed (pen 2) — used after SAM2 so the
+ *  cornea-vet step shows a COMPLETE cornea/background partition to correct (and gives Smart fill a background
+ *  seed). On save pen 2 → canonical background 0, so the labelmap is unchanged. */
+export function fillBackgroundSeed(): void {
+  if (!nv || !nv.drawBitmap) return;
+  const b = nv.drawBitmap as Uint8Array;
+  for (let i = 0; i < b.length; i++) if (b[i] === 0) b[i] = 2;
+  try { nv.refreshDrawing(true); } catch { /* */ }
   nv.drawScene();
-  renderDrawOverlay();   // show the propagated labels on the 2-D overlay
+  renderDrawOverlay();
+}
+
+/** Smart 3-D fill via the CPU worker. Resolves {ok, reason}; reports 0..100 via onProgress. Pushes a niivue
+ *  undo bitmap first so the fill is undoable. Returns reason:"no-seeds" if no cornea/scar seed exists. */
+export async function smartFill(onProgress?: (pct: number) => void): Promise<{ ok: boolean; reason?: "no-volume" | "no-seeds" | "size-mismatch" }> {
+  if (!nv || !nv.volumes.length || !nv.drawBitmap) return { ok: false, reason: "no-volume" };
+  const dr = nv.volumes[0].dimsRAS as number[] | undefined;
+  if (!dr || dr.length < 4) return { ok: false, reason: "no-volume" };
+  const N = dr[1] * dr[2] * dr[3];
+  const draw = nv.drawBitmap as Uint8Array;
+  // intensity in RAS order (matches drawBitmap), quantised to 8-bit over the display window.
+  const vol = nv.volumes[0] as unknown as {
+    img2RAS: () => ArrayLike<number>; cal_min?: number; cal_max?: number; global_min?: number; global_max?: number;
+  };
+  const ras = vol.img2RAS();
+  // GUARD: seeds (drawBitmap), intensity (img2RAS) and the worker's output must all be exactly N voxels —
+  // a mismatch (e.g. a stale drawing from a differently-sized volume) would corrupt drawBitmap on set().
+  if (draw.length !== N || ras.length !== N) return { ok: false, reason: "size-mismatch" };
+  const seeds = draw.slice();
+  let hasFg = false;
+  for (let i = 0; i < seeds.length; i++) { const s = seeds[i]; if (s === 1 || s === 3) { hasFg = true; break; } }
+  if (!hasFg) return { ok: false, reason: "no-seeds" };   // need ≥1 cornea/scar seed to grow from
+  let lo = vol.cal_min ?? 0, hi = vol.cal_max ?? 0;
+  if (!(hi > lo)) { lo = vol.global_min ?? 0; hi = vol.global_max ?? 1; }
+  const scale = hi > lo ? 255 / (hi - lo) : 0;   // flat volume → 0 = spatial-only flood (no crash)
+  const q = new Uint8Array(ras.length);
+  for (let i = 0; i < ras.length; i++) { const t = (ras[i] - lo) * scale; q[i] = t <= 0 ? 0 : t >= 255 ? 255 : t | 0; }
+  // A FRESH worker per run, terminated in finally — no listener accumulation / no reuse of a hung worker.
+  const worker = new Worker(new URL("./growcut.worker.ts", import.meta.url), { type: "module" });
+  try {
+    const label = await new Promise<Uint8Array>((resolve, reject) => {
+      worker.onmessage = (ev: MessageEvent) => {
+        const d = ev.data as { type: string; pct?: number; label?: Uint8Array };
+        if (d.type === "progress") onProgress?.(d.pct ?? 0);
+        else if (d.type === "done") {
+          if (!d.label || d.label.length !== N) reject(new Error(`growcut returned ${d.label?.length ?? 0} voxels, expected ${N}`));
+          else resolve(d.label);
+        }
+      };
+      worker.onerror = (e) => reject(new Error(e.message || "growcut worker failed"));
+      worker.postMessage({ intensity: q, seeds, nx: dr[1], ny: dr[2], nz: dr[3], spatial: 1 }, [q.buffer, seeds.buffer]);
+    });
+    try { nv.drawAddUndoBitmap(); } catch { /* undo push best-effort */ }
+    draw.set(label);
+    try { nv.refreshDrawing(true); } catch (e) { console.error("[smartFill] refreshDrawing failed", e); }
+    nv.drawScene();
+    renderDrawOverlay();
+    return { ok: true };
+  } finally {
+    worker.terminate();
+  }
 }
 
 export function setDrawingEnabled(on: boolean): void {

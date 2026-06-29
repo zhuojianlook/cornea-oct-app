@@ -421,29 +421,32 @@ export function TimelineBar() {
   }
 
   return (
-    <div className="flex items-center gap-3 px-3 border-b overflow-x-auto [&>*]:shrink-0"
-      style={{ minHeight: 46, backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}>
-      {strip}
-      <span style={{ width: 1, height: 26, background: "var(--c-border)" }} />
-      <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
-      <div className="flex-1" />
-      {/* PUBLICATION: compare scar-detection strategies' reproducibility on this eye's replicates. Available
-          once a scan/consensus is segmented (needs ≥2 segmented replicates of the eye+subgroup). */}
-      {caseInfo && (step >= 5 || isConsensus) && (
-        <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
-          onClick={() => { setShowCompare(true); compareStrategies(); }}
-          title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">
-          ⚖ Compare strategies
-        </Button>
-      )}
-      {/* #6 — the "⊞ Auto subgroups" button moved OUT of this global top-right into the Subgroup steps (7/8)
-          actions (AutoSubgroupBtn), next to the subgroup-assignment controls. */}
-      {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
-      {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
-        <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-          title={status.detail}>{status.detail}</span>
-      )}
-      {(busy || !!sam2RunningCaseId) && <CircularProgress size={16} />}
+    <div className="flex flex-col border-b" style={{ backgroundColor: "var(--c-surface)", borderColor: "var(--c-border)" }}>
+      {/* Row 1 — the per-scan lifecycle STEPS. */}
+      <div className="flex items-center gap-3 px-3 overflow-x-auto [&>*]:shrink-0" style={{ minHeight: 28 }}>
+        {strip}
+      </div>
+      {/* Row 2 — the action BUTTONS for the current step (+ compare strategies + live progress). */}
+      <div className="flex items-center gap-3 px-3 overflow-x-auto [&>*]:shrink-0 border-t" style={{ minHeight: 40, borderColor: "var(--c-border)" }}>
+        <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
+        <div className="flex-1" />
+        {/* PUBLICATION: compare scar-detection strategies' reproducibility on this eye's replicates. Available
+            once a scan/consensus is segmented (needs ≥2 segmented replicates of the eye+subgroup). */}
+        {caseInfo && (step >= 5 || isConsensus) && (
+          <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
+            onClick={() => { setShowCompare(true); compareStrategies(); }}
+            title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">
+            ⚖ Compare strategies
+          </Button>
+        )}
+        {/* #6 — "⊞ Auto subgroups" lives in the Subgroup steps (7/8) actions, not here. */}
+        {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
+        {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
+          <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+            title={status.detail}>{status.detail}</span>
+        )}
+        {(busy || !!sam2RunningCaseId) && <CircularProgress size={16} />}
+      </div>
 
       {/* PUBLICATION: scar-strategy reproducibility table. */}
       <Dialog open={showCompare} onClose={() => setShowCompare(false)} maxWidth="md" fullWidth>
