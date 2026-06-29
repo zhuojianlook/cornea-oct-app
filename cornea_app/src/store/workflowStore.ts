@@ -100,6 +100,7 @@ interface WorkflowState {
   penSize: number;        // brush thickness (voxels)
   penFilled: boolean;     // filled pen: draw a closed outline → fill the enclosed region
   paintMode: boolean;     // true = brush paints; false = navigate (click moves crosshair, no paint)
+  cropRegionMode: boolean; // #9 — Fix-columns "Crop" box mode is active → viewer forces sagittal + disables coronal
   drawOpacity: number;
   correcting: boolean;
 
@@ -216,6 +217,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     penSize: 3,
     penFilled: false,
     paintMode: true,
+    cropRegionMode: false,
     drawOpacity: 0.5,
     correcting: false,
 
@@ -283,6 +285,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.subgroupProposal = null;
         s.correcting = false;
         s.corneaOnlyPaint = false;
+        s.cropRegionMode = false;
         s.hintMode = false;
         s.scarHints = [];
         s.scarEditMode = false;

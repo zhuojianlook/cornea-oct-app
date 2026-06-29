@@ -1497,7 +1497,7 @@ def _case_identity(cid: str) -> tuple[str, str, str]:
 
 
 def _case_crop_lateral(case_id: str) -> list[int]:
-    """#9 — the persisted lateral-crop columns (oct_params.crop_lateral) for a case, or []."""
+    """LEGACY #9 v1 — the persisted full-slice lateral-crop columns (oct_params.crop_lateral), or []."""
     raw = (orch.read_manifest(case_id).get("oct_params") or {}).get("crop_lateral") or []
     out = []
     for c in raw:
@@ -1508,21 +1508,48 @@ def _case_crop_lateral(case_id: str) -> list[int]:
     return sorted(set(out))
 
 
+def _case_crop_region(case_id: str):
+    """#9 v2 — the persisted BOX crop (oct_params.crop_region = {'lateral':[lo,hi], 'frames':[…]}), or None."""
+    r = (orch.read_manifest(case_id).get("oct_params") or {}).get("crop_region")
+    if not isinstance(r, dict):
+        return None
+    lat = r.get("lateral") or []
+    frames = r.get("frames") or []
+    if len(lat) != 2 or not frames:
+        return None
+    try:
+        lo, hi = sorted((int(lat[0]), int(lat[1])))
+        fs = sorted({int(f) for f in frames})
+    except (ValueError, TypeError):
+        return None
+    return {"lateral": [lo, hi], "frames": fs}
+
+
 def _case_valid_mask(case_id: str):
     """#9 crop-aware analytics — a bool validity volume in the case's labelmap grid: True everywhere except
-    the cropped LATERAL band (axis 0 of the saved NIfTI = the 513 fast-scan axis). None if nothing cropped
-    (callers treat None as all-valid). Used by compare-strategies to restrict to the common valid region."""
+    the cropped region. The saved labelmap axis order is (lateral=axis0, depth=axis1, frames=axis2), so a BOX
+    crop {lateral:[lo,hi], frames:[…]} zeros valid[lo:hi+1, :, f]; the LEGACY full-slice crop zeros
+    valid[lat, :, :]. None if nothing cropped (callers treat None as all-valid). Used by compare-strategies."""
     import numpy as np
-    crop = _case_crop_lateral(case_id)
-    if not crop:
+    region = _case_crop_region(case_id)
+    legacy = _case_crop_lateral(case_id)
+    if region is None and not legacy:
         return None
     arr, _ = labels.best_labelmap_nnunet(case_id)
     if arr is None:
         return None
+    n_lat, _depth, n_fr = arr.shape          # saved labelmap = (lateral, depth, frames)
     valid = np.ones(arr.shape, bool)
-    idx = [i for i in crop if 0 <= i < arr.shape[0]]      # lateral = axis 0 in the saved labelmap
-    if idx:
-        valid[idx, :, :] = False
+    if region is not None:
+        lo = max(0, min(n_lat - 1, region["lateral"][0]))
+        hi = max(0, min(n_lat - 1, region["lateral"][1]))
+        for f in region["frames"]:
+            if 0 <= f < n_fr:
+                valid[lo:hi + 1, :, f] = False
+    if legacy:
+        idx = [i for i in legacy if 0 <= i < n_lat]
+        if idx:
+            valid[idx, :, :] = False
     return valid
 
 
@@ -1820,10 +1847,11 @@ class OctPreprocessRequest(BaseModel):
                                              # cropped (no top surface). A STICKY oct_param; on re-run those
                                              # frames are reconstructed by posterior continuity (bottom-edge
                                              # guidance). None = carry persisted set; [] = clear the crop.
-    crop_lateral: List[int] | None = None    # #9 "Crop": problematic LATERAL columns (0..512, the 513 fast-scan
-                                             # axis) to REMOVE — zeroed in the corrected volume before SAM2. A
-                                             # STICKY oct_param recorded so scar-alignment excludes the lost band.
-                                             # None = carry persisted set; [] = clear the crop.
+    crop_lateral: List[int] | None = None    # LEGACY #9 v1 full-slice crop (kept for old cases).
+    crop_region: dict | None = None          # #9 v2 "Crop": a BOX = {'lateral':[lo,hi], 'frames':[…]} — remove
+                                             # certain FRAME columns over a RANGE of LATERAL slices (zeroed before
+                                             # SAM2). A STICKY oct_param recorded so scar-alignment excludes the
+                                             # lost box. None = carry persisted; {} or empty frames = clear the crop.
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
     manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
@@ -2149,11 +2177,21 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             eff_params["surface_crop_frames"] = scf
         else:
             eff_params.pop("surface_crop_frames", None)
-    # #9 "Crop" — sticky lateral-column removal (carried through the eff_params merge on later re-runs, like a
-    # geometric property of the scan). When THIS request supplies it (non-None), REPLACE the persisted set; an
-    # empty list clears the crop. preprocess_oct_to_nifti zeros these lateral columns; the set is also persisted
-    # so the consensus/subgroup/compare analytics can exclude the removed band (crop-aware scar alignment).
-    if req.crop_lateral is not None:
+    # #9 "Crop" — STICKY box crop (carried through the eff_params merge on later re-runs, like a geometric
+    # property of the scan). crop_region = {'lateral':[lo,hi], 'frames':[…]} removes those frame columns over
+    # the lateral-slice range (zeroed before SAM2); recorded so the compare/subgroup analytics exclude the box
+    # (crop-aware). When THIS request supplies crop_region (non-None), REPLACE it; empty/no frames clears it AND
+    # the legacy full-slice crop. The legacy crop_lateral path is kept only for old cases.
+    if req.crop_region is not None:
+        cr = req.crop_region if isinstance(req.crop_region, dict) else {}
+        lat = cr.get("lateral") or []
+        frames = sorted({int(f) for f in (cr.get("frames") or [])})
+        if len(lat) == 2 and frames:
+            eff_params["crop_region"] = {"lateral": [int(lat[0]), int(lat[1])], "frames": frames}
+            eff_params.pop("crop_lateral", None)   # a VALID box crop supersedes the legacy full-slice crop
+        else:
+            eff_params.pop("crop_region", None)    # explicit clear (empty frames) — don't touch legacy here
+    elif req.crop_lateral is not None:         # legacy full-slice crop (old clients)
         cl = sorted(set(_int_list(req.crop_lateral)))
         if cl:
             eff_params["crop_lateral"] = cl
@@ -2591,18 +2629,29 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
                   "kind": "decision", "group": "volume",
                   "branch": (f"{len(eff_params.get('manual_shifts') or {})} frame(s) nudged — applied LAST as ground truth"
                              if eff_params.get("manual_shifts") else "none — applied LAST, after all fitting/guards")})
-    # #9 Custom column crop — the user-removed LATERAL band (zeroed before SAM2). Shown as a volume node with
-    # the contiguous ranges; scar-alignment analytics exclude this band so a partial crop doesn't bias metrics.
-    crop_lat = sorted(int(c) for c in (eff_params.get("crop_lateral") or []))
-    if crop_lat:
-        runs, s0 = [], crop_lat[0]; prev = crop_lat[0]
-        for c in crop_lat[1:] + [None]:
-            if c is None or c != prev + 1:
-                runs.append(f"{s0}–{prev}" if prev > s0 else f"{s0}"); s0 = c
+    # #9 Custom crop — the user-removed BOX (frame columns × lateral-slice range, zeroed before SAM2). Shown
+    # as a volume node; scar-alignment analytics exclude this box so a partial crop doesn't bias metrics.
+    def _runs(xs):
+        xs = sorted(set(int(x) for x in xs)); out, s0, prev = [], None, None
+        for c in xs + [None]:
+            if c is None or (prev is not None and c != prev + 1):
+                out.append(f"{s0}–{prev}" if prev > s0 else f"{s0}"); s0 = c
+            else:
+                s0 = s0 if s0 is not None else c
             prev = c if c is not None else prev
-        steps.append({"label": _vlabel(f"Custom column crop — {len(crop_lat)} lateral column(s) removed"),
+        return out
+    region = eff_params.get("crop_region") if isinstance(eff_params.get("crop_region"), dict) else None
+    if region and region.get("frames") and (region.get("lateral") or []):
+        lo, hi = int(region["lateral"][0]), int(region["lateral"][1])
+        fr = sorted(int(f) for f in region["frames"])
+        steps.append({"label": _vlabel(f"Custom crop — {len(fr)} frame-column(s) over lateral {min(lo,hi)}–{max(lo,hi)}"),
                       "kind": "decision", "group": "volume",
-                      "branch": f"lateral {', '.join(runs)} of 513 zeroed before SAM2 — excluded from scar-alignment (crop-aware)"})
+                      "branch": f"frames {', '.join(_runs(fr))} zeroed across depth over lateral slices {min(lo,hi)}–{max(lo,hi)} of 513, before SAM2 — excluded from scar-alignment (crop-aware)"})
+    crop_lat = sorted(int(c) for c in (eff_params.get("crop_lateral") or []))   # legacy full-slice crop
+    if crop_lat:
+        steps.append({"label": _vlabel(f"Custom column crop (legacy) — {len(crop_lat)} lateral slice(s) removed"),
+                      "kind": "decision", "group": "volume",
+                      "branch": f"lateral {', '.join(_runs(crop_lat))} of 513 fully zeroed before SAM2 — excluded from scar-alignment"})
     return {"steps": steps, "slices": n_slices, "index": cur_index}
 
 

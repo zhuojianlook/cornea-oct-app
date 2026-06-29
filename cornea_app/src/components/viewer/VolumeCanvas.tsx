@@ -75,8 +75,11 @@ export function VolumeCanvas() {
   // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
   // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
   const overlay2d = compareView || fixColsView;
+  // #9 — Fix-columns "Crop region" mode is SAGITTAL-ONLY (the crop is defined in sagittal terms: frame
+  // columns over a lateral-slice range), so force sagittal + disable the coronal option while it's active.
+  const cropRegionMode = useWorkflowStore((s) => s.cropRegionMode);
   const orient2d: "axial" | "coronal" | "sagittal" = fixColsView
-    ? (view === "coronal" ? "coronal" : "sagittal")
+    ? (cropRegionMode ? "sagittal" : (view === "coronal" ? "coronal" : "sagittal"))
     : (view === "axial" || view === "coronal" || view === "sagittal") ? view : "sagittal";
   // Slices | Segmentation overlay toggle (Segmentation greyed until SAM2 has run). On the niivue path it
   // simply shows/hides the cornea/scar overlay by opacity; the 2-D gallery reads the same flag.
@@ -289,7 +292,7 @@ export function VolumeCanvas() {
         <ToggleButtonGroup size="small" exclusive value={overlay2d ? orient2d : view} onChange={onView}>
           {!overlay2d && <ToggleButton value="multi">Multi</ToggleButton>}
           {!fixColsView && <ToggleButton value="axial">Axial</ToggleButton>}
-          <ToggleButton value="coronal">Coronal</ToggleButton>
+          {!cropRegionMode && <ToggleButton value="coronal">Coronal</ToggleButton>}
           <ToggleButton value="sagittal">Sagittal</ToggleButton>
           {!overlay2d && <ToggleButton value="render">3D</ToggleButton>}
         </ToggleButtonGroup>

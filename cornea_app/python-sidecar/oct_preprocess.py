@@ -1829,22 +1829,53 @@ def raw_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
 
 
 def _crop_lateral_indices(params: dict | None, n_lateral: int) -> np.ndarray:
-    """#9 Crop: resolve the sticky lateral-crop selection (params['crop_lateral'] = flat int indices into
-    0..n_lateral-1, the 513 fast-scan axis) to a clean, in-bounds, de-duplicated index array."""
+    """LEGACY (#9 v1): the old full-slice crop — params['crop_lateral'] = flat lateral indices (0..512) to
+    zero ENTIRELY. Kept so cases saved before the box crop still apply. Returns a clean in-bounds array."""
     raw = (params or {}).get("crop_lateral") or []
     out = sorted({int(c) for c in raw if 0 <= int(c) < int(n_lateral)})
     return np.array(out, dtype=int)
 
 
-def _apply_lateral_crop(corrected: np.ndarray, params: dict | None) -> tuple[np.ndarray, int]:
-    """#9 Crop: ZERO the user-marked lateral columns so a problematic band (e.g. lateral 51-80 of 513) is
-    removed BEFORE SAM2. `corrected` is (frames, depth, lateral); the crop indexes the LAST axis. The
-    removed region is recorded in the manifest (crop_lateral) so scar-alignment analytics exclude it."""
-    idx = _crop_lateral_indices(params, corrected.shape[2])
-    if idx.size:
-        corrected = np.ascontiguousarray(corrected)
-        corrected[:, :, idx] = 0
-    return corrected, int(idx.size)
+def _crop_region_box(params: dict | None, n_frames: int, n_lateral: int):
+    """#9 v2 Crop: the BOX crop = certain FRAME columns over a RANGE of LATERAL slices. params['crop_region']
+    = {'lateral': [lo, hi] (inclusive sagittal-slice range), 'frames': [int, …] (the marked frame columns)}.
+    Returns (lat_lo, lat_hi, [frame indices]) clamped in-bounds, or None when nothing valid is selected."""
+    r = (params or {}).get("crop_region")
+    if not isinstance(r, dict):
+        return None
+    lat = r.get("lateral") or []
+    if len(lat) != 2:
+        return None
+    lo, hi = sorted((int(lat[0]), int(lat[1])))
+    lo = max(0, min(int(n_lateral) - 1, lo)); hi = max(0, min(int(n_lateral) - 1, hi))
+    fs = sorted({int(f) for f in (r.get("frames") or []) if 0 <= int(f) < int(n_frames)})
+    if not fs:
+        return None
+    return (lo, hi, fs)
+
+
+def _apply_crop(corrected: np.ndarray, params: dict | None) -> tuple[np.ndarray, int]:
+    """#9 Crop: ZERO a BOX = (lateral-slice range) × (frame columns) across ALL depth — i.e. remove certain
+    columns within a slice for a range of slices, BEFORE SAM2. `corrected` is (frames, depth, lateral), so a
+    box zeros corrected[frame, :, lat_lo:lat_hi+1] for each marked frame. Also honours the LEGACY full-slice
+    crop (crop_lateral). The removed region is recorded so scar-alignment analytics exclude it. Returns
+    (corrected, n_voxels_zeroed)."""
+    n_frames, depth, n_lateral = corrected.shape
+    box = _crop_region_box(params, n_frames, n_lateral)
+    legacy = _crop_lateral_indices(params, n_lateral)
+    if box is None and legacy.size == 0:
+        return corrected, 0
+    corrected = np.ascontiguousarray(corrected)
+    zeroed = 0
+    if box is not None:
+        lo, hi, fs = box
+        for f in fs:
+            corrected[f, :, lo:hi + 1] = 0
+        zeroed += len(fs) * (hi - lo + 1) * depth
+    if legacy.size:
+        corrected[:, :, legacy] = 0
+        zeroed += int(legacy.size) * n_frames * depth
+    return corrected, int(zeroed)
 
 
 def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
@@ -1906,9 +1937,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         if ms:
             corrected, n_ms = apply_manual_shifts(corrected, ms)
             info["manual_shifts"] = {"n_frames": int(n_ms)}
-        corrected, n_crop = _apply_lateral_crop(corrected, p_all)
+        corrected, n_crop = _apply_crop(corrected, p_all)
         if n_crop:
-            info["crop_lateral"] = {"n_columns": n_crop}
+            info["crop"] = {"n_voxels": n_crop}
         write_volume_nifti(corrected, out_nifti, sp)
         info["out"] = str(out_nifti)
         return info
@@ -1960,9 +1991,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if ms:
         corrected, n_ms = apply_manual_shifts(corrected, ms)
         info["manual_shifts"] = {"n_frames": int(n_ms)}
-    corrected, n_crop = _apply_lateral_crop(corrected, p_all)
+    corrected, n_crop = _apply_crop(corrected, p_all)
     if n_crop:
-        info["crop_lateral"] = {"n_columns": n_crop}
+        info["crop"] = {"n_voxels": n_crop}
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     return info
