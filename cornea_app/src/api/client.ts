@@ -74,6 +74,20 @@ async function apiJson<T>(path: string, method = "GET", body?: string): Promise<
   return parsed as T;
 }
 
+// Base64-encode bytes in CHUNKS. `btoa(String.fromCharCode(...bytes))` spreads the WHOLE array as function
+// args, which overflows the call stack ("Maximum call stack size exceeded") for anything more than ~100 KB —
+// e.g. an edited segmentation drawing (a full-volume NIfTI). That silently broke every drawing upload through
+// the Tauri proxy (Confirm cornea/background, Save correction) for large/dense drawings — the encode threw
+// before the request was sent, so no flag was ever written. Chunking keeps each spread small.
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x8000; // 32 KB per spread
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[]);
+  }
+  return btoa(binary);
+}
+
 /** Upload one or more files to a sidecar endpoint (multipart, field "files"). */
 async function apiUpload<T>(path: string, files: File[]): Promise<T> {
   const invoke = await getInvoke();
@@ -82,7 +96,7 @@ async function apiUpload<T>(path: string, files: File[]): Promise<T> {
     const payload = await Promise.all(
       files.map(async (f) => ({
         name: f.name,
-        data: btoa(String.fromCharCode(...new Uint8Array(await f.arrayBuffer()))),
+        data: bytesToBase64(new Uint8Array(await f.arrayBuffer())),
       })),
     );
     text = (await invoke("proxy_upload", {
