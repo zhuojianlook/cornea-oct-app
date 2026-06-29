@@ -1308,11 +1308,17 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
               fill="rgba(255,170,40,0.34)" stroke="none" pointerEvents="none" />
           ))}
         </>)}
-        {/* #9 CROP REGION: the marked FRAME columns (blue bands) to crop over the lateral-slice range. */}
-        {latCropMode && [...latCropFrames].map((f) => (
-          <rect key={`lc${f}`} x={f} y={0} width={1} height={depthVox}
-            fill="rgba(93,176,255,0.34)" stroke="none" pointerEvents="none" />
-        ))}
+        {/* #9 CROP REGION: the marked FRAME columns (blue bands), shown ONLY on slices INSIDE the marked
+            lateral range. Until "Mark end" is clicked the range is just the start slice (Mark start sets
+            lo=hi), so the bands appear on the start slice alone — not on every slice. Before any range is
+            marked (lo==null) they show on the current slice so column-marking stays visible. */}
+        {latCropMode
+          && (latCropLo == null
+              || (borderSliceIdx != null && borderSliceIdx >= latCropLo && borderSliceIdx <= (latCropHi ?? latCropLo)))
+          && [...latCropFrames].map((f) => (
+            <rect key={`lc${f}`} x={f} y={0} width={1} height={depthVox}
+              fill="rgba(93,176,255,0.34)" stroke="none" pointerEvents="none" />
+          ))}
       </svg>
     </div>
   ) : null;

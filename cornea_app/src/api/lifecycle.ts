@@ -1,28 +1,31 @@
 /* Per-scan lifecycle model — the single source of truth for the progress TIMELINE (TimelineBar) and the
    colour-coded scan entries (OctLoader). A scan advances linearly; each step requires the previous, so a
    later flag set while an earlier one is cleared (e.g. a re-preprocess resets preproc_vetted) correctly
-   drops the scan back. Colours per the spec: raw=grey, auto=red, vetted=orange, classified=yellow,
-   SAM2-auto=light blue, SAM2-corrected=dark blue, scheduled=green. */
+   drops the scan back. Colours follow a smooth monotonic spectral ramp (see LIFECYCLE_STEPS): idle slate →
+   red → pink → … → blue → … → green (done), so the strip reads as a natural progression. */
 
 export type LifecycleStep = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
 
 export interface StepMeta { step: LifecycleStep; color: string; label: string; short: string; }
 
 // Index = step number. step 0 = no scan loaded.
+// Colours follow a SMOOTH MONOTONIC SPECTRAL RAMP so the strip reads as a natural progression (no jarring
+// hue jumps): idle slate → red (needs work) → pink → fuchsia → purple → violet → indigo → blue → sky → cyan
+// → teal → green (done). All bright 400-shades for good contrast with the dark pill text.
 export const LIFECYCLE_STEPS: { color: string; label: string; short: string }[] = [
   { color: "transparent", label: "—", short: "—" },
-  { color: "#7d8794", label: "Raw image", short: "Raw" },                          // 1 grey
-  { color: "#ef4444", label: "Preprocessed · automatic", short: "Auto" },          // 2 red
-  { color: "#f59e0b", label: "Preprocessed · manually vetted", short: "Vetted" },  // 3 orange
-  { color: "#eab308", label: "Scar / control classified", short: "Classified" },   // 4 yellow
-  { color: "#38bdf8", label: "Cornea segmented (SAM2)", short: "Cornea" },         // 5 light blue
-  { color: "#818cf8", label: "Cornea/background vetted (paint)", short: "Cornea✓" }, // 6 indigo (NEW)
-  { color: "#a855f7", label: "Subgroup assigned", short: "Subgroup" },            // 7 purple (now BEFORE scar)
-  { color: "#f43f5e", label: "Scar segmented", short: "Scar" },                    // 8 rose
-  { color: "#14b8a6", label: "Replicates aligned", short: "Aligned" },            // 9 teal
-  { color: "#06b6d4", label: "Normalized against controls", short: "Normalized" }, // 10 cyan
-  { color: "#2563eb", label: "Manually corrected", short: "Corrected" },           // 11 dark blue
-  { color: "#22c55e", label: "Scheduled for training", short: "Scheduled" },       // 12 green
+  { color: "#94a3b8", label: "Raw image", short: "Raw" },                          // 1 slate (idle)
+  { color: "#f87171", label: "Preprocessed · automatic", short: "Auto" },          // 2 red (needs vetting)
+  { color: "#f472b6", label: "Preprocessed · manually vetted", short: "Vetted" },  // 3 pink
+  { color: "#e879f9", label: "Scar / control classified", short: "Classified" },   // 4 fuchsia
+  { color: "#c084fc", label: "Cornea segmented (SAM2)", short: "Cornea" },         // 5 purple
+  { color: "#a78bfa", label: "Cornea/background vetted (paint)", short: "Cornea✓" }, // 6 violet
+  { color: "#818cf8", label: "Subgroup assigned", short: "Subgroup" },            // 7 indigo (BEFORE scar)
+  { color: "#60a5fa", label: "Scar segmented", short: "Scar" },                    // 8 blue
+  { color: "#38bdf8", label: "Replicates aligned", short: "Aligned" },            // 9 sky
+  { color: "#22d3ee", label: "Normalized against controls", short: "Normalized" }, // 10 cyan
+  { color: "#2dd4bf", label: "Manually corrected", short: "Corrected" },           // 11 teal
+  { color: "#4ade80", label: "Scheduled for training", short: "Scheduled" },       // 12 green (done)
 ];
 
 type Manifest = Record<string, unknown> | null | undefined;

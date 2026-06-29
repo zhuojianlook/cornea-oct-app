@@ -1616,7 +1616,7 @@ def _eye_all_segmented(case_id: str) -> tuple[list[str], dict]:
 
 
 @app.post("/api/case/{case_id}/subgroup/auto")
-def subgroup_auto(case_id: str, req: SubgroupAutoRequest) -> dict:
+def subgroup_auto(case_id: str, req: SubgroupAutoRequest | None = None) -> dict:
     """AUTO-ASSIGN subgroups for this scan's eye by PURE bright-spot (hysteresis scar) alignment: cluster the
     eye's cornea-segmented scans so the SAME lesion's replicates group together and a different/displaced lesion
     splits off (subgroup.auto_subgroups), plus an en-face OVERLAY (coloured by proposed subgroup) to verify.
@@ -1627,7 +1627,7 @@ def subgroup_auto(case_id: str, req: SubgroupAutoRequest) -> dict:
         raise HTTPException(400, f"Need ≥2 cornea-segmented scans of this eye to auto-assign subgroups (found "
                                  f"{len(members)}). Run SAM2 cornea on the eye's other repeats first.")
     try:
-        res = sg.auto_subgroups(members, req.params)   # includes the cornea-aligned en-face overlay
+        res = sg.auto_subgroups(members, req.params if req else None)   # includes the cornea-aligned en-face overlay
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     res["patient"] = key["patient"]; res["eye"] = key["eye"]
@@ -2780,6 +2780,13 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
                     base_surf = None
             except Exception:  # noqa: BLE001 — fall back to the fast detector if the baseline can't be built
                 base_surf = None
+        # #9 crop_region: make the previewed edge/curve reflect the TRUNCATED volume — for slices INSIDE the
+        # cropped lateral range, exclude the cropped frame-columns from the quadratic fit and interpolate the
+        # edge across them (matches the re-detected corrected volume; without this the overlay never changes).
+        _crop_box = oct_mod._crop_region_box(p, n_frames, n)
+        _crop_lo, _crop_hi, _crop_fs = _crop_box if _crop_box else (0, -1, [])
+        _crop_keep = (np.array([j not in set(int(f) for f in _crop_fs) for j in range(n_frames)])
+                      if _crop_fs else None)
         edges: list = []; fits: list = []
         for i in range(n):
             if use_surf:
@@ -2790,8 +2797,14 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
                 sl = np.ascontiguousarray(arr[i]).astype(np.float32)
                 raw = oct_mod._detect_surface_gradient(sl, sigma)  # fast, no prior, no bilateral (pass>1 only)
                 e = oct_mod._smooth_median(oct_mod._correct_surface(raw, max_jump), mfs).astype(np.float64)
+            in_crop = (_crop_box is not None and _crop_lo <= i <= _crop_hi
+                       and _crop_keep is not None and int(_crop_keep.sum()) >= 3)
             try:
-                f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
+                if in_crop:
+                    f = np.polyval(np.polyfit(xs[_crop_keep], e[_crop_keep], 2), xs)  # fit kept frames, extrapolate
+                    e = e.copy(); e[~_crop_keep] = f[~_crop_keep]                     # interpolate edge over cropped cols
+                else:
+                    f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
             except Exception:  # noqa: BLE001
                 f = e
             edges.append([round(float(v), 1) for v in e])

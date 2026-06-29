@@ -1899,6 +1899,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
+    # #9 Crop RE-DETECT: zero the cropped box on the RAW volume BEFORE surface detection, so the anterior-edge
+    # DP detector + RANSAC parabola fit + warp are all computed on the TRUNCATED volume — the removed
+    # frame-columns no longer pull the surface (the DP smoothly bridges the gap; RANSAC drops any residual as
+    # an outlier). The box is full-depth, so it stays zero through the depth-only warp; the final _apply_crop
+    # re-asserts it (idempotent). No-op when no crop is set, so non-cropped preprocessing is byte-unchanged.
+    if params and (params.get("crop_region") or params.get("crop_lateral")):
+        vol, _ = _apply_crop(vol, params)
     # SURFACE-CROP re-run: the user confirmed a set of surface-cropped frames (surface_crop_frames). Build the
     # per-slice anterior edges with those frames reconstructed by POSTERIOR CONTINUITY (their bottom edge,
     # matched to the non-cropped frames' bottom edge) and warp via the provided_edges path — a single,
