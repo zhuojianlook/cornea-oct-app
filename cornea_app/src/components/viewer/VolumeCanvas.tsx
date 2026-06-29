@@ -5,7 +5,7 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, type ViewName } from "../../niivue/nvController";
 import { scanStep, hasSegmentation } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
@@ -53,7 +53,7 @@ export function VolumeCanvas() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
-  const [brush, setBrush] = useState<{ x: number; y: number } | null>(null);
+  const [brush, setBrush] = useState<{ x: number; y: number; size: number } | null>(null);
   // Before/after comparison (raw vs preprocessed). The button + view only exist once the scan has
   // been preprocessed — i.e. its raw snapshot (context_raw previews) was captured.
   const [hasRaw, setHasRaw] = useState(false);
@@ -378,7 +378,10 @@ export function VolumeCanvas() {
         onMouseMove={(e) => {
           if (!painting) { if (brush) setBrush(null); return; }
           const r = e.currentTarget.getBoundingClientRect();
-          setBrush({ x: e.clientX - r.left, y: e.clientY - r.top });
+          const x = e.clientX - r.left, y = e.clientY - r.top;
+          // #1 — size the cursor to the ACTUAL painted footprint (penSize voxels → screen px), not a guess.
+          const sz = brushScreenSize(x, y);
+          setBrush({ x, y, size: sz ? Math.max(4, sz.w) : Math.max(6, penSize * 3) });
           // #paint — keep the 2-D drawing overlay live during a stroke even if niivue's location callback
           // lags (rAF-coalesced; cheap). The brush updates the drawBitmap; this reflects it on screen.
           scheduleOverlay();
@@ -397,7 +400,7 @@ export function VolumeCanvas() {
             className="absolute rounded-full pointer-events-none"
             style={{
               left: brush!.x, top: brush!.y, transform: "translate(-50%, -50%)",
-              width: Math.max(6, penSize * 3), height: Math.max(6, penSize * 3),
+              width: brush!.size, height: brush!.size,
               border: `1.5px solid ${PEN_COLOR[penLabel] ?? "#fff"}`,
               boxShadow: "0 0 0 1px rgba(0,0,0,0.5)",
               background: penLabel === 0 ? "transparent" : `${PEN_COLOR[penLabel]}22`,

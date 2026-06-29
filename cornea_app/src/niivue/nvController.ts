@@ -196,9 +196,46 @@ export function setPen(label: number, filled = false): void {
 }
 
 /** Brush thickness (voxels). */
+let appPenSize = 3;
 export function setPenSize(size: number): void {
-  if (!nv) return;
-  nv.opts.penSize = Math.max(1, Math.round(size));
+  appPenSize = Math.max(1, Math.round(size));
+  if (nv) nv.opts.penSize = appPenSize;
+}
+
+// #1 — the on-screen brush cursor must match the ACTUAL painted footprint (penSize VOXELS), not a fixed
+// px guess. The brush is a sphere of radius brushRadiusMm in physical space; niivue renders slices
+// isotropically in mm, so its on-screen diameter = 2·radiusMm · (tile px per mm). (Ported from the annotator.)
+function rasSpacing(): [number, number, number] | null {
+  const pd = (nv?.volumes[0] as unknown as { pixDimsRAS?: number[] } | undefined)?.pixDimsRAS;
+  if (pd && pd.length >= 4) return [Math.abs(pd[1]) || 1, Math.abs(pd[2]) || 1, Math.abs(pd[3]) || 1];
+  return null;
+}
+function brushRadiusMm(): number {
+  const sp = rasSpacing();
+  if (!sp) return 0;
+  const s = [sp[0], sp[1], sp[2]].sort((a, b) => a - b);
+  return (appPenSize / 2) * s[1];   // penSize = diameter in median-spacing voxels → physically round in every view
+}
+/** On-screen diameter (CSS px) of the brush at cursor (xCss,yCss), or null when not over a 2-D tile. */
+export function brushScreenSize(xCss: number, yCss: number): { w: number; h: number } | null {
+  if (!nv || !nv.volumes.length) return null;
+  const slices = (nv as unknown as {
+    screenSlices?: Array<{ leftTopWidthHeight: number[]; axCorSag: number; fovMM: number[] }>;
+  }).screenSlices;
+  if (!slices?.length) return null;
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const xd = xCss * dpr, yd = yCss * dpr;
+  for (const s of slices) {
+    if (s.axCorSag > 2) continue;
+    const [lx, ly, lw, lh] = s.leftTopWidthHeight;
+    if (lw <= 0 || lh <= 0 || xd < lx || yd < ly || xd > lx + lw || yd > ly + lh) continue;
+    const fov = s.fovMM;
+    if (!fov || fov.length < 2 || fov[0] <= 0) return null;
+    const pxPerMM = lw / fov[0];                  // isotropic in mm
+    const d = (2 * brushRadiusMm() * pxPerMM) / dpr;
+    return d > 0 ? { w: d, h: d } : null;
+  }
+  return null;
 }
 
 // Smart fill = CPU "Grow from seeds" in a WEB WORKER (ported from the annotator). niivue's GPU drawGrowCut

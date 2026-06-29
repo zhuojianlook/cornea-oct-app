@@ -1,7 +1,7 @@
 /* Pen controls for the correction drawing layer (cornea / background / scar / erase) + brush size,
    filled-region pen, and the Smart fill (3-D GrowCut) that propagates scribbles across all slices. */
 
-import { ToggleButton, ToggleButtonGroup, Slider, Tooltip, Button, CircularProgress } from "@mui/material";
+import { ToggleButton, ToggleButtonGroup, Slider, Tooltip, Button, CircularProgress, LinearProgress } from "@mui/material";
 import { useWorkflowStore, type PenLabel } from "../../store/workflowStore";
 import { setDrawOpacity } from "../../niivue/nvController";
 
@@ -13,7 +13,7 @@ const PENS: { value: PenLabel; label: string; color: string }[] = [
 ];
 
 export function PaintToolbar() {
-  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint, smartFillBusy,
+  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint, smartFillBusy, smartFillPct,
           setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, undoCorrection, set } = useWorkflowStore();
   if (!correcting) return null;
   // #3/#11 cornea/background vet step exposes two clear pens: Cornea (label 1, blue) and Background (label 2,
@@ -62,13 +62,19 @@ export function PaintToolbar() {
           ↶ Undo
         </Button>
       </Tooltip>
-      <Tooltip title="Smart fill (GrowCut): after scribbling a little Cornea, Background AND Scar on a few slices, this propagates those labels through the whole 3-D volume by intensity similarity — so you don't paint every slice/view. Runs on the full volume (a few seconds). Review and correct, then Apply.">
-        <span>
+      <Tooltip title="Smart fill (CPU grow-from-seeds): after scribbling a little Cornea, Background AND Scar on a few slices, this propagates those labels through the whole 3-D volume by intensity similarity — so you don't paint every slice/view. Runs off the main thread with a progress bar. Review and correct, then Apply.">
+        <span className="flex items-center gap-2">
           <Button size="small" variant="contained" onClick={() => runSmartFill()} disabled={smartFillBusy}
             startIcon={smartFillBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
             sx={{ py: 0.25, px: 1.2, fontSize: 12, textTransform: "none" }}>
             {smartFillBusy ? "Filling…" : "✨ Smart fill"}
           </Button>
+          {smartFillBusy && (
+            <span className="flex items-center gap-1" style={{ width: 110 }}>
+              <LinearProgress variant="determinate" value={smartFillPct} sx={{ flex: 1, height: 6, borderRadius: 3 }} />
+              <span className="text-[11px]" style={{ color: "var(--c-text-dim)", minWidth: 26, textAlign: "right" }}>{smartFillPct}%</span>
+            </span>
+          )}
         </span>
       </Tooltip>
       <Tooltip title="Drawing opacity">

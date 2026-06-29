@@ -815,6 +815,14 @@ async def segmentation_from_drawing(case_id: str, files: List[UploadFile] = File
                 "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
 
 
+@app.post("/api/case/{case_id}/segmentation/from-drawing-cornea-vet")
+async def segmentation_from_drawing_cornea_vet(case_id: str, files: List[UploadFile] = File(...)) -> dict:
+    """#11 cornea/background VET confirm — same as segmentation/from-drawing but cornea_vet hardcoded true
+    (sets `cornea_vetted`, not `corrected_labelmap`). A DEDICATED endpoint so the flag can't be lost to a
+    dropped `?cornea_vet=true` query string through the upload proxy (which was making Confirm a no-op)."""
+    return await segmentation_from_drawing(case_id, files, cornea_vet=True)
+
+
 @app.post("/api/case/{case_id}/vet-cornea")
 def vet_cornea(case_id: str) -> dict:
     """#11 — confirm the cornea/background segmentation is correct WITHOUT painting (the SAM2 result was

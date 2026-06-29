@@ -171,6 +171,7 @@ interface WorkflowState {
   corneaOnlyPaint: boolean;
   corneaVetBusy: boolean;   // #1 — loading the cornea/background paint layer (spinner on the Paint button)
   smartFillBusy: boolean;   // #4 — GrowCut smart-fill running (spinner + disable, avoids the "hung" look)
+  smartFillPct: number;     // smart-fill progress 0..100 (drives the progress bar)
   startCorneaVetPaint: () => Promise<void>;
   confirmCorneaVet: () => Promise<void>;
   cancelCorrection: () => Promise<void>;
@@ -213,6 +214,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     corneaOnlyPaint: false,
     corneaVetBusy: false,
     smartFillBusy: false,
+    smartFillPct: 0,
     penLabel: 1,
     penSize: 3,
     penFilled: false,
@@ -653,7 +655,9 @@ export const useWorkflowStore = create<WorkflowState>()(
           const bytes = await nv.exportDrawing();
           if (!bytes) throw new Error("Could not export the cornea/background drawing.");
           const file = new File([bytes as unknown as BlobPart], "seg-drawing.nii.gz");
-          await api.upload(`/api/case/${caseId}/segmentation/from-drawing?cornea_vet=true`, [file]);
+          // dedicated endpoint (no ?query) — the upload proxy was dropping ?cornea_vet=true, so the backend
+          // set corrected_labelmap instead of cornea_vetted and Confirm appeared to do nothing.
+          await api.upload(`/api/case/${caseId}/segmentation/from-drawing-cornea-vet`, [file]);
           if (useCaseStore.getState().caseId !== caseId) return;
           nv.endDrawing();
           await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
@@ -710,10 +714,12 @@ export const useWorkflowStore = create<WorkflowState>()(
       if (get().smartFillBusy) return;
       set((s) => {
         s.smartFillBusy = true;
+        s.smartFillPct = 0;
         s.status = { kind: "working", title: "Smart fill", detail: "Growing labels from your scribbles (CPU, off the main thread)…" };
       });
       try {
         const res = await nv.smartFill((pct) => set((s) => {
+          s.smartFillPct = pct;
           if (s.smartFillBusy) s.status = { kind: "working", title: "Smart fill", detail: `Growing labels from your scribbles… ${pct}%` };
         }));
         if (!res.ok) {
@@ -732,7 +738,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       } catch (e) {
         set((s) => { s.status = { kind: "error", title: "Smart fill failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
-        set((s) => { s.smartFillBusy = false; });
+        set((s) => { s.smartFillBusy = false; s.smartFillPct = 0; });
       }
     },
 

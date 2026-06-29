@@ -35,7 +35,6 @@ export function TimelineBar() {
   const confirmCorneaVet = useWorkflowStore((s) => s.confirmCorneaVet);
   const corneaVetBusy = useWorkflowStore((s) => s.corneaVetBusy);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
-  const undoCorrection = useWorkflowStore((s) => s.undoCorrection);
   const runScarAuto = useWorkflowStore((s) => s.runScarAuto);
   const runScarAutoSam2 = useWorkflowStore((s) => s.runScarAutoSam2);
   const exportScarSummary = useWorkflowStore((s) => s.exportScarSummary);
@@ -161,7 +160,7 @@ export function TimelineBar() {
   ) : (
     <>
       <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => saveCorrection()}>Save correction</Button>
-      <Button size="small" variant="outlined" disabled={busy} onClick={() => undoCorrection()} title="Undo last edit">↶</Button>
+      {/* Undo lives in the pen bar (PaintToolbar) — no duplicate here (#4). */}
       <Button size="small" variant="outlined" color="inherit" disabled={busy} onClick={() => cancelCorrection()}>Cancel</Button>
     </>
   );
@@ -180,7 +179,7 @@ export function TimelineBar() {
     <>
       <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => confirmCorneaVet()}
         title="Save the cornea/background edits and unlock scar detection.">✓ Confirm cornea/background</Button>
-      <Button size="small" variant="outlined" disabled={busy} onClick={() => undoCorrection()} title="Undo last edit">↶</Button>
+      {/* Undo lives in the pen bar (PaintToolbar) — no duplicate here (#4). */}
       <Button size="small" variant="outlined" color="inherit" disabled={busy} onClick={() => cancelCorrection()}>Cancel</Button>
     </>
   );
