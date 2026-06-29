@@ -173,6 +173,39 @@ def test_build_consensus_majority_vote_end_to_end(make_case, make_volume):
     assert set(np.unique(cons_arr)).issubset({0, consensus.REF_CORNEA, consensus.REF_SCAR})
 
 
+def test_matched_fraction_uses_own_scar_as_denominator(make_case, make_volume):
+    """matched_fraction = |scar_c ∩ consensus| / |scar_c| (the SCAN'S OWN scar is the denominator),
+    per the docstring + types.ts. A scan whose scar extends well beyond the consensus must report a
+    LOW matched_fraction (most of its scar disagrees), not 1.0. Regression for the inverted denominator
+    (was |...|/|consensus|, which reported 1.0 for an over-segmented scan and flagged a fully-corroborated
+    small scan as low_correspondence)."""
+    shape = (6, 24, 20)
+    base = make_volume(shape=shape, fill=20, cornea_band=(8, 16))
+    shared = (2, 4, 11, 13, 6, 9)          # 2*2*3 = 12 voxels — agreed by all 3 → the consensus
+    a = _make_consensus_member(make_case, "case_mfa", shared, base)
+    b = _make_consensus_member(make_case, "case_mfb", shared, base)
+    c = _make_consensus_member(make_case, "case_mfc", shared, base)
+    # Give the REFERENCE (a) an extra unique scar block so its scar (24 vox) is double the consensus (12).
+    a_lab = np.zeros(shape, np.uint8)
+    a_lab[:, 8:16, :] = consensus.REF_CORNEA
+    a_lab[2:4, 11:13, 6:9] = consensus.REF_SCAR      # shared (12)
+    a_lab[2:4, 11:13, 14:17] = consensus.REF_SCAR    # a-only (12) → outside consensus
+    labels.write_label_nifti(a_lab, orch.case_root(a) / "previews" / "volume.nii.gz", labels.corrected_path(a))
+
+    cons_cid = "case_cons_mf"
+    orch.ensure_case_dirs(cons_cid)
+    report = consensus.build_consensus([a, b, c], cons_cid, reference=a)
+    per = {p["case"]: p for p in report["per_scan"]}
+    # a: half its scar lies outside the consensus → 12/24 = 0.5 (NOT 1.0 as the old denominator gave)
+    assert abs(per[a]["matched_fraction"] - 0.5) < 0.05
+    # b, c: scar == consensus → fully matched
+    assert per[b]["matched_fraction"] == 1.0
+    assert per[c]["matched_fraction"] == 1.0
+    # b/c are fully corroborated → must NOT be flagged low_correspondence
+    assert per[b]["low_correspondence"] is False
+    assert per[c]["low_correspondence"] is False
+
+
 # ── 3. FOV / cornea clipping in the per-scan native consensus map ─────────────
 def test_cons_native_clipped_to_member_fov_and_cornea(make_case, make_volume):
     """The per-scan cons_native.nii.gz keeps the consensus scar only where the

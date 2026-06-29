@@ -128,7 +128,9 @@ def evaluate(register_fn, name: str = "strategy") -> dict:
     ok = [r for r in per if "error" not in r]
     mean = lambda k: round(float(np.mean([r[k] for r in ok])), 3) if ok else None  # noqa: E731
     vols = np.array(scar_vols, dtype=float)
-    cv = round(float(vols.std() / vols.mean() * 100), 2) if vols.mean() else 0.0
+    # Sample SD (ddof=1) — the correct test-retest dispersion estimator, matching every production path
+    # (consensus.py, scar_bench.py, observer_analysis.py). ddof=1 is undefined for n=1, so guard it.
+    cv = round(float(vols.std(ddof=1) / vols.mean() * 100), 2) if (len(vols) > 1 and vols.mean()) else 0.0
     return {
         "name": name,
         "n_ok": len(ok),

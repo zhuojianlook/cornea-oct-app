@@ -115,12 +115,26 @@ def _minimal_bspline(fb: sitk.Image, mb: sitk.Image, rigid: sitk.Transform,
 
 def _cornea_dice_iso(mlab: sitk.Image, flab_iso: sitk.Image,
                      ref_cm_iso: np.ndarray, tx: sitk.Transform) -> float:
-    """Cornea Dice of the moving label warped by tx onto the iso reference grid."""
+    """Cornea Dice of the moving label warped by tx onto the iso reference grid (optimiser-grid only)."""
     w = sitk.Resample(_iso(mlab, interp=sitk.sitkNearestNeighbor), flab_iso, tx,
                       sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
     a = sitk.GetArrayFromImage(w) >= CORNEA_MIN
     inter = int(np.logical_and(a, ref_cm_iso).sum())
     s = int(a.sum()) + int(ref_cm_iso.sum())
+    return 2 * inter / s if s else 0.0
+
+
+def _cornea_dice_orig(mlab: sitk.Image, fixed_grid: sitk.Image,
+                      ref_cm_orig: np.ndarray, tx: sitk.Transform) -> float:
+    """Cornea Dice on the ORIGINAL (anisotropic) fixed grid via a SINGLE NN resample — exactly the path
+    production uses (resample_label). The best-of-identity decision must be made on this grid, not the
+    0.02 mm iso optimisation grid: on real OCT spacing (~0.008x0.006x0.04) the iso decision can disagree
+    with the grid the consensus is actually built on, so the "never worse than identity" guarantee would
+    only hold on the iso grid otherwise."""
+    w = sitk.Resample(mlab, fixed_grid, tx, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+    a = sitk.GetArrayFromImage(w) >= CORNEA_MIN
+    inter = int(np.logical_and(a, ref_cm_orig).sum())
+    s = int(a.sum()) + int(ref_cm_orig.sum())
     return 2 * inter / s if s else 0.0
 
 
@@ -140,17 +154,18 @@ def align_transform(fixed_vol_path: Path, fixed_label_path: Path,
 
     fi, mi = _iso(fvol), _iso(mvol)
     flab_iso = _iso(flab, interp=sitk.sitkNearestNeighbor)
-    ref_cm_iso = sitk.GetArrayFromImage(flab_iso) >= CORNEA_MIN
     # cornea-only metric mask on the iso fixed grid (dilated ~0.2 mm for context; dark bg excluded).
     cornea_mask_iso = sitk.Cast(
         sitk.BinaryDilate(sitk.BinaryThreshold(flab_iso, CORNEA_MIN, 255, 1, 0), [10, 10, 10]),
         sitk.sitkUInt8)
+    # Decide accept/reject on the ORIGINAL fixed grid (where the consensus is built), not the iso grid.
+    ref_cm_orig = sitk.GetArrayFromImage(flab) >= CORNEA_MIN
 
     ident = identity()
-    d_id = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, ident)
+    d_id = _cornea_dice_orig(mlab, flab, ref_cm_orig, ident)
     try:
-        rigid = _rigid_intensity(fi, mi, fixed_mask=cornea_mask_iso)
-        d_rig = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, rigid)
+        rigid = _rigid_intensity(fi, mi, fixed_mask=cornea_mask_iso)   # optimise on the iso grid
+        d_rig = _cornea_dice_orig(mlab, flab, ref_cm_orig, rigid)      # but judge on the persisted grid
     except Exception:  # noqa: BLE001 — diverged optimiser → fall back to identity
         rigid, d_rig = ident, -1.0
     if d_rig > d_id:

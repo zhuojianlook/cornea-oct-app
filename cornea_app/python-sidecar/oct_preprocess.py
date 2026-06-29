@@ -1554,6 +1554,18 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     ism = 0.0 if use_provided else float(p.get("interslice_smooth", 0.0) or 0.0)
     if ism > 0 and n > 2:
         disp_field = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=ism, axis=0)
+        # The inter-slice Gaussian re-mixes neighbouring slices, which can pull a clipped/cut column's shift
+        # back below the per-slice tissue-preservation clamps applied in _disp_worker (clip: disp>=0 so an
+        # above-frame epithelium apex isn't truncated; user-cut: disp==0). Re-assert them per slice so
+        # smoothing can't silently re-introduce epithelial truncation on clipped eyes. (Ordinary columns —
+        # the vast majority — keep the full inter-slice smoothing benefit.)
+        for i in range(n):
+            cc = clip_cols_list[i]
+            if cc.size:
+                disp_field[i][cc] = np.maximum(disp_field[i][cc], 0.0)
+            zc = zero_cols_list[i]
+            if zc.size:
+                disp_field[i][zc] = 0.0
 
     # 4) warp each slice by its guarded+smoothed displacement, then revert.
     warped = np.array([_warp_by_displacement(sag[i], disp_field[i]) for i in range(n)])

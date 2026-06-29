@@ -261,7 +261,12 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
     for p in per_scan:
         c = p["case"]
         common = data_masks[c] & ref_mask
-        p["matched_fraction"] = _frac(warped_scars[c], consensus)
+        # matched_fraction = fraction of THIS scan's own scar that falls in the consensus (its scar is the
+        # denominator) — matches the docstring + types.ts and makes low_correspondence flag a scan whose scar
+        # mostly DISAGREES with the consensus. (Was _frac(warped, consensus) = recall-of-consensus, which
+        # inverted the flag: a small scar fully inside a big consensus was wrongly flagged, and a big scar
+        # barely overlapping a small consensus looked perfect.)
+        p["matched_fraction"] = _frac(consensus, warped_scars[c])
         p["low_correspondence"] = p["matched_fraction"] < 0.3 and p["role"] != "reference"
         p["scar_dice_to_ref_fov"] = round(_dice(ref_scar & common, warped_scars[c] & common), 3)
         union = data_masks[c] | ref_mask

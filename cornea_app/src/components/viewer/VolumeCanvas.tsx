@@ -148,8 +148,11 @@ export function VolumeCanvas() {
       .then(() => {
         if (cancelled) return;
         setView(view);
-        // Re-show an existing segmentation when reopening a finished case.
-        useWorkflowStore.getState().tryLoadExistingSegmentation();
+        // Re-show an existing segmentation when reopening a finished case — but ONLY if the manifest says
+        // one exists. Calling it for an unsegmented (step-2) case fetches segmentation-display.nii.gz that
+        // isn't there yet and logs a 404 on every open; the overlay correctly stays hidden either way.
+        const liveManifest = useCaseStore.getState().caseInfo?.manifest as Record<string, unknown> | null;
+        if (hasSegmentation(liveManifest)) useWorkflowStore.getState().tryLoadExistingSegmentation();
       })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
