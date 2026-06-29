@@ -5,7 +5,7 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, type ViewName } from "../../niivue/nvController";
 import { scanStep, hasSegmentation } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
@@ -17,6 +17,7 @@ import { MotionPanel } from "./MotionPanel";
 
 export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);   // #paint — WebGL-independent 2-D drawing overlay
   const volumeUrl = useCaseStore((s) => s.volumeUrl);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const setCaseId = useCaseStore((s) => s.setCaseId);
@@ -122,6 +123,15 @@ export function VolumeCanvas() {
       attach(canvasRef.current);
       setNoWebgl(webglFailure());
     }
+    // #paint — register the WebGL-independent 2-D drawing overlay (so brush strokes are visible on the
+    // WebKitGTK stack where niivue's draw tile renders blank), and keep it sized/redrawn on resize.
+    setOverlayCanvas(overlayRef.current);
+    let ro: ResizeObserver | undefined;
+    if (overlayRef.current?.parentElement && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(() => requestAnimationFrame(() => renderDrawOverlay()));
+      ro.observe(overlayRef.current.parentElement);
+    }
+    return () => { ro?.disconnect(); setOverlayCanvas(null); };
   }, []);
 
   useEffect(() => {
@@ -366,11 +376,18 @@ export function VolumeCanvas() {
           if (!painting) { if (brush) setBrush(null); return; }
           const r = e.currentTarget.getBoundingClientRect();
           setBrush({ x: e.clientX - r.left, y: e.clientY - r.top });
+          // #paint — keep the 2-D drawing overlay live during a stroke even if niivue's location callback
+          // lags (rAF-coalesced; cheap). The brush updates the drawBitmap; this reflects it on screen.
+          scheduleOverlay();
         }}
-        onMouseLeave={() => setBrush(null)}
+        onMouseUp={() => scheduleOverlay()}
+        onMouseLeave={() => { setBrush(null); scheduleOverlay(); }}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full"
           style={{ cursor: painting ? "crosshair" : "default", filter: viewerFilter || undefined }} />
+        {/* #paint — WebGL-independent 2-D drawing overlay: renders brush strokes that niivue's WebGL draw
+            tile doesn't show on the WebKitGTK stack. pointer-events:none so paint clicks still hit niivue. */}
+        <canvas ref={overlayRef} className="absolute inset-0 h-full w-full" style={{ pointerEvents: "none" }} />
         {showBrush && (
           // Brush-size cursor (approx — actual voxels depend on zoom): shows the active pen + size.
           <div

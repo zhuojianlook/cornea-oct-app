@@ -14,7 +14,7 @@ const PENS: { value: PenLabel; label: string; color: string }[] = [
 
 export function PaintToolbar() {
   const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint, smartFillBusy,
-          setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, set } = useWorkflowStore();
+          setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, undoCorrection, set } = useWorkflowStore();
   if (!correcting) return null;
   // #3/#11 cornea/background vet step exposes two clear pens: Cornea (label 1, blue) and Background (label 2,
   // GREY). Background is a real non-zero SEED (so Smart fill/GrowCut has a background seed — fixes the hang)
@@ -55,6 +55,12 @@ export function PaintToolbar() {
           onChange={() => setPenFilled(!penFilled)} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>
           ▣ Fill region
         </ToggleButton>
+      </Tooltip>
+      <Tooltip title="Undo the last brush stroke / smart fill (Ctrl+Z also works in niivue)">
+        <Button size="small" variant="outlined" onClick={() => undoCorrection()}
+          sx={{ py: 0.25, px: 1.2, fontSize: 12, textTransform: "none" }}>
+          ↶ Undo
+        </Button>
       </Tooltip>
       <Tooltip title="Smart fill (GrowCut): after scribbling a little Cornea, Background AND Scar on a few slices, this propagates those labels through the whole 3-D volume by intensity similarity — so you don't paint every slice/view. Runs on the full volume (a few seconds). Review and correct, then Apply.">
         <span>

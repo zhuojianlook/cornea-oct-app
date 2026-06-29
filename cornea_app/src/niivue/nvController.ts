@@ -54,6 +54,12 @@ export function attach(canvas: HTMLCanvasElement): Niivue | null {
     });
     nv.attachToCanvas(canvas);
     nv.setSliceType(SLICE.multi);
+    // Live-update the 2-D drawing overlay whenever niivue changes the displayed location — which includes
+    // every point of a native pen DRAG (niivue calls createOnLocationChange after each paint step — verified
+    // in the dist PEN branch) and slice scroll/scrub — so brush strokes appear immediately even though
+    // niivue's WebGL draw tile is blank here. rAF-coalesced (scheduleOverlay) so a fast drag fires at most
+    // one overlay render per frame (the pixel loop is heavy).
+    (nv as unknown as { onLocationChange: (loc: unknown) => void }).onLocationChange = () => scheduleOverlay();
     if (typeof window !== "undefined") (window as unknown as { nv: Niivue }).nv = nv;  // debug/testing hook
     // Distinct overlay colors so cornea (label 1) and scar (label 2) are easy to tell apart in the
     // 3D/WebGL viewer (the default "warm" ramp makes both warm). With cal_min 0.9 / cal_max 2.1,
@@ -90,6 +96,8 @@ export async function loadVolume(url: string): Promise<void> {
 export function setView(view: ViewName): void {
   if (!nv) return;
   nv.setSliceType(SLICE[view]);
+  // tile layout changed → re-render the 2-D overlay now + after the WebKitGTK layout settles.
+  renderDrawOverlay(); requestAnimationFrame(renderDrawOverlay); setTimeout(renderDrawOverlay, 120);
 }
 
 // ── Single-plane slice navigation (#2 — a visible slice scrollbar) ──────────────────────────────────
@@ -126,6 +134,7 @@ export function setSliceIndex(view: ViewName, idx: number): void {
   if (!nv || ax < 0 || n <= 1) return;
   nv.scene.crosshairPos[ax] = Math.max(0, Math.min(1, idx / (n - 1)));   // mutate in place (keeps the vec3 type)
   nv.drawScene();
+  renderDrawOverlay();   // the displayed slice changed → re-render the overlay for the new slice
 }
 
 export function hasVolume(): boolean {
@@ -157,6 +166,7 @@ export async function loadDrawing(url: string): Promise<void> {
   if (!ok) throw new Error("Correction layer failed to load (segmentation drawing missing or mismatched).");
   try { nv.setDrawColormap(DRAW_CMAP as unknown as string); } catch { /* older niivue → default LUT */ }
   nv.setDrawingEnabled(true);
+  renderDrawOverlay();   // render the just-loaded labels on the 2-D overlay (WebGL draw tile is blank here)
 }
 
 /** End correction: stop the pen AND clear the drawing bitmap so it can't linger over the committed
@@ -166,12 +176,15 @@ export function endDrawing(): void {
   nv.setDrawingEnabled(false);
   try { nv.closeDrawing(); } catch { /* no-op if no drawing */ }
   nv.drawScene();
+  renderDrawOverlay();   // drawBitmap is gone now → clears the 2-D overlay
 }
 
 /** Undo the last brush stroke / smart fill (niivue keeps a drawing undo stack). */
 export function undoDrawing(): void {
   if (!nv) return;
-  try { nv.drawUndo(); nv.drawScene(); } catch { /* nothing to undo */ }
+  let undid = false;
+  try { nv.drawUndo(); undid = true; } catch { /* nothing to undo */ }
+  if (undid) { nv.drawScene(); renderDrawOverlay(); }   // reflect the undone stroke on the 2-D overlay
 }
 
 /** Pen label: 0 erase, 1 cornea, 2 background, 3 scar. `filled`=true auto-fills a closed outline
@@ -194,6 +207,7 @@ export function smartFill(): void {
   if (!nv) return;
   nv.drawGrowCut();
   nv.drawScene();
+  renderDrawOverlay();   // show the propagated labels on the 2-D overlay
 }
 
 export function setDrawingEnabled(on: boolean): void {
@@ -215,10 +229,95 @@ export function drawingSeedCount(): number {
   return seen.size;
 }
 
+// ── WebGL-independent 2-D drawing OVERLAY (the annotator's fix, ported) ──────────────────────────────
+// On the desktop NVIDIA/WebKitGTK stack niivue's WebGL DRAW layer never reaches the 2-D slice tiles, so
+// brush strokes are recorded in drawBitmap but INVISIBLE (the user sees only the crosshair move). We
+// bypass that by rendering the drawing OURSELVES on a plain 2-D <canvas> over the niivue canvas
+// (pointer-events:none): inverse-sample each device pixel → texture-frac via niivue's OWN
+// screenXY2TextureFrac (exact per-tile affine from 3 inset points; no orientation maths) → drawBitmap
+// label → colour. niivue's 3-D render + volume overlays still use WebGL. RULE (memory): when niivue's
+// 2-D-tile draw rendering fails on a driver, bypass it with this overlay — don't keep poking refreshDrawing.
+let overlayCanvas: HTMLCanvasElement | null = null;
+export function setOverlayCanvas(c: HTMLCanvasElement | null): void { overlayCanvas = c; if (c) renderDrawOverlay(); }
+// drawBitmap pen value → on-screen RGBA (translucent so the anatomy shows through; further scaled by the
+// live drawOpacity). 1 cornea (blue), 2 background (grey), 3 scar (red) — matches the pen/segmentation colours.
+const OVERLAY_RGBA: Record<number, [number, number, number, number]> = {
+  1: [26, 178, 255, 150],
+  2: [142, 142, 147, 110],
+  3: [255, 69, 58, 160],
+};
+let _overlayScheduled = false;
+/** rAF-coalesced overlay re-render (one per frame) — used for the high-frequency paint/location stream. */
+export function scheduleOverlay(): void {
+  if (_overlayScheduled) return;
+  _overlayScheduled = true;
+  requestAnimationFrame(() => { _overlayScheduled = false; renderDrawOverlay(); });
+}
+export function renderDrawOverlay(): void {
+  const cv = overlayCanvas;
+  if (!nv || !cv) return;
+  const d = nv.drawBitmap as Uint8Array | undefined;
+  const dr = nv.volumes?.[0]?.dimsRAS as number[] | undefined;
+  const gl = nv.gl as WebGL2RenderingContext | undefined;
+  const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number; leftTopWidthHeight: number[] }> }).screenSlices;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => number[] | null }).screenXY2TextureFrac;
+  const ctx = cv.getContext("2d");
+  if (!gl || !ctx) return;
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  if (cv.width !== W) cv.width = W;
+  if (cv.height !== H) cv.height = H;
+  ctx.clearRect(0, 0, W, H);
+  if (!d || !dr || !slices || typeof f2f !== "function") return;   // nothing being edited → overlay clears
+  const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny;
+  const nvAny = nv as unknown as { drawOpacity?: number; opts?: { drawOpacity?: number } };
+  const op = Math.max(0.15, Math.min(1, nvAny.drawOpacity ?? nvAny.opts?.drawOpacity ?? 0.5));
+  const img = ctx.createImageData(W, H);
+  const data = img.data;
+  let any = false;
+  for (let ti = 0; ti < slices.length; ti++) {
+    const s = slices[ti];
+    if (s.axCorSag > 2) continue;                       // skip the 3-D render tile
+    const [lx, ly, lw, lh] = s.leftTopWidthHeight;
+    if (lw <= 2 || lh <= 2) continue;
+    // screen→frac is AFFINE per tile; derive it from 3 INSET points (inset dodges letterbox edge-clamp).
+    const ox = Math.min(2, lw / 4), oy = Math.min(2, lh / 4);
+    const p0 = f2f.call(nv, lx + ox, ly + oy, ti);
+    const p1 = f2f.call(nv, lx + lw - ox, ly + oy, ti);
+    const p2 = f2f.call(nv, lx + ox, ly + lh - oy, ti);
+    if (!p0 || !p1 || !p2) continue;
+    const dx = (lw - 2 * ox), dy = (lh - 2 * oy);
+    const A = [0, 0, 0], B = [0, 0, 0], C = [0, 0, 0];
+    for (let k = 0; k < 3; k++) {
+      A[k] = (p1[k] - p0[k]) / dx;
+      B[k] = (p2[k] - p0[k]) / dy;
+      C[k] = p0[k] - A[k] * (lx + ox) - B[k] * (ly + oy);
+    }
+    const x0 = Math.max(0, Math.floor(lx)), x1 = Math.min(W, Math.ceil(lx + lw));
+    const y0 = Math.max(0, Math.floor(ly)), y1 = Math.min(H, Math.ceil(ly + lh));
+    for (let py = y0; py < y1; py++) {
+      const fy0 = B[0] * py + C[0], fy1 = B[1] * py + C[1], fy2 = B[2] * py + C[2];
+      const rowOff = py * W;
+      for (let px = x0; px < x1; px++) {
+        const fx = A[0] * px + fy0, fy = A[1] * px + fy1, fz = A[2] * px + fy2;
+        const ix = Math.round(fx * nx - 0.5); if (ix < 0 || ix >= nx) continue;
+        const iy = Math.round(fy * ny - 0.5); if (iy < 0 || iy >= ny) continue;
+        const iz = Math.round(fz * nz - 0.5); if (iz < 0 || iz >= nz) continue;
+        const lab = d[iz * nxny + iy * nx + ix];
+        if (!lab) continue;
+        const c = OVERLAY_RGBA[lab]; if (!c) continue;
+        const o = (rowOff + px) * 4;
+        data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = Math.round(c[3] * op); any = true;
+      }
+    }
+  }
+  if (any) ctx.putImageData(img, 0, 0);
+}
+
 export function setDrawOpacity(opacity: number): void {
   if (!nv) return;
   nv.drawOpacity = opacity;
   nv.drawScene();
+  renderDrawOverlay();   // the overlay alpha tracks drawOpacity
 }
 
 /** Export the edited drawing bitmap as NIfTI bytes. */
