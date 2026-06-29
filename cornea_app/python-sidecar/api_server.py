@@ -1027,6 +1027,41 @@ def get_warped_scan(case_id: str, member: str, kind: str) -> FileResponse:
     return FileResponse(str(p), media_type="application/gzip", filename=f"{kind}.nii.gz")
 
 
+@app.get("/api/case/{case_id}/overlap/{a}/{b}.nii.gz")
+def get_overlap_nifti(case_id: str, a: str, b: str, label: str = "cornea") -> FileResponse:
+    """3-label OVERLAP map (1 = A only, 2 = B only, 3 = both) of the `label` region (cornea|scar) between two
+    sources, BOTH already in the reference frame: a consensus member id, or the literal "consensus" for the
+    voted result. Powers the Volume-align view (each scan its own colour, overlap red, cornea only — no
+    background) and the Both view (per-scan scar vs the consensus scar, distinct colours)."""
+    ccid = orch.safe_case_id(case_id)
+    if not orch.read_manifest(ccid).get("consensus_cases"):
+        raise HTTPException(400, "Not a consensus case — align the replicates first.")
+    want_scar = (label == "scar")
+
+    def _mask(src: str) -> np.ndarray:
+        if src == "consensus":
+            p = labels.corrected_path(ccid)
+        else:
+            p = orch.case_root(ccid) / "scans" / orch.safe_case_id(src) / "label.nii.gz"
+        if not Path(str(p)).exists():
+            raise HTTPException(404, f"No warped label for '{src}' — rebuild the consensus.")
+        arr = _read_label_ijk(p)
+        return (arr == 2) if want_scar else (arr >= 1)   # scar = label 2; cornea = cornea+scar (≥1)
+
+    ma, mb = _mask(a), _mask(b)
+    if ma.shape != mb.shape:
+        raise HTTPException(400, "Overlap operands differ in shape — rebuild the consensus.")
+    ov = np.zeros(ma.shape, dtype=np.uint8)
+    ov[ma & ~mb] = 1            # A only
+    ov[mb & ~ma] = 2            # B only
+    ov[ma & mb] = 3            # both → red
+    base = orch.case_root(ccid) / "previews" / "volume.nii.gz"
+    safe = lambda s: "cons" if s == "consensus" else orch.safe_case_id(s)
+    dst = orch.case_root(ccid) / "previews" / f"overlap_{'scar' if want_scar else 'cornea'}_{safe(a)}_{safe(b)}.nii.gz"
+    labels.write_label_nifti(ov, base, dst)
+    return FileResponse(str(dst), media_type="application/gzip", filename="overlap.nii.gz")
+
+
 @app.get("/api/case/{case_id}/agreement-stats")
 def get_agreement_stats(case_id: str, tol_mm: float = 0.0) -> dict:
     """Reproducibility readout for the overlap viewer at boundary tolerance `tol_mm`: tier volumes +

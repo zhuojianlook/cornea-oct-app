@@ -12,7 +12,7 @@ import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import type { PreviewImage, ConsensusReport, ConsensusScan } from "../../api/types";
 import { OverlapViewer } from "./OverlapViewer";
-import { AlignmentViewer } from "./AlignmentViewer";
+import { OverlapPairViewer } from "./OverlapPairViewer";
 
 const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 type Orient = (typeof ORIENTS)[number];
@@ -46,7 +46,7 @@ export function SubgroupGrid() {
 
   const [orient, setOrient] = useState<Orient>("sagittal");
   const [overlay, setOverlay] = useState<Overlay>("cons");
-  const [mode, setMode] = useState<"consensus" | "grid" | "align" | "overlap">("consensus");
+  const [mode, setMode] = useState<"consensus" | "grid" | "align" | "overlap" | "both">("consensus");
   const [masterIdx, setMasterIdx] = useState(0);
   const [data, setData] = useState<Record<string, ScanPreviews>>({});
   const [loading, setLoading] = useState(false);
@@ -135,6 +135,7 @@ export function SubgroupGrid() {
           <ToggleButton value="grid" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Scans grid</ToggleButton>
           <ToggleButton value="align" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Volume align</ToggleButton>
           <ToggleButton value="overlap" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Scar overlap</ToggleButton>
+          <ToggleButton value="both" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Both</ToggleButton>
         </ToggleButtonGroup>
         {(mode === "grid" || mode === "consensus") && (
           <>
@@ -188,10 +189,15 @@ export function SubgroupGrid() {
         );
       })()}
       {mode === "align" && consensusId && (
-        <AlignmentViewer caseId={consensusId} members={scans} refCid={refCid} />
+        <OverlapPairViewer caseId={consensusId} members={scans} refCid={refCid}
+          label="cornea" aSource="ref" aLabel="reference" bLabel="this scan" />
       )}
       {mode === "overlap" && consensusId && (
         <OverlapViewer caseId={consensusId} nScans={scans.length} />
+      )}
+      {mode === "both" && consensusId && (
+        <OverlapPairViewer caseId={consensusId} members={scans} refCid={refCid}
+          label="scar" aSource="consensus" aLabel="consensus" bLabel="this scan" />
       )}
       {mode === "grid" && (<>
         {/* grid headers + rows */}
