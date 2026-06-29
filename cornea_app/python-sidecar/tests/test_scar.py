@@ -1,0 +1,264 @@
+"""Unit tests for scar.py — the density-tier API and the hysteresis scar detector.
+
+Focus (per the module's documented invariants):
+  * density_tiers_absolute: cornea-median-anchored tiers, ascending by intensity,
+    0 outside the scar, and the relative-quantile fallback when no cornea reference.
+  * detect_scar_hysteresis: on a synthetic bright blob inside a stromal band, the
+    detected mask covers the blob, is a single connected component, excludes
+    background, and grows monotonically as the lower cut drops (larger gap).
+
+Everything uses tiny synthetic uint16 arrays (<=32 per axis) and the detector
+default morphology (erode/smooth/min_voxels) is dialed down so a small volume is
+not eroded away. No SAM2 / torch / network / real data.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from scipy import ndimage
+
+import scar
+
+
+# ── local helpers (kept out of conftest per task constraints) ───────────────
+
+def _blob_volume(F=16, D=24, L=16, band=(8, 18), blob_intensity=320,
+                 stroma_intensity=80, bg=20,
+                 blob=(5, 11, 11, 15, 5, 11)):
+    """Synthetic OCT-like volume: a dim uniform stromal band along depth with one
+    clearly-brightest scar blob inside it, plus a cornea labelmap (0=bg,1=cornea).
+    Returns (vol_uint16, labelmap_uint8, blob_bool_mask)."""
+    vol = np.full((F, D, L), bg, np.uint16)
+    vol[:, band[0]:band[1], :] = stroma_intensity
+    f0, f1, d0, d1, l0, l1 = blob
+    vol[f0:f1, d0:d1, l0:l1] = blob_intensity
+    lab = np.zeros((F, D, L), np.uint8)
+    lab[:, band[0]:band[1], :] = scar.CORNEA
+    bmask = np.zeros((F, D, L), bool)
+    bmask[f0:f1, d0:d1, l0:l1] = True
+    return vol, lab, bmask
+
+
+def _run_hyst(vol, lab, gap=12.0, phi=92.0):
+    """detect_scar_hysteresis with small-volume-friendly morphology params."""
+    return scar.detect_scar_hysteresis(
+        vol, lab, phi_percentile=phi, gap=gap,
+        erode_surface=1, smooth=0.6, min_voxels=5, open_iter=0, close_iter=0)
+
+
+# ── density_tiers_absolute ──────────────────────────────────────────────────
+
+def test_density_tiers_absolute_three_ascending_tiers():
+    """3 clear brightness levels inside the scar map to ascending tiers 1/2/3,
+    cut at the cornea-median × (1.6, 2.4) defaults."""
+    F, D, L = 8, 12, 12
+    v = np.zeros((F, D, L), np.uint16)
+    cornea = np.zeros((F, D, L), bool)
+    cornea[:, 2:8, :] = True
+    v[cornea] = 100  # normal cornea reflectivity → reference median = 100
+
+    scar_mask = np.zeros((F, D, L), bool)
+    lo = np.s_[:, 3:4, 0:4]
+    mid = np.s_[:, 3:4, 4:8]
+    hi = np.s_[:, 3:4, 8:12]
+    for s in (lo, mid, hi):
+        scar_mask[s] = True
+    # 1.2× / 2.0× / 3.0× of the ref → tier 1 / 2 / 3
+    v[lo] = 120
+    v[mid] = 200
+    v[hi] = 300
+
+    cornea_full = cornea | scar_mask
+    tiers, cutoffs = scar.density_tiers_absolute(scar_mask, v, cornea_full)
+
+    # cutoffs are ref × ratios (ref median = 100, ratios = (1.6, 2.4))
+    assert cutoffs == pytest.approx([160.0, 240.0])
+    # exactly the three tiers appear inside the scar, ascending by intensity
+    assert sorted(np.unique(tiers[scar_mask]).tolist()) == [1, 2, 3]
+    assert np.unique(tiers[lo]).tolist() == [1]
+    assert np.unique(tiers[mid]).tolist() == [2]
+    assert np.unique(tiers[hi]).tolist() == [3]
+    # nothing tiered outside the scar
+    assert (tiers[~scar_mask] == 0).all()
+    assert tiers.dtype == np.uint8
+
+
+def test_density_tiers_absolute_monotone_in_intensity():
+    """Tier assignment is monotone non-decreasing in voxel intensity: a brighter
+    scar voxel never lands in a lower tier than a dimmer one."""
+    F, D, L = 4, 8, 8
+    v = np.zeros((F, D, L), np.uint16)
+    cornea = np.zeros((F, D, L), bool)
+    cornea[:, 1:7, :] = True
+    v[cornea] = 50  # ref median = 50 → cutoffs 80, 120
+
+    scar_mask = np.zeros((F, D, L), bool)
+    scar_mask[:, 3:5, :] = True
+    # ramp of intensities across the lateral axis inside the scar slab
+    ramp = np.linspace(40, 300, L).astype(np.uint16)
+    v[:, 3:5, :] = ramp[None, None, :]
+
+    tiers, cutoffs = scar.density_tiers_absolute(scar_mask, v, cornea | scar_mask)
+    assert cutoffs == pytest.approx([80.0, 120.0])
+    # within the slab, intensity and tier rise together
+    lat_intensity = v[0, 3, :].astype(float)
+    lat_tier = tiers[0, 3, :].astype(int)
+    order = np.argsort(lat_intensity)
+    assert np.all(np.diff(lat_tier[order]) >= 0)
+
+
+def test_density_tiers_absolute_uses_cornea_only_for_reference():
+    """The reference median ignores scar voxels (cornea_only = cornea & ~scar): a
+    very bright scar must NOT pull the reference up and dilute its own tiers."""
+    F, D, L = 4, 8, 8
+    v = np.zeros((F, D, L), np.uint16)
+    cornea = np.zeros((F, D, L), bool)
+    cornea[:, 1:7, :] = True
+    v[cornea] = 100  # normal cornea
+    scar_mask = np.zeros((F, D, L), bool)
+    scar_mask[:, 3:5, :] = True
+    v[scar_mask] = 5000  # extreme bright scar; would wreck a naive whole-cornea ref
+
+    _, cutoffs = scar.density_tiers_absolute(scar_mask, v, cornea | scar_mask)
+    # ref stays 100 (scar excluded) → cutoffs 160, 240, NOT scaled by the 5000s
+    assert cutoffs == pytest.approx([160.0, 240.0])
+
+
+def test_density_tiers_absolute_custom_ratios_change_cutoffs():
+    """Passing custom ratios scales the cutoffs by ref × ratio and yields
+    len(ratios)+1 tiers."""
+    F, D, L = 3, 6, 6
+    v = np.zeros((F, D, L), np.uint16)
+    cornea = np.zeros((F, D, L), bool)
+    cornea[:, 1:5, :] = True
+    v[cornea] = 100
+    scar_mask = np.zeros((F, D, L), bool)
+    scar_mask[:, 2:4, :] = True
+    v[:, 2:4, 0:2] = 150
+    v[:, 2:4, 2:4] = 250
+    v[:, 2:4, 4:6] = 450
+
+    tiers, cutoffs = scar.density_tiers_absolute(
+        scar_mask, v, cornea | scar_mask, ratios=(2.0, 4.0))
+    assert cutoffs == pytest.approx([200.0, 400.0])
+    # 150<200 →1, 250 in [200,400) →2, 450>=400 →3
+    assert np.unique(tiers[:, 2:4, 0:2]).tolist() == [1]
+    assert np.unique(tiers[:, 2:4, 2:4]).tolist() == [2]
+    assert np.unique(tiers[:, 2:4, 4:6]).tolist() == [3]
+
+
+def test_density_tiers_absolute_empty_scar_returns_empty():
+    """No scar → all-zero tier volume and empty cutoffs."""
+    F, D, L = 4, 6, 6
+    v = np.full((F, D, L), 100, np.uint16)
+    cornea = np.ones((F, D, L), bool)
+    empty = np.zeros((F, D, L), bool)
+    tiers, cutoffs = scar.density_tiers_absolute(empty, v, cornea)
+    assert tiers.sum() == 0
+    assert cutoffs == []
+
+
+def test_density_tiers_absolute_fallback_to_quantiles_without_reference():
+    """When there is no cornea tissue outside the scar (ref unusable), it falls
+    back to intra-scar quantile tiers (still 1..3, 0 elsewhere)."""
+    F, D, L = 4, 6, 6
+    scar_mask = np.zeros((F, D, L), bool)
+    scar_mask[:, 2:4, :] = True
+    v = np.zeros((F, D, L), np.uint16)
+    # spread of intensities so quantile splitting yields 3 distinct tiers
+    v[scar_mask] = (np.arange(scar_mask.sum()) % 3) * 100 + 50
+    cornea_only_empty = scar_mask.copy()  # cornea_mask == scar → cornea_only empty
+
+    tiers, cutoffs = scar.density_tiers_absolute(scar_mask, v, cornea_only_empty)
+    assert sorted(np.unique(tiers[scar_mask]).tolist()) == [1, 2, 3]
+    assert (tiers[~scar_mask] == 0).all()
+    # fallback cutoffs are intra-scar quantiles, NOT the fixed ref×ratio values
+    assert len(cutoffs) == 2
+    assert cutoffs[0] < cutoffs[1]
+
+
+# ── detect_scar_hysteresis ──────────────────────────────────────────────────
+
+def test_hysteresis_covers_blob_connected_and_excludes_background():
+    """On a bright blob inside a stromal band: the mask fully covers the blob,
+    is a single connected component, lies inside the cornea, and touches no bg."""
+    vol, lab, blob = _blob_volume()
+    mask = _run_hyst(vol, lab, gap=12.0)
+
+    assert mask.shape == vol.shape
+    assert mask.dtype == bool
+    assert mask.any()
+    # covers the bright blob entirely
+    assert (blob & ~mask).sum() == 0
+    # single coherent 3D object (cross-plane sanity by construction)
+    _, n = ndimage.label(mask)
+    assert n == 1
+    # entirely inside the cornea, never in background
+    cornea = lab == scar.CORNEA
+    assert (mask & ~cornea).sum() == 0
+    assert (mask & (lab == scar.BG)).sum() == 0
+
+
+def test_hysteresis_monotone_lower_cut_grows_mask():
+    """Growing to a LOWER cut (larger gap → lower tlo) yields a SUPERSET mask:
+    monotone non-decreasing, never flips voxels off."""
+    vol, lab, _ = _blob_volume()
+    gaps = [4.0, 8.0, 12.0, 20.0]
+    masks = [_run_hyst(vol, lab, gap=g) for g in gaps]
+    sizes = [int(m.sum()) for m in masks]
+    # non-decreasing in size
+    assert sizes == sorted(sizes)
+    # and actually nested: each larger-gap mask is a superset of the smaller
+    for prev, cur in zip(masks, masks[1:]):
+        assert (prev & ~cur).sum() == 0
+
+
+def test_hysteresis_seed_must_exist_higher_percentile_smaller_or_equal():
+    """Raising phi_percentile (a stricter seed) cannot grow the mask: the high-
+    percentile result is a subset of (or equal to) the lower-percentile result."""
+    vol, lab, blob = _blob_volume()
+    loose = _run_hyst(vol, lab, gap=12.0, phi=85.0)
+    strict = _run_hyst(vol, lab, gap=12.0, phi=95.0)
+    assert (strict & ~loose).sum() == 0
+    # the strict seed still catches the unambiguously-bright blob
+    assert (blob & ~strict).sum() == 0
+
+
+def test_hysteresis_no_cornea_returns_empty():
+    """No cornea label → empty mask of the right shape (no crash, no false scar)."""
+    vol, _, _ = _blob_volume()
+    empty_lab = np.zeros(vol.shape, np.uint8)
+    mask = scar.detect_scar_hysteresis(
+        vol, empty_lab, erode_surface=1, smooth=0.6, min_voxels=5)
+    assert mask.shape == vol.shape
+    assert not mask.any()
+
+
+def test_hysteresis_no_scar_when_stroma_is_flat():
+    """A uniform stromal band with NO bright blob: min_voxels pruning + the lack
+    of a distinct bright core means the detector does not invent a coherent scar
+    blob covering the whole flat stroma when the seed/grow span the whole ROI."""
+    F, D, L = 16, 24, 16
+    vol = np.full((F, D, L), 20, np.uint16)
+    vol[:, 8:18, :] = 100  # perfectly flat stroma, no scar
+    lab = np.zeros((F, D, L), np.uint8)
+    lab[:, 8:18, :] = scar.CORNEA
+    # high min_voxels relative to volume: a flat percentile cut grabs a thin shell
+    # that should be pruned, so no spurious scar survives.
+    mask = scar.detect_scar_hysteresis(
+        vol, lab, phi_percentile=99.0, gap=1.0,
+        erode_surface=1, smooth=0.6, min_voxels=100000,
+        open_iter=0, close_iter=0)
+    assert not mask.any()
+
+
+def test_hysteresis_min_voxels_prunes_tiny_components():
+    """A scar smaller than min_voxels is dropped (the candidate must be a coherent
+    3D volume of sufficient size)."""
+    vol, lab, blob = _blob_volume()
+    big_min = int(blob.sum()) * 1000
+    mask = scar.detect_scar_hysteresis(
+        vol, lab, phi_percentile=92.0, gap=12.0,
+        erode_surface=1, smooth=0.6, min_voxels=big_min,
+        open_iter=0, close_iter=0)
+    assert not mask.any()

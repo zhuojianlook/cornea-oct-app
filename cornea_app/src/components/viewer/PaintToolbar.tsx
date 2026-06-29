@@ -44,17 +44,19 @@ export function PaintToolbar() {
         ))}
       </ToggleButtonGroup>
       <Tooltip title="Brush size (voxels)">
-        <div className="flex items-center gap-2" style={{ width: 120 }}>
+        <div className="flex items-center gap-2" style={{ width: 120, opacity: paintMode ? 1 : 0.4 }}>
           <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>Size</span>
-          <Slider size="small" min={1} max={15} step={1} value={penSize} valueLabelDisplay="auto"
+          <Slider size="small" min={1} max={15} step={1} value={penSize} valueLabelDisplay="auto" disabled={!paintMode}
             onChange={(_, v) => setPenSize(v as number)} />
         </div>
       </Tooltip>
       <Tooltip title="Filled pen: draw a closed outline around a region and the enclosed area is painted (one stroke per patch).">
-        <ToggleButton size="small" value="filled" selected={penFilled}
-          onChange={() => setPenFilled(!penFilled)} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>
-          ▣ Fill region
-        </ToggleButton>
+        <span>
+          <ToggleButton size="small" value="filled" selected={penFilled} disabled={!paintMode}
+            onChange={() => setPenFilled(!penFilled)} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>
+            ▣ Fill region
+          </ToggleButton>
+        </span>
       </Tooltip>
       <Tooltip title="Undo the last brush stroke / smart fill (Ctrl+Z also works in niivue)">
         <Button size="small" variant="outlined" onClick={() => undoCorrection()}

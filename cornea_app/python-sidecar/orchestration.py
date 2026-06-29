@@ -99,11 +99,24 @@ def write_manifest_value(case_id: str, updates: dict) -> dict:
         # bytes rather than overwriting an empty {} merged with the update — that would
         # destroy oct_source and every prior flag (HIGH-severity data-loss path).
         if path.exists():
+            raw = ""
+            unreadable = False
             try:
                 raw = path.read_text()
             except Exception:
-                raw = ""
-            if raw.strip():
+                unreadable = True
+            if unreadable:
+                # Binary / non-UTF-8 garbage — a plausible partial-write crash artifact. We can't merge it,
+                # but it may hold the only copy of oct_source + every prior flag, so back it up rather than
+                # silently overwrite (mirrors the decodable-but-invalid branch below; previously a binary
+                # corrupt manifest was destroyed with NO backup — found by the unit suite).
+                try:
+                    if path.stat().st_size > 0:
+                        os.replace(path, path.with_suffix(path.suffix + ".corrupt"))
+                except OSError:
+                    pass
+                current = {}
+            elif raw.strip():
                 try:
                     parsed = json.loads(raw)
                 except Exception:

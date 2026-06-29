@@ -224,11 +224,20 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
     # scan→ref transform), keep it within that scan's own cornea, and write it beside the scan's
     # warped artifacts. The reference scan is exact (identity); others use the rigid inverse.
     cons_scar_ref = sitk.GetImageFromArray(consensus.astype(np.uint8))
-    cons_scar_ref.CopyInformation(ref_img)
+    cons_scar_ref.CopyInformation(ref_img)   # ref_img is CANON (origin 0, identity direction) — see reg._canon above
     for c in cids:
         try:
             native_img = sitk.ReadImage(str(_vol_path(c)))
-            cs = sitk.Resample(cons_scar_ref, native_img, _inverse_rigid(transforms[c]),
+            # GEOMETRY FIX: transforms[c] + cons_scar_ref both live in CANON space (reg._canon zeroes the
+            # origin + identity direction). The raw native_img carries the OCT's rotated/flipped direction
+            # (e.g. [[1,0,0],[0,0,1],[0,-1,0]]), so resampling the canon consensus straight onto it through a
+            # canon-space transform sent every output point to the wrong physical location → the consensus
+            # scar sampled background everywhere and cons_native came out with ZERO scar (silently). _canon
+            # only rewrites the origin/direction metadata (NOT the voxel grid), so a canon'd copy has the
+            # identical sampling grid — resample onto THAT, then write the result back with the ORIGINAL
+            # native geometry so it overlays the member's own files.
+            native_canon = reg._canon(sitk.ReadImage(str(_vol_path(c))))
+            cs = sitk.Resample(cons_scar_ref, native_canon, _inverse_rigid(transforms[c]),
                                sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
             cs_arr = sitk.GetArrayFromImage(cs) > 0
             # TRUNCATE to this scan's actual data FOV (not just its cornea): a partial-FOV replicate only gets

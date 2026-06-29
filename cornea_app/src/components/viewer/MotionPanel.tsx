@@ -163,7 +163,8 @@ export function MotionPanel() {
               patient's eye/head motion during the ~0.7 s scan — its spectrum, dominant frequencies, and direction.
             </span>
             <span style={{ fontSize: 12 }}>Resolvable band ≈ 1.5–{Math.round((ascanRate || 70000) / NOMINAL_APF / 2)} Hz · slower drift/pulse and tremor &gt;Nyquist are not recoverable in a 0.7 s scan.</span>
-            <Button variant="contained" disableElevation disabled={busy || !hasVolume} onClick={() => run()} sx={{ textTransform: "none" }}>
+            <Button variant="contained" disableElevation disabled={busy || !hasVolume} onClick={() => run()}
+              startIcon={busy ? <CircularProgress size={12} color="inherit" /> : undefined} sx={{ textTransform: "none" }}>
               {busy ? "Analysing…" : "Analyze motion"}
             </Button>
             {!hasVolume && <span style={{ fontSize: 11 }}>Load + preprocess a scan first.</span>}

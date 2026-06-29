@@ -117,10 +117,13 @@ export function SubgroupGrid() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [maxLen, orient]);
 
+  const [openingCid, setOpeningCid] = useState<string | null>(null);
   const focusCorrect = async (cid: string) => {
+    if (openingCid) return;          // guard: a slow openCase reload shouldn't fire twice on double-click
+    setOpeningCid(cid);
     wfSet("reviewConsensusId", consensusId);
     setCaseId(cid);
-    await openCase();
+    try { await openCase(); } finally { setOpeningCid(null); }
   };
 
   const overlayList = (p: ScanPreviews) => (overlay === "cons" ? p.cons : p.seg);
@@ -248,9 +251,10 @@ export function SubgroupGrid() {
                   </span>
                 )}
                 <Tooltip title="Open this scan to brush/erase its scar, then return to the subgroup" arrow>
-                  <Button size="small" variant="outlined" onClick={() => focusCorrect(cid)}
+                  <Button size="small" variant="outlined" onClick={() => focusCorrect(cid)} disabled={openingCid != null}
+                    startIcon={openingCid === cid ? <CircularProgress size={11} color="inherit" /> : undefined}
                     sx={{ py: 0, px: 0.8, fontSize: 10, textTransform: "none", mt: "auto", alignSelf: "flex-start" }}>
-                    Correct ✎
+                    {openingCid === cid ? "Opening…" : "Correct ✎"}
                   </Button>
                 </Tooltip>
               </div>

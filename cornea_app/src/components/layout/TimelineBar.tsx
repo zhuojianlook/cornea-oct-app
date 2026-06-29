@@ -42,6 +42,7 @@ export function TimelineBar() {
   const runScarAuto = useWorkflowStore((s) => s.runScarAuto);
   const runScarAutoSam2 = useWorkflowStore((s) => s.runScarAutoSam2);
   const exportScarSummary = useWorkflowStore((s) => s.exportScarSummary);
+  const scarSummaryInfo = useWorkflowStore((s) => s.scarSummaryInfo);
   const exportCorrectionMp4 = useWorkflowStore((s) => s.exportCorrectionMp4);
   const mp4Busy = useWorkflowStore((s) => s.mp4Busy);
   const correctionMp4Url = useWorkflowStore((s) => s.correctionMp4Url);
@@ -90,6 +91,11 @@ export function TimelineBar() {
   // #14a: which scar op is running (so its button shows a spinner + live progress, not just the global one).
   const [scarKind, setScarKind] = useState<"threshold" | "sam2" | "hints" | null>(null);
   useEffect(() => { if (!scarBusy) setScarKind(null); }, [scarBusy]);
+  // #spinner: which slow shared-busy action is running (align/normalize/skip-norm/use-raw/export), so its
+  // OWN button shows a spinner — these all flip the shared segBusy/scarBusy/caseBusy, so we name the
+  // specific one here and clear it when the work settles.
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  useEffect(() => { if (!busy) setBusyAction(null); }, [busy]);
   // Short live-progress label for the running scar button (e.g. SAM2 per-plane %). Falls back to a verb.
   const scarProgress = status.kind === "working" ? status.detail : "";
   const [editAssign, setEditAssign] = useState<Record<string, string>>({});
@@ -206,25 +212,35 @@ export function TimelineBar() {
     </Button>
   ) : null;
   const ExportBtn = (
-    <Button size="small" variant="outlined" color="success" disabled={busy} onClick={() => exportScarSummary()}
-      title="Recompute scar volume/area/density for every case → scar_summary.csv">Export metrics</Button>
+    <>
+      <Button size="small" variant="outlined" color="success" disabled={busy} onClick={() => { setBusyAction("export"); exportScarSummary(); }}
+        startIcon={busyAction === "export" ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title="Recompute scar volume/area/density for every case → scar_summary.csv">{busyAction === "export" ? "Exporting…" : "Export metrics"}</Button>
+      {scarSummaryInfo && !scarBusy && (
+        <span className="text-[11px]" style={{ color: "var(--c-text-dim)", maxWidth: 320, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+          title={scarSummaryInfo}>{scarSummaryInfo}</span>
+      )}
+    </>
   );
   const AlignBtn = (
-    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => alignReplicates()}
+    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => { setBusyAction("align"); alignReplicates(); }}
+      startIcon={busyAction === "align" ? <CircularProgress size={13} color="inherit" /> : undefined}
       title="Register + vote this eye's repeat scans (same subgroup) into one consensus, using the scar as-is. Normalization against controls is the next step.">
-      ⌖ Align replicates
+      {busyAction === "align" ? "Aligning…" : "⌖ Align replicates"}
     </Button>
   );
   const NormalizeBtn = (
-    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => normalizeConsensus()}
+    <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => { setBusyAction("normalize"); normalizeConsensus(); }}
+      startIcon={busyAction === "normalize" ? <CircularProgress size={13} color="inherit" /> : undefined}
       title="Re-derive scar as excess over the control (no-scar) baseline and rebuild the consensus. Needs tagged + segmented control scans.">
-      ◎ Normalize against controls
+      {busyAction === "normalize" ? "Normalizing…" : "◎ Normalize against controls"}
     </Button>
   );
   const SkipNormBtn = (
-    <Button size="small" variant="outlined" color="inherit" disabled={busy || correcting} onClick={() => skipNormalization()}
+    <Button size="small" variant="outlined" color="inherit" disabled={busy || correcting} onClick={() => { setBusyAction("skipnorm"); skipNormalization(); }}
+      startIcon={busyAction === "skipnorm" ? <CircularProgress size={13} color="inherit" /> : undefined}
       title="Skip control-normalisation — keep the aligned consensus as-is, then correct / schedule it.">
-      ⏭ Skip normalization
+      {busyAction === "skipnorm" ? "Skipping…" : "⏭ Skip normalization"}
     </Button>
   );
   // STEP 9 scar-source decision: which scar boundary becomes each replicate's TRAINING label.
@@ -270,7 +286,6 @@ export function TimelineBar() {
         <MenuItem value="depthnorm" sx={{ fontSize: 12 }}>Depth-normalised (uses controls)</MenuItem>
         <MenuItem value="normal_anchor" sx={{ fontSize: 12 }}>Normal-stroma anchor</MenuItem>
         <MenuItem value="robust_mad" sx={{ fontSize: 12 }}>Robust MAD</MenuItem>
-        <MenuItem value="morph_lcc" sx={{ fontSize: 12 }}>Morph + largest component</MenuItem>
         <MenuItem value="brightness" sx={{ fontSize: 12 }}>Brightness percentile</MenuItem>
       </Select>
       <label className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }} title="How much hyper-reflectivity to flag">
@@ -364,9 +379,10 @@ export function TimelineBar() {
           title="Re-run the full auto preprocessing on the raw .OCT again (fresh surface detect + warp). Keeps this scan's params/classification; drops the current correction's segmentation.">
           {caseBusy ? "Re-running…" : "↻ Re-run preprocessing"}
         </Button>
-        <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => approveRaw()}
+        <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => { setBusyAction("useraw"); approveRaw(); }}
+          startIcon={busyAction === "useraw" ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Use the ORIGINAL (raw) scan as the working volume instead of the correction. Drops any segmentation; also marks it vetted.">
-          ↩ Use original (raw)
+          {busyAction === "useraw" ? "Loading…" : "↩ Use original (raw)"}
         </Button>
       </>
     );

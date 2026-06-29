@@ -155,7 +155,7 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
         <Tooltip arrow title="Allow the scar to match if it lies within this distance of another scan — absorbs small residual shift / through-plane sampling so a thin boundary offset isn't counted as disagreement.">
           <div className="flex items-center gap-2" style={{ width: 200 }}>
             <span className="text-[11px] whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>tolerance {tolMm.toFixed(2)}mm</span>
-            <Slider size="small" min={0} max={0.15} step={0.01} value={tolMm}
+            <Slider size="small" min={0} max={0.15} step={0.01} value={tolMm} disabled={busy}
               onChange={(_, v) => setTolMm(v as number)}
               onChangeCommitted={(_, v) => applyTolerance(v as number)} />
           </div>
