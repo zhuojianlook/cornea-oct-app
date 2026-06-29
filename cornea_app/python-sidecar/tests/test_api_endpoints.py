@@ -353,3 +353,30 @@ def test_cases_list_skips_consensus_member(client, make_case):
     ids = {c["case_id"] for c in r.json()["cases"]}
     assert "case_real_oct" in ids
     assert "case_cons_synthetic" not in ids
+
+
+def test_flag_endpoints_404_on_unknown_case_no_ghost_dir(client, cases_root):
+    # The flag-only manifest endpoints must 404 on a typo'd/unknown id rather than silently
+    # materialize a ghost case dir (write_manifest_value mkdirs the case dir). Regression guard
+    # for the v0.0.93 _require_case() check on vet/classify/subgroup/confirm/schedule/skip.
+    ghost = "case_does_not_exist_zzz"
+    calls = [
+        ("/api/case/%s/vet-preprocessing" % ghost, {}),
+        ("/api/case/%s/classification" % ghost, {"classification": "scar"}),
+        ("/api/case/%s/subgroup" % ghost, {"subgroup": "1"}),
+        ("/api/case/%s/subgroup/confirm" % ghost, {}),
+        ("/api/case/%s/training/schedule" % ghost, {"scheduled": True}),
+        ("/api/case/%s/scar/skip" % ghost, {}),
+    ]
+    for path, body in calls:
+        r = client.post(path, json=body)
+        assert r.status_code == 404, "%s -> %s (expected 404)" % (path, r.status_code)
+    # no manifest / case dir was created for the ghost id
+    assert not (cases_root / ghost).exists()
+
+
+def test_flag_endpoints_still_work_for_existing_case(client, make_case):
+    # The guard must NOT break the normal path: an existing case still flips its flag.
+    cid = make_case("case_guard_ok", manifest={"oct_preprocessed": True})
+    r = client.post("/api/case/%s/vet-preprocessing" % cid, json={})
+    assert r.status_code == 200 and r.json()["preproc_vetted"] is True

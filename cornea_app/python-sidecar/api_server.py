@@ -100,6 +100,16 @@ def health() -> dict:
     return {"status": "ok", "shell_version": os.environ.get("CORNEA_SHELL_VERSION", "")}
 
 
+def _require_case(case_id: str) -> str:
+    """Resolve + sanitize a case id, 404 if its directory doesn't exist. write_manifest_value mkdirs the
+    case dir, so a flag-only endpoint posting to a typo'd/unknown id would otherwise silently materialize a
+    ghost case under CASES_ROOT. Mirrors the guard reset_step / vet_cornea already use."""
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, f"No such case: {case_id}")
+    return cid
+
+
 # ── Upload size limits (DoS guard) ─────────────────────────────────────────
 # The sidecar listens on loopback and is reachable by any allowed-origin page, so an upload
 # handler that reads the whole body into memory in one shot can be made to exhaust RAM/disk.
@@ -1153,16 +1163,20 @@ def consensus_scar_choice(case_id: str, req: ConsensusScarRequest | None = None)
                     print(f"[consensus-scar] {mc}: consensus has no scar in this scan's FOV — kept its own scar", file=sys.stderr)
                     skipped.append(mc)
                     continue
-                labels.write_label_nifti(cons_arr, nat_vol, labels.corrected_path(mc))
-                # the member's OWN scar is now the consensus scar — refresh its context_seg preview so the
-                # Scans-grid "Per scan" column matches the new labelmap (else it shows the pre-apply scar).
-                try:
-                    postprocess.render_seg_previews(nat_vol, _read_label_ijk(labels.corrected_path(mc)),
-                                                    _preview_group_dir(mc, "context_seg"), dense_rotated=True, density_from_self=True)
-                except Exception:  # noqa: BLE001 — preview refresh is best-effort
-                    pass
-                orch.case_qa_json(mc).unlink(missing_ok=True)   # stale QA; recomputed on next view
-                orch.write_manifest_value(mc, {"corrected_labelmap": True, "consensus_scar_source": "consensus"})
+                # Serialize against scar/edit + scar/auto on the SAME member (they do a locked
+                # read-modify-write of this labelmap) — without the lock a concurrent brush/auto run
+                # could clobber, or be clobbered by, this consensus write (last-writer-wins).
+                with _labelmap_lock(mc):
+                    labels.write_label_nifti(cons_arr, nat_vol, labels.corrected_path(mc))
+                    # the member's OWN scar is now the consensus scar — refresh its context_seg preview so the
+                    # Scans-grid "Per scan" column matches the new labelmap (else it shows the pre-apply scar).
+                    try:
+                        postprocess.render_seg_previews(nat_vol, _read_label_ijk(labels.corrected_path(mc)),
+                                                        _preview_group_dir(mc, "context_seg"), dense_rotated=True, density_from_self=True)
+                    except Exception:  # noqa: BLE001 — preview refresh is best-effort
+                        pass
+                    orch.case_qa_json(mc).unlink(missing_ok=True)   # stale QA; recomputed on next view
+                    orch.write_manifest_value(mc, {"corrected_labelmap": True, "consensus_scar_source": "consensus"})
                 applied.append(mc)
             except Exception as exc:  # noqa: BLE001
                 print(f"[consensus-scar] apply failed for {mc}: {exc}", file=sys.stderr)
@@ -1855,6 +1869,12 @@ def normalize_consensus(case_id: str) -> dict:
     for mc in members:                                 # re-derive each member's scar control-normalised
         try:
             scar_auto(mc, ScarAutoRequest(method="depthnorm", replace=True))
+            # If the member's labelmap had been overwritten by an earlier "Use consensus (all)" apply,
+            # scar_auto has now REPLACED it with the depthnorm scar — so clear the now-stale flags
+            # (corrected_labelmap made scanStep read it as step 11 "Manually corrected"; consensus_scar_source
+            # no longer reflects the on-disk labelmap). Without this a normalized member falsely shows as
+            # corrected with a consensus source it no longer carries.
+            orch.write_manifest_value(mc, {"corrected_labelmap": None, "consensus_scar_source": None})
         except Exception as exc:  # noqa: BLE001
             print(f"[normalize] depthnorm scar skipped for {mc}: {exc}", file=sys.stderr)
     sub = orch.read_manifest(ccid).get("scar_subgroup")
@@ -1976,7 +1996,7 @@ def confirm_subgroup(case_id: str) -> dict:
     """Confirm this scan's scar-subgroup (already set via /subgroup): which lesion set it belongs to, so the
     right repeats align together. Sets subgroup_confirmed so the timeline advances Cornea✓ → Subgroup → Scar
     (subgroup is assigned BEFORE scar so the strategy comparison at the Scar step is per-subgroup)."""
-    cid = orch.safe_case_id(case_id)
+    cid = _require_case(case_id)
     sub = str(orch.read_manifest(cid).get("scar_subgroup") or "1").strip() or "1"
     m = orch.write_manifest_value(cid, {"scar_subgroup": sub, "subgroup_confirmed": True})
     return {"ok": True, "scar_subgroup": m.get("scar_subgroup"), "subgroup_confirmed": True}
@@ -1987,7 +2007,7 @@ def skip_scar(case_id: str) -> dict:
     """For a CONTROL (no-scar) scan: mark the scar step done WITHOUT running a detector (there is no scar to
     segment). Controls are an eye-wide normal baseline with no lesion subgroup, so they skip the Subgroup step
     and go Cornea✓ → (no scar) → align/correct."""
-    m = orch.write_manifest_value(case_id, {"scar_done": True})
+    m = orch.write_manifest_value(_require_case(case_id), {"scar_done": True})
     return {"ok": True, "scar_done": bool(m.get("scar_done"))}
 
 
@@ -2608,7 +2628,7 @@ def set_case_classification(case_id: str, req: ClassificationRequest) -> dict:
         updates["scar_range"] = None
     elif req.scar_range is not None:
         updates["scar_range"] = [int(x) for x in req.scar_range] or None
-    m = orch.write_manifest_value(case_id, updates)
+    m = orch.write_manifest_value(_require_case(case_id), updates)
     return {"ok": True, "scar_classification": m.get("scar_classification"),
             "scar_range": m.get("scar_range")}
 
@@ -2618,7 +2638,7 @@ def vet_preprocessing(case_id: str) -> dict:
     """Timeline step 3: mark the preprocessing as MANUALLY VETTED (the user reviewed before/after +
     Fix-columns and approves it). Manifest metadata only — turns the scan entry orange and is the gate
     before scar/control classification. A later auto/Fix-columns re-run clears this (see oct-preprocess)."""
-    m = orch.write_manifest_value(case_id, {"preproc_vetted": True})
+    m = orch.write_manifest_value(_require_case(case_id), {"preproc_vetted": True})
     return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted"))}
 
 
@@ -2632,7 +2652,7 @@ def set_case_subgroup(case_id: str, req: SubgroupRequest) -> dict:
     same eye that must be voted SEPARATELY, never merged). Without this the loader's per-scan subgroup
     is client-only and lost on reload, silently collapsing distinct lesions into one consensus."""
     sub = (req.subgroup or "1").strip() or "1"
-    m = orch.write_manifest_value(case_id, {"scar_subgroup": sub})
+    m = orch.write_manifest_value(_require_case(case_id), {"scar_subgroup": sub})
     return {"ok": True, "scar_subgroup": m.get("scar_subgroup")}
 
 
@@ -2644,7 +2664,7 @@ class TrainingScheduleRequest(BaseModel):
 def schedule_training(case_id: str, req: TrainingScheduleRequest) -> dict:
     """Timeline final step: schedule (or unschedule) this scan for nnU-Net training (turns the entry
     green). Manifest flag only; nnunet_train restricts to scheduled scans when any scan is scheduled."""
-    m = orch.write_manifest_value(case_id, {"training_scheduled": bool(req.scheduled)})
+    m = orch.write_manifest_value(_require_case(case_id), {"training_scheduled": bool(req.scheduled)})
     return {"ok": True, "training_scheduled": bool(m.get("training_scheduled"))}
 
 
