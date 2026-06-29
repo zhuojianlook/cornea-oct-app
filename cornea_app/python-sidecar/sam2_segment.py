@@ -58,6 +58,7 @@ def _resolve_ckpt() -> Path | None:
 
 
 _PREDICTOR = None
+_CUDA_TUNED = False
 
 
 def _device():
@@ -65,8 +66,31 @@ def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _tune_cuda():
+    """#5 — squeeze the installed GPU (e.g. an Ampere RTX 3090): enable TF32 matmul/cuDNN and cuDNN
+    autotuning so SAM2's convolutions/matmuls run at full speed. Idempotent + best-effort (never fail
+    inference over a tuning flag). nnU-Net runs in its own subprocess and self-tunes, so this is SAM2-only."""
+    global _CUDA_TUNED
+    if _CUDA_TUNED:
+        return
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True     # Ampere TF32 matmul (≈free speedup)
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True            # autotune conv algos for our fixed slice sizes
+            try:
+                torch.set_float32_matmul_precision("high")   # newer torch — prefer TF32 paths
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    _CUDA_TUNED = True
+
+
 def _predictor():
     global _PREDICTOR
+    _tune_cuda()
     if _PREDICTOR is None:
         ckpt = _resolve_ckpt()
         if ckpt is None:
@@ -457,13 +481,57 @@ def segment_volume(volume_nifti: Path, work: Path,
         sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
         fused = lbl == int(np.argmax(sizes)) + 1
     fused = ndimage.binary_fill_holes(fused)
+    # #13 — NO holes within the cornea thickness. The cornea is a single contiguous band along the A-scan
+    # (depth) direction, so any gap between its anterior and posterior surface in a column is a SAM2 vote
+    # dropout, not real anatomy. binary_fill_holes only fills FULLY-enclosed cavities (a gap that leaks to
+    # the edge survives), so additionally solid-fill each A-scan column between its first and last cornea
+    # voxel. Downstream scar detection/normalization assumes a solid cornea, so this must hold.
+    holes_before = int(fused.sum())
+    fused = _fill_cornea_thickness(fused)
+    thickness_filled = int(fused.sum()) - holes_before
     label = fused.astype(np.uint8)
     meta = {"per_plane": per_plane, "vote_threshold": vote,
             "cornea_voxels": int(label.sum()), "model": "sam2.1_hiera_small",
             "planes_failed": planes_failed,
+            "thickness_filled_voxels": thickness_filled,   # #13 — how many in-thickness gaps were closed
             "degraded": bool(planes_failed)}        # surfaced so a silent under-segment is visible
     _free_gpu()
     return label, meta
+
+
+def _depth_axis(mask: np.ndarray) -> int:
+    """The A-scan/depth axis = the one whose face-on projection fills the cornea into the densest disc
+    (the cornea is a thin curved shell; collapsing its thin direction yields the largest footprint).
+    Mirrors scar._depth_axis so the thickness-fill agrees with downstream scar detection."""
+    shape = mask.shape
+    best_axis, best_score = 0, -1.0
+    for a in range(3):
+        footprint = int(mask.any(axis=a).sum())
+        plane_area = shape[(a + 1) % 3] * shape[(a + 2) % 3]
+        score = footprint / max(plane_area, 1)
+        if score > best_score:
+            best_axis, best_score = a, score
+    return best_axis
+
+
+def _fill_cornea_thickness(mask: np.ndarray) -> np.ndarray:
+    """Make the cornea a SOLID band along the A-scan/depth axis: for each (lateral, frame) column, fill
+    every voxel between the first and last cornea voxel. Closes in-thickness vote-dropout holes that
+    binary_fill_holes can't (those that leak to an edge). A column with no cornea stays empty. Vectorised."""
+    if not mask.any():
+        return mask
+    depth = _depth_axis(mask)
+    m = np.moveaxis(mask, depth, -1)                 # (A, B, D) — depth last
+    present = m.any(axis=-1)                          # columns that contain any cornea
+    if not present.any():
+        return mask
+    D = m.shape[-1]
+    idx = np.arange(D)
+    first = m.argmax(axis=-1)                         # first True along depth (0 where empty — masked below)
+    last = D - 1 - m[..., ::-1].argmax(axis=-1)       # last True along depth
+    band = (idx[None, None, :] >= first[..., None]) & (idx[None, None, :] <= last[..., None])
+    band &= present[..., None]                        # don't fabricate a band in empty columns
+    return np.moveaxis(band, -1, depth)
 
 
 def _free_gpu():

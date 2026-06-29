@@ -80,7 +80,12 @@ def _strategy_detectors(phi: float):
     }
 
 
-def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0, sam2_scar_fn=None) -> dict:
+class Cancelled(Exception):
+    """Raised internally when a caller-supplied should_cancel() asks compare_strategies to stop."""
+
+
+def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0, sam2_scar_fn=None,
+                       should_cancel=None, valid_masks=None) -> dict:
     """READ-ONLY test–retest reproducibility of each scar strategy on a set of REPLICATE scans (same eye+
     subgroup, already cornea-segmented). Aligns the replicates to the reference ONCE (volume-intensity
     driven, detector-independent), then for each strategy computes the scar mask per replicate IN MEMORY
@@ -118,12 +123,33 @@ def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0
         label_mod.write_label_nifti(mask.astype(np.uint8), _vol(cid), tmp)
         return reg.resample_label(tmp, ref_vol, tx[cid]) >= 1
 
+    # #9 CROP-AWARE: a replicate cropped at some lateral columns has NO data there, so comparing it against
+    # an un-cropped replicate over the full volume would bias Dice/CV. Warp each replicate's VALIDITY mask
+    # (False on its cropped band) to the reference and intersect → the region valid in EVERY replicate; the
+    # scar masks (and volumes) are then measured ONLY over that common region. No crop → common_valid = None
+    # and behaviour is unchanged. valid_masks: {cid: bool ndarray in the replicate's native labelmap grid}.
+    common_valid = None
+    if valid_masks and any(vm is not None and not bool(np.all(vm)) for vm in valid_masks.values()):
+        wv = []
+        for cid in members:
+            vm = valid_masks.get(cid)
+            native = np.ones(data[cid][0].shape, bool) if vm is None else np.asarray(vm).astype(bool)
+            wv.append(warp(native.astype(np.uint8), cid))   # validity in the reference frame
+        common_valid = np.logical_and.reduce(wv) if wv else None
+
     rows = []
+    cancelled = False
+    _cancel = should_cancel if callable(should_cancel) else (lambda: False)
     try:
         for name in chosen:
+            if _cancel():                         # stop before starting another (e.g. slow SAM2) strategy
+                cancelled = True
+                break
             try:
                 warped, vols = {}, []
                 for cid in members:
+                    if _cancel():                 # stop between replicates so a cancel takes effect promptly
+                        raise Cancelled
                     lab, vol = data[cid]
                     if name == "sam2":
                         if sam2_scar_fn is None:
@@ -131,8 +157,13 @@ def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0
                         m = np.asarray(sam2_scar_fn(cid)).astype(bool) & ((lab == 1) | (lab == 2))
                     else:
                         m = np.asarray(dets[name](lab, vol)) & ((lab == 1) | (lab == 2))
-                    vols.append(float(m.sum()) * vmm3)
-                    warped[cid] = warp(m, cid)
+                    w = warp(m, cid)
+                    if common_valid is not None:
+                        w = w & common_valid                  # crop-aware: keep only the common valid region
+                        vols.append(float(w.sum()) * vmm3)    # volume over the common region (ref frame)
+                    else:
+                        vols.append(float(m.sum()) * vmm3)    # no crop → native volume, unchanged
+                    warped[cid] = w
                 mean = float(np.mean(vols)); sd = float(np.std(vols, ddof=1)) if len(vols) > 1 else 0.0
                 pd = _pairwise(warped, _dice)
                 ph = _pairwise(warped, lambda a, b: _hd95(a, b, samp))
@@ -145,12 +176,16 @@ def compare_strategies(member_ids, strategies=None, phi_percentile: float = 92.0
                     "mean_pairwise_hd95_mm": round(float(np.nanmean(ph)), 3) if ph and not np.all(np.isnan(ph)) else None,
                     "n": len(members),
                 })
+            except Cancelled:                     # user cancelled mid-strategy → stop, return what we have
+                cancelled = True
+                break
             except Exception as exc:  # noqa: BLE001 — one bad strategy shouldn't kill the table
                 rows.append({"strategy": name, "error": str(exc)[:120], "n": len(members)})
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
     return {"rows": rows, "members": members, "n": len(members),
-            "phi_percentile": float(phi_percentile), "reference": ref}
+            "phi_percentile": float(phi_percentile), "reference": ref, "cancelled": cancelled,
+            "crop_aware": bool(common_valid is not None)}
 
 
 def main():

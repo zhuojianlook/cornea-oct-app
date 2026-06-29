@@ -266,6 +266,30 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const cropDirty = useMemo(
     () => cropCols.size !== persistedCrop.size || [...cropCols].some((f) => !persistedCrop.has(f)),
     [cropCols, persistedCrop]);
+  // #9 LATERAL CROP mode (distinct from surface-crop above): remove a band of problematic LATERAL columns
+  // (the 513 fast-scan axis = the sagittal slice index). Scrub sagittal slices to pick a range, then re-run;
+  // the band is zeroed before SAM2 and recorded so scar-alignment excludes it. A STICKY oct_param.
+  const persistedLatCropSig = JSON.stringify(
+    (((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.crop_lateral) ?? []);
+  const persistedLatCrop = useMemo(() => {
+    try { return new Set((JSON.parse(persistedLatCropSig) as number[]).map(Number)); } catch { return new Set<number>(); }
+  }, [persistedLatCropSig]);
+  const [latCropMode, setLatCropMode] = useState(false);
+  const [latCropCols, setLatCropCols] = useState<Set<number>>(new Set());
+  const [latCropStart, setLatCropStart] = useState<number | null>(null);
+  const [latCropBusy, setLatCropBusy] = useState(false);
+  useEffect(() => { setLatCropCols(new Set(persistedLatCrop)); }, [persistedLatCrop]);
+  const latCropDirty = useMemo(
+    () => latCropCols.size !== persistedLatCrop.size || [...latCropCols].some((f) => !persistedLatCrop.has(f)),
+    [latCropCols, persistedLatCrop]);
+  const latCropRanges = useMemo(() => {
+    const xs = [...latCropCols].sort((a, b) => a - b);
+    const runs: string[] = []; let s0: number | null = null, prev = -2;
+    for (const c of xs) { if (c !== prev + 1) { if (s0 != null) runs.push(prev > s0 ? `${s0}–${prev}` : `${s0}`); s0 = c; } prev = c; }
+    if (s0 != null) runs.push(prev > s0 ? `${s0}–${prev}` : `${s0}`);
+    return runs;
+  }, [latCropCols]);
   // Bumped after we render context previews on demand, to force the fetch effect to
   // re-pull (can't reuse segSig — the auto-select effect depends on it and would loop).
   const [refetchTick, setRefetchTick] = useState(0);
@@ -602,6 +626,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
       return;
     }
     if (cutMode) return;   // cut-line elements own their pointerdown; an empty-area press does nothing here
+    if (latCropMode) {     // #9 lateral-crop marks via the scrub + buttons, not canvas drag → drag = PAN only
+      if (e.button === 1 || e.shiftKey) borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode: "pan" };
+      return;
+    }
     // middle-button OR shift+left = PAN (so you can move around while zoomed); plain left = edit the border.
     // readOnly (inspecting an earlier completed step) → PAN only; the border can't be edited until rollback.
     const mode: "edit" | "pan" = (readOnly || e.button === 1 || e.shiftKey) ? "pan" : "edit";
@@ -805,6 +833,32 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     } finally {
       setRerunBusy(false);
     }
+  };
+  // #9: re-run preprocessing with the marked LATERAL columns removed (zeroed before SAM2). An empty set
+  // clears the crop (plain auto preprocess). Drops the segmentation; the band is recorded crop-aware.
+  const rerunLatCrop = async () => {
+    if (!caseId) return;
+    setLatCropBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST",
+        JSON.stringify({ crop_lateral: [...latCropCols].sort((a, b) => a - b) }));
+      await openCase();
+      wfSet("segVersion", segSig + 1);
+    } catch {
+      /* surfaced via the spinner stopping; the volume is unchanged on failure */
+    } finally {
+      setLatCropBusy(false);
+    }
+  };
+  // Mark the current sagittal slice as the start/end of a lateral crop range (each sagittal slice = one
+  // lateral column). "end" fills in every column between start and the current slice.
+  const latMarkStart = () => { if (borderSliceIdx != null) setLatCropStart(borderSliceIdx); };
+  const latMarkEnd = () => {
+    if (borderSliceIdx == null) return;
+    const a = latCropStart == null ? borderSliceIdx : latCropStart;
+    const lo = Math.min(a, borderSliceIdx), hi = Math.max(a, borderSliceIdx);
+    setLatCropCols((cur) => { const n = new Set(cur); for (let i = lo; i <= hi; i++) n.add(i); return n; });
+    setLatCropStart(null);
   };
   // Open directly in surface-crop mode when launched from the toolbar's "Detect surface crop" (cropStart),
   // and auto-detect the cropped frames once. Switching cropStart back off returns to the normal border editor.
@@ -1296,7 +1350,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
           <>
             {fixCols ? (
               <>
-                <ToggleButtonGroup size="small" exclusive value={cropMode ? "crop" : cutMode ? "cut" : borderMode}
+                <ToggleButtonGroup size="small" exclusive value={latCropMode ? "latcrop" : cropMode ? "crop" : cutMode ? "cut" : borderMode}
                   onChange={(_, v) => {
                     if (!v) return;
                     // Clear the inactive modes' UNCONFIRMED edits on switch so a stray point/drag in one mode
@@ -1305,10 +1359,11 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                     if (v !== "parabola") setParaAnchors(new Map());
                     if (v !== "edge") setBorderAnchors(cloneAnchors(persistedAnchors));
                     if (v === "crop") {
-                      setCropMode(true); setCutMode(false);
+                      setCropMode(true); setCutMode(false); setLatCropMode(false);
                       if (cropCols.size === 0 && Object.keys(cropCounts).length === 0) void detectCrop();
-                    } else if (v === "cut") { setCutMode(true); setCropMode(false); }
-                    else { setCutMode(false); setCropMode(false); setBorderMode(v); }
+                    } else if (v === "latcrop") { setLatCropMode(true); setCropMode(false); setCutMode(false); }
+                    else if (v === "cut") { setCutMode(true); setCropMode(false); setLatCropMode(false); }
+                    else { setCutMode(false); setCropMode(false); setLatCropMode(false); setBorderMode(v); }
                   }}>
                   <ToggleButton value="edge" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
                     title="Drag the noisy detected edge onto the true surface — a LOCAL correction (only the dragged region + nearby slices change)">Edge</ToggleButton>
@@ -1318,9 +1373,12 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                     title="Mark a clipped surface (top/left/right) to exclude from the fit, then re-run — robust on clipped scans">✂ Cut</ToggleButton>
                   <ToggleButton value="crop" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
                     title="Detect surface-cropped frames (apex above the window) and re-run — those frames are aligned by their visible BOTTOM edge (posterior continuity), not the missing top">✛ Surface crop</ToggleButton>
+                  <ToggleButton value="latcrop" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
+                    title="Crop away a band of problematic LATERAL columns (the 513 fast-scan axis = sagittal slice index): scrub to the start slice → Mark start, scrub to the end → Mark end, then Confirm & re-run. The band is removed before SAM2 and excluded from scar-alignment (crop-aware).">⊟ Crop slices</ToggleButton>
                 </ToggleButtonGroup>
                 <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
+                    latCropMode ? (<>Scrub <b>sagittal</b> slices to the band edges: <b>Mark start</b> then <b>Mark end</b> — lateral columns between are removed. {orient !== "sagittal" ? <b style={{ color: "#ffaa28" }}>switch to Sagittal to pick the range</b> : <>current slice <b>{borderSliceIdx ?? "—"}</b>{latCropStart != null ? <> · start <b style={{ color: "#ffaa28" }}>{latCropStart}</b></> : null}</>} · {latCropCols.size} col(s){latCropRanges.length ? ` [${latCropRanges.join(", ")}]` : ""}</>) :
                     cropMode ? (cropBusy ? "Detecting surface-cropped frames…" : (<>The <b style={{ color: "#ffaa28" }}>amber</b> columns are surface-cropped — aligned by the <b style={{ color: "#ffaa28" }}>orange bottom edge</b> → <b style={{ color: "#39d98a" }}>green reconstructed surface</b> (it leaves the top where the apex is cropped). Click/drag columns to add/remove, then <b>Confirm &amp; re-run</b>. · {cropCols.size} frame(s)</>)) :
                     cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
                     borderMode === "parabola" ? (<>Drag points to shape the <b style={{ color: "#39d98a" }}>green parabola</b>, then <b>Confirm</b>; scrub, then <b>Run</b>.{paraCount ? ` · ${paraCount} pt(s)` : ""}</>) :
@@ -1356,7 +1414,31 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
               </span>
             )}
             {fixCols ? (
-              cropMode ? (
+              latCropMode ? (
+                <>
+                  <button onClick={latMarkStart} disabled={latCropBusy || readOnly || orient !== "sagittal" || borderSliceIdx == null}
+                    title="Set the START of the lateral crop band = the current sagittal slice"
+                    style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: (latCropBusy || readOnly || orient !== "sagittal") ? "default" : "pointer", fontSize: 11, padding: "2px 6px", opacity: (latCropBusy || readOnly || orient !== "sagittal") ? 0.6 : 1 }}>
+                    Mark start{latCropStart != null ? ` (${latCropStart})` : ""}
+                  </button>
+                  <button onClick={latMarkEnd} disabled={latCropBusy || readOnly || orient !== "sagittal" || borderSliceIdx == null}
+                    title="Set the END = the current sagittal slice — every lateral column between start and end is cropped"
+                    style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: (latCropBusy || readOnly || orient !== "sagittal") ? "default" : "pointer", fontSize: 11, padding: "2px 6px", opacity: (latCropBusy || readOnly || orient !== "sagittal") ? 0.6 : 1 }}>
+                    Mark end
+                  </button>
+                  {latCropCols.size > 0 && !readOnly && (
+                    <button onClick={() => { setLatCropCols(new Set()); setLatCropStart(null); }} disabled={latCropBusy}
+                      style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                      Clear
+                    </button>
+                  )}
+                  <button onClick={rerunLatCrop} disabled={latCropBusy || !latCropDirty || readOnly}
+                    title={readOnly ? "Inspecting an earlier step — roll back to it to edit" : latCropDirty ? "Re-run preprocessing with the marked lateral band removed (zeroed before SAM2; excluded from scar-alignment)" : "Mark a lateral crop range first (or Clear to remove the crop)"}
+                    style={{ background: (latCropDirty && !readOnly) ? "var(--c-accent)" : "var(--c-surface2)", color: "#fff", border: "none", borderRadius: 4, cursor: (latCropBusy || !latCropDirty || readOnly) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (latCropBusy || !latCropDirty || readOnly) ? 0.6 : 1 }}>
+                    {latCropBusy ? "Running…" : `Confirm & re-run${latCropCols.size ? ` (${latCropCols.size})` : ""}`}
+                  </button>
+                </>
+              ) : cropMode ? (
                 <>
                   <button onClick={detectCrop} disabled={cropBusy || rerunBusy || readOnly}
                     title="Auto-detect surface-cropped frames (apex above the window) — verify/edit the amber columns, then Confirm & re-run"
@@ -1531,24 +1613,31 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
             </div>
           )
         ) : showBeforeAfter ? (
-          <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "center", justifyContent: "center" }}>
-            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+          // #6: each panel gets an EQUAL flex column whose image AREA is flex:1; the <img> fills it with
+          // objectFit:contain so it scales UP to use the whole canvas, and equal boxes + shared slice
+          // geometry render raw and corrected at the SAME size (no more "original larger").
+          <div style={{ display: "flex", gap: 10, width: "100%", height: "100%", alignItems: "stretch", justifyContent: "center" }}>
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
               <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>original (raw)</span>
-              {rawCur ? (
-                <img src={imgSrc(rawCur)} alt="raw" draggable={false}
-                  style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter }} />
-              ) : (
-                <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>no raw slice here</span>
-              )}
+              <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {rawCur ? (
+                  <img src={imgSrc(rawCur)} alt="raw" draggable={false}
+                    style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter }} />
+                ) : (
+                  <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>no raw slice here</span>
+                )}
+              </div>
             </div>
-            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
               <span className="text-[11px]" style={{ color: "var(--c-green)" }}>preprocessed</span>
-              <img src={imgSrc(cur)} alt="corrected" draggable={false} onDoubleClick={onSliceDoubleClick}
-                title="Double-click for the preprocessing steps"
-                style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter, cursor: "zoom-in" }} />
+              <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <img src={imgSrc(cur)} alt="corrected" draggable={false} onDoubleClick={onSliceDoubleClick}
+                  title="Double-click for the preprocessing steps"
+                  style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "pixelated", filter: enhanceFilter, cursor: "zoom-in" }} />
+              </div>
             </div>
             {canThird && (
-              <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+              <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
                 {hasSeg && hasCons ? (
                   <ToggleButtonGroup size="small" exclusive value={effThird} onChange={(_, v) => v && setThirdMode(v)}>
                     <ToggleButton value="seg" sx={{ py: 0, px: 0.8, fontSize: 10, textTransform: "none" }}>This scan</ToggleButton>
@@ -1559,12 +1648,14 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                     {effThird === "cons" ? "subgroup consensus" : "this scan (segmented)"}
                   </span>
                 )}
-                {thirdCur ? (
-                  <img src={imgSrc(thirdCur)} alt={effThird} draggable={false}
-                    style={{ maxHeight: "calc(100% - 28px)", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated" }} />
-                ) : (
-                  <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>no slice here</span>
-                )}
+                <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {thirdCur ? (
+                    <img src={imgSrc(thirdCur)} alt={effThird} draggable={false}
+                      style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "pixelated" }} />
+                  ) : (
+                    <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>no slice here</span>
+                  )}
+                </div>
               </div>
             )}
           </div>

@@ -6,7 +6,7 @@
    scan to another / a new group. (SAM2 + consensus runs per group, downstream of this.) */
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Typography, TextField, LinearProgress, Slider, Checkbox, ToggleButton, ToggleButtonGroup, Collapse, Select, MenuItem } from "@mui/material";
+import { Button, Typography, TextField, LinearProgress, Slider, Checkbox, ToggleButton, ToggleButtonGroup, Collapse, Select, MenuItem, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions } from "@mui/material";
 import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
@@ -174,10 +174,10 @@ export function OctLoader() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParams] = useState<Record<string, number>>(defaultParams());
   const [paramsOpen, setParamsOpen] = useState(false);
-  // Surface-detector strategy: "dp" = the native dynamic-programming detector (default) | "legacy" = the old
-  // gradient-argmax + RANSAC path. Exposed so the legacy strategy stays available (compare / fall back) and
-  // can be retired once DP is proven. Sent in the preprocess params; auto-tune only applies to DP.
-  const [detector, setDetectorState] = useState<"dp" | "legacy">("dp");
+  // Surface detector: ALWAYS the native dynamic-programming path WITH the legacy cross-check (scar-guard).
+  // Preprocessing runs BOTH and keeps the DP result within the vicinity of the legacy edge, so the old
+  // DP|Legacy selection toggle was removed. Kept as a const ("dp") so the auto-tune gating below still reads.
+  const detector = "dp" as const;
   // Iterative refinement: re-apply the correction until the boundary stops improving (auto-stops
   // before it worsens). Default 5 (auto-converge); 1 = the single faithful pass.
   const [maxPasses, setMaxPasses] = useState(5);
@@ -246,6 +246,26 @@ export function OctLoader() {
     catch { /* leave the previous count */ }
   };
   useEffect(() => { refreshCount(); }, []);
+
+  // #4: keep the sidebar entry's step colour/label in sync with the OPEN scan INSTANTLY. Timeline actions
+  // (approve / classify / SAM2 / schedule …) mutate caseStore.caseInfo.manifest (immer → fresh ref), but
+  // each sidebar row colours from its own `life` snapshot (fetched from cases/list). Mirror the live manifest
+  // onto the matching row here so it recolours the moment a step completes — not only after reselecting it.
+  const liveCaseInfo = useCaseStore((s) => s.caseInfo);
+  useEffect(() => {
+    const cid = liveCaseInfo?.case_id;
+    const man = liveCaseInfo?.manifest as Record<string, unknown> | undefined;
+    if (!cid || !man) return;
+    setScans((cur) => {
+      let changed = false;
+      const next = cur.map((s) => {
+        if (s.caseId !== cid) return s;
+        changed = true;
+        return { ...s, life: { ...(s.life ?? {}), ...man } };
+      });
+      return changed ? next : cur;
+    });
+  }, [liveCaseInfo]);
 
   const patchScan = (id: string, p: Partial<OctScan>) =>
     setScans((cur) => cur.map((s) => (s.id === id ? { ...s, ...p } : s)));
@@ -488,13 +508,11 @@ export function OctLoader() {
   };
 
   // DESTRUCTIVE: delete every persisted case on disk so re-uploads start fresh instead of
-  // reusing the deterministic case folder + its old segmentation. Guarded by a confirm.
-  const wipeAll = async () => {
-    const n = casesCount ?? 0;
-    if (!window.confirm(
-      `Delete ALL ${n || ""} saved case(s)?\n\nThis removes every corrected volume, segmentation, ` +
-      `label and preview on disk — it cannot be undone. Re-uploads will then start fresh.`,
-    )) return;
+  // reusing the deterministic case folder + its old segmentation. Guarded by a confirm MODAL
+  // (window.confirm is unreliable inside the Tauri WebKitGTK webview) — see the Dialog at render.
+  const [wipeConfirmOpen, setWipeConfirmOpen] = useState(false);
+  const doWipe = async () => {
+    setWipeConfirmOpen(false);
     setBusy(true);
     // Clear the sidebar list + empty the viewer IMMEDIATELY (optimistic) so the UI responds at once — the
     // on-disk delete of many case folders can take a while; the busy LinearProgress shows it's working.
@@ -551,12 +569,6 @@ export function OctLoader() {
     setParams((cur) => ({ ...cur, [key]: v }));
     setScans((cur) => cur.map((s) => (s.status === "done" ? { ...s, status: "ready" } : s)));
   };
-  // Switching detector strategy also invalidates corrected scans (the boundary differs).
-  const setDetector = (d: "dp" | "legacy") => {
-    setDetectorState(d);
-    setScans((cur) => cur.map((s) => (s.status === "done" ? { ...s, status: "ready" } : s)));
-  };
-
   const runPreprocess = async () => {
     // Skip already-corrected (non-stale) scans — re-clicking is a no-op for them.
     const sel = scans.filter((s) => s.selected && s.caseId && s.status !== "error" && s.status !== "done");
@@ -753,11 +765,31 @@ export function OctLoader() {
 
       {/* Destructive reset: clear the on-disk case store so re-uploads don't reuse old output. */}
       {!!casesCount && (
-        <Button variant="text" size="small" color="error" onClick={wipeAll} disabled={busy}
+        <Button variant="text" size="small" color="error" onClick={() => setWipeConfirmOpen(true)} disabled={busy}
           sx={{ alignSelf: "flex-start", textTransform: "none", minWidth: 0, p: 0.25, fontSize: 11 }}>
           🗑 Wipe all saved cases ({casesCount})
         </Button>
       )}
+
+      {/* #12: confirmatory modal for the destructive wipe (replaces window.confirm, which the WebKitGTK
+          webview can silently swallow — a stray click would otherwise delete everything with no prompt). */}
+      <Dialog open={wipeConfirmOpen} onClose={() => setWipeConfirmOpen(false)} maxWidth="xs">
+        <DialogTitle sx={{ color: "var(--c-red)", fontSize: 16 }}>Delete ALL saved cases?</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ fontSize: 13 }}>
+            This permanently removes every corrected volume, segmentation, label and preview on disk for
+            all <b>{casesCount ?? 0}</b> case(s). It <b>cannot be undone</b>. Re-uploads will start fresh.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setWipeConfirmOpen(false)} size="small" sx={{ textTransform: "none" }}>
+            Cancel
+          </Button>
+          <Button onClick={doWipe} size="small" color="error" variant="contained" sx={{ textTransform: "none" }}>
+            Delete all {casesCount ?? 0} cases
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       {scans.length > 0 && !loaded && (
         <Button variant="contained" size="small" onClick={load} disabled={busy || scans.length < 1}>
@@ -975,16 +1007,8 @@ export function OctLoader() {
             </div>
           </Collapse>
 
-          {/* DETECTOR strategy: DP (native dynamic-programming, default) vs Legacy (old gradient-argmax + RANSAC).
-              Kept so legacy stays available to compare/fall back; remove the toggle once DP is proven. */}
-          <div className="flex items-center gap-2 px-1" title="Corneal-surface detector. DP = the native dynamic-programming detector (recommended). Legacy = the old gradient-argmax + RANSAC method.">
-            <span className="text-[10px]" style={{ width: 88, color: "var(--c-text-dim)" }}>Detector</span>
-            <ToggleButtonGroup size="small" exclusive value={detector} disabled={busy}
-              onChange={(_, v) => v && setDetector(v as "dp" | "legacy")}>
-              <ToggleButton value="dp" sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>DP</ToggleButton>
-              <ToggleButton value="legacy" sx={{ py: 0, px: 1, fontSize: 10, textTransform: "none" }}>Legacy</ToggleButton>
-            </ToggleButtonGroup>
-          </div>
+          {/* Detector is always the native DP path WITH the legacy cross-check (scar-guard) — preprocessing uses
+              BOTH, so the old DP|Legacy selection toggle was removed (detector stays "dp", which runs the guard). */}
 
           {/* Native AUTO-TUNE control (DP only): the app tunes the DP detector to each scan itself. The toggle
               turns it on/off; the bias slider shifts what it optimises for (sharper vs smoother surface). */}

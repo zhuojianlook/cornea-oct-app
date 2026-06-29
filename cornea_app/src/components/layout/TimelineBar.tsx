@@ -23,6 +23,7 @@ export function TimelineBar() {
   const alignReplicates = useWorkflowStore((s) => s.alignReplicates);
   const normalizeConsensus = useWorkflowStore((s) => s.normalizeConsensus);
   const compareStrategies = useWorkflowStore((s) => s.compareStrategies);
+  const cancelCompareStrategies = useWorkflowStore((s) => s.cancelCompareStrategies);
   const strategyComparison = useWorkflowStore((s) => s.strategyComparison);
   const autoSubgroups = useWorkflowStore((s) => s.autoSubgroups);
   const applySubgroups = useWorkflowStore((s) => s.applySubgroups);
@@ -30,11 +31,17 @@ export function TimelineBar() {
   const subgroupBusy = useWorkflowStore((s) => s.subgroupBusy);
   const loadCorrectionLayer = useWorkflowStore((s) => s.loadCorrectionLayer);
   const saveCorrection = useWorkflowStore((s) => s.saveCorrection);
+  const startCorneaVetPaint = useWorkflowStore((s) => s.startCorneaVetPaint);
+  const confirmCorneaVet = useWorkflowStore((s) => s.confirmCorneaVet);
   const cancelCorrection = useWorkflowStore((s) => s.cancelCorrection);
   const undoCorrection = useWorkflowStore((s) => s.undoCorrection);
   const runScarAuto = useWorkflowStore((s) => s.runScarAuto);
   const runScarAutoSam2 = useWorkflowStore((s) => s.runScarAutoSam2);
   const exportScarSummary = useWorkflowStore((s) => s.exportScarSummary);
+  const exportCorrectionMp4 = useWorkflowStore((s) => s.exportCorrectionMp4);
+  const mp4Busy = useWorkflowStore((s) => s.mp4Busy);
+  const correctionMp4Url = useWorkflowStore((s) => s.correctionMp4Url);
+  const correctionMp4Info = useWorkflowStore((s) => s.correctionMp4Info);
   const set = useWorkflowStore((s) => s.set);
   const hintMode = useWorkflowStore((s) => s.hintMode);
   const hintPositive = useWorkflowStore((s) => s.hintPositive);
@@ -49,6 +56,8 @@ export function TimelineBar() {
   const setClassification = useCaseStore((s) => s.setClassification);
   const vetPreprocessing = useCaseStore((s) => s.vetPreprocessing);
   const approveRaw = useCaseStore((s) => s.approveRaw);
+  const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
+  const caseBusy = useCaseStore((s) => s.busy);
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const resetStep = useCaseStore((s) => s.resetStep);
   const confirmSubgroup = useCaseStore((s) => s.confirmSubgroup);
@@ -57,7 +66,7 @@ export function TimelineBar() {
   const isConsensus = Boolean(manifest?.consensus_cases);
   const subgroup = String(manifest?.scar_subgroup ?? "1") || "1";
 
-  const busy = segBusy || scarBusy;
+  const busy = segBusy || scarBusy || caseBusy;
   const step: LifecycleStep = scanStep(manifest);
   const maxStep = LIFECYCLE_STEPS.length - 1;   // 10
   // Which step is being VIEWED, and whether that's an inspect (earlier, read-only) vs the live step.
@@ -74,6 +83,11 @@ export function TimelineBar() {
   const [showCompare, setShowCompare] = useState(false);
   // Auto subgroup-assignment dialog (bright-spot alignment + overlay → editable grouping → apply).
   const [showSubgroup, setShowSubgroup] = useState(false);
+  // #14a: which scar op is running (so its button shows a spinner + live progress, not just the global one).
+  const [scarKind, setScarKind] = useState<"threshold" | "sam2" | "hints" | null>(null);
+  useEffect(() => { if (!scarBusy) setScarKind(null); }, [scarBusy]);
+  // Short live-progress label for the running scar button (e.g. SAM2 per-plane %). Falls back to a verb.
+  const scarProgress = status.kind === "working" ? status.detail : "";
   const [editAssign, setEditAssign] = useState<Record<string, string>>({});
   useEffect(() => {
     if (subgroupProposal) {
@@ -107,7 +121,7 @@ export function TimelineBar() {
   // ── the step strip: click a REACHED step to VIEW it (earlier = inspect read-only; current = back to live) ──
   const strip = (
     <div className="flex items-center gap-1">
-      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] as LifecycleStep[]).map((i) => {
+      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as LifecycleStep[]).map((i) => {
         const reached = stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
         const viewing = viewStep === i;
@@ -141,11 +155,29 @@ export function TimelineBar() {
 
   // ── reusable action sub-controls ──
   const Correct = !correcting ? (
-    <Button size="small" variant="outlined" disabled={busy || !segLoaded} onClick={() => loadCorrectionLayer()}
+    <Button size="small" variant="outlined" disabled={busy || !segLoaded} onClick={() => { set("corneaOnlyPaint", false); loadCorrectionLayer(); }}
       title="Edit the labelmap with the pen (cornea/scar/erase), then Save">Correct ✎</Button>
   ) : (
     <>
       <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => saveCorrection()}>Save correction</Button>
+      <Button size="small" variant="outlined" disabled={busy} onClick={() => undoCorrection()} title="Undo last edit">↶</Button>
+      <Button size="small" variant="outlined" color="inherit" disabled={busy} onClick={() => cancelCorrection()}>Cancel</Button>
+    </>
+  );
+
+  // #11 — STEP 5 cornea/background vet: paint cornea/background (scar pen hidden), then confirm → unlocks Scar.
+  const CorneaVet = !correcting ? (
+    <>
+      <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Vet the cornea/background segmentation, then:</span>
+      <Button size="small" variant="outlined" disabled={busy || !segLoaded} onClick={() => startCorneaVetPaint()}
+        title="Paint to correct the SAM2 cornea/background (cornea/background/erase pens only — no scar yet).">✎ Paint cornea/background</Button>
+      <Button size="small" variant="contained" color="secondary" disabled={busy || !segLoaded} onClick={() => confirmCorneaVet()}
+        title="Confirm the cornea/background is correct — unlocks scar detection/editing.">✓ Confirm cornea/background</Button>
+    </>
+  ) : (
+    <>
+      <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => confirmCorneaVet()}
+        title="Save the cornea/background edits and unlock scar detection.">✓ Confirm cornea/background</Button>
       <Button size="small" variant="outlined" disabled={busy} onClick={() => undoCorrection()} title="Undo last edit">↶</Button>
       <Button size="small" variant="outlined" color="inherit" disabled={busy} onClick={() => cancelCorrection()}>Cancel</Button>
     </>
@@ -210,10 +242,21 @@ export function TimelineBar() {
   const ScarReRun = classification !== "control" ? (
     <>
       {ScarMethod}
-      <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAuto()}
-        title="CLASSICAL detector: threshold the scar inside the cornea using the selected method (e.g. hysteresis) + sensitivity. Fast (seconds). Re-run after changing the method/sensitivity.">Detect scar (threshold)</Button>
-      <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded} onClick={() => runScarAutoSam2()}
-        title="SAM2 (deep-learning) scar: run SAM2 on cornea-vs-scar across axial/coronal/sagittal and take the 2-of-3 vote. Slower (~1–2 min); an alternative to the threshold detector when it struggles.">Scar via SAM2</Button>
+      <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded}
+        onClick={() => { setScarKind("threshold"); runScarAuto(); }}
+        startIcon={scarKind === "threshold" ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title="CLASSICAL detector: threshold the scar inside the cornea using the selected method (e.g. hysteresis) + sensitivity. Fast (seconds). Re-run after changing the method/sensitivity.">
+        {scarKind === "threshold" ? "Detecting…" : "Detect scar (threshold)"}
+      </Button>
+      <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded}
+        onClick={() => { setScarKind("sam2"); runScarAutoSam2(); }}
+        startIcon={scarKind === "sam2" ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title="SAM2 (deep-learning) scar: run SAM2 on cornea-vs-scar across axial/coronal/sagittal and take the 2-of-3 vote. Slower (~1–2 min); an alternative to the threshold detector when it struggles.">
+        {scarKind === "sam2" ? "Running SAM2…" : "Scar via SAM2"}
+      </Button>
+      {scarKind && scarProgress && (
+        <span className="text-[11px]" style={{ color: "var(--c-text-dim)", maxWidth: 300, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={scarProgress}>{scarProgress}</span>
+      )}
       <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
         onClick={() => set("hintMode", !hintMode)}
         title="Optional touch-up: click ON a scar region (then 'scar') or on non-scar tissue (then 'not') in the slices to give SAM2 point prompts, then Apply to re-segment the scar from your clicks.">
@@ -224,7 +267,9 @@ export function TimelineBar() {
           <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>click marks:</span>
           <Button size="small" variant={hintPositive ? "contained" : "outlined"} color="error" onClick={() => set("hintPositive", true)} title="Clicks add scar">scar</Button>
           <Button size="small" variant={!hintPositive ? "contained" : "outlined"} onClick={() => set("hintPositive", false)} title="Clicks remove scar">not scar</Button>
-          <Button size="small" variant="contained" color="warning" disabled={busy || hintCount === 0} onClick={() => applyScarHints()}>Apply ({hintCount})</Button>
+          <Button size="small" variant="contained" color="warning" disabled={busy || hintCount === 0}
+            startIcon={scarKind === "hints" ? <CircularProgress size={13} color="inherit" /> : undefined}
+            onClick={() => { setScarKind("hints"); applyScarHints(); }}>{scarKind === "hints" ? "Applying…" : `Apply (${hintCount})`}</Button>
           <Button size="small" variant="outlined" disabled={busy || hintCount === 0} onClick={() => clearScarHints()}>Clear</Button>
         </>
       )}
@@ -263,6 +308,11 @@ export function TimelineBar() {
           title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification.">
           ✓ Approve preprocessing
         </Button>
+        <Button size="small" variant="outlined" color="primary" disabled={busy} onClick={() => rerunPreprocess()}
+          startIcon={caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title="Re-run the full auto preprocessing on the raw .OCT again (fresh surface detect + warp). Keeps this scan's params/classification; drops the current correction's segmentation.">
+          {caseBusy ? "Re-running…" : "↻ Re-run preprocessing"}
+        </Button>
         <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => approveRaw()}
           title="Use the ORIGINAL (raw) scan as the working volume instead of the correction. Drops any segmentation; also marks it vetted.">
           ↩ Use original (raw)
@@ -271,13 +321,25 @@ export function TimelineBar() {
     );
   } else if (step === 3) {
     actions = (
-      <div className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
-        title="Does this corrected volume have a scar? 'No scar' marks it a control (normal baseline). Replicates/controls are grouped in the sidebar.">
-        Classify:
-        <Button size="small" variant={classification === "scar" ? "contained" : "outlined"} color="error"
-          disabled={busy} onClick={() => setClassification(classification === "scar" ? null : "scar")}>Scar</Button>
-        <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
-          disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar (control)</Button>
+      <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
+        <span className="flex items-center gap-1"
+          title="Does this corrected volume have a scar? 'No scar' marks it a control (normal baseline). Replicates/controls are grouped in the sidebar.">
+          Classify:
+          <Button size="small" variant={classification === "scar" ? "contained" : "outlined"} color="error"
+            disabled={busy} onClick={() => setClassification(classification === "scar" ? null : "scar")}>Scar</Button>
+          <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
+            disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar (control)</Button>
+        </span>
+        {sep}
+        {/* #10 — save the preprocessing correction as an MP4 grid (planes × passes, before↔after). */}
+        <Button size="small" variant="outlined" disabled={busy || mp4Busy} onClick={() => exportCorrectionMp4()}
+          startIcon={mp4Busy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title="Render this scan's correction as an MP4: rows = axial/coronal/sagittal, columns = after (final) → passes → before (raw), scrubbing every slice.">
+          {mp4Busy ? "Rendering MP4…" : "🎞 Save correction MP4"}
+        </Button>
+        {correctionMp4Url && !mp4Busy && (
+          <a href={correctionMp4Url} download style={{ color: "var(--c-accent)", fontSize: 12 }} title={correctionMp4Info}>⤓ Download MP4</a>
+        )}
       </div>
     );
   } else if (step === 4) {
@@ -292,7 +354,11 @@ export function TimelineBar() {
       </>
     );
   } else if (step === 5) {
-    // cornea segmented → SCAR step. Scar scan: detect / compare strategies. Control: no scar → continue.
+    // #11 cornea segmented (light blue) → VET the cornea/background (paint, scar pen hidden), then confirm
+    // → unlocks the Scar step. Scar detection is NOT shown here until cornea/background is confirmed.
+    actions = <>{CorneaVet}</>;
+  } else if (step === 6) {
+    // cornea/background vetted (indigo) → SCAR step. Scar scan: detect. Control: no scar → continue.
     actions = classification === "control" ? (
       <>
         <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => skipScar()}
@@ -307,7 +373,7 @@ export function TimelineBar() {
         {ScarReRun}{sep}{Correct}
       </>
     );
-  } else if (step === 6) {
+  } else if (step === 7) {
     // scar segmented (rose) → assign this scan's SUBGROUP (gates align); re-run scar / correct to iterate.
     actions = (
       <>
@@ -315,7 +381,7 @@ export function TimelineBar() {
         {ScarReRun && <>{sep}{ScarReRun}</>}
       </>
     );
-  } else if (step === 7) {
+  } else if (step === 8) {
     // subgroup assigned (purple) → align this subgroup's replicates
     actions = (
       <>
@@ -324,17 +390,17 @@ export function TimelineBar() {
         {sep}{SubgroupConfirm}{sep}{Correct}
       </>
     );
-  } else if (step === 8) {
+  } else if (step === 9) {
     // aligned (teal) → normalize against controls (next), or correct / schedule
     actions = <>{NormalizeBtn}{sep}{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
-  } else if (step === 9) {
+  } else if (step === 10) {
     // normalized (cyan) → correct / schedule
     actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
-  } else if (step === 10) {
+  } else if (step === 11) {
     // manually corrected (dark blue)
     actions = <>{ScheduleBtn}{sep}{Correct}{ExportBtn}</>;
   } else {
-    // step 11 — scheduled (green)
+    // step 12 — scheduled (green)
     actions = (
       <>
         <span className="text-xs" style={{ color: "#22c55e" }}>✓ Scheduled for training.</span>
@@ -382,13 +448,21 @@ export function TimelineBar() {
         <DialogTitle sx={{ fontSize: 16 }}>Scar strategy reproducibility (test–retest)</DialogTitle>
         <DialogContent sx={{ fontSize: 13 }}>
           {!strategyComparison && scarBusy && (
-            <div className="flex items-center gap-2 py-4"><CircularProgress size={18} /> Running each strategy on the eye's replicates…</div>
+            <div className="flex items-center gap-2 py-4"><CircularProgress size={18} />
+              <span style={{ maxWidth: 520, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={status.detail}>
+                {status.kind === "working" ? status.detail : "Running each strategy on the eye's replicates…"}
+              </span>
+            </div>
+          )}
+          {strategyComparison?.cancelled && (
+            <div className="text-xs mb-2" style={{ color: "var(--c-amber, #ffaa28)" }}>⚠ Stopped early — partial results below.</div>
           )}
           {strategyComparison && (
             <>
               <div className="text-xs mb-2" style={{ color: "var(--c-text-dim)" }}>
                 {strategyComparison.n} replicates{strategyComparison.subgroup ? ` · subgroup “${strategyComparison.subgroup}”` : ""} · φ={strategyComparison.phi_percentile} ·
                 reproducibility only (no manual GT). Higher Dice / lower HD95·CV·RC = more reproducible; read Dice alongside volume (Dice rises with mask size).
+                {strategyComparison.crop_aware && <><br /><b style={{ color: "var(--c-amber, #ffaa28)" }}>⊟ Crop-aware:</b> a replicate has a cropped lateral band — metrics use only the region valid in every replicate.</>}
               </div>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead>
@@ -413,8 +487,15 @@ export function TimelineBar() {
           )}
         </DialogContent>
         <DialogActions>
+          {scarBusy && (
+            <Button size="small" color="error" variant="outlined" onClick={() => cancelCompareStrategies()}
+              title="Stop the run — the current step finishes, then no further strategies/replicates are processed.">
+              ✕ Cancel run
+            </Button>
+          )}
           <Button size="small" disabled={!strategyComparison} onClick={downloadComparisonCsv}>⤓ Download CSV</Button>
-          <Button size="small" variant="contained" onClick={() => setShowCompare(false)}>Close</Button>
+          {/* Closing while running also cancels (otherwise the slow run would keep grinding in the background). */}
+          <Button size="small" variant="contained" onClick={() => { if (scarBusy) cancelCompareStrategies(); setShowCompare(false); }}>Close</Button>
         </DialogActions>
       </Dialog>
 

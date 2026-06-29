@@ -787,9 +787,13 @@ def get_segmentation_drawing(case_id: str) -> FileResponse:
 
 
 @app.post("/api/case/{case_id}/segmentation/from-drawing")
-async def segmentation_from_drawing(case_id: str, files: List[UploadFile] = File(...)) -> dict:
-    """Save an edited segmentation drawing as the canonical corrected labelmap,
-    then re-render the overlay so the gallery reflects the correction."""
+async def segmentation_from_drawing(case_id: str, files: List[UploadFile] = File(...),
+                                    cornea_vet: bool = False) -> dict:
+    """Save an edited segmentation drawing as the canonical corrected labelmap, then re-render the overlay
+    so the gallery reflects the correction. #11 cornea_vet=true → this is the CORNEA/BACKGROUND vet step
+    (paint cornea/background only, before scar): the labelmap is saved the same way, but we set the
+    `cornea_vetted` flag (which gates the Scar step) INSTEAD of `corrected_labelmap` (the final manual-
+    correction flag), so the timeline advances Cornea → Cornea/bg-vetted, not straight to Corrected."""
     orch.ensure_case_dirs(case_id)
     if not files:
         raise HTTPException(400, "No drawing uploaded.")
@@ -804,10 +808,23 @@ async def segmentation_from_drawing(case_id: str, files: List[UploadFile] = File
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(500, f"Could not parse corrected drawing: {exc}")
         postprocess.render_seg_previews(_working_volume(case_id), arr, orch.segmentation_preview_dir(case_id))
-        qa = {"segments": labels.labelmap_counts(arr), "source": "corrected"}
-        orch.write_manifest_value(case_id, {"corrected_labelmap": str(labels.corrected_path(case_id))})
+        qa = {"segments": labels.labelmap_counts(arr), "source": "cornea_vet" if cornea_vet else "corrected"}
+        orch.write_manifest_value(case_id, {"cornea_vetted": True} if cornea_vet
+                                  else {"corrected_labelmap": str(labels.corrected_path(case_id))})
         return {"case_info": orch.current_case_info(case_id), "qa": qa,
                 "images": orch.preview_images_from_dir("Segmentation", orch.segmentation_preview_dir(case_id))}
+
+
+@app.post("/api/case/{case_id}/vet-cornea")
+def vet_cornea(case_id: str) -> dict:
+    """#11 — confirm the cornea/background segmentation is correct WITHOUT painting (the SAM2 result was
+    already good). Sets `cornea_vetted`, which unlocks the Scar step. (Painting + confirm goes through
+    segmentation/from-drawing?cornea_vet=true instead.)"""
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, "Unknown case.")
+    m = orch.write_manifest_value(cid, {"cornea_vetted": True})
+    return {"ok": True, "cornea_vetted": bool(m.get("cornea_vetted"))}
 
 
 @app.get("/api/case/{case_id}/segmentation.nii.gz")
@@ -1479,6 +1496,36 @@ def _case_identity(cid: str) -> tuple[str, str, str]:
     return pid, eye, sub
 
 
+def _case_crop_lateral(case_id: str) -> list[int]:
+    """#9 — the persisted lateral-crop columns (oct_params.crop_lateral) for a case, or []."""
+    raw = (orch.read_manifest(case_id).get("oct_params") or {}).get("crop_lateral") or []
+    out = []
+    for c in raw:
+        try:
+            out.append(int(c))
+        except (ValueError, TypeError):
+            pass
+    return sorted(set(out))
+
+
+def _case_valid_mask(case_id: str):
+    """#9 crop-aware analytics — a bool validity volume in the case's labelmap grid: True everywhere except
+    the cropped LATERAL band (axis 0 of the saved NIfTI = the 513 fast-scan axis). None if nothing cropped
+    (callers treat None as all-valid). Used by compare-strategies to restrict to the common valid region."""
+    import numpy as np
+    crop = _case_crop_lateral(case_id)
+    if not crop:
+        return None
+    arr, _ = labels.best_labelmap_nnunet(case_id)
+    if arr is None:
+        return None
+    valid = np.ones(arr.shape, bool)
+    idx = [i for i in crop if 0 <= i < arr.shape[0]]      # lateral = axis 0 in the saved labelmap
+    if idx:
+        valid[idx, :, :] = False
+    return valid
+
+
 def _eye_replicates(case_id: str) -> tuple[list[str], dict]:
     """SEGMENTED replicates of this scan's eye + scar-subgroup (same patient_id + eye + scar_subgroup, a cornea
     labelmap present, not a consensus case). Returns (member_ids incl. case_id first, {patient,eye,subgroup})."""
@@ -1691,12 +1738,34 @@ def compare_strategies(case_id: str, req: CompareStrategiesRequest) -> dict:
             scar_c = np.isin(lbl, [i + 1 for i, s in enumerate(sizes) if s >= 200])
         return scar_c & ((arr == 1) | (arr == 2))
 
+    # #15 cooperative cancel: a concurrent /compare-strategies/cancel sets the flag for this case; the
+    # bench loop checks it between strategies AND replicates, so Cancel actually stops the (slow, SAM2)
+    # run rather than letting it grind on in the background. Clear any stale flag before starting.
+    _COMPARE_CANCEL.discard(cid)
+    # #9 crop-aware: pass each replicate's validity mask so cropped lateral bands are excluded from the
+    # common comparison region (a cropped replicate has no data there — comparing the full volume would bias
+    # the metric). Cheap to build; None per case when nothing was cropped.
+    valid_masks = {mc: _case_valid_mask(mc) for mc in members}
     try:
-        result = scar_bench.compare_strategies(members, req.strategies, req.phi_percentile, sam2_scar_fn=_sam2_scar_mask)
+        result = scar_bench.compare_strategies(members, req.strategies, req.phi_percentile,
+                                               sam2_scar_fn=_sam2_scar_mask,
+                                               should_cancel=lambda: cid in _COMPARE_CANCEL,
+                                               valid_masks=valid_masks)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    finally:
+        _COMPARE_CANCEL.discard(cid)
     result["subgroup"] = key.get("subgroup")
     return result
+
+
+@app.post("/api/case/{case_id}/compare-strategies/cancel")
+def compare_strategies_cancel(case_id: str) -> dict:
+    """#15 — request the in-flight compare-strategies run for this case to STOP. The running endpoint
+    (a separate threadpool thread) polls this flag between strategies/replicates and returns early. A
+    SAM2 step already in progress finishes (no mid-kernel interrupt), then no further work is done."""
+    _COMPARE_CANCEL.add(orch.safe_case_id(case_id))
+    return {"ok": True}
 
 
 @app.post("/api/case/{case_id}/subgroup/confirm")
@@ -1751,6 +1820,10 @@ class OctPreprocessRequest(BaseModel):
                                              # cropped (no top surface). A STICKY oct_param; on re-run those
                                              # frames are reconstructed by posterior continuity (bottom-edge
                                              # guidance). None = carry persisted set; [] = clear the crop.
+    crop_lateral: List[int] | None = None    # #9 "Crop": problematic LATERAL columns (0..512, the 513 fast-scan
+                                             # axis) to REMOVE — zeroed in the corrected volume before SAM2. A
+                                             # STICKY oct_param recorded so scar-alignment excludes the lost band.
+                                             # None = carry persisted set; [] = clear the crop.
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
     manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
@@ -2076,6 +2149,16 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             eff_params["surface_crop_frames"] = scf
         else:
             eff_params.pop("surface_crop_frames", None)
+    # #9 "Crop" — sticky lateral-column removal (carried through the eff_params merge on later re-runs, like a
+    # geometric property of the scan). When THIS request supplies it (non-None), REPLACE the persisted set; an
+    # empty list clears the crop. preprocess_oct_to_nifti zeros these lateral columns; the set is also persisted
+    # so the consensus/subgroup/compare analytics can exclude the removed band (crop-aware scar alignment).
+    if req.crop_lateral is not None:
+        cl = sorted(set(_int_list(req.crop_lateral)))
+        if cl:
+            eff_params["crop_lateral"] = cl
+        else:
+            eff_params.pop("crop_lateral", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
     # surface_cut (fix-columns "Re-run with cuts") is a PER-RUN override like force_columns, NOT a sticky
@@ -2179,7 +2262,7 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
              # The segmentation files were just deleted above; CLEAR their manifest flags too, else
              # scanStep (which keys off sam2_meta/corrected_labelmap/consensus_case BEFORE preproc_vetted)
              # would keep reporting the scan as segmented while its overlay 404s. (Mirrors _STEP_RESET_FLAGS.)
-             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None, "cornea_vetted": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if cls:
         extra["scar_classification"] = cls
@@ -2271,7 +2354,7 @@ def keep_raw_case(case_id: str) -> dict:
              # a later auto re-preprocess clears these as usual.
              "preproc_vetted": True, "training_scheduled": False,
              # seg files were deleted above → clear their flags so the timeline drops to Vetted (not SAM2).
-             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
+             "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None, "cornea_vetted": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if m.get("scar_classification"):
         extra["scar_classification"] = m.get("scar_classification")
@@ -2355,17 +2438,18 @@ _STEP_RESET_FLAGS: dict[int, list[str]] = {
     3: ["preproc_vetted"],                          # Vetted
     4: ["scar_classification", "scar_range"],       # Classified (scar/control)
     5: ["sam2_meta", "qa_json", "segmentation_preview_dir"],  # Cornea (SAM2)
-    6: ["scar_done", "scar_metrics"],               # Scar segmented
-    7: ["subgroup_confirmed"],                      # Subgroup assigned
-    8: ["consensus_case"],                          # Aligned (link to the eye's consensus)
-    9: ["normalized"],                              # Normalised against controls
-    10: ["corrected_labelmap"],                     # Manually corrected
-    11: ["training_scheduled"],                     # Scheduled for training
+    6: ["cornea_vetted"],                           # Cornea/background paint-vetted
+    7: ["scar_done", "scar_metrics"],               # Scar segmented
+    8: ["subgroup_confirmed"],                      # Subgroup assigned
+    9: ["consensus_case"],                          # Aligned (link to the eye's consensus)
+    10: ["normalized"],                             # Normalised against controls
+    11: ["corrected_labelmap"],                     # Manually corrected
+    12: ["training_scheduled"],                     # Scheduled for training
 }
 
 
 class ResetStepRequest(BaseModel):
-    step: int   # target step to return to (1-10); everything AFTER it is cleared
+    step: int   # target step to return to (1-12); everything AFTER it is cleared
 
 
 @app.post("/api/case/{case_id}/reset-step")
@@ -2379,8 +2463,8 @@ def reset_step(case_id: str, req: ResetStepRequest) -> dict:
     if orch.read_manifest(cid).get("consensus_cases"):
         raise HTTPException(400, "This is a built consensus case — rebuild it rather than resetting a step.")
     target = int(req.step)
-    if target < 1 or target > 11:
-        raise HTTPException(400, "step must be 1-11.")
+    if target < 1 or target > 12:
+        raise HTTPException(400, "step must be 1-12.")
     updates: dict = {}
     cleared: list[str] = []
     for s, keys in _STEP_RESET_FLAGS.items():
@@ -2469,7 +2553,7 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
             b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
             steps.append({"label": it["label"], "data_url": f"data:image/png;base64,{b64}",
                           "kind": it.get("kind", "stage"), "branch": it.get("branch", ""),
-                          "group": "per-slice"})
+                          "group": "per-slice", "lane": it.get("lane", "full")})
     # ── VOLUME-LEVEL decisions (the newer steps): note nodes carrying the REAL numbers from the last
     # preprocess. These are whole-volume decisions (keep-best iteration, axial ping-pong refine,
     # inter-slice smoothing) that can't be faithfully shown from one slice, so they're reported as
@@ -2507,7 +2591,54 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
                   "kind": "decision", "group": "volume",
                   "branch": (f"{len(eff_params.get('manual_shifts') or {})} frame(s) nudged — applied LAST as ground truth"
                              if eff_params.get("manual_shifts") else "none — applied LAST, after all fitting/guards")})
+    # #9 Custom column crop — the user-removed LATERAL band (zeroed before SAM2). Shown as a volume node with
+    # the contiguous ranges; scar-alignment analytics exclude this band so a partial crop doesn't bias metrics.
+    crop_lat = sorted(int(c) for c in (eff_params.get("crop_lateral") or []))
+    if crop_lat:
+        runs, s0 = [], crop_lat[0]; prev = crop_lat[0]
+        for c in crop_lat[1:] + [None]:
+            if c is None or c != prev + 1:
+                runs.append(f"{s0}–{prev}" if prev > s0 else f"{s0}"); s0 = c
+            prev = c if c is not None else prev
+        steps.append({"label": _vlabel(f"Custom column crop — {len(crop_lat)} lateral column(s) removed"),
+                      "kind": "decision", "group": "volume",
+                      "branch": f"lateral {', '.join(runs)} of 513 zeroed before SAM2 — excluded from scar-alignment (crop-aware)"})
     return {"steps": steps, "slices": n_slices, "index": cur_index}
+
+
+@app.post("/api/case/{case_id}/export-correction-mp4")
+def export_correction_mp4_endpoint(case_id: str) -> dict:
+    """#10 — render the scan's preprocessing correction as an MP4 grid (rows = axial/coronal/sagittal,
+    columns = after(final) → passes → before(raw); each frame scrubs a slice). Saved under the case's
+    exports/ folder; returns its path + a download URL. Read-only on the case data."""
+    import correction_video
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, "Unknown case.")
+    pid, eye, _ = _case_identity(cid)
+    stem = f"{(pid or 'scan').upper()}_{(eye or '').upper()}_{cid}_correction".replace(" ", "_").replace("/", "-")
+    out = orch.case_root(cid) / "exports" / f"{stem}.mp4"
+    # clear any prior export so the download route always serves THIS render
+    if out.parent.exists():
+        for old in out.parent.glob("*_correction.mp4"):
+            old.unlink(missing_ok=True)
+    try:
+        info = correction_video.export_correction_mp4(cid, out)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    info["download_url"] = f"/api/case/{cid}/correction.mp4"
+    return info
+
+
+@app.get("/api/case/{case_id}/correction.mp4")
+def download_correction_mp4(case_id: str) -> FileResponse:
+    """Serve the most-recent exported correction MP4 (see export-correction-mp4)."""
+    cid = orch.safe_case_id(case_id)
+    exp = orch.case_root(cid) / "exports"
+    files = sorted(exp.glob("*_correction.mp4"), key=lambda p: p.stat().st_mtime, reverse=True) if exp.exists() else []
+    if not files:
+        raise HTTPException(404, "No exported correction video — export it first.")
+    return FileResponse(str(files[0]), media_type="video/mp4", filename=files[0].name)
 
 
 _BORDER_VOL_CACHE: dict = {}  # path -> (mtime, ndarray) — last border-input volume, so SCRUBBING a pass's
@@ -3151,6 +3282,11 @@ _COHORT_LOCK = threading.Lock()
 # Serialises all SAM2/CUDA inference (cohort worker thread + user-triggered endpoints
 # run on separate threads and share one predictor + CUDA context).
 _GPU_LOCK = threading.Lock()
+
+# #15 — case_ids whose in-flight compare-strategies run was asked to stop. The (slow) compare endpoint
+# polls membership between strategies/replicates and returns early; the cancel endpoint just adds the id.
+# A plain set is fine: add/discard/membership on str keys are atomic under CPython's GIL.
+_COMPARE_CANCEL: set[str] = set()
 
 # Live SAM2 progress, keyed by safe_case_id, so the UI can poll a meaningful phase ("axial 1/3",
 # "fusing", "scar") instead of an opaque spinner. Written by segment_sam2's callback (under the GPU

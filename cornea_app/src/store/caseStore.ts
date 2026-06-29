@@ -37,6 +37,9 @@ interface CaseState {
   // Before/after "Use original (raw)": discard the correction, make the raw .OCT the working volume +
   // mark it vetted (drops any segmentation; reloads the volume).
   approveRaw: () => Promise<void>;
+  // #3 Auto step: re-run the full auto preprocessing on the raw .OCT again (fresh auto detect/warp,
+  // keeping the scan's persisted params + classification). Drops any segmentation; reloads the volume.
+  rerunPreprocess: () => Promise<void>;
   // Step regression: roll the scan back to `step`, clearing every later step's manifest flag so the
   // user can redo from there (flag-only on the backend; files remain and are overwritten on re-run).
   resetStep: (step: number) => Promise<void>;
@@ -182,6 +185,30 @@ export const useCaseStore = create<CaseState>()(
         wf.set("segVersion", wf.segVersion + 1);
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      } finally {
+        set((s) => { s.busy = false; });
+      }
+    },
+
+    rerunPreprocess: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { s.busy = true; s.apiError = null; });
+      useWorkflowStore.getState().set("status", { kind: "working", title: "Re-running preprocessing",
+        detail: "Re-detecting the corneal surface and re-warping from the raw .OCT — this can take a minute." });
+      try {
+        // Empty params → a NORMAL auto preprocess from the raw .OCT (drops stale border anchors/cache;
+        // keeps the scan's persisted params + classification + any sticky manual corrections). The endpoint
+        // also drops the segmentation + resets preproc_vetted, so the timeline falls back to Auto (red).
+        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ params: {} }));
+        await get().openCase();                 // reload the re-corrected working volume (cache-busted URL)
+        const wf = useWorkflowStore.getState();  // refresh previews + reflect the dropped segmentation
+        wf.set("segVersion", wf.segVersion + 1);
+        wf.set("status", { kind: "done", title: "Preprocessing re-run", detail: "Fresh auto correction applied — review (Before/after · Fix-columns), then Approve." });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        set((s) => { s.apiError = m; });
+        useWorkflowStore.getState().set("status", { kind: "error", title: "Re-run failed", detail: m });
       } finally {
         set((s) => { s.busy = false; });
       }

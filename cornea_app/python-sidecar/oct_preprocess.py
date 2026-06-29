@@ -1828,6 +1828,25 @@ def raw_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     return write_volume_nifti(vol, out_nifti, sp)
 
 
+def _crop_lateral_indices(params: dict | None, n_lateral: int) -> np.ndarray:
+    """#9 Crop: resolve the sticky lateral-crop selection (params['crop_lateral'] = flat int indices into
+    0..n_lateral-1, the 513 fast-scan axis) to a clean, in-bounds, de-duplicated index array."""
+    raw = (params or {}).get("crop_lateral") or []
+    out = sorted({int(c) for c in raw if 0 <= int(c) < int(n_lateral)})
+    return np.array(out, dtype=int)
+
+
+def _apply_lateral_crop(corrected: np.ndarray, params: dict | None) -> tuple[np.ndarray, int]:
+    """#9 Crop: ZERO the user-marked lateral columns so a problematic band (e.g. lateral 51-80 of 513) is
+    removed BEFORE SAM2. `corrected` is (frames, depth, lateral); the crop indexes the LAST axis. The
+    removed region is recorded in the manifest (crop_lateral) so scar-alignment analytics exclude it."""
+    idx = _crop_lateral_indices(params, corrected.shape[2])
+    if idx.size:
+        corrected = np.ascontiguousarray(corrected)
+        corrected[:, :, idx] = 0
+    return corrected, int(idx.size)
+
+
 def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             params: dict | None = None, volume_index: int = 0,
                             progress=None, companion_txt: str | Path | None = None,
@@ -1887,6 +1906,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         if ms:
             corrected, n_ms = apply_manual_shifts(corrected, ms)
             info["manual_shifts"] = {"n_frames": int(n_ms)}
+        corrected, n_crop = _apply_lateral_crop(corrected, p_all)
+        if n_crop:
+            info["crop_lateral"] = {"n_columns": n_crop}
         write_volume_nifti(corrected, out_nifti, sp)
         info["out"] = str(out_nifti)
         return info
@@ -1938,6 +1960,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if ms:
         corrected, n_ms = apply_manual_shifts(corrected, ms)
         info["manual_shifts"] = {"n_frames": int(n_ms)}
+    corrected, n_crop = _apply_lateral_crop(corrected, p_all)
+    if n_crop:
+        info["crop_lateral"] = {"n_columns": n_crop}
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     return info
@@ -1988,17 +2013,18 @@ def _draw_curve(rgb: np.ndarray, y_per_x: np.ndarray, color, dashed: bool = Fals
     return rgb
 
 
-def _disp_resize(rgb: np.ndarray, out_h: int = 320, out_w: int = 460) -> np.ndarray:
-    # Integer block-replication so EVERY frame column is exactly the same width (#1 "uniform AND
-    # crisp"). The old np.linspace().round() index map gave some columns 1px more than others (W
-    # rarely divides out_w evenly), which is the column-width irregularity seen in the Steps filmstrip.
-    # Each frame becomes kw px wide, each depth row kh px tall; the viewer scales with image-rendering
-    # pixelated. Overlays (red/blue curves) are drawn at native resolution BEFORE this, so they scale too.
+def _disp_resize(rgb: np.ndarray, px_aspect: float = 1.0, base_h: int = 480) -> np.ndarray:
+    # MORPHOLOGICALLY-CORRECT block-replication (#2): each frame column is `px_aspect`× as wide as a depth
+    # row (= slice_spacing / depth_spacing ≈ 12.8 for the Avanti), so the sagittal slice shows at its true
+    # ~2:1 LANDSCAPE shape instead of the squashed portrait the old fixed 460×320 box produced. Integer
+    # replication keeps every frame column exactly the same width (uniform AND crisp). base_h targets the
+    # depth (row) display height. Overlays (red/green/blue curves) are drawn at native res BEFORE this, so
+    # they scale with the image; the viewer renders image-rendering: pixelated.
     H, W = rgb.shape[:2]
     if H == 0 or W == 0:
         return rgb
-    kw = max(1, round(out_w / W))
-    kh = max(1, round(out_h / H))
+    kh = max(1, round(base_h / H))
+    kw = max(1, round(kh * float(px_aspect)))
     if kw == 1 and kh == 1:
         return rgb
     out = np.repeat(np.repeat(rgb, kh, axis=0), kw, axis=1)
@@ -2055,38 +2081,63 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     sl = sag[idx].astype(np.float32)
     steps = []
     _si = [0]
+    # Morphologically-correct display aspect (#2): a frame column is (slice_spacing / depth_spacing)× as
+    # wide as a depth row, so the sagittal slice renders at its true ~2:1 landscape shape. Per-scan geometry
+    # from the companion .txt when available, else the Avanti constants.
+    geom = companion_geometry(companion_txt, n_frames=sag.shape[2]) if companion_txt else {}
+    depth_sp = float(geom.get("depth_spacing") or DEPTH_SPACING)
+    frame_sp = float(geom.get("slice_spacing") or SLICE_SPACING)
+    px_aspect = (frame_sp / depth_sp) if depth_sp > 0 else 1.0
 
-    def add(label, rgb, kind="stage", branch=""):
+    def add(label, rgb, kind="stage", branch="", lane="full"):
+        # lane: "full" spans the tree; "dp" / "legacy" are the two parallel detector branches.
         _si[0] += 1
-        steps.append((f"{_si[0]}. {label}", _disp_resize(rgb), kind, branch))
+        steps.append((f"{_si[0]}. {label}", _disp_resize(rgb, px_aspect), kind, branch, lane))
 
     add(f"Original — sagittal slice {idx}/{n}", _gray_rgb(sl))
-    merged = _merged_side_edge(sl, p)                # the detected edge (DP by default, or legacy)
-    if str(p.get("detector", "dp")).lower() != "legacy":
-        # ── NATIVE DP detector filmstrip (matches what auto preprocessing now does) ──
-        img = ndimage.gaussian_filter(sl, sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
-        add("Despeckle — anisotropic Gaussian (heavier along depth)", _gray_rgb(img))
-        gy = np.gradient(img, axis=0); np.clip(gy, 0.0, None, out=gy)
-        bw = max(2, int(p.get("dp_below", 24)))
-        below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))
-        score = gy * np.maximum(below - float(np.median(img)), 0.0)
-        score = score / (score.max(axis=0, keepdims=True) + 1e-6)
-        add("Surface score — dark→bright gradient × bright-tissue-below (brighter = more surface-like)",
-            _gray_rgb(score * 255.0), kind="decision",
-            branch="locks to the anterior epithelium (a real edge AND bright cornea just below), not internal layers or top speckle")
-        add("Detected surface (red) — DP smooth path", _draw_curve(_gray_rgb(sl), merged, _C_RED),
-            kind="decision", branch=f"dynamic-programming shortest smooth MAX-score path (per-frame depth step ≤ {int(p.get('dp_max_jump', 10))}) + 3-point sub-voxel refine")
-    else:
-        # ── legacy {hist-eq, raw} gradient-argmax + RANSAC choice filmstrip ──
-        heq = _histeq(sl)
-        add("Histogram equalized", _gray_rgb(heq))
-        filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
-                                   int(p["d"]), int(p["sigmaColor"]), int(p["sigmaSpace"]))
-        add("Bilateral filtered", _gray_rgb(filt))
-        raw_edge = _detect_surface_gradient(filt, p["sigma"])
-        add("Surface edge detected (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED))
-        add("Side-corrected boundary (green)", _draw_curve(_gray_rgb(sl), merged, _C_GREEN),
-            kind="decision", branch="per side: keep the hist-eq OR raw edge, whichever fits its RANSAC quadratic best")
+    # The FINAL anterior edge = the guarded DP path (what auto preprocessing uses). We now ALWAYS render
+    # BOTH detector branches (#2 "the program runs both methods") as a decision tree that converges at the
+    # DP scar-guard cross-check, regardless of the detector param.
+    merged = _merged_side_edge(sl, p)
+
+    # ── DP lane (the native detector auto preprocessing uses) ──
+    img = ndimage.gaussian_filter(sl, sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
+    add("DP · despeckle — anisotropic Gaussian (heavier along depth)", _gray_rgb(img), lane="dp")
+    gy = np.gradient(img, axis=0); np.clip(gy, 0.0, None, out=gy)
+    bw = max(2, int(p.get("dp_below", 24)))
+    below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))
+    score = gy * np.maximum(below - float(np.median(img)), 0.0)
+    score = score / (score.max(axis=0, keepdims=True) + 1e-6)
+    add("DP · surface score — dark→bright gradient × bright-tissue-below", _gray_rgb(score * 255.0),
+        kind="decision", lane="dp",
+        branch="locks to the anterior epithelium (a real edge AND bright cornea just below), not internal layers or top speckle")
+    dp_raw = _detect_surface_dp(sl, p)               # DP BEFORE the scar-guard (to show the guard's effect)
+    add("DP · detected surface (red) — smooth path", _draw_curve(_gray_rgb(sl), dp_raw, _C_RED),
+        kind="decision", lane="dp",
+        branch=f"dynamic-programming shortest smooth MAX-score path (per-frame depth step ≤ {int(p.get('dp_max_jump', 10))}) + 3-point sub-voxel refine")
+
+    # ── Legacy lane (the 'old method' — and the DP scar-guard's reference surface) ──
+    heq = _histeq(sl)
+    add("Legacy · histogram equalized", _gray_rgb(heq), lane="legacy")
+    filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+                               int(p["d"]), int(p["sigmaColor"]), int(p["sigmaSpace"]))
+    add("Legacy · bilateral filtered", _gray_rgb(filt), lane="legacy")
+    raw_edge = _detect_surface_gradient(filt, p["sigma"])
+    add("Legacy · gradient-argmax edge (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED), lane="legacy")
+    legacy_edge = _legacy_surface(sl, p)
+    add("Legacy · side-corrected RANSAC surface (green)", _draw_curve(_gray_rgb(sl), legacy_edge, _C_GREEN),
+        kind="decision", lane="legacy",
+        branch="per side: keep the hist-eq OR raw edge, whichever fits its RANSAC quadratic best (robust to a bright internal scar)")
+
+    # ── Merge: DP scar-guard cross-check — both lanes converge on the final edge ──
+    guard_ov = _draw_curve(_draw_curve(_gray_rgb(sl), legacy_edge, _C_GREEN), merged, _C_RED)
+    n_pulled = int(np.count_nonzero(np.abs(np.asarray(dp_raw) - np.asarray(merged)) > 0.5))
+    add("Scar-guard cross-check — red = final DP (guarded), green = legacy reference", guard_ov,
+        kind="decision", lane="full",
+        branch=(f"where raw DP dives > {float(p.get('dp_scar_tol', 18)):.0f}px DEEPER than legacy (scar-lock signature), "
+                f"DP is re-detected within ±{float(p.get('dp_scar_window', 12)):.0f}px of legacy → {n_pulled} frame(s) pulled "
+                "back; the final anterior edge = guarded DP"))
+
     # clipped-apex: if the dome apex is above the frame, fit/extrapolate from the in-frame flanks so the
     # filmstrip's fit + final warp match a real clip-aware re-run (preview == result).
     clip_cols, clip_fit = (_resolve_clip(merged, sl, res, p) if p.get("clip_handling", True)
@@ -2094,7 +2145,7 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     quad = clip_fit if clip_fit is not None else _fit_quadratic_ransac(merged, res)
     im6 = _draw_curve(_gray_rgb(sl), merged, _C_GREEN)
     _clip_note = f"; apex clipped → extrapolated from in-frame flanks ({len(clip_cols)} cols)" if len(clip_cols) else ""
-    add("Quadratic warp-target fit — green=edge, blue=fit", _draw_curve(im6, quad, _C_BLUE, dashed=True),
+    add("Quadratic warp-target fit — green = edge, blue = fit", _draw_curve(im6, quad, _C_BLUE, dashed=False),
         kind="decision", branch=f"RANSAC quadratic (residual ≤ {res:.0f}px); degree-2 polyfit fallback if RANSAC fails{_clip_note}")
     nb = [merged]
     if idx > 0:
@@ -2109,7 +2160,7 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
     n_snapped = int(np.count_nonzero(snap))
     quad_a = clip_fit if clip_fit is not None else _fit_quadratic_ransac(active_e, res)
     im7 = _draw_curve(_gray_rgb(sl), active_e, _C_MAGENTA)
-    add("3D active correction — magenta=corrected, blue=fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=True),
+    add("3D active correction — magenta = corrected, blue = fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=False),
         kind="decision", branch=f"snap cols deviating > {at:.0f}px from the 3-slice neighbour median → {n_snapped} snapped")
     # Final warp: same logic as smooth_volume — with the over-correction guard (#2) + clipped-apex handling
     # so the filmstrip matches a real re-run (runaway shift interpolated from good neighbours + clamped;
@@ -2161,10 +2212,10 @@ if __name__ == "__main__":
         for old in _outdir.glob("step_*.png"):   # clear stale steps from a prior run
             old.unlink()
         _entries = []
-        for _i, (_label, _rgb, _kind, _branch) in enumerate(_steps):
+        for _i, (_label, _rgb, _kind, _branch, _lane) in enumerate(_steps):
             _fn = f"step_{_i:02d}.png"
             (_outdir / _fn).write_bytes(_png_bytes(_rgb))
-            _entries.append({"label": _label, "file": _fn, "kind": _kind, "branch": _branch})
+            _entries.append({"label": _label, "file": _fn, "kind": _kind, "branch": _branch, "lane": _lane})
         # New shape: {slices, index, steps}; the API reader tolerates the legacy list too.
         (_outdir / "labels.json").write_text(_json.dumps({"slices": _n, "index": _idx, "steps": _entries}))
     elif a.mode == "border":

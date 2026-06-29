@@ -13,9 +13,11 @@ const PENS: { value: PenLabel; label: string; color: string }[] = [
 ];
 
 export function PaintToolbar() {
-  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity,
+  const { penLabel, penSize, penFilled, paintMode, correcting, drawOpacity, corneaOnlyPaint,
           setPenLabel, setPenSize, setPenFilled, setPaintMode, runSmartFill, set } = useWorkflowStore();
   if (!correcting) return null;
+  // #11 cornea/background vet step exposes ONLY the cornea/background/erase pens (no scar).
+  const pens = corneaOnlyPaint ? PENS.filter((p) => p.value !== 3) : PENS;
 
   return (
     <div className="flex items-center gap-3 px-3 border-b overflow-x-auto [&>*]:shrink-0" style={{ minHeight: 36, borderColor: "var(--c-border)" }}>
@@ -29,7 +31,7 @@ export function PaintToolbar() {
         Pen
       </span>
       <ToggleButtonGroup size="small" exclusive disabled={!paintMode} value={penLabel} onChange={(_, v) => v !== null && setPenLabel(v)}>
-        {PENS.map((p) => (
+        {pens.map((p) => (
           <ToggleButton key={p.value} value={p.value}>
             <span
               style={{ width: 10, height: 10, borderRadius: "50%", background: p.color, marginRight: 6, display: "inline-block" }}

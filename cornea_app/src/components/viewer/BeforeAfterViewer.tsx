@@ -8,7 +8,7 @@
    by the iterative preprocess); a non-iterative scan has one corrected pass = a plain raw|final view. */
 
 import { useEffect, useMemo, useState } from "react";
-import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
+import { ToggleButton, ToggleButtonGroup, Slider, CircularProgress } from "@mui/material";
 import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
@@ -120,12 +120,20 @@ export function BeforeAfterViewer({ orient, filter }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orient, after.length]);
 
+  // #6: the <img> fills its (equal) panel area and scales UP to maximize the canvas; objectFit:contain +
+  // equal boxes + shared slice geometry render raw and corrected at the SAME size (no "original larger").
   const imgStyle: React.CSSProperties = {
-    maxHeight: "calc(100% - 28px)",
-    maxWidth: "100%",
+    width: "100%",
+    height: "100%",
     objectFit: "contain",
     imageRendering: "pixelated",
     filter: filter || undefined,
+  };
+  const panelCol: React.CSSProperties = {
+    flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+  };
+  const imgArea: React.CSSProperties = {
+    flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center",
   };
 
   return (
@@ -147,11 +155,16 @@ export function BeforeAfterViewer({ orient, filter }: {
               value={Math.min(passIdx, steps.length - 1)}
               onChange={(_, v) => v !== null && setPassIdx(v as number)}
             >
-              {steps.map((s, i) => (
-                <ToggleButton key={s.group} value={i} sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>
-                  {s.label}
-                </ToggleButton>
-              ))}
+              {steps.map((s, i) => {
+                const sel = i === Math.min(passIdx, steps.length - 1);
+                return (
+                  <ToggleButton key={s.group} value={i} sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none", gap: 0.5 }}>
+                    {/* #7: spinner on the SELECTED pass while its previews load, so the click has feedback. */}
+                    {sel && loading && <CircularProgress size={11} color="inherit" />}
+                    {s.label}
+                  </ToggleButton>
+                );
+              })}
             </ToggleButtonGroup>
             {curStep?.metric != null && (
               <span className="text-[11px]" style={{ color: curStep.best ? "var(--c-green)" : "var(--c-text-dim)" }}>
@@ -192,49 +205,31 @@ export function BeforeAfterViewer({ orient, filter }: {
               gap: 10,
               width: "100%",
               height: "100%",
-              alignItems: "center",
+              alignItems: "stretch",
               justifyContent: "center",
             }}
           >
-            <div
-              style={{
-                flex: 1,
-                minWidth: 0,
-                height: "100%",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 4,
-              }}
-            >
+            <div style={panelCol}>
               <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                 original (raw)
               </span>
-              {rawCur ? (
-                <img src={imgSrc(rawCur)} alt="raw" draggable={false} style={imgStyle} />
-              ) : (
-                <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-                  no raw slice here
-                </span>
-              )}
+              <div style={imgArea}>
+                {rawCur ? (
+                  <img src={imgSrc(rawCur)} alt="raw" draggable={false} style={imgStyle} />
+                ) : (
+                  <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+                    no raw slice here
+                  </span>
+                )}
+              </div>
             </div>
-            <div
-              style={{
-                flex: 1,
-                minWidth: 0,
-                height: "100%",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 4,
-              }}
-            >
+            <div style={panelCol}>
               <span className="text-[11px]" style={{ color: "var(--c-green)" }}>
                 {curStep?.label ?? "preprocessed"}
               </span>
-              <img src={imgSrc(cur)} alt="preprocessed" draggable={false} style={imgStyle} />
+              <div style={imgArea}>
+                <img src={imgSrc(cur)} alt="preprocessed" draggable={false} style={imgStyle} />
+              </div>
             </div>
           </div>
         )}

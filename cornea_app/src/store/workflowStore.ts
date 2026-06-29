@@ -54,6 +54,8 @@ export interface StrategyRow {
 }
 export interface StrategyComparison {
   rows: StrategyRow[]; members: string[]; n: number; phi_percentile: number; reference?: string; subgroup?: string;
+  cancelled?: boolean;   // #15 — true when the run was stopped early via Cancel (rows are partial)
+  crop_aware?: boolean;  // #9 — true when a replicate was cropped, so metrics use the common valid region
 }
 
 export interface SubgroupPair { a: string; b: string; dice: number; centroid_dist_mm: number | null; sim: number; }
@@ -158,10 +160,16 @@ interface WorkflowState {
   alignReplicates: () => Promise<void>;
   normalizeConsensus: () => Promise<void>;
   compareStrategies: () => Promise<void>;
+  cancelCompareStrategies: () => Promise<void>;
   autoSubgroups: () => Promise<void>;
   applySubgroups: (assignments: Record<string, string>) => Promise<void>;
   loadCorrectionLayer: () => Promise<void>;
   saveCorrection: () => Promise<void>;
+  // #11 cornea/background vet step: paint cornea/background only (scar pen hidden), then confirm → sets
+  // cornea_vetted (gates the Scar step). corneaOnlyPaint hides the Scar pen in the PaintToolbar.
+  corneaOnlyPaint: boolean;
+  startCorneaVetPaint: () => Promise<void>;
+  confirmCorneaVet: () => Promise<void>;
   cancelCorrection: () => Promise<void>;
   undoCorrection: () => void;
   setPenLabel: (label: PenLabel) => void;
@@ -176,6 +184,12 @@ interface WorkflowState {
   clearScarHints: () => void;
   applyScarHints: () => Promise<void>;
   exportScarSummary: () => Promise<void>;
+  // #10 — render this scan's preprocessing correction as an MP4 grid (planes × passes). Sets mp4Busy and,
+  // on success, correctionMp4Url (a download link).
+  exportCorrectionMp4: () => Promise<void>;
+  mp4Busy: boolean;
+  correctionMp4Url: string | null;
+  correctionMp4Info: string;
   tryLoadExistingSegmentation: () => Promise<void>;
   setSegOpacity: (o: number) => void;
   toggleSegmentation: (show: boolean) => void;
@@ -193,6 +207,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     sam2RunningCaseId: null,
     selectedStep: null,
 
+    corneaOnlyPaint: false,
     penLabel: 1,
     penSize: 3,
     penFilled: false,
@@ -227,6 +242,9 @@ export const useWorkflowStore = create<WorkflowState>()(
 
     segBusy: false,
     scarBusy: false,
+    mp4Busy: false,
+    correctionMp4Url: null,
+    correctionMp4Info: "",
     motionBusy: false,
     motionResult: null,
     ascanRateHz: 70000,
@@ -260,6 +278,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.strategyComparison = null;
         s.subgroupProposal = null;
         s.correcting = false;
+        s.corneaOnlyPaint = false;
         s.hintMode = false;
         s.scarHints = [];
         s.scarEditMode = false;
@@ -452,14 +471,25 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.strategyComparison = r;
-          s.status = { kind: "done", title: "Strategy comparison ready",
-            detail: `${r.rows.length} strategies × ${r.n} replicates — see the table (download CSV for the paper).` };
+          s.status = r.cancelled
+            ? { kind: "done", title: "Strategy comparison stopped", detail: `Cancelled after ${r.rows.length} strategy(ies) — partial results shown.` }
+            : { kind: "done", title: "Strategy comparison ready",
+                detail: `${r.rows.length} strategies × ${r.n} replicates — see the table (download CSV for the paper).` };
         });
       } catch (e) {
         set((s) => { s.status = { kind: "error", title: "Comparison failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
         set((s) => { s.scarBusy = false; });
       }
+    },
+    cancelCompareStrategies: async () => {
+      // #15 — actually stop the in-flight (slow, SAM2) compare run: the backend polls this flag between
+      // strategies/replicates and returns the partial table. Best-effort; scarBusy clears when it returns.
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => { s.status = { kind: "working", title: "Stopping comparison", detail: "Finishing the current step, then stopping…" }; });
+      try { await api.json(`/api/case/${caseId}/compare-strategies/cancel`, "POST", JSON.stringify({})); }
+      catch { /* best-effort — if the run already finished there's nothing to cancel */ }
     },
     autoSubgroups: async () => {
       const caseId = useCaseStore.getState().caseId;
@@ -573,12 +603,58 @@ export const useWorkflowStore = create<WorkflowState>()(
       }
       set((s) => {
         s.correcting = false;
+        s.corneaOnlyPaint = false;
         s.status = { kind: "idle", title: "Correction cancelled", detail: "Edits discarded; the labelmap is unchanged." };
       });
     },
 
     undoCorrection: () => {
       nv.undoDrawing();
+    },
+
+    // #11 — enter cornea/background paint mode: same drawing layer as Correct, but the PaintToolbar hides
+    // the Scar pen (corneaOnlyPaint) and the pen defaults to Cornea. Confirm goes through confirmCorneaVet.
+    startCorneaVetPaint: async () => {
+      set((s) => { s.corneaOnlyPaint = true; if (s.penLabel === 3) s.penLabel = 1; });
+      await get().loadCorrectionLayer();
+      set((s) => { if (s.penLabel === 3) s.penLabel = 1; });
+      nv.setPen(get().penLabel === 3 ? 1 : get().penLabel, get().penFilled);
+    },
+
+    // #11 — confirm cornea/background: if the user painted (correcting), save the drawing with cornea_vet=true
+    // (sets cornea_vetted, NOT corrected_labelmap); otherwise just mark cornea_vetted. Advances Cornea → vetted.
+    confirmCorneaVet: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => { s.segBusy = true; s.status = { kind: "working", title: "Confirming cornea/background", detail: "Saving the vetted cornea segmentation." }; });
+      try {
+        if (get().correcting) {
+          const bytes = await nv.exportDrawing();
+          if (!bytes) throw new Error("Could not export the cornea/background drawing.");
+          const file = new File([bytes as unknown as BlobPart], "seg-drawing.nii.gz");
+          await api.upload(`/api/case/${caseId}/segmentation/from-drawing?cornea_vet=true`, [file]);
+          if (useCaseStore.getState().caseId !== caseId) return;
+          nv.endDrawing();
+          await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
+          if (useCaseStore.getState().caseId !== caseId) return;
+        } else {
+          await api.json(`/api/case/${caseId}/vet-cornea`, "POST", JSON.stringify({}));
+          if (useCaseStore.getState().caseId !== caseId) return;
+        }
+        // Advance the timeline Cornea(5) → Cornea/bg vetted(6) optimistically.
+        useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).cornea_vetted = true; });
+        set((s) => {
+          s.correcting = false;
+          s.corneaOnlyPaint = false;
+          s.segLoaded = true;
+          s.segVersion += 1;
+          s.status = { kind: "done", title: "Cornea/background vetted", detail: "Scar detection is now unlocked." };
+        });
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Confirm failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.segBusy = false; });
+      }
     },
 
     setPenLabel: (label) => {
@@ -827,6 +903,25 @@ export const useWorkflowStore = create<WorkflowState>()(
         set((s) => {
           s.scarBusy = false;
         });
+      }
+    },
+
+    exportCorrectionMp4: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => { s.mp4Busy = true; s.correctionMp4Url = null; s.correctionMp4Info = "Rendering correction MP4 (planes × passes)…"; });
+      try {
+        const res = await api.json<{ out: string; frames: number; columns: string[]; download_url: string }>(
+          `/api/case/${caseId}/export-correction-mp4`, "POST", JSON.stringify({}));
+        if (useCaseStore.getState().caseId !== caseId) return;
+        set((s) => {
+          s.correctionMp4Url = resourceUrl(`${res.download_url}?t=${Date.now()}`);
+          s.correctionMp4Info = `Saved ${res.frames}-frame MP4 (${res.columns.join(" · ")}) → ${res.out}`;
+        });
+      } catch (e) {
+        set((s) => { s.correctionMp4Info = `Export failed: ${e instanceof Error ? e.message : String(e)}`; });
+      } finally {
+        set((s) => { s.mp4Busy = false; });
       }
     },
 
