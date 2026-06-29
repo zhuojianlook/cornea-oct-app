@@ -247,8 +247,9 @@ export function TimelineBar() {
     </>
   );
 
-  // Re-run scar after SAM2 (iteration): detect/SAM2-scar + click-hints. Non-control only.
-  const ScarReRun = classification !== "control" ? (
+  // INITIAL scar DETECTION (step 6 "Scar"): pick a strategy + run a detector → produces the scar. The scar
+  // CORRECTION tools (guide-hints, Correct ✎) live in step 7 once an initial scar exists. Non-control only.
+  const ScarDetect = classification !== "control" ? (
     <>
       {ScarMethod}
       <Button size="small" variant="outlined" color="error" disabled={busy || !segLoaded}
@@ -266,6 +267,12 @@ export function TimelineBar() {
       {scarKind && scarProgress && (
         <span className="text-[11px]" style={{ color: "var(--c-text-dim)", maxWidth: 300, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={scarProgress}>{scarProgress}</span>
       )}
+    </>
+  ) : null;
+
+  // Scar REFINEMENT (correction): click-hint touch-up of an EXISTING scar. Lives in step 7. Non-control only.
+  const ScarRefine = classification !== "control" ? (
+    <>
       <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
         onClick={() => set("hintMode", !hintMode)}
         title="Optional touch-up: click ON a scar region (then 'scar') or on non-scar tissue (then 'not') in the slices to give SAM2 point prompts, then Apply to re-segment the scar from your clicks.">
@@ -284,6 +291,9 @@ export function TimelineBar() {
       )}
     </>
   ) : null;
+
+  // Full scar controls = detect + refine, shown together in the Scar-correction step (7) so you can iterate.
+  const ScarReRun = classification !== "control" ? <>{ScarDetect}{ScarRefine}</> : null;
 
   const sep = <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />;
 
@@ -378,8 +388,8 @@ export function TimelineBar() {
       </>
     ) : (
       <>
-        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Segment scar:</span>
-        {ScarReRun}{sep}{Correct}
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Detect the scar (pick a strategy + run; refine/correct in the next step):</span>
+        {ScarDetect}
       </>
     );
   } else if (step === 7) {
@@ -429,9 +439,10 @@ export function TimelineBar() {
       <div className="flex items-center gap-3 px-3 overflow-x-auto [&>*]:shrink-0 border-t" style={{ minHeight: 40, borderColor: "var(--c-border)" }}>
         <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
         <div className="flex-1" />
-        {/* PUBLICATION: compare scar-detection strategies' reproducibility on this eye's replicates. Available
-            once a scan/consensus is segmented (needs ≥2 segmented replicates of the eye+subgroup). */}
-        {caseInfo && (step >= 5 || isConsensus) && (
+        {/* PUBLICATION: compare scar-detection strategies' reproducibility across the eye's replicates. Lives in
+            the Scar step (6) — where you pick a detector — and on a consensus case (subgroup-specific). Needs ≥2
+            cornea-segmented replicates of the eye+subgroup; a control has no scar so it's hidden there. */}
+        {caseInfo && ((step === 6 && classification !== "control") || isConsensus) && (
           <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
             onClick={() => { setShowCompare(true); compareStrategies(); }}
             title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">
