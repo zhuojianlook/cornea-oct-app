@@ -49,6 +49,20 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
   const agreementUrl = (tol: number) =>
     resourceUrl(`/api/case/${caseId}/agreement.nii.gz?tol_mm=${tol}&t=${Date.now()}`);
 
+  // Load the faint cornea base + the agreement overlay together (loadVolumes REPLACES, so no accumulation
+  // on re-tolerance). The cornea is best-effort context: if /cornea.nii.gz is unavailable, fall back to the
+  // agreement alone so the core scar-overlap still renders. The agreement is always the LAST volume.
+  const loadOverlay = async (nv: Niivue, tol: number) => {
+    const cmap = (nv.colormaps?.() ?? []).includes("overlap3") ? "overlap3" : "warm";
+    const agr = { url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 };
+    try {
+      const cornea = { url: resourceUrl(`/api/case/${caseId}/cornea.nii.gz?t=${Date.now()}`), colormap: "gray", opacity: 1, cal_min: 0, cal_max: 4 };
+      await nv.loadVolumes([cornea, agr]);
+    } catch {
+      await nv.loadVolumes([agr]);   // cornea context unavailable — show the agreement alone
+    }
+  };
+
   const fetchStats = async (tol: number) => {
     try {
       const r = await fetch(resourceUrl(`/api/case/${caseId}/agreement-stats?tol_mm=${tol}`));
@@ -76,12 +90,7 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
       return;
     }
     (async () => {
-      // Faint CONSENSUS CORNEA as context (so the scar agreement isn't floating in empty space — no raw
-      // grayscale anatomy though), with the scar agreement (overlap core = red) on top.
-      const cmap = (nv.colormaps?.() ?? []).includes("overlap3") ? "overlap3" : "warm";
-      const corneaUrl = resourceUrl(`/api/case/${caseId}/cornea.nii.gz?t=${Date.now()}`);
-      await nv.loadVolumes([{ url: corneaUrl, colormap: "gray", opacity: 1, cal_min: 0, cal_max: 4 }]);
-      await nv.addVolumeFromUrl({ url: agreementUrl(0), colormap: cmap, opacity, cal_min: 16, cal_max: 100 });
+      await loadOverlay(nv, 0);   // faint consensus cornea (context) + scar agreement (overlap core = red)
       if (cancelled) return;
       nv.setSliceType(VIEWS.render);
       nv.updateGLVolume();
@@ -89,7 +98,12 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
     })()
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; nvRef.current = null; };
+    return () => {
+      cancelled = true;
+      // free the WebGL context so repeated mode switches don't exhaust the browser's context budget.
+      try { (nv as unknown as { gl?: WebGLRenderingContext }).gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* */ }
+      nvRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
@@ -102,12 +116,10 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
   // Reload the overlay at a new boundary tolerance (slider release) + refresh the readout.
   const applyTolerance = async (tol: number) => {
     const nv = nvRef.current;
-    const cmap = (nv?.colormaps?.() ?? []).includes("overlap3") ? "overlap3" : "warm";
     if (!nv) return;
     setBusy(true);
     try {
-      while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);   // keep the cornea base
-      await nv.addVolumeFromUrl({ url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 });
+      await loadOverlay(nv, tol);   // replaces both layers (cornea base + agreement) — no accumulation
       nv.setSliceType(VIEWS[view]);
       nv.updateGLVolume();
       await fetchStats(tol);

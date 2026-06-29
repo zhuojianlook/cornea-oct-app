@@ -38,7 +38,7 @@ def write_label_nifti(arr_ijk: np.ndarray, base_nifti: Path, dst: Path) -> Path:
     temp then os.replace) so a crash mid-write can't corrupt the canonical labelmap, and
     shape-guarded so a stale label from a different capture can't be stamped with the
     wrong geometry."""
-    import os
+    import os, uuid
     base = nib.load(str(base_nifti))
     arr = np.ascontiguousarray(arr_ijk.astype(np.uint8))
     if tuple(base.shape[:3]) != tuple(arr.shape[:3]):
@@ -46,7 +46,9 @@ def write_label_nifti(arr_ijk: np.ndarray, base_nifti: Path, dst: Path) -> Path:
             f"Label shape {tuple(arr.shape[:3])} != base volume shape {tuple(base.shape[:3])}; "
             f"refusing to stamp a mismatched affine onto {dst.name}.")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name("_tmp_" + dst.name)             # keeps .nii.gz so nibabel gzips
+    # UNIQUE temp per write (uuid) so two concurrent writes to the SAME dst (e.g. parallel cornea/agreement
+    # requests for one case) can't clobber each other's temp; the final os.replace stays atomic.
+    tmp = dst.with_name(f"_tmp_{uuid.uuid4().hex}_{dst.name}")   # keeps .nii.gz so nibabel gzips
     nib.save(nib.Nifti1Image(arr, base.affine), str(tmp))
     os.replace(str(tmp), str(dst))                      # atomic rename on the same filesystem
     return dst

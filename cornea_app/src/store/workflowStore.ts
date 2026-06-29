@@ -173,6 +173,7 @@ interface WorkflowState {
   corneaOnlyPaint: boolean;
   corneaVetBusy: boolean;   // #1 — loading the cornea/background paint layer (spinner on the Paint button)
   correctBusy: boolean;     // loading the Correct paint layer / restoring on Cancel (spinner on Correct & Cancel)
+  consensusScarMode: "consensus" | "own" | null;   // which step-9 scar-source choice is being applied (spinner)
   smartFillBusy: boolean;   // #4 — GrowCut smart-fill running (spinner + disable, avoids the "hung" look)
   smartFillPct: number;     // smart-fill progress 0..100 (drives the progress bar)
   startCorneaVetPaint: () => Promise<void>;
@@ -217,6 +218,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     corneaOnlyPaint: false,
     corneaVetBusy: false,
     correctBusy: false,
+    consensusScarMode: null,
     smartFillBusy: false,
     smartFillPct: 0,
     penLabel: 1,
@@ -496,21 +498,25 @@ export const useWorkflowStore = create<WorkflowState>()(
       if (!caseId) return;
       set((s) => {
         s.segBusy = true;
+        s.consensusScarMode = mode;
         s.status = { kind: "working", title: mode === "consensus" ? "Applying consensus scar" : "Keeping per-replicate scars",
           detail: mode === "consensus" ? "Writing the voted consensus scar into every replicate (truncated to each scan's own data)." : "Each replicate keeps its own scar boundary." };
       });
       try {
-        const r = await api.json<{ applied?: string[] }>(`/api/case/${caseId}/consensus-scar`, "POST", JSON.stringify({ mode }));
+        const r = await api.json<{ applied?: string[]; skipped?: string[] }>(`/api/case/${caseId}/consensus-scar`, "POST", JSON.stringify({ mode }));
         useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).consensus_scar_source = mode; });
+        const nSkip = r.skipped?.length ?? 0;
         set((s) => {
           s.segVersion += 1;
           s.status = { kind: "done", title: "Scar source set",
-            detail: mode === "consensus" ? `Consensus scar applied to ${r.applied?.length ?? 0} replicate(s).` : "Each replicate keeps its own scar." };
+            detail: mode === "consensus"
+              ? `Consensus scar applied to ${r.applied?.length ?? 0} replicate(s)` + (nSkip ? `; ${nSkip} kept their own (no consensus scar in their data).` : ".")
+              : "Each replicate keeps its own scar." };
         });
       } catch (e) {
         set((s) => { s.status = { kind: "error", title: "Scar-source choice failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
-        set((s) => { s.segBusy = false; });
+        set((s) => { s.segBusy = false; s.consensusScarMode = null; });
       }
     },
 

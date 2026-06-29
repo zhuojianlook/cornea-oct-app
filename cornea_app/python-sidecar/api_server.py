@@ -1135,7 +1135,7 @@ def consensus_scar_choice(case_id: str, req: ConsensusScarRequest | None = None)
     if not ccid or not orch.read_manifest(ccid).get("consensus_cases"):
         raise HTTPException(400, "No aligned consensus for this scan yet — align the replicates first.")
     members = list(orch.read_manifest(ccid).get("consensus_cases") or [])
-    applied = []
+    applied, skipped = [], []
     if mode == "consensus":
         scans_dir = orch.case_root(ccid) / "scans"
         for mc in members:
@@ -1143,9 +1143,17 @@ def consensus_scar_choice(case_id: str, req: ConsensusScarRequest | None = None)
             nat_vol = orch.case_root(mc) / "previews" / "volume.nii.gz"
             if not cn.exists() or not nat_vol.exists():
                 print(f"[consensus-scar] no native consensus map for {mc} — skipped", file=sys.stderr)
+                skipped.append(mc)
                 continue
             try:
-                labels.write_label_nifti(_read_label_ijk(cn), nat_vol, labels.corrected_path(mc))
+                cons_arr = _read_label_ijk(cn)
+                # SAFETY: never wipe a member's own scar with an empty consensus. If the voted consensus has no
+                # scar in THIS scan's FOV (cons_native is cornea-only), keep the member's own scar untouched.
+                if not (cons_arr == 2).any():
+                    print(f"[consensus-scar] {mc}: consensus has no scar in this scan's FOV — kept its own scar", file=sys.stderr)
+                    skipped.append(mc)
+                    continue
+                labels.write_label_nifti(cons_arr, nat_vol, labels.corrected_path(mc))
                 # the member's OWN scar is now the consensus scar — refresh its context_seg preview so the
                 # Scans-grid "Per scan" column matches the new labelmap (else it shows the pre-apply scar).
                 try:
@@ -1162,7 +1170,7 @@ def consensus_scar_choice(case_id: str, req: ConsensusScarRequest | None = None)
         for mc in members:
             orch.write_manifest_value(mc, {"consensus_scar_source": "own"})
     orch.write_manifest_value(ccid, {"consensus_scar_source": mode})
-    return {"ok": True, "mode": mode, "members": members, "applied": applied}
+    return {"ok": True, "mode": mode, "members": members, "applied": applied, "skipped": skipped}
 
 
 @app.get("/api/case/{case_id}/agreement-stats")
@@ -2651,8 +2659,8 @@ _STEP_RESET_FLAGS: dict[int, list[str]] = {
     6: ["cornea_vetted"],                           # Cornea/background paint-vetted
     7: ["subgroup_confirmed"],                      # Subgroup assigned (now BEFORE scar)
     8: ["scar_done", "scar_metrics"],               # Scar segmented (now AFTER subgroup)
-    9: ["consensus_case"],                          # Aligned (link to the eye's consensus)
-    10: ["normalized"],                             # Normalised against controls
+    9: ["consensus_case", "consensus_scar_source"],            # Aligned (link + the scar-source choice)
+    10: ["normalized", "normalization_skipped"],               # Normalised against controls (or skipped)
     11: ["corrected_labelmap"],                     # Manually corrected
     12: ["training_scheduled"],                     # Scheduled for training
 }

@@ -111,7 +111,9 @@ export function SubgroupGrid() {
 
   // Clamp / reset the master index to the middle when orientation or data changes.
   useEffect(() => {
-    if (maxLen > 0) setMasterIdx((i) => Math.min(Math.max(i, 0), maxLen - 1) || Math.floor(maxLen / 2));
+    // clamp into range; only fall back to the middle when the index is OUT of range (not when it's a
+    // legitimate 0 — `|| middle` used to snap slice 0 to the middle on every orientation change).
+    if (maxLen > 0) setMasterIdx((i) => (i >= 0 && i < maxLen ? i : Math.floor(maxLen / 2)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [maxLen, orient]);
 

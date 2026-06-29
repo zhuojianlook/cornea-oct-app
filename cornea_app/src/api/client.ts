@@ -12,7 +12,25 @@ import type { AppConfig } from "./types";
 // get_sidecar_base. We resolve it once here so DIRECT resource fetches (resourceUrl → niivue) and the
 // browser-fetch fallback hit the right sidecar. JSON/upload calls in the shell go via proxy_request,
 // which reads the same port shell-side.
-let _base = "http://127.0.0.1:8765";
+// In the Tauri shell get_sidecar_base (below) supplies the real port. In a plain BROWSER the FastAPI sidecar
+// serves the app AND the API from the SAME origin (serve.sh single-port), so default to that origin so a
+// single-port deployment works on ANY port/host — EXCEPT the Vite dev server (:1420), where the sidecar is a
+// separate process on :8765. (The Tauri webview is tauri://localhost — not http — so it keeps the :8765
+// default and then get_sidecar_base overrides it.)
+function _defaultBase(): string {
+  try {
+    if (typeof window !== "undefined") {
+      const w = window as unknown as Record<string, unknown>;
+      const inTauri = "__TAURI_INTERNALS__" in w || "__TAURI__" in w || "__TAURI_IPC__" in w;
+      const loc = window.location;
+      if (!inTauri && loc && loc.protocol.startsWith("http") && loc.port !== "1420" && loc.origin) {
+        return loc.origin;
+      }
+    }
+  } catch { /* fall through to the loopback default */ }
+  return "http://127.0.0.1:8765";
+}
+let _base = _defaultBase();
 let _basePromise: Promise<void> | null = null;
 export function initSidecarBase(): Promise<void> {
   if (!_basePromise) {

@@ -231,6 +231,9 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
             cs = sitk.Resample(cons_scar_ref, native_img, _inverse_rigid(transforms[c]),
                                sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
             cs_arr = sitk.GetArrayFromImage(cs) > 0
+            # TRUNCATE to this scan's actual data FOV (not just its cornea): a partial-FOV replicate only gets
+            # the part of the consensus scar that falls within its own imaged data — important for training.
+            cs_arr = cs_arr & (sitk.GetArrayFromImage(native_img) > 0)
             own_cornea = reg.resample_label(labels.corrected_path(c), _vol_path(c), reg.identity()) >= REF_CORNEA
             nat = np.where(own_cornea, REF_CORNEA, 0).astype(np.uint8)
             nat[cs_arr & own_cornea] = REF_SCAR

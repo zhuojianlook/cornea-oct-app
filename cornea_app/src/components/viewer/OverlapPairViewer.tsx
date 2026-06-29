@@ -43,12 +43,18 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
   const regionUrl = (region: string, bb: string) =>
     resourceUrl(`/api/case/${caseId}/align-region/${aRef}/${bb}/${region}.nii.gz?t=${Date.now()}`);
 
+  const loadingRef = useRef(false);   // serialize loads so a rapid replicate switch can't race two loadVolumes
   const loadPair = async (nv: Niivue, bb: string) => {
-    await nv.loadVolumes([
-      { url: regionUrl("a", bb), colormap: "rgA", opacity: opA, cal_min: 0, cal_max: 2 },
-      { url: regionUrl("b", bb), colormap: "rgB", opacity: opB, cal_min: 0, cal_max: 2 },
-      { url: regionUrl("both", bb), colormap: "rgBoth", opacity: opBoth, cal_min: 0, cal_max: 2 },
-    ]);
+    loadingRef.current = true;
+    try {
+      await nv.loadVolumes([
+        { url: regionUrl("a", bb), colormap: "rgA", opacity: opA, cal_min: 0, cal_max: 2 },
+        { url: regionUrl("b", bb), colormap: "rgB", opacity: opB, cal_min: 0, cal_max: 2 },
+        { url: regionUrl("both", bb), colormap: "rgBoth", opacity: opBoth, cal_min: 0, cal_max: 2 },
+      ]);
+    } finally {
+      loadingRef.current = false;
+    }
   };
 
   useEffect(() => {
@@ -74,14 +80,20 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
     })()
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; nvRef.current = null; };
+    return () => {
+      cancelled = true;
+      // free the WebGL context so repeated mode switches don't exhaust the browser's context budget.
+      try { (nv as unknown as { gl?: WebGLRenderingContext }).gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* */ }
+      nvRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
   // swap the compared replicate
   useEffect(() => {
     const nv = nvRef.current;
-    if (!nv || !b || nv.volumes.length === 0) return;   // skip the initial run (mount effect does the first load)
+    // skip the initial run (mount effect does the first load) and any time a load is already in flight.
+    if (!nv || !b || nv.volumes.length === 0 || loadingRef.current) return;
     let cancelled = false;
     (async () => {
       await loadPair(nv, b);

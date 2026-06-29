@@ -25,6 +25,7 @@ export function TimelineBar() {
   const skipNormalization = useWorkflowStore((s) => s.skipNormalization);
   const applyConsensusScar = useWorkflowStore((s) => s.applyConsensusScar);
   const correctBusy = useWorkflowStore((s) => s.correctBusy);
+  const consensusScarMode = useWorkflowStore((s) => s.consensusScarMode);
   const compareStrategies = useWorkflowStore((s) => s.compareStrategies);
   const cancelCompareStrategies = useWorkflowStore((s) => s.cancelCompareStrategies);
   const strategyComparison = useWorkflowStore((s) => s.strategyComparison);
@@ -232,14 +233,16 @@ export function TimelineBar() {
     <span className="flex items-center gap-1.5">
       <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Training scar:</span>
       <Button size="small" variant={scarSource === "consensus" ? "contained" : "outlined"} color="info" disabled={busy || correcting}
+        startIcon={consensusScarMode === "consensus" ? <CircularProgress size={13} color="inherit" /> : undefined}
         onClick={() => applyConsensusScar("consensus")}
         title="Use the voted CONSENSUS scar for EVERY replicate (each truncated to its own data FOV, so a partial scan only gets the part within its data). Most reproducible training label.">
-        Use consensus (all)
+        {consensusScarMode === "consensus" ? "Applying…" : "Use consensus (all)"}
       </Button>
       <Button size="small" variant={scarSource === "own" ? "contained" : "outlined"} color="inherit" disabled={busy || correcting}
+        startIcon={consensusScarMode === "own" ? <CircularProgress size={13} color="inherit" /> : undefined}
         onClick={() => applyConsensusScar("own")}
         title="Keep each replicate's OWN scar boundary as its training label.">
-        Keep each replicate's
+        {consensusScarMode === "own" ? "Saving…" : "Keep each replicate's"}
       </Button>
     </span>
   );
