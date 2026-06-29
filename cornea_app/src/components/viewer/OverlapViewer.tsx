@@ -76,10 +76,9 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
       return;
     }
     (async () => {
-      const vol = resourceUrl(`/api/case/${caseId}/volume.nii.gz?t=${Date.now()}`);
-      await nv.loadVolumes([{ url: vol, colormap: "gray" }]);
+      // No grayscale anatomy background — show ONLY the scar agreement (overlap core = red), per spec.
       const cmap = (nv.colormaps?.() ?? []).includes("overlap3") ? "overlap3" : "warm";
-      await nv.addVolumeFromUrl({ url: agreementUrl(0), colormap: cmap, opacity: 0.75, cal_min: 16, cal_max: 100 });
+      await nv.loadVolumes([{ url: agreementUrl(0), colormap: cmap, opacity: 1, cal_min: 16, cal_max: 100 }]);
       if (cancelled) return;
       nv.setSliceType(VIEWS.render);
       nv.updateGLVolume();
@@ -94,7 +93,7 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
   useEffect(() => { nvRef.current?.setSliceType(VIEWS[view]); }, [view]);
   useEffect(() => {
     const nv = nvRef.current;
-    if (nv && nv.volumes.length > 1) { nv.setOpacity(nv.volumes.length - 1, opacity); nv.drawScene(); }
+    if (nv && nv.volumes.length >= 1) { nv.setOpacity(0, opacity); nv.drawScene(); }
   }, [opacity]);
 
   // Reload the overlay at a new boundary tolerance (slider release) + refresh the readout.
@@ -104,8 +103,8 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
     if (!nv) return;
     setBusy(true);
     try {
-      while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
-      await nv.addVolumeFromUrl({ url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 });
+      await nv.loadVolumes([{ url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 }]);
+      nv.setSliceType(VIEWS[view]);
       nv.updateGLVolume();
       await fetchStats(tol);
     } catch (e) {

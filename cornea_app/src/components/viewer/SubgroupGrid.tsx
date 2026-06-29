@@ -46,10 +46,24 @@ export function SubgroupGrid() {
 
   const [orient, setOrient] = useState<Orient>("sagittal");
   const [overlay, setOverlay] = useState<Overlay>("cons");
-  const [mode, setMode] = useState<"grid" | "align" | "overlap">("grid");
+  const [mode, setMode] = useState<"consensus" | "grid" | "align" | "overlap">("consensus");
   const [masterIdx, setMasterIdx] = useState(0);
   const [data, setData] = useState<Record<string, ScanPreviews>>({});
   const [loading, setLoading] = useState(false);
+  // The VOTED CONSENSUS result's own segmentation previews (density-coloured) — so the consensus itself is
+  // visible at step 9, not only the per-scan grid. Fetched from the consensus case's "segmentation" group.
+  const [consImgs, setConsImgs] = useState<PreviewImage[]>([]);
+  useEffect(() => {
+    if (!consensusId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await api.json<{ images: PreviewImage[] }>(`/api/case/${consensusId}/previews/segmentation`);
+        if (!cancelled) setConsImgs(r.images || []);
+      } catch { if (!cancelled) setConsImgs([]); }
+    })();
+    return () => { cancelled = true; };
+  }, [consensusId, segSig]);
 
   // Fetch the four preview groups for every member scan (lazy URL listings → cheap).
   const scanKey = scans.join(",");
@@ -117,34 +131,62 @@ export function SubgroupGrid() {
           Subgroup{subgroupLabel && subgroupLabel !== "1" ? ` · ${subgroupLabel}` : ""} — {scans.length} scans
         </span>
         <ToggleButtonGroup size="small" exclusive value={mode} onChange={(_, v) => v && setMode(v)}>
+          <ToggleButton value="consensus" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Consensus</ToggleButton>
           <ToggleButton value="grid" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Scans grid</ToggleButton>
           <ToggleButton value="align" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Volume align</ToggleButton>
           <ToggleButton value="overlap" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Scar overlap</ToggleButton>
         </ToggleButtonGroup>
-        {mode === "grid" && (
+        {(mode === "grid" || mode === "consensus") && (
           <>
             <ToggleButtonGroup size="small" exclusive value={orient} onChange={(_, v) => v && setOrient(v)}>
               {ORIENTS.map((o) => (
                 <ToggleButton key={o} value={o} style={{ textTransform: "capitalize" }}>{o}</ToggleButton>
               ))}
             </ToggleButtonGroup>
-            <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>Scar</span>
-            <ToggleButtonGroup size="small" exclusive value={overlay} onChange={(_, v) => v && setOverlay(v)}>
-              <ToggleButton value="seg" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Per scan</ToggleButton>
-              <ToggleButton value="cons" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Consensus</ToggleButton>
-            </ToggleButtonGroup>
-            <div className="flex items-center gap-2" style={{ flex: 1, minWidth: 180 }}>
-              <span className="text-xs whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
-                slice {maxLen ? masterIdx + 1 : 0}/{maxLen}
-              </span>
-              <Slider size="small" min={0} max={Math.max(0, maxLen - 1)} value={Math.min(masterIdx, Math.max(0, maxLen - 1))}
-                onChange={(_, v) => setMasterIdx(v as number)} />
-            </div>
+            {mode === "grid" && (<>
+              <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>Scar</span>
+              <ToggleButtonGroup size="small" exclusive value={overlay} onChange={(_, v) => v && setOverlay(v)}>
+                <ToggleButton value="seg" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Per scan</ToggleButton>
+                <ToggleButton value="cons" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Consensus</ToggleButton>
+              </ToggleButtonGroup>
+            </>)}
+            {(() => {
+              const len = mode === "consensus" ? byOrient(consImgs).length : maxLen;
+              return (
+                <div className="flex items-center gap-2" style={{ flex: 1, minWidth: 180 }}>
+                  <span className="text-xs whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
+                    slice {len ? masterIdx + 1 : 0}/{len}
+                  </span>
+                  <Slider size="small" min={0} max={Math.max(0, len - 1)} value={Math.min(masterIdx, Math.max(0, len - 1))}
+                    onChange={(_, v) => setMasterIdx(v as number)} />
+                </div>
+              );
+            })()}
             {loading && <CircularProgress size={16} />}
           </>
         )}
       </div>
 
+      {mode === "consensus" && (() => {
+        const list = byOrient(consImgs);
+        const cur = list[Math.min(masterIdx, Math.max(0, list.length - 1))];
+        return (
+          <div className="flex flex-1 flex-col min-h-0">
+            <div className="px-3 py-1 border-b text-[11px]" style={{ borderColor: "var(--c-border)", color: "var(--c-text-dim)" }}>
+              Voted consensus (≥½ of the {scans.length} aligned replicates agree), scar shown by reflectivity
+              density (diffuse → dense). The per-scan members are in “Scans grid”.
+            </div>
+            <div className="flex-1 min-h-0 flex items-center justify-center p-3">
+              {cur ? (
+                <img src={imgSrc(cur)} alt="consensus" draggable={false}
+                  style={{ maxHeight: "100%", maxWidth: "100%", objectFit: "contain", imageRendering: "pixelated" }} />
+              ) : (
+                <span className="text-sm" style={{ color: "var(--c-text-dim)" }}>No consensus preview yet — align the replicates.</span>
+              )}
+            </div>
+          </div>
+        );
+      })()}
       {mode === "align" && consensusId && (
         <AlignmentViewer caseId={consensusId} members={scans} refCid={refCid} />
       )}

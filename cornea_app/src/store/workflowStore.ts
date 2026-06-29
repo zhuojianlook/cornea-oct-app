@@ -160,6 +160,7 @@ interface WorkflowState {
   runSam2: () => Promise<void>;
   alignReplicates: () => Promise<void>;
   normalizeConsensus: () => Promise<void>;
+  skipNormalization: () => Promise<void>;
   compareStrategies: () => Promise<void>;
   cancelCompareStrategies: () => Promise<void>;
   autoSubgroups: () => Promise<void>;
@@ -460,6 +461,26 @@ export const useWorkflowStore = create<WorkflowState>()(
         });
       } catch (e) {
         set((s) => { s.status = { kind: "error", title: "Normalize failed", detail: e instanceof Error ? e.message : String(e) }; });
+      } finally {
+        set((s) => { s.segBusy = false; });
+      }
+    },
+
+    // STEP 9 "Skip normalization": keep the aligned consensus AS-IS (no control-baseline re-derivation) and
+    // advance the timeline so it can be corrected / scheduled. Records normalization_skipped for the export.
+    skipNormalization: async () => {
+      const caseId = useCaseStore.getState().caseId;
+      if (!caseId) return;
+      set((s) => { s.segBusy = true; s.status = { kind: "working", title: "Skipping normalization", detail: "Keeping the aligned consensus as-is." }; });
+      try {
+        await api.json(`/api/case/${caseId}/skip-normalization`, "POST", JSON.stringify({}));
+        useCaseStore.setState((cs) => { if (cs.caseInfo) { const mm = cs.caseInfo.manifest as Record<string, unknown>; mm.normalized = true; mm.normalization_skipped = true; } });
+        set((s) => {
+          s.segVersion += 1; s.selectedStep = null;
+          s.status = { kind: "done", title: "Normalization skipped", detail: "Using the aligned consensus as-is — correct it, then schedule for training." };
+        });
+      } catch (e) {
+        set((s) => { s.status = { kind: "error", title: "Skip failed", detail: e instanceof Error ? e.message : String(e) }; });
       } finally {
         set((s) => { s.segBusy = false; });
       }

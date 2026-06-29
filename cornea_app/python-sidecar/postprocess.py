@@ -27,17 +27,21 @@ def _spacing(affine: np.ndarray) -> list[float]:
 
 def render_seg_previews(volume_nifti: Path, arr_ijk: np.ndarray, out_dir: Path,
                         density_vol: np.ndarray | None = None,
-                        dense_rotated: bool = False) -> int:
+                        dense_rotated: bool = False, density_from_self: bool = False) -> int:
     """Render segmentation overlay PNGs from a labelmap, in-process (numpy).
 
     When `density_vol` is given, the scar is shown in 3 reflectivity tiers
     (diffuse → dense) instead of flat red, so the mix of opacities is visible.
+    `density_from_self=True` derives the tiers from THIS volume's own reflectivity (used for the
+    consensus/step-9 previews, which have no separate raw volume to pass).
 
     `dense_rotated=True` renders EVERY slice with the same rotation/size as the grayscale
     context previews — used for the gallery's 3rd before/after panel so the overlay scrubs
     in lock-step with raw/corrected (display-only; the clickable segmentation group stays
     sparse + unrotated, so scar-edit/hint coordinates are unaffected)."""
     img = nib.load(str(volume_nifti))
+    if density_vol is None and density_from_self:
+        density_vol = np.asarray(img.dataobj)   # IJK reflectivity (same grid as arr_ijk) → density tiers
     vol_kji = np.ascontiguousarray(np.asarray(img.dataobj).transpose(2, 1, 0))
     scar = arr_ijk == SCAR
     masks_by_name = {

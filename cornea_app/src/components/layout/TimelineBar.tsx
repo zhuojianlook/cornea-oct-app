@@ -22,6 +22,7 @@ export function TimelineBar() {
   const selectStep = useWorkflowStore((s) => s.selectStep);
   const alignReplicates = useWorkflowStore((s) => s.alignReplicates);
   const normalizeConsensus = useWorkflowStore((s) => s.normalizeConsensus);
+  const skipNormalization = useWorkflowStore((s) => s.skipNormalization);
   const compareStrategies = useWorkflowStore((s) => s.compareStrategies);
   const cancelCompareStrategies = useWorkflowStore((s) => s.cancelCompareStrategies);
   const strategyComparison = useWorkflowStore((s) => s.strategyComparison);
@@ -212,6 +213,12 @@ export function TimelineBar() {
     <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => normalizeConsensus()}
       title="Re-derive scar as excess over the control (no-scar) baseline and rebuild the consensus. Needs tagged + segmented control scans.">
       ◎ Normalize against controls
+    </Button>
+  );
+  const SkipNormBtn = (
+    <Button size="small" variant="outlined" color="inherit" disabled={busy || correcting} onClick={() => skipNormalization()}
+      title="Skip control-normalisation — keep the aligned consensus as-is, then correct / schedule it.">
+      ⏭ Skip normalization
     </Button>
   );
   // STEP 6: confirm this scan's subgroup (which lesion set it belongs to → which repeats align together).
@@ -420,8 +427,9 @@ export function TimelineBar() {
       </>
     );
   } else if (step === 9) {
-    // aligned (teal) → normalize against controls (next), or correct / schedule
-    actions = <>{NormalizeBtn}{sep}{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
+    // aligned (teal) → normalize against controls, or SKIP normalization (use the consensus as-is); then
+    // correct. Schedule/Export/Compare are NOT here — they live at the later (normalized/corrected) steps.
+    actions = <>{NormalizeBtn}{sep}{SkipNormBtn}{sep}{Correct}</>;
   } else if (step === 10) {
     // normalized (cyan) → correct / schedule
     actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
@@ -432,7 +440,7 @@ export function TimelineBar() {
     // step 12 — scheduled (green)
     actions = (
       <>
-        <span className="text-xs" style={{ color: "#22c55e" }}>✓ Scheduled for training.</span>
+        <span className="text-xs" style={{ color: "#4ade80" }}>✓ Scheduled for training.</span>
         <Button size="small" variant="outlined" disabled={busy} onClick={() => scheduleTraining(false)}>Unschedule</Button>
         {Correct}{ExportBtn}
       </>
@@ -449,11 +457,11 @@ export function TimelineBar() {
       <div className="flex items-center gap-3 px-3 overflow-x-auto [&>*]:shrink-0 border-t" style={{ minHeight: 40, borderColor: "var(--c-border)" }}>
         <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
         <div className="flex-1" />
-        {/* PUBLICATION: compare scar-detection strategies' reproducibility across the eye's replicates. Lives in
-            the Scar-detection step (7) — where you pick a detector, AFTER subgroup is assigned, so the comparison
-            is PER-SUBGROUP — and on a consensus case. Needs ≥2 cornea-segmented replicates of the eye+subgroup;
-            a control has no scar so it's hidden. */}
-        {caseInfo && ((step === 7 && classification !== "control") || isConsensus) && (
+        {/* PUBLICATION: compare scar-detection strategies' reproducibility across the eye's replicates. Lives
+            ONLY in the Scar-detection step (7) — where you pick a detector, AFTER subgroup is assigned, so the
+            comparison is PER-SUBGROUP. Needs ≥2 cornea-segmented replicates of the eye+subgroup; a control has
+            no scar so it's hidden. (Not shown on the aligned consensus / step 9.) */}
+        {caseInfo && step === 7 && classification !== "control" && (
           <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
             onClick={() => { setShowCompare(true); compareStrategies(); }}
             title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">

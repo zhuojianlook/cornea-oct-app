@@ -1455,7 +1455,7 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
 
     cons_vol = orch.case_root(ccid) / "previews" / "volume.nii.gz"
     cons_lab = _read_label_ijk(labels.corrected_path(ccid))
-    postprocess.render_seg_previews(cons_vol, cons_lab, _preview_group_dir(ccid, "segmentation"))
+    postprocess.render_seg_previews(cons_vol, cons_lab, _preview_group_dir(ccid, "segmentation"), density_from_self=True)
     # Per-scan tabs: each scan's warped image with its own scar, and with the consensus
     # scar clipped to that scan's FOV (so it isn't painted over empty background).
     scans_dir = orch.case_root(ccid) / "scans"
@@ -1464,19 +1464,19 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
         slab = _read_label_ijk(scans_dir / cid / "label.nii.gz")
         data_mask = np.asarray(nib.load(str(svol)).dataobj) > 0
         cons_clipped = np.where(data_mask, cons_lab, 0).astype(np.uint8)
-        postprocess.render_seg_previews(svol, slab, _preview_group_dir(ccid, f"scan_{cid}_self"))
-        postprocess.render_seg_previews(svol, cons_clipped, _preview_group_dir(ccid, f"scan_{cid}_cons"))
+        postprocess.render_seg_previews(svol, slab, _preview_group_dir(ccid, f"scan_{cid}_self"), density_from_self=True)
+        postprocess.render_seg_previews(svol, cons_clipped, _preview_group_dir(ccid, f"scan_{cid}_cons"), density_from_self=True)
         # Dense+rotated overlays in the SCAN's NATIVE frame for the gallery's 3rd before/after
         # panel (aligns slice-for-slice with raw/corrected): own cornea+scar (context_seg) and
         # the subgroup consensus mapped to native (context_cons). Convenience — never fail build.
         try:
             nat_vol = orch.case_root(cid) / "previews" / "volume.nii.gz"
             own = _read_label_ijk(labels.corrected_path(cid))
-            postprocess.render_seg_previews(nat_vol, own, _preview_group_dir(cid, "context_seg"), dense_rotated=True)
+            postprocess.render_seg_previews(nat_vol, own, _preview_group_dir(cid, "context_seg"), dense_rotated=True, density_from_self=True)
             cons_native = scans_dir / cid / "cons_native.nii.gz"
             if cons_native.exists():
                 postprocess.render_seg_previews(nat_vol, _read_label_ijk(cons_native),
-                                                _preview_group_dir(cid, "context_cons"), dense_rotated=True)
+                                                _preview_group_dir(cid, "context_cons"), dense_rotated=True, density_from_self=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[consensus] native before/after panel skipped for {cid}: {exc}", file=sys.stderr)
         # Link the scan back to its consensus + subgroup (frontend panel + metrics attribution).
@@ -1713,6 +1713,20 @@ def normalize_consensus(case_id: str) -> dict:
     return {"consensus_case": ccid2, "normalized": True, "n_controls": n_controls,
             "n_replicates": len(members), "report": report,
             "images": orch.preview_images_from_dir("Segmentation", _preview_group_dir(ccid2, "segmentation"))}
+
+
+@app.post("/api/case/{case_id}/skip-normalization")
+def skip_normalization(case_id: str) -> dict:
+    """STEP 9 — skip control-normalisation: keep the aligned consensus AS-IS (no depthnorm re-derivation) and
+    advance the timeline so it can be corrected / scheduled. Records normalization_skipped so the export can
+    note this consensus was NOT control-normalised."""
+    cid = orch.safe_case_id(case_id)
+    m = orch.read_manifest(cid)
+    ccid = cid if m.get("consensus_cases") else (m.get("consensus_case") or "")
+    if not ccid or not orch.read_manifest(ccid).get("consensus_cases"):
+        raise HTTPException(400, "No aligned consensus for this scan yet — align the replicates first.")
+    mm = orch.write_manifest_value(ccid, {"normalized": True, "normalization_skipped": True})
+    return {"ok": True, "consensus_case": ccid, "normalized": bool(mm.get("normalized")), "normalization_skipped": True}
 
 
 class CompareStrategiesRequest(BaseModel):

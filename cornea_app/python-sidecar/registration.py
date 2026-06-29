@@ -61,13 +61,18 @@ def _iso(img: sitk.Image, interp=sitk.sitkLinear, iso: float = ISO) -> sitk.Imag
 
 
 # ── cascade stages ──────────────────────────────────────────────────────────
-def _rigid_intensity(fi: sitk.Image, mi: sitk.Image) -> sitk.Transform:
-    """Multi-resolution rigid (Euler3D) via Mattes MI on raw iso intensities."""
+def _rigid_intensity(fi: sitk.Image, mi: sitk.Image,
+                     fixed_mask: sitk.Image | None = None) -> sitk.Transform:
+    """Multi-resolution rigid (Euler3D = translation + rotation) via Mattes MI on raw iso
+    intensities. When fixed_mask is given the metric is restricted to it (the cornea), so the
+    alignment is driven by the cornea and the dark background is ignored."""
     R = sitk.ImageRegistrationMethod()
     R.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
     R.SetMetricSamplingStrategy(R.RANDOM)
     R.SetMetricSamplingPercentage(0.05, seed=1)
     R.SetInterpolator(sitk.sitkLinear)
+    if fixed_mask is not None:
+        R.SetMetricFixedMask(fixed_mask)   # cornea-only metric → align the cornea, not the background
     R.SetOptimizerAsRegularStepGradientDescent(
         learningRate=0.8, minStep=1e-4, numberOfIterations=80,
         relaxationFactor=0.7, gradientMagnitudeTolerance=1e-6)
@@ -121,43 +126,36 @@ def _cornea_dice_iso(mlab: sitk.Image, flab_iso: sitk.Image,
 
 def align_transform(fixed_vol_path: Path, fixed_label_path: Path,
                     moving_vol_path: Path, moving_label_path: Path) -> tuple[sitk.Transform, str]:
-    """Align the moving scan onto the fixed by the guarded intensity+BSpline cascade.
+    """Align the moving scan onto the fixed by a RIGID-ONLY, CORNEA-MASKED registration.
 
-    Returns (transform, mode) where mode ∈ {"rigid+bspline", "rigid", "identity"}
-    reflecting the last stage that improved cornea overlap. The transform pulls the
-    moving image/label into the fixed grid (sitk fixed→moving convention)."""
+    Translation + rotation ONLY — the volumes are never WARPED/deformed, so the cornea (and the
+    scar inside it) is repositioned rigidly and any residual scar-overlap gap reflects true
+    test–retest variability rather than a deformation forced to inflate overlap. The Mattes-MI
+    metric is restricted to the (dilated) reference cornea, so the dark background is ignored.
+    Kept only if it beats identity on cornea overlap (best-of-identity guard), else identity.
+    Returns (transform, mode∈{"rigid","identity"}); the transform pulls the moving image/label
+    into the fixed grid (sitk fixed→moving convention)."""
     fvol, mvol = _read_vol(fixed_vol_path), _read_vol(moving_vol_path)
     flab, mlab = _read_label(fixed_label_path), _read_label(moving_label_path)
 
     fi, mi = _iso(fvol), _iso(mvol)
     flab_iso = _iso(flab, interp=sitk.sitkNearestNeighbor)
     ref_cm_iso = sitk.GetArrayFromImage(flab_iso) >= CORNEA_MIN
+    # cornea-only metric mask on the iso fixed grid (dilated ~0.2 mm for context; dark bg excluded).
+    cornea_mask_iso = sitk.Cast(
+        sitk.BinaryDilate(sitk.BinaryThreshold(flab_iso, CORNEA_MIN, 255, 1, 0), [10, 10, 10]),
+        sitk.sitkUInt8)
 
-    # Stage 1: intensity rigid, kept only if it beats identity on cornea overlap.
     ident = identity()
+    d_id = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, ident)
     try:
-        rigid = _rigid_intensity(fi, mi)
+        rigid = _rigid_intensity(fi, mi, fixed_mask=cornea_mask_iso)
         d_rig = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, rigid)
     except Exception:  # noqa: BLE001 — diverged optimiser → fall back to identity
         rigid, d_rig = ident, -1.0
-    d_id = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, ident)
-    base = rigid if d_rig > d_id else ident
-    base_dice = max(d_rig, d_id)
-    mode = "rigid" if base is rigid else "identity"
-
-    # Stage 2: minimal cornea-masked BSpline; kept only if it doesn't degrade cornea.
-    fb, mb = _iso(fvol, iso=ISO_B), _iso(mvol, iso=ISO_B)
-    flab_b = _iso(flab, interp=sitk.sitkNearestNeighbor, iso=ISO_B)
-    cornea_mask = sitk.BinaryThreshold(flab_b, CORNEA_MIN, 255, 1, 0)
-    cornea_mask = sitk.Cast(sitk.BinaryDilate(cornea_mask, [4, 4, 2]), sitk.sitkUInt8)
-    try:
-        composite = _minimal_bspline(fb, mb, base, cornea_mask)
-        d_bsp = _cornea_dice_iso(mlab, flab_iso, ref_cm_iso, composite)
-        if d_bsp >= base_dice - 0.002:  # not overfit → accept the warp
-            return composite, "rigid+bspline" if base is rigid else "bspline"
-    except Exception:  # noqa: BLE001 — BSpline failed → keep the rigid/identity base
-        pass
-    return base, mode
+    if d_rig > d_id:
+        return rigid, "rigid"
+    return ident, "identity"
 
 
 # ── Stronger VOLUMETRIC registration (rigid → affine → denser cornea-driven BSpline) ──
