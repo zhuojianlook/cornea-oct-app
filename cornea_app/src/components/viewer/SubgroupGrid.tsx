@@ -46,7 +46,8 @@ export function SubgroupGrid() {
 
   const [orient, setOrient] = useState<Orient>("sagittal");
   const [overlay, setOverlay] = useState<Overlay>("cons");
-  const [mode, setMode] = useState<"consensus" | "grid" | "align" | "overlap" | "both">("consensus");
+  const [mode, setMode] = useState<"consensus" | "grid" | "align" | "overlap">("consensus");
+  const repName = (cid: string) => `replicate ${scans.indexOf(cid) + 1}`;
   const [masterIdx, setMasterIdx] = useState(0);
   const [data, setData] = useState<Record<string, ScanPreviews>>({});
   const [loading, setLoading] = useState(false);
@@ -135,7 +136,6 @@ export function SubgroupGrid() {
           <ToggleButton value="grid" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Scans grid</ToggleButton>
           <ToggleButton value="align" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Volume align</ToggleButton>
           <ToggleButton value="overlap" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Scar overlap</ToggleButton>
-          <ToggleButton value="both" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Both</ToggleButton>
         </ToggleButtonGroup>
         {(mode === "grid" || mode === "consensus") && (
           <>
@@ -189,15 +189,10 @@ export function SubgroupGrid() {
         );
       })()}
       {mode === "align" && consensusId && (
-        <OverlapPairViewer caseId={consensusId} members={scans} refCid={refCid}
-          label="cornea" aSource="ref" aLabel="reference" bLabel="this scan" />
+        <OverlapPairViewer caseId={consensusId} members={scans} refCid={refCid} />
       )}
       {mode === "overlap" && consensusId && (
         <OverlapViewer caseId={consensusId} nScans={scans.length} />
-      )}
-      {mode === "both" && consensusId && (
-        <OverlapPairViewer caseId={consensusId} members={scans} refCid={refCid}
-          label="scar" aSource="consensus" aLabel="consensus" bLabel="this scan" />
       )}
       {mode === "grid" && (<>
         {/* grid headers + rows */}
@@ -208,7 +203,7 @@ export function SubgroupGrid() {
         <div style={{ flex: 1, textAlign: "center" }}>before (raw)</div>
         <div style={{ flex: 1, textAlign: "center", color: "var(--c-green)" }}>after (corrected)</div>
         <div style={{ flex: 1, textAlign: "center", color: "var(--c-accent)" }}>
-          {overlay === "cons" ? "consensus scar" : "this scan's scar"}
+          {overlay === "cons" ? "consensus scar" : "this replicate's scar"}
         </div>
       </div>
 
@@ -237,7 +232,8 @@ export function SubgroupGrid() {
                     <span title="low correspondence (likely a different FOV)"
                       style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--c-red, #ff6b6b)", flex: "none" }} />
                   )}
-                  {shortLabel(cid)} {isRef && <span style={{ color: "var(--c-text-dim)" }} title="reference">★</span>}
+                  {repName(cid)} <span style={{ color: "var(--c-text-dim)", fontWeight: 400 }}>{shortLabel(cid)}</span>
+                  {isRef && <span style={{ color: "var(--c-text-dim)" }} title="alignment anchor">⚓</span>}
                 </span>
                 {ps && (
                   <span className="text-[10px]" style={{ color: "var(--c-text-dim)", lineHeight: 1.3 }}>

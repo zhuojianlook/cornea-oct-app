@@ -1062,6 +1062,109 @@ def get_overlap_nifti(case_id: str, a: str, b: str, label: str = "cornea") -> Fi
     return FileResponse(str(dst), media_type="application/gzip", filename="overlap.nii.gz")
 
 
+@app.get("/api/case/{case_id}/cornea.nii.gz")
+def get_cornea_nifti(case_id: str) -> FileResponse:
+    """The case's CORNEA mask (1 where cornea or scar) — a faint anatomical CONTEXT layer for the scar-overlap
+    view, so the scar agreement isn't floating in empty space. Derived from the corrected labelmap."""
+    cid = orch.safe_case_id(case_id)
+    lp = labels.corrected_path(cid)
+    if not Path(str(lp)).exists():
+        raise HTTPException(404, "No segmentation for this case.")
+    arr = (_read_label_ijk(lp) >= 1).astype(np.uint8)
+    base = orch.case_root(cid) / "previews" / "volume.nii.gz"
+    base = base if base.exists() else lp
+    dst = orch.case_root(cid) / "previews" / "cornea_mask.nii.gz"
+    labels.write_label_nifti(arr, base, dst)
+    return FileResponse(str(dst), media_type="application/gzip", filename="cornea.nii.gz")
+
+
+@app.get("/api/case/{case_id}/align-region/{a}/{b}/{region}.nii.gz")
+def get_align_region_nifti(case_id: str, a: str, b: str, region: str) -> FileResponse:
+    """For Volume-align: a per-region map (1 = cornea, 2 = scar) of ONE of the three regions of the A/B overlap
+    (both in the reference frame). region ∈ {a, b, both}: 'a' = in A but not B, 'b' = in B but not A,
+    'both' = the intersection. The viewer loads all three with distinct colours + independent opacity (cornea
+    faint, scar opaque), so 'what aligns' is clear: red (both) = aligned; a coloured ghost = residual offset."""
+    ccid = orch.safe_case_id(case_id)
+    if not orch.read_manifest(ccid).get("consensus_cases"):
+        raise HTTPException(400, "Not a consensus case — align the replicates first.")
+    if region not in ("a", "b", "both"):
+        raise HTTPException(400, "region must be a|b|both.")
+
+    def _lab(src: str) -> np.ndarray:
+        p = labels.corrected_path(ccid) if src == "consensus" else orch.case_root(ccid) / "scans" / orch.safe_case_id(src) / "label.nii.gz"
+        if not Path(str(p)).exists():
+            raise HTTPException(404, f"No warped label for '{src}' — rebuild the consensus.")
+        return _read_label_ijk(p)
+
+    la, lb = _lab(a), _lab(b)
+    if la.shape != lb.shape:
+        raise HTTPException(400, "Operands differ in shape — rebuild the consensus.")
+    ac, bc, asc, bsc = la >= 1, lb >= 1, la == 2, lb == 2
+    if region == "a":
+        cm, sm = ac & ~bc, asc & ~bsc
+    elif region == "b":
+        cm, sm = bc & ~ac, bsc & ~asc
+    else:
+        cm, sm = ac & bc, asc & bsc
+    out = np.zeros(la.shape, dtype=np.uint8)
+    out[cm] = 1          # region cornea
+    out[sm] = 2          # region scar (overrides cornea where both)
+    base = orch.case_root(ccid) / "previews" / "volume.nii.gz"
+    dst = orch.case_root(ccid) / "previews" / f"align_{orch.safe_case_id(a)}_{orch.safe_case_id(b)}_{region}.nii.gz"
+    labels.write_label_nifti(out, base, dst)
+    return FileResponse(str(dst), media_type="application/gzip", filename="region.nii.gz")
+
+
+class ConsensusScarRequest(BaseModel):
+    mode: str = "own"   # "consensus" → push the voted consensus scar to every member; "own" → keep each member's
+
+
+@app.post("/api/case/{case_id}/consensus-scar")
+def consensus_scar_choice(case_id: str, req: ConsensusScarRequest | None = None) -> dict:
+    """STEP 9 scar-source decision for an aligned consensus. mode='consensus' → set each member's
+    corrected_labelmap = its own cornea + the VOTED CONSENSUS scar mapped into that member's native frame
+    (cons_native.nii.gz, already truncated to the member's cornea + data FOV, so a partial-FOV scan only gets
+    the part of the consensus scar within its own data). mode='own' → keep each member's own scar (no-op).
+    Records consensus_scar_source on the consensus + each member."""
+    mode = (req.mode if req else "own").strip().lower()
+    if mode not in ("consensus", "own"):
+        raise HTTPException(400, "mode must be 'consensus' or 'own'.")
+    cid = orch.safe_case_id(case_id)
+    m = orch.read_manifest(cid)
+    ccid = cid if m.get("consensus_cases") else (m.get("consensus_case") or "")
+    if not ccid or not orch.read_manifest(ccid).get("consensus_cases"):
+        raise HTTPException(400, "No aligned consensus for this scan yet — align the replicates first.")
+    members = list(orch.read_manifest(ccid).get("consensus_cases") or [])
+    applied = []
+    if mode == "consensus":
+        scans_dir = orch.case_root(ccid) / "scans"
+        for mc in members:
+            cn = scans_dir / orch.safe_case_id(mc) / "cons_native.nii.gz"
+            nat_vol = orch.case_root(mc) / "previews" / "volume.nii.gz"
+            if not cn.exists() or not nat_vol.exists():
+                print(f"[consensus-scar] no native consensus map for {mc} — skipped", file=sys.stderr)
+                continue
+            try:
+                labels.write_label_nifti(_read_label_ijk(cn), nat_vol, labels.corrected_path(mc))
+                # the member's OWN scar is now the consensus scar — refresh its context_seg preview so the
+                # Scans-grid "Per scan" column matches the new labelmap (else it shows the pre-apply scar).
+                try:
+                    postprocess.render_seg_previews(nat_vol, _read_label_ijk(labels.corrected_path(mc)),
+                                                    _preview_group_dir(mc, "context_seg"), dense_rotated=True, density_from_self=True)
+                except Exception:  # noqa: BLE001 — preview refresh is best-effort
+                    pass
+                orch.case_qa_json(mc).unlink(missing_ok=True)   # stale QA; recomputed on next view
+                orch.write_manifest_value(mc, {"corrected_labelmap": True, "consensus_scar_source": "consensus"})
+                applied.append(mc)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[consensus-scar] apply failed for {mc}: {exc}", file=sys.stderr)
+    else:
+        for mc in members:
+            orch.write_manifest_value(mc, {"consensus_scar_source": "own"})
+    orch.write_manifest_value(ccid, {"consensus_scar_source": mode})
+    return {"ok": True, "mode": mode, "members": members, "applied": applied}
+
+
 @app.get("/api/case/{case_id}/agreement-stats")
 def get_agreement_stats(case_id: str, tol_mm: float = 0.0) -> dict:
     """Reproducibility readout for the overlap viewer at boundary tolerance `tol_mm`: tier volumes +
@@ -1501,19 +1604,26 @@ def _build_consensus_case(cases: List[str], group: str | None = None,
         cons_clipped = np.where(data_mask, cons_lab, 0).astype(np.uint8)
         postprocess.render_seg_previews(svol, slab, _preview_group_dir(ccid, f"scan_{cid}_self"), density_from_self=True)
         postprocess.render_seg_previews(svol, cons_clipped, _preview_group_dir(ccid, f"scan_{cid}_cons"), density_from_self=True)
-        # Dense+rotated overlays in the SCAN's NATIVE frame for the gallery's 3rd before/after
-        # panel (aligns slice-for-slice with raw/corrected): own cornea+scar (context_seg) and
-        # the subgroup consensus mapped to native (context_cons). Convenience — never fail build.
+        # Dense+rotated overlays in the SCAN's NATIVE frame for the gallery's 3rd before/after panel (aligns
+        # slice-for-slice with raw/corrected). context_seg (own cornea+scar) and context_cons (the subgroup
+        # consensus scar mapped to this scan's native frame) are rendered in SEPARATE try blocks so a failure
+        # of one never silently drops the other — the Scans-grid "Per scan ↔ Consensus" toggle needs BOTH.
+        nat_vol = orch.case_root(cid) / "previews" / "volume.nii.gz"
         try:
-            nat_vol = orch.case_root(cid) / "previews" / "volume.nii.gz"
-            own = _read_label_ijk(labels.corrected_path(cid))
-            postprocess.render_seg_previews(nat_vol, own, _preview_group_dir(cid, "context_seg"), dense_rotated=True, density_from_self=True)
-            cons_native = scans_dir / cid / "cons_native.nii.gz"
-            if cons_native.exists():
-                postprocess.render_seg_previews(nat_vol, _read_label_ijk(cons_native),
-                                                _preview_group_dir(cid, "context_cons"), dense_rotated=True, density_from_self=True)
+            postprocess.render_seg_previews(nat_vol, _read_label_ijk(labels.corrected_path(cid)),
+                                            _preview_group_dir(cid, "context_seg"), dense_rotated=True, density_from_self=True)
         except Exception as exc:  # noqa: BLE001
-            print(f"[consensus] native before/after panel skipped for {cid}: {exc}", file=sys.stderr)
+            print(f"[consensus] context_seg panel skipped for {cid}: {exc}", file=sys.stderr)
+        try:
+            cons_native = scans_dir / cid / "cons_native.nii.gz"
+            # Fall back to the scan's own CORNEA (no scar) if the native consensus map is missing, so the
+            # Consensus toggle ALWAYS shows a distinct (scar-free) result instead of reusing the per-scan image.
+            cons_lab_native = (_read_label_ijk(cons_native) if cons_native.exists()
+                               else np.where(_read_label_ijk(labels.corrected_path(cid)) >= 1, 1, 0).astype(np.uint8))
+            postprocess.render_seg_previews(nat_vol, cons_lab_native,
+                                            _preview_group_dir(cid, "context_cons"), dense_rotated=True, density_from_self=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[consensus] context_cons panel skipped for {cid}: {exc}", file=sys.stderr)
         # Link the scan back to its consensus + subgroup (frontend panel + metrics attribution).
         orch.write_manifest_value(cid, {"consensus_case": ccid, "scar_subgroup": sub_label})
 

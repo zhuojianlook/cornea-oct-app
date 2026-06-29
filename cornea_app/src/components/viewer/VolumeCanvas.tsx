@@ -237,8 +237,10 @@ export function VolumeCanvas() {
     );
   }
 
-  // A per-subgroup consensus: the synchronized multi-scan grid is the view (2D, no WebGL needed).
-  if (isSubgroup) {
+  // A per-subgroup consensus: the synchronized multi-scan grid is the view (2D, no WebGL needed) — EXCEPT
+  // while correcting the consensus itself, where the niivue paint layer + PaintToolbar must show (otherwise
+  // the grid would hide the brush). The grid returns as soon as the correction is saved/cancelled.
+  if (isSubgroup && !correcting) {
     return (
       <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
         <SubgroupGrid />

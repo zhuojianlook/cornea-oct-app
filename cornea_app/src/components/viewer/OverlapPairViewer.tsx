@@ -1,9 +1,10 @@
-/* Pairwise OVERLAP viewer (cornea-align + per-scan-vs-consensus "Both").
-   Renders a single 3-label overlap map served by /api/case/{id}/overlap/{a}/{b}.nii.gz?label=…:
-     1 = A only (blue) · 2 = B only (amber) · 3 = both (red) · 0 = neither (transparent).
-   There is NO grayscale background — only the cornea (or scar) of the two registered scans, so where the
-   red overlaps the corneas are aligned and a coloured ghost off the red is residual misalignment. Used for
-   "Volume align" (label=cornea, A=reference) and "Both" (label=scar, A=voted consensus). Owns its Niivue. */
+/* Volume-align viewer — pairwise cornea+scar alignment of two replicates in the reference frame.
+   The A/B overlap is split into THREE region maps served by /api/case/{id}/align-region/{a}/{b}/{region}:
+   region "a" (in A only), "b" (in B only), "both" (the intersection). Each is loaded as its own niivue
+   volume so it gets its OWN colour and its OWN opacity slider — and within each, the cornea is faint and
+   the scar opaque (the bright scar "constellation" is what alignment is really about). So: red (both) = the
+   two replicates align; a coloured ghost off the red = a residual rigid (xyz + rotation) offset. There is
+   NO grayscale background. Owns its own niivue instance. */
 
 import { useEffect, useRef, useState } from "react";
 import { Niivue, SLICE_TYPE } from "@niivue/niivue";
@@ -17,31 +18,38 @@ const VIEWS = {
   sagittal: SLICE_TYPE.SAGITTAL,
 } as const;
 type ViewKey = keyof typeof VIEWS;
-const short = (cid: string) => cid.split("_").pop() || cid;
 
-// value 0 → transparent; 1 = A (blue); 2 = B (amber); 3 = both (red). With cal_min 0 / cal_max 3 the values
-// map to LUT indices 0 / 85 / 170 / 255 = the four control points below.
-const PAIR_CMAP = { R: [0, 60, 245, 235], G: [0, 165, 200, 40], B: [0, 255, 45, 40], A: [0, 215, 215, 255], I: [0, 85, 170, 255] };
-const A_RGB = "rgb(60,165,255)", B_RGB = "rgb(245,200,45)", BOTH_RGB = "rgb(235,40,40)";
+// Per-region colormaps over value 0/1/2 (cal_min 0 / cal_max 2 → indices 0/128/255). Value 1 = cornea
+// (faint, A≈95), value 2 = scar (opaque, A≈235). A = replicate-A colour, B = replicate-B colour, both = red.
+const RG_A = { R: [0, 70, 70], G: [0, 150, 180], B: [0, 255, 255], A: [0, 95, 235], I: [0, 128, 255] };
+const RG_B = { R: [0, 245, 245], G: [0, 185, 205], B: [0, 40, 40], A: [0, 95, 235], I: [0, 128, 255] };
+const RG_BOTH = { R: [0, 235, 235], G: [0, 70, 45], B: [0, 70, 45], A: [0, 95, 235], I: [0, 128, 255] };
+const A_RGB = "rgb(70,170,255)", B_RGB = "rgb(245,195,45)", BOTH_RGB = "rgb(235,55,45)";
 
-export function OverlapPairViewer({
-  caseId, members, refCid, label, aSource, aLabel, bLabel,
-}: {
-  caseId: string; members: string[]; refCid?: string;
-  label: "cornea" | "scar"; aSource: "ref" | "consensus"; aLabel: string; bLabel: string;
-}) {
-  const ref = refCid && members.includes(refCid) ? refCid : members[0];
-  const a = aSource === "consensus" ? "consensus" : ref;
-  const bOptions = aSource === "consensus" ? members : members.filter((m) => m !== ref);
+export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string; members: string[]; refCid?: string }) {
+  const aRef = refCid && members.includes(refCid) ? refCid : members[0];
+  const bOptions = members.filter((m) => m !== aRef);
+  const repName = (cid: string) => `replicate ${members.indexOf(cid) + 1}`;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const nvRef = useRef<Niivue | null>(null);
   const [b, setB] = useState(bOptions[0] ?? "");
   const [view, setView] = useState<ViewKey>("render");
-  const [opacity, setOpacity] = useState(0.9);
+  const [opA, setOpA] = useState(0.85);
+  const [opB, setOpB] = useState(0.85);
+  const [opBoth, setOpBoth] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const ovUrl = (bb: string) => resourceUrl(`/api/case/${caseId}/overlap/${a}/${bb}.nii.gz?label=${label}&t=${Date.now()}`);
+  const regionUrl = (region: string, bb: string) =>
+    resourceUrl(`/api/case/${caseId}/align-region/${aRef}/${bb}/${region}.nii.gz?t=${Date.now()}`);
+
+  const loadPair = async (nv: Niivue, bb: string) => {
+    await nv.loadVolumes([
+      { url: regionUrl("a", bb), colormap: "rgA", opacity: opA, cal_min: 0, cal_max: 2 },
+      { url: regionUrl("b", bb), colormap: "rgB", opacity: opB, cal_min: 0, cal_max: 2 },
+      { url: regionUrl("both", bb), colormap: "rgBoth", opacity: opBoth, cal_min: 0, cal_max: 2 },
+    ]);
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -51,7 +59,7 @@ export function OverlapPairViewer({
     const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false });
     try {
       nv.attachToCanvas(canvas);
-      try { nv.addColormap("pair3", PAIR_CMAP); } catch { /* older niivue → fall back to "warm" */ }
+      try { nv.addColormap("rgA", RG_A); nv.addColormap("rgB", RG_B); nv.addColormap("rgBoth", RG_BOTH); } catch { /* older niivue */ }
       nvRef.current = nv;
     } catch (e) {
       setError(`Niivue failed to initialise: ${e instanceof Error ? e.message : String(e)}`);
@@ -59,8 +67,7 @@ export function OverlapPairViewer({
       return;
     }
     (async () => {
-      const cmap = (nv.colormaps?.() ?? []).includes("pair3") ? "pair3" : "warm";
-      if (b) await nv.loadVolumes([{ url: ovUrl(b), colormap: cmap, opacity, cal_min: 0, cal_max: 3 }]);
+      if (b) await loadPair(nv, b);
       if (cancelled) return;
       nv.setSliceType(VIEWS.render);
       nv.updateGLVolume();
@@ -71,15 +78,13 @@ export function OverlapPairViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
-  // swap the compared scan. Skip the initial run (volumes still empty) — the mount effect does the first
-  // load; otherwise both fire on mount and race to append two copies (breaking the single-volume opacity).
+  // swap the compared replicate
   useEffect(() => {
     const nv = nvRef.current;
-    if (!nv || !b || nv.volumes.length === 0) return;
+    if (!nv || !b || nv.volumes.length === 0) return;   // skip the initial run (mount effect does the first load)
     let cancelled = false;
     (async () => {
-      const cmap = (nv.colormaps?.() ?? []).includes("pair3") ? "pair3" : "warm";
-      await nv.loadVolumes([{ url: ovUrl(b), colormap: cmap, opacity, cal_min: 0, cal_max: 3 }]);
+      await loadPair(nv, b);
       if (!cancelled) { nv.setSliceType(VIEWS[view]); nv.updateGLVolume(); }
     })().catch((e) => !cancelled && setError(String(e)));
     return () => { cancelled = true; };
@@ -87,7 +92,18 @@ export function OverlapPairViewer({
   }, [b]);
 
   useEffect(() => { nvRef.current?.setSliceType(VIEWS[view]); }, [view]);
-  useEffect(() => { const nv = nvRef.current; if (nv && nv.volumes.length) { nv.setOpacity(0, opacity); nv.drawScene(); } }, [opacity]);
+  useEffect(() => { const nv = nvRef.current; if (nv && nv.volumes.length >= 1) { nv.setOpacity(0, opA); nv.drawScene(); } }, [opA]);
+  useEffect(() => { const nv = nvRef.current; if (nv && nv.volumes.length >= 2) { nv.setOpacity(1, opB); nv.drawScene(); } }, [opB]);
+  useEffect(() => { const nv = nvRef.current; if (nv && nv.volumes.length >= 3) { nv.setOpacity(2, opBoth); nv.drawScene(); } }, [opBoth]);
+
+  const opSlider = (label: string, rgb: string, val: number, set: (v: number) => void) => (
+    <div className="flex items-center gap-2" style={{ width: 168 }}>
+      <span className="flex items-center gap-1 text-[11px] whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
+        <span style={{ width: 10, height: 10, borderRadius: 2, background: rgb, flex: "none" }} />{label}
+      </span>
+      <Slider size="small" min={0} max={1} step={0.05} value={val} onChange={(_, v) => set(v as number)} />
+    </div>
+  );
 
   return (
     <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
@@ -98,26 +114,22 @@ export function OverlapPairViewer({
           <ToggleButton value="axial">Axial</ToggleButton>
           <ToggleButton value="sagittal">Sagittal</ToggleButton>
         </ToggleButtonGroup>
-        <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{aLabel} vs</span>
+        <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{repName(aRef)} vs</span>
         <ToggleButtonGroup size="small" exclusive value={b} onChange={(_, v) => v && setB(v)}>
           {bOptions.map((m) => (
-            <ToggleButton key={m} value={m} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>{short(m)}</ToggleButton>
+            <ToggleButton key={m} value={m} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>{repName(m)}</ToggleButton>
           ))}
         </ToggleButtonGroup>
-        <div className="flex items-center gap-2" style={{ width: 130 }}>
-          <span className="text-[11px] whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>opacity</span>
-          <Slider size="small" min={0} max={1} step={0.05} value={opacity} onChange={(_, v) => setOpacity(v as number)} />
-        </div>
-        <div className="flex items-center gap-3" style={{ marginLeft: "auto" }}>
-          <span className="flex items-center gap-1 text-[11px]" style={{ color: "var(--c-text-dim)" }}><span style={{ width: 10, height: 10, borderRadius: 2, background: A_RGB }} />{aLabel}</span>
-          <span className="flex items-center gap-1 text-[11px]" style={{ color: "var(--c-text-dim)" }}><span style={{ width: 10, height: 10, borderRadius: 2, background: B_RGB }} />{bLabel}</span>
-          <span className="flex items-center gap-1 text-[11px]" style={{ color: "var(--c-text-dim)" }}><span style={{ width: 10, height: 10, borderRadius: 2, background: BOTH_RGB }} />overlap</span>
-        </div>
+      </div>
+      <div className="flex items-center gap-4 px-3 py-1 border-b flex-wrap" style={{ minHeight: 36, borderColor: "var(--c-border)" }}>
+        {opSlider(repName(aRef), A_RGB, opA, setOpA)}
+        {opSlider(repName(b) || "replicate B", B_RGB, opB, setOpB)}
+        {opSlider("overlap", BOTH_RGB, opBoth, setOpBoth)}
+        <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>cornea faint · scar opaque</span>
       </div>
       <div className="px-3 py-1 border-b text-[11px]" style={{ borderColor: "var(--c-border)", color: "var(--c-text-dim)" }}>
-        {label === "cornea"
-          ? "Cornea of each registered scan in the reference frame (no background). Overlap (red) = aligned; a coloured ghost off the red = residual misalignment (rigid translation/rotation only — no warping)."
-          : "Per-scan scar vs the voted consensus scar. Overlap (red) = agreement; coloured-only = where they differ."}
+        Two replicates in the reference frame (cornea + scar, no background). <b style={{ color: BOTH_RGB }}>Red</b> = the
+        scans align; a coloured ghost off the red = a residual rigid offset (translation/rotation only — no warping).
       </div>
       <div className="relative flex-1 min-h-0 min-w-0">
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />

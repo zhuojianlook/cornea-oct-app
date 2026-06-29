@@ -76,9 +76,12 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
       return;
     }
     (async () => {
-      // No grayscale anatomy background — show ONLY the scar agreement (overlap core = red), per spec.
+      // Faint CONSENSUS CORNEA as context (so the scar agreement isn't floating in empty space — no raw
+      // grayscale anatomy though), with the scar agreement (overlap core = red) on top.
       const cmap = (nv.colormaps?.() ?? []).includes("overlap3") ? "overlap3" : "warm";
-      await nv.loadVolumes([{ url: agreementUrl(0), colormap: cmap, opacity: 1, cal_min: 16, cal_max: 100 }]);
+      const corneaUrl = resourceUrl(`/api/case/${caseId}/cornea.nii.gz?t=${Date.now()}`);
+      await nv.loadVolumes([{ url: corneaUrl, colormap: "gray", opacity: 1, cal_min: 0, cal_max: 4 }]);
+      await nv.addVolumeFromUrl({ url: agreementUrl(0), colormap: cmap, opacity, cal_min: 16, cal_max: 100 });
       if (cancelled) return;
       nv.setSliceType(VIEWS.render);
       nv.updateGLVolume();
@@ -93,7 +96,7 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
   useEffect(() => { nvRef.current?.setSliceType(VIEWS[view]); }, [view]);
   useEffect(() => {
     const nv = nvRef.current;
-    if (nv && nv.volumes.length >= 1) { nv.setOpacity(0, opacity); nv.drawScene(); }
+    if (nv && nv.volumes.length > 1) { nv.setOpacity(nv.volumes.length - 1, opacity); nv.drawScene(); }
   }, [opacity]);
 
   // Reload the overlay at a new boundary tolerance (slider release) + refresh the readout.
@@ -103,7 +106,8 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
     if (!nv) return;
     setBusy(true);
     try {
-      await nv.loadVolumes([{ url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 }]);
+      while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);   // keep the cornea base
+      await nv.addVolumeFromUrl({ url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 });
       nv.setSliceType(VIEWS[view]);
       nv.updateGLVolume();
       await fetchStats(tol);

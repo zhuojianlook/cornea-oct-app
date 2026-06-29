@@ -23,6 +23,8 @@ export function TimelineBar() {
   const alignReplicates = useWorkflowStore((s) => s.alignReplicates);
   const normalizeConsensus = useWorkflowStore((s) => s.normalizeConsensus);
   const skipNormalization = useWorkflowStore((s) => s.skipNormalization);
+  const applyConsensusScar = useWorkflowStore((s) => s.applyConsensusScar);
+  const correctBusy = useWorkflowStore((s) => s.correctBusy);
   const compareStrategies = useWorkflowStore((s) => s.compareStrategies);
   const cancelCompareStrategies = useWorkflowStore((s) => s.cancelCompareStrategies);
   const strategyComparison = useWorkflowStore((s) => s.strategyComparison);
@@ -156,13 +158,16 @@ export function TimelineBar() {
 
   // ── reusable action sub-controls ──
   const Correct = !correcting ? (
-    <Button size="small" variant="outlined" disabled={busy || !segLoaded} onClick={() => { set("corneaOnlyPaint", false); loadCorrectionLayer(); }}
-      title="Edit the labelmap with the pen (cornea/scar/erase), then Save">Correct ✎</Button>
+    <Button size="small" variant="outlined" disabled={busy || !segLoaded || correctBusy} onClick={() => { set("corneaOnlyPaint", false); loadCorrectionLayer(); }}
+      startIcon={correctBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+      title="Edit the labelmap with the pen (cornea/scar/erase), then Save">{correctBusy ? "Loading…" : "Correct ✎"}</Button>
   ) : (
     <>
-      <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => saveCorrection()}>Save correction</Button>
+      <Button size="small" variant="contained" color="secondary" disabled={busy || correctBusy} onClick={() => saveCorrection()}
+        startIcon={segBusy ? <CircularProgress size={13} color="inherit" /> : undefined}>{segBusy ? "Saving…" : "Save correction"}</Button>
       {/* Undo lives in the pen bar (PaintToolbar) — no duplicate here (#4). */}
-      <Button size="small" variant="outlined" color="inherit" disabled={busy} onClick={() => cancelCorrection()}>Cancel</Button>
+      <Button size="small" variant="outlined" color="inherit" disabled={busy || correctBusy} onClick={() => cancelCorrection()}
+        startIcon={correctBusy ? <CircularProgress size={13} color="inherit" /> : undefined}>{correctBusy ? "Cancelling…" : "Cancel"}</Button>
     </>
   );
 
@@ -220,6 +225,23 @@ export function TimelineBar() {
       title="Skip control-normalisation — keep the aligned consensus as-is, then correct / schedule it.">
       ⏭ Skip normalization
     </Button>
+  );
+  // STEP 9 scar-source decision: which scar boundary becomes each replicate's TRAINING label.
+  const scarSource = (manifest?.consensus_scar_source as string | undefined) ?? null;
+  const ScarSource = (
+    <span className="flex items-center gap-1.5">
+      <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Training scar:</span>
+      <Button size="small" variant={scarSource === "consensus" ? "contained" : "outlined"} color="info" disabled={busy || correcting}
+        onClick={() => applyConsensusScar("consensus")}
+        title="Use the voted CONSENSUS scar for EVERY replicate (each truncated to its own data FOV, so a partial scan only gets the part within its data). Most reproducible training label.">
+        Use consensus (all)
+      </Button>
+      <Button size="small" variant={scarSource === "own" ? "contained" : "outlined"} color="inherit" disabled={busy || correcting}
+        onClick={() => applyConsensusScar("own")}
+        title="Keep each replicate's OWN scar boundary as its training label.">
+        Keep each replicate's
+      </Button>
+    </span>
   );
   // STEP 6: confirm this scan's subgroup (which lesion set it belongs to → which repeats align together).
   const SubgroupConfirm = (
@@ -427,12 +449,13 @@ export function TimelineBar() {
       </>
     );
   } else if (step === 9) {
-    // aligned (teal) → normalize against controls, or SKIP normalization (use the consensus as-is); then
-    // correct. Schedule/Export/Compare are NOT here — they live at the later (normalized/corrected) steps.
-    actions = <>{NormalizeBtn}{sep}{SkipNormBtn}{sep}{Correct}</>;
+    // aligned (teal) → choose the TRAINING scar (each replicate's own vs the voted consensus), then normalize
+    // against controls or SKIP normalization (use the consensus as-is); Correct to touch up. Schedule/Export
+    // are NOT here — they live at the later (corrected/scheduled) steps.
+    actions = <>{ScarSource}{sep}{NormalizeBtn}{sep}{SkipNormBtn}{sep}{Correct}</>;
   } else if (step === 10) {
-    // normalized (cyan) → correct / schedule
-    actions = <>{Correct}{sep}{ScheduleBtn}{ExportBtn}</>;
+    // normalized (cyan) → correct only; scheduling/export live at the corrected/scheduled steps (11/12).
+    actions = <>{Correct}</>;
   } else if (step === 11) {
     // manually corrected (dark blue)
     actions = <>{ScheduleBtn}{sep}{Correct}{ExportBtn}</>;
@@ -453,10 +476,11 @@ export function TimelineBar() {
       <div className="flex items-center gap-3 px-3 overflow-x-auto [&>*]:shrink-0" style={{ minHeight: 28 }}>
         {strip}
       </div>
-      {/* Row 2 — the action BUTTONS for the current step (+ compare strategies + live progress). */}
-      <div className="flex items-center gap-3 px-3 overflow-x-auto [&>*]:shrink-0 border-t" style={{ minHeight: 40, borderColor: "var(--c-border)" }}>
-        <div className="flex items-center gap-2 [&>*]:shrink-0">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
-        <div className="flex-1" />
+      {/* Row 2 — the action BUTTONS for the current step (+ compare strategies + live progress). Wraps onto
+          extra rows when a step has many controls, rather than scrolling off-screen. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1 border-t" style={{ minHeight: 40, borderColor: "var(--c-border)" }}>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
+        <div className="flex-1" style={{ minWidth: 12 }} />
         {/* PUBLICATION: compare scar-detection strategies' reproducibility across the eye's replicates. Lives
             ONLY in the Scar-detection step (7) — where you pick a detector, AFTER subgroup is assigned, so the
             comparison is PER-SUBGROUP. Needs ≥2 cornea-segmented replicates of the eye+subgroup; a control has
