@@ -176,9 +176,10 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
     ref_scar = ref_lab == REF_SCAR
 
     scans_dir = orch.case_root(consensus_case_id) / "scans"
-    warped_scars = {}
+    warped_scars = {}                                  # vote artifacts (scar-best-of guarded) → build the consensus
+    report_scars = {}                                  # CORNEA-driven warp → HONEST out-of-sample reproducibility
     data_masks = {}                                    # scan → where it has image data (post-warp FOV)
-    transforms = {}                                    # scan → the chosen scan→ref transform
+    transforms = {}                                    # scan → the chosen scan→ref transform (for the consensus vote)
     per_scan = []
     for c in cids:
         if c == ref:
@@ -186,6 +187,7 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
             wlab = ref_lab
             mode, sd = "reference", 1.0
             chosen = reg.identity()
+            report_scars[c] = ref_scar
         else:
             # Align by the guarded intensity+BSpline cascade on the RAW volumes
             # (masks alone can't localise the gross inter-scan shift; see registration.py).
@@ -193,14 +195,19 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
                                            _vol_path(c), labels.corrected_path(c))
             lab_reg = reg.resample_label(labels.corrected_path(c), ref_vol_path, tx)
             lab_id = reg.resample_label(labels.corrected_path(c), ref_vol_path, reg.identity())
-            # best-of guard (final safety net): never accept an alignment whose scar
-            # overlaps the reference worse than no registration at all.
+            # best-of guard (safety net for the CONSENSUS VOTE only): never let a scan VOTE with an alignment
+            # whose scar overlaps the reference worse than no registration at all.
             if _dice(ref_scar, lab_reg == REF_SCAR) >= _dice(ref_scar, lab_id == REF_SCAR):
                 wlab, chosen = lab_reg, tx
             else:
                 wlab, chosen, mode = lab_id, reg.identity(), "identity"
             wvol = reg.resample_volume(_vol_path(c), ref_vol_path, chosen)
-            sd = round(_dice(ref_scar, wlab == REF_SCAR), 3)
+            # REPORTED reproducibility uses the CORNEA-driven alignment (tx, chosen independently of scar) so
+            # the scar Dice is an HONEST out-of-sample measure — NOT the scar-overlap-maximising pick the vote
+            # uses (reporting the metric you optimised is optimistically biased). The consensus mask is
+            # unchanged: it still votes with warped_scars below.
+            report_scars[c] = lab_reg == REF_SCAR
+            sd = round(_dice(ref_scar, report_scars[c]), 3)
         warped_scars[c] = wlab == REF_SCAR
         transforms[c] = chosen
         wvol_arr = sitk.GetArrayFromImage(wvol)
@@ -268,7 +275,9 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
         # barely overlapping a small consensus looked perfect.)
         p["matched_fraction"] = _frac(consensus, warped_scars[c])
         p["low_correspondence"] = p["matched_fraction"] < 0.3 and p["role"] != "reference"
-        p["scar_dice_to_ref_fov"] = round(_dice(ref_scar & common, warped_scars[c] & common), 3)
+        # FOV-restricted scar Dice TO REF is a reproducibility metric → use the cornea-driven warp (report_scars)
+        # so it is an honest out-of-sample number, consistent with scar_dice_to_ref + mean_pairwise.
+        p["scar_dice_to_ref_fov"] = round(_dice(ref_scar & common, report_scars[c] & common), 3)
         union = data_masks[c] | ref_mask
         p["fov_overlap_fraction"] = round(float(common.sum()) / float(union.sum() or 1), 3)
 
@@ -276,13 +285,15 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
     # Sample std (ddof=1) is the correct test-retest dispersion estimator for a small
     # set of repeat acquisitions; population std (ddof=0) understates reproducibility CV.
     mean = float(np.mean(vols)); std = float(np.std(vols, ddof=1)) if len(vols) > 1 else 0.0
-    pair = [round(_dice(warped_scars[cids[i]], warped_scars[cids[j]]), 3)
+    # Pairwise reproducibility Dice → cornea-driven warp (report_scars), the honest out-of-sample measure
+    # (independent of the scar-overlap-maximising pick the consensus vote uses).
+    pair = [round(_dice(report_scars[cids[i]], report_scars[cids[j]]), 3)
             for i in range(n) for j in range(i + 1, n)]
     pair_fov = []
     for i in range(n):
         for j in range(i + 1, n):
             common = data_masks[cids[i]] & data_masks[cids[j]]
-            pair_fov.append(round(_dice(warped_scars[cids[i]] & common, warped_scars[cids[j]] & common), 3))
+            pair_fov.append(round(_dice(report_scars[cids[i]] & common, report_scars[cids[j]] & common), 3))
 
     # write consensus labelmap (cornea=1, consensus scar=2) + agreement (prob*100) map
     cons_label = np.where(ref_cornea, REF_CORNEA, 0).astype(np.uint8)
@@ -306,6 +317,10 @@ def build_consensus(case_ids, consensus_case_id, reference=None) -> dict:
         "union_mm3": round(float(((votes >= 1) & ref_cornea).sum() * vmm3), 4),
         "mean_pairwise_scar_dice": round(float(np.mean(pair)), 3) if pair else None,
         "mean_pairwise_scar_dice_fov": round(float(np.mean(pair_fov)), 3) if pair_fov else None,
+        # Provenance for the paper: all reported scar Dice (per-scan + pairwise, full + FOV) are measured on
+        # the CORNEA-driven alignment (chosen independently of scar), so they are honest out-of-sample
+        # reproducibility — not the scar-overlap-maximising alignment used to build the consensus vote.
+        "repro_alignment": "cornea_driven",
         "per_scan": per_scan,
         "scans": cids,
     }

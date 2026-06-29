@@ -472,10 +472,16 @@ def _correct_surface(surface_y: np.ndarray, max_jump: float) -> np.ndarray:
     n = surface_y.size
     if n < 2:
         return surface_y
-    outlier = np.zeros(n, dtype=bool)
-    for i in range(1, n):
-        if abs(surface_y[i] - surface_y[i - 1]) > max_jump:
-            outlier[i] = True
+    # Flag the SPIKE itself (at ANY index, including 0) by its deviation from a LOCAL MEDIAN. The old
+    # predecessor-difference test (abs(y[i]-y[i-1])>max_jump) had two real defects: (1) it never tested
+    # index 0, so a first-frame spike was never corrected; (2) when y[i] is a spike and y[i+1] is the good
+    # value, the |y[i+1]-y[i]| jump flagged the GOOD sample (the one that "jumps back") and interpolated it
+    # away instead of the spike. A robust local-median test flags the actual outlier regardless of position;
+    # smooth corneal curvature stays within max_jump of its local median so it is never flagged.
+    k = max(3, int(2 * round(max_jump / 5.0)) + 1)      # small odd window (~5 for the default max_jump=10)
+    k = min(k, n)
+    med = ndimage.median_filter(surface_y, size=k)
+    outlier = np.abs(surface_y - med) > max_jump
     valid = np.where(~outlier)[0]
     if len(valid) < 2:
         return surface_y

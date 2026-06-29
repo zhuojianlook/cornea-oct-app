@@ -419,3 +419,28 @@ class TestAxialRefineNeverWorse:
         # the guard reports a (never-worse) smoothness comparison.
         assert info["surf_rms_after"] <= info["surf_rms_before"] + 1e-9
         assert "applied" in info
+
+
+# ── _correct_surface robust-outlier fix (v0.0.95): flags the spike at ANY index (incl. 0), not the
+#    good neighbour, via a local-median test instead of the predecessor-difference test. ──
+def test_correct_surface_fixes_first_frame_spike():
+    base = np.arange(100.0, 120.0)          # smooth slope-1 line
+    y = base.copy(); y[0] = 300.0           # spike at index 0 (the old loop never tested index 0)
+    out = M._correct_surface(y, max_jump=10.0)
+    assert abs(out[0] - 100.0) < 6.0        # the spike is corrected toward the line
+    assert np.allclose(out[1:], base[1:])   # every good sample is untouched
+
+
+def test_correct_surface_replaces_spike_not_good_neighbour():
+    base = np.arange(100.0, 120.0)
+    y = base.copy(); y[10] = 300.0          # mid spike
+    out = M._correct_surface(y, max_jump=10.0)
+    assert abs(out[10] - 110.0) < 6.0       # the SPIKE (index 10) is the one replaced
+    assert out[9] == 109.0 and out[11] == 111.0   # the good neighbours are NOT overwritten
+
+
+def test_correct_surface_leaves_smooth_curve_untouched():
+    x = np.linspace(-1.0, 1.0, 40)
+    y = 200.0 - 50.0 * (x ** 2)             # smooth dome, per-step change << max_jump
+    out = M._correct_surface(y, max_jump=10.0)
+    assert np.allclose(out, y)              # no false positives on legitimate curvature
