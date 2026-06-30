@@ -141,6 +141,15 @@ DEFAULT_PARAMS: dict = {
     "crop_min_slices": 3,
     "crop_margin": 6.0,        # reconstruct a marked frame only where the posterior-continuity surface sits this
                                # many px ABOVE the detected anterior (the clip symptom) — a strict no-op elsewhere
+    # surface-crop WARP target: align by the DETECTED POSTERIOR (the still-visible bottom edge — reliable even
+    # when the apex, or a WHOLE EDGE, is clipped above the frame), flattened PER-SLICE to a robust 1-D smooth
+    # along frames. NOT a global RANSAC parabola (the clipped region makes one parabola over-curve the periphery
+    # → large edge shifts the warp truncates; and a one-sided clip is not a symmetric dome) and NOT cross-slice
+    # smoothing (adjacent slices legitimately differ; forcing them together makes large truncating shifts). Each
+    # posterior lands on one smooth per-slice curve with SMALL shifts, and the apex is left above the frame where
+    # it was acquired (no columns cut off). median = de-spike a mis-locked frame, gaussian = smooth.
+    "crop_target_med": 11,     # per-slice median window (frames) on the detected posterior
+    "crop_target_sigma": 2.0,  # per-slice gaussian sigma applied after the median
     # ── DP scar-guard ── cross-check the DP anterior edge against the legacy ('old method') RANSAC-quadratic
     # surface, which is robust to a bright internal scar. Where DP dives >dp_scar_tol px DEEPER than legacy over
     # a run of >=dp_scar_min_run frames (the scar-lock signature), re-run DP confined to +/-dp_scar_window of the
@@ -1042,9 +1051,11 @@ def _crop_reconstruct_slice(slice_img: np.ndarray, anterior: np.ndarray, crop_fr
 
 
 def build_surface_crop_edges(sag: np.ndarray, crop_frames, params: dict | None = None,
-                             workers: int | None = None) -> np.ndarray:
-    """Per-slice anterior-edge array (n_slices, n_frames) to feed the warp as provided_edges, where the
-    user-confirmed surface-CROPPED frames are reconstructed by POSTERIOR CONTINUITY.
+                             workers: int | None = None):
+    """Returns (anterior_edges, posterior_edges), each (n_slices, n_frames). `anterior_edges` feeds the warp as
+    provided_edges, where the user-confirmed surface-CROPPED frames are reconstructed by POSTERIOR CONTINUITY;
+    `posterior_edges` is the detected bottom edge per slice — the warp's alignment target for the crop path
+    (the apex/edge may be clipped above the frame, but the posterior is still visible, so it is what we match).
 
     A cropped frame has no anterior surface (its apex is above the window), so its placement is taken from its
     still-visible BOTTOM (posterior) edge: effective_anterior(f) = posterior(f) − thickness(f), where
@@ -1062,13 +1073,13 @@ def build_surface_crop_edges(sag: np.ndarray, crop_frames, params: dict | None =
     p = {**DEFAULT_PARAMS, **(params or {})}
     edges = detect_surface_all(sag, p, workers=workers)            # (n_slices, n_frames) anterior
     F = int(sag.shape[2])
+    posterior = np.zeros_like(edges)                               # detected bottom edge (warp target for the crop path)
     cf = np.array(sorted({int(f) for f in (crop_frames or []) if 0 <= int(f) < F}), dtype=int)
-    if cf.size == 0:
-        return edges
     for i in range(int(sag.shape[0])):
-        out, _b, _adopted = _crop_reconstruct_slice(sag[i], edges[i], cf, p)
+        out, b, _adopted = _crop_reconstruct_slice(sag[i], edges[i], cf, p)
         edges[i] = out.astype(np.float32)
-    return edges
+        posterior[i] = b.astype(np.float32)
+    return edges, posterior
 
 
 def _surface_confidence(sl_smooth: np.ndarray, edge: np.ndarray):
@@ -1396,7 +1407,9 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
                   detect_volume: np.ndarray | None = None,
                   provided_edges: np.ndarray | None = None,
                   clip_report: dict | None = None,
-                  fixed_clip_cols: list | None = None):
+                  fixed_clip_cols: list | None = None,
+                  crop_target: bool = False,
+                  crop_posterior: np.ndarray | None = None):
     """Apply the corneal-edge + column correction with 3D active correction to a
     (frames, H, W) volume; returns the corrected volume (same shape/dtype).
 
@@ -1538,9 +1551,23 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     max_disp = 0.0 if use_provided else float(p.get("max_displacement", 0.0) or 0.0)
     bad_cols = [] if use_provided else [int(c) for c in (p.get("force_columns") or [])]
     good_cols = [] if use_provided else [int(c) for c in (p.get("good_columns") or [])]
-    items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols, max_disp,
-              clip_cols_list[i], clip_fit_list[i], zero_cols_list[i]) for i in range(n)]
-    disp_field = np.array(_map_slices(_disp_worker, items, progress, 0.5, 0.9, workers))  # (n_slices, n_frames)
+    if use_provided and crop_target and crop_posterior is not None:
+        # SURFACE-CROP target: align by the DETECTED POSTERIOR (the still-visible bottom edge — reliable even
+        # when the apex, or a WHOLE EDGE, is clipped above the frame), flattened PER-SLICE to a robust 1-D smooth
+        # along frames. NOT a global RANSAC parabola (it is dominated by the steep clipped region and over-curves
+        # the periphery → large edge shifts the warp truncates; and a one-sided clip is not a symmetric dome) and
+        # NOT cross-slice smoothing (adjacent slices legitimately differ; forcing them together makes large
+        # truncating shifts). Each posterior lands on one smooth per-slice curve with SMALL shifts; the apex is
+        # left above the frame where it was acquired. corr_factor scales the flatten like the legacy path.
+        cm = max(1, int(p.get("crop_target_med", 11)))
+        cs = float(p.get("crop_target_sigma", 2.0))
+        pb = np.asarray(crop_posterior, dtype=np.float64)
+        tgt = np.stack([ndimage.gaussian_filter1d(ndimage.median_filter(pb[i], size=cm), cs) for i in range(n)])
+        disp_field = (tgt - pb) * corr_factor                         # (n_slices, n_frames)
+    else:
+        items = [(sag[i], active[i], res, corr_factor, bad_cols, good_cols, max_disp,
+                  clip_cols_list[i], clip_fit_list[i], zero_cols_list[i]) for i in range(n)]
+        disp_field = np.array(_map_slices(_disp_worker, items, progress, 0.5, 0.9, workers))  # (n_slices, n_frames)
     # SURFACE-CROP safety (provided_edges only): a reconstructed posterior-continuity column whose apex is
     # ABOVE the frame (provided edge < 0) must never be shifted UP — there's no acquired tissue above row 0,
     # so a negative shift would truncate real epithelium off the top. Clamp disp >= 0 exactly at those
@@ -1930,6 +1957,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # deliberate flatten to that surface. Skipped when an explicit fix-columns re-detect (provided_edges) is
     # already supplied (that manual surface wins). Auto-tune first so the anterior detection matches the warp.
     _crop_frames = (params or {}).get("surface_crop_frames") if params else None
+    _crop_mode = provided_edges is None and bool(_crop_frames)   # surface-crop (vs marched re-detect)
+    _crop_posterior = None
     _crop_tune: dict = {}
     if provided_edges is None and _crop_frames:
         params = dict(params or {})
@@ -1942,12 +1971,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                 _crop_tune = {"params": _best, "score": round(float(_sc), 2)}   # surfaced → caller persists dp_*
             except Exception:  # noqa: BLE001 — tuning is best-effort
                 pass
-        provided_edges = build_surface_crop_edges(_sagv, _crop_frames, params, workers=workers)
+        provided_edges, _crop_posterior = build_surface_crop_edges(_sagv, _crop_frames, params, workers=workers)
     if provided_edges is not None:
         # fix-columns marched re-detection: a SINGLE warp that flattens to the user-validated surface,
         # NO iteration and NO axial-refine (both re-detect with no prior and could deviate from the
         # previewed surface) — so the corrected volume matches the scrub preview exactly.
-        corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges, workers=workers)
+        corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges,
+                                  workers=workers, crop_target=_crop_mode, crop_posterior=_crop_posterior)
         info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [],
                 "stopped": "surface_crop" if _crop_frames else "redetect",
                 "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0}}

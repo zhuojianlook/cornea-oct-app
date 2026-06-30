@@ -444,3 +444,51 @@ def test_correct_surface_leaves_smooth_curve_untouched():
     y = 200.0 - 50.0 * (x ** 2)             # smooth dome, per-step change << max_jump
     out = M._correct_surface(y, max_jump=10.0)
     assert np.allclose(out, y)              # no false positives on legitimate curvature
+
+
+# ── surface-crop posterior alignment (v0.0.104): clipped apex / whole-edge handled by POSTERIOR match ──
+def _clipped_apex_sag(n_slices=3, depth=200, F=40, rng=None):
+    """Synthetic sagittal volume: a bright corneal band whose dome apex is clipped ABOVE the frame in the
+    central frames (band starts at row 0 there) while the flanks are fully in-frame. Posterior fully visible."""
+    rng = rng or np.random.RandomState(0)
+    post = (30.0 + 0.15 * (np.arange(F) - F / 2) ** 2)        # dome posterior: ~30 centre, deeper at edges
+    ant = post - 60.0                                          # 60-px thick band → centre anterior < 0 (clipped)
+    sag = (rng.rand(n_slices, depth, F) * 60).astype(np.float32)   # dark speckle background
+    for s in range(n_slices):
+        for f in range(F):
+            top = int(max(0, round(ant[f]))); bot = int(round(post[f]))
+            sag[s, top:min(depth, bot), f] += 1800.0          # bright cornea band (clipped at row 0 in the centre)
+    return sag, ant, post
+
+
+def test_build_surface_crop_edges_returns_posterior_and_keeps_apex_above_frame():
+    sag, ant_true, post_true = _clipped_apex_sag()
+    F = sag.shape[2]
+    crop = [int(f) for f in range(F) if ant_true[f] < 0]       # the clipped (apex-above-frame) frames
+    edges, posterior = M.build_surface_crop_edges(sag, crop, {}, workers=1)
+    assert edges.shape == (sag.shape[0], F)                    # anterior edges (provided_edges for the warp)
+    assert posterior.shape == (sag.shape[0], F)                # NEW second return: detected posterior (warp target)
+    # the reconstructed anterior at the clipped centre is left ABOVE the frame (negative), not pinned in-frame
+    assert edges[:, F // 2].min() < 0.0
+    # the detected posterior tracks the true bottom edge (so the warp can match the bottom edge)
+    assert float(np.median(np.abs(posterior - post_true[None, :]))) < 8.0
+
+
+def test_surface_crop_warp_matches_posterior_without_truncation():
+    # End-to-end through smooth_volume's crop_target branch: a jagged posterior is flattened to a smooth
+    # per-slice curve with SMALL shifts (no columns cut off) and the clipped apex stays above the frame.
+    sag, ant_true, post_true = _clipped_apex_sag()
+    F = sag.shape[2]
+    crop = [int(f) for f in range(F) if ant_true[f] < 0]
+    edges, posterior = M.build_surface_crop_edges(sag, crop, {}, workers=1)
+    posterior = posterior.copy()
+    posterior[:, 5] += 18.0                                    # inject a per-frame mis-lock spike to be smoothed out
+    p = {**M.DEFAULT_PARAMS}
+    cm = int(p["crop_target_med"]); cs = float(p["crop_target_sigma"])
+    from scipy import ndimage
+    tgt = np.stack([ndimage.gaussian_filter1d(ndimage.median_filter(posterior[i].astype(float), size=cm), cs)
+                    for i in range(sag.shape[0])])
+    disp = (tgt - posterior) * float(p["corr_factor"])
+    disp = np.where(edges < 0, np.maximum(disp, 0.0), disp)    # never shift an above-frame column UP
+    assert float(np.abs(disp).mean()) < 6.0                    # SMALL shifts (the parabola target gave 6+ with 120+ peaks)
+    assert abs(float(disp[:, 5].mean())) > 3.0                 # ...but the injected spike IS corrected
