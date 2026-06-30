@@ -31,20 +31,20 @@ export function webglFailure(): string | null {
   return webglError;
 }
 
-/** Attach Niivue to the canvas. Returns null (and records webglFailure) if the
- *  browser can't provide a WebGL2 context, so the rest of the app still works. */
-export function attach(canvas: HTMLCanvasElement): Niivue | null {
-  if (nv) return nv;
-  // Probe for WebGL2 first — niivue throws hard without it, which would
-  // otherwise blank the whole React tree.
-  const probe = canvas.getContext("webgl2");
-  if (!probe) {
-    webglError =
-      "This browser/window can't provide a WebGL2 context, so the 3D viewer is disabled. " +
-      "Open the app in Chrome or Firefox (not the VS Code Simple Browser). " +
-      "Seed/segmentation thumbnails on the right still work.";
-    return null;
-  }
+let _canvas: HTMLCanvasElement | null = null;
+let _onRestored: (() => void) | null = null;
+let _listenersBound = false;
+let _contextLost = false;
+
+/** True while the WebGL context is lost (between webglcontextlost and webglcontextrestored). */
+export function contextLost(): boolean { return _contextLost; }
+
+/** Register a callback fired AFTER a lost WebGL context is restored + niivue rebuilt, so the host can
+ *  reload the current volume/overlay (niivue's GPU state is wiped by a context loss). null to clear. */
+export function onContextRestored(cb: (() => void) | null): void { _onRestored = cb; }
+
+/** Build (or rebuild) the Niivue instance on `canvas`. Shared by attach() and context-loss recovery. */
+function _createNv(canvas: HTMLCanvasElement): Niivue | null {
   try {
     nv = new Niivue({
       backColor: [0.11, 0.11, 0.12, 1],
@@ -85,6 +85,40 @@ export function attach(canvas: HTMLCanvasElement): Niivue | null {
     nv = null;
     return null;
   }
+}
+
+/** Attach Niivue to the canvas. Returns null (and records webglFailure) if the
+ *  browser can't provide a WebGL2 context, so the rest of the app still works. */
+export function attach(canvas: HTMLCanvasElement): Niivue | null {
+  if (nv) return nv;
+  // Probe for WebGL2 first — niivue throws hard without it, which would
+  // otherwise blank the whole React tree.
+  const probe = canvas.getContext("webgl2");
+  if (!probe) {
+    webglError =
+      "This browser/window can't provide a WebGL2 context, so the 3D viewer is disabled. " +
+      "Open the app in Chrome or Firefox (not the VS Code Simple Browser). " +
+      "Seed/segmentation thumbnails on the right still work.";
+    return null;
+  }
+  _canvas = canvas;
+  const inst = _createNv(canvas);
+  // WebGL CONTEXT-LOSS RECOVERY: WebKitGTK/NVIDIA can drop the WebGL2 context under pressure (many viewers
+  // opened, a GPU reset, a resize storm). Without recovery the singleton niivue holds a DEAD context and the
+  // canvas stays black forever — switching scans just reloads into the dead context. preventDefault() on
+  // "lost" is REQUIRED for the browser to later fire "restored"; on "restored" we rebuild niivue and ask the
+  // host (VolumeCanvas) to reload the current volume/overlay, since the GPU state was wiped.
+  if (!_listenersBound) {
+    _listenersBound = true;
+    canvas.addEventListener("webglcontextlost", (e) => { e.preventDefault(); _contextLost = true; }, false);
+    canvas.addEventListener("webglcontextrestored", () => {
+      nv = null;
+      if (_canvas) _createNv(_canvas);
+      _contextLost = false;
+      try { _onRestored?.(); } catch { /* host reload is best-effort */ }
+    }, false);
+  }
+  return inst;
 }
 
 /** Load (or replace) the grayscale base volume. */

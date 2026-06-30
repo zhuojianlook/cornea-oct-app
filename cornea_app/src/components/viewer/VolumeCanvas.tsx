@@ -5,7 +5,7 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, type ViewName } from "../../niivue/nvController";
 import { scanStep, hasSegmentation } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
@@ -53,6 +53,9 @@ export function VolumeCanvas() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [noWebgl, setNoWebgl] = useState<string | null>(null);
+  // Bumped when a lost WebGL context is restored (nvController rebuilds niivue) → re-runs the volume
+  // load effect below so the rebuilt viewer is repopulated instead of staying black.
+  const [glTick, setGlTick] = useState(0);
   const [brush, setBrush] = useState<{ x: number; y: number; size: number } | null>(null);
   // Before/after comparison (raw vs preprocessed). The button + view only exist once the scan has
   // been preprocessed — i.e. its raw snapshot (context_raw previews) was captured.
@@ -126,6 +129,9 @@ export function VolumeCanvas() {
       attach(canvasRef.current);
       setNoWebgl(webglFailure());
     }
+    // Recover from a lost WebGL context (WebKitGTK drops it under pressure): nvController rebuilds niivue
+    // on "restored"; we bump glTick so the load effect repopulates the rebuilt viewer (else it stays black).
+    onContextRestored(() => setGlTick((t) => t + 1));
     // #paint — register the WebGL-independent 2-D drawing overlay (so brush strokes are visible on the
     // WebKitGTK stack where niivue's draw tile renders blank), and keep it sized/redrawn on resize.
     setOverlayCanvas(overlayRef.current);
@@ -134,7 +140,7 @@ export function VolumeCanvas() {
       ro = new ResizeObserver(() => requestAnimationFrame(() => renderDrawOverlay()));
       ro.observe(overlayRef.current.parentElement);
     }
-    return () => { ro?.disconnect(); setOverlayCanvas(null); };
+    return () => { ro?.disconnect(); setOverlayCanvas(null); onContextRestored(null); };
   }, []);
 
   useEffect(() => {
@@ -160,7 +166,7 @@ export function VolumeCanvas() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [volumeUrl]);
+  }, [volumeUrl, glTick]);
 
   // Is a raw (pre-preprocessing) snapshot available for this case? Re-checked on case load AND on
   // every (re)open (volumeUrl is cache-busted per openCase, so it changes right after a preprocess
