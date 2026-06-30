@@ -163,6 +163,13 @@ DEFAULT_PARAMS: dict = {
                                   # across frames. A clean clip has a near-flat posterior (span ~70-90); a much
                                   # larger span is a steep TILT / decentred scan (CS008 OD ~341) that the extend
                                   # warp would mangle — AUTO skips it (→ normal pipeline). A MANUAL crop ignores this.
+    "crop_auto_max_pad": 75,      # auto gate: AND the REQUIRED upward extension <= this many rows. A genuine apex
+                                  # clip needs only a modest pad (sweep: CS014/CS015/CS021 all ~46-48); a pad of
+                                  # 100+ means the warp wants to shift the whole cornea up a long way = a decentred
+                                  # / tilted / artefacted scan, not a localized clip (sweep false-fires CS005 OD(6)
+                                  # pad 100, CS011 OD(3) pad 110 → gross SAM2 over-seg). pad is the CLEAN
+                                  # discriminator (frac/span overlap), so AUTO skips a too-large pad (→ normal
+                                  # pipeline). A MANUAL crop ignores this. Below crop_max_pad (the clamp cap).
     "crop_target_med": 11,        # robust median window (frames) on the detected posterior before the shift
     "crop_slice_smooth": 2.0,     # cross-slice gaussian on the posterior parabola (3-D consistency)
     "crop_pad_margin": 8,         # extra rows above the highest above-old-top point (breathing room)
@@ -2122,17 +2129,24 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                                                       workers=workers, detect=_det)
         _lo, _hi = int(0.3 * _sagv.shape[0]), int(0.7 * _sagv.shape[0])
         _pb_span = float(np.ptp(np.median(_Pb[_lo:_hi], axis=0)))      # posterior span across frames = TILT detector
-        if _auto_crop and (_clamped or _pb_span > float(_pc.get("crop_auto_max_span", 200))):
-            # AUTO: an extreme extension (> crop_max_pad) OR a large posterior span = a steep TILT / decentred
-            # scan or an artifact, not a clean clip — the extend warp would mangle it (CS008 OD span ~341).
-            # Don't auto-mangle: fall through to the normal pipeline (a manual crop still applies).
+        if _auto_crop and (_clamped or _pb_span > float(_pc.get("crop_auto_max_span", 200))
+                           or int(_pad) > int(_pc.get("crop_auto_max_pad", 75))):
+            # AUTO: an extreme extension (clamped, or pad > crop_auto_max_pad) OR a large posterior span = a
+            # steep TILT / decentred / artefacted scan, not a clean localized clip — the extend warp would
+            # mangle it (CS008 OD span ~341; CS005 OD(6) pad 100 & CS011 OD(3) pad 110 → SAM2 floods the
+            # extended canvas). Don't auto-mangle: fall through to the normal pipeline (a manual crop applies).
             _crop_frames = None
         else:
             corrected = revert_sagittal(_out_sag)              # (frames, depth+pad, lateral) — same per-voxel spacing
+            _F_tot = int(_sagv.shape[2])
+            _peak = max((int(v) for v in _ci.get("counts", {}).values()), default=-1) if _auto_crop else -1
             info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "surface_crop",
                     "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0},
                     "surface_crop": {"n_frames": len(list(_crop_frames)), "pad": int(_pad),
-                                     "auto": bool(_auto_crop), "clamped": bool(_clamped)}}
+                                     "auto": bool(_auto_crop), "clamped": bool(_clamped),
+                                     "n_frames_total": _F_tot,
+                                     "frac_frames": round(len(list(_crop_frames)) / max(1, _F_tot), 3),
+                                     "peak_slices": _peak, "pb_span": round(_pb_span, 1)}}
             if _crop_tune:
                 info["auto_tune"] = _crop_tune
             p_all = {**DEFAULT_PARAMS, **(params or {})}
