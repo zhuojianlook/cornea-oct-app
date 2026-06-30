@@ -13,18 +13,34 @@ from scipy import ndimage
 BG, CORNEA, SCAR = 0, 1, 2
 
 
-def regularize_cornea(label_ijk: np.ndarray, margin: int = 8, smooth: int = 25) -> np.ndarray:
-    """Clip protrusion SPIKES from the cornea so its anterior + posterior boundaries form a SMOOTH shell.
+def regularize_cornea(label_ijk: np.ndarray, despike: int = 15, smooth_sigma: float = 2.5,
+                      max_hole_w: int = 9) -> np.ndarray:
+    """Reconstruct the cornea as a SMOOTH band between a smoothed anterior and posterior surface.
 
-    The cornea is a smooth curved band; a thin downward (or upward) spike — e.g. where SAM2 follows the
-    central specular/saturation streak past the true posterior surface — is an artifact, not tissue. Per
-    A-line (along the DEPTH axis) the cornea is kept only between the MEDIAN-smoothed anterior and posterior
-    surfaces ± `margin` voxels; voxels beyond that (the spike) are dropped to background. The smoothed
-    surfaces follow genuine (smooth) curvature/thickness variation, so only sharp spikes are removed.
+    The cornea is a smooth curved shell. SAM2 segments each B-scan well, but ACROSS the slice direction
+    there is no smoothness constraint, so the posterior (endothelial) boundary is jagged frame-to-frame
+    and — at the central specular/saturation streak — either NOTCHES up into the stroma (under-segmentation)
+    or SPIKES down past the true surface (over-segmentation). Trimming alone cannot repair a notch, and
+    trimming deep excursions while leaving shallow notches actually makes the posterior look more ragged.
 
-    Conservative + scar-safe: SCAR voxels (label 2) are NEVER clipped (scar lives inside the band), only
-    cornea (label 1). The depth axis is detected automatically (the axis along which the cornea is thinnest)
-    so it works regardless of array orientation. Returns the regularized labelmap (same shape/dtype)."""
+    Here, per A-line (along the DEPTH axis), we estimate the anterior + posterior surfaces, DESPIKE them
+    with a median filter (rejects the streak and thin excursions), SMOOTH them with a Gaussian, and set
+    the cornea to the SOLID band between the two smoothed surfaces — repairing notches AND spikes so both
+    boundaries are smooth. The anterior epithelium is reliable and the posterior endothelium is
+    anatomically smooth, so snapping to the smoothed surfaces is faithful, not lossy.
+
+    Scar-safe by construction: SCAR voxels (label 2) are never written, and the smoothed band is CLAMPED
+    to enclose every retained scar A-line, so scar always stays ⊆ a contiguous cornea band (never orphaned
+    in background even when the despike would otherwise discard the deep excursion the scar sits on). Note:
+    scar contributes to the raw anterior/posterior extent, but the despike/smooth may override that — the
+    enclosure clamp is what guarantees scar stays inside cornea, not the raw-extent contribution.
+
+    Robustness: the anterior/posterior surfaces are seeded from REAL cornea A-lines only (the nearest-valid
+    fill runs on the pre-fill footprint, so a through-depth drop-out never leaks a sentinel that would
+    collapse the band there); and only THIN (≤ `max_hole_w`-wide, streak-like) enclosed footprint gaps are
+    bridged — a genuine wide clear cavity (e.g. a central full-thickness defect) is left empty, not
+    fabricated into solid cornea. The depth axis is detected automatically (the axis along which the cornea
+    is thinnest) so it works regardless of array orientation. Returns the labelmap (same shape/dtype)."""
     arr = np.rint(np.asarray(label_ijk)).astype(np.uint8)
     band = arr >= CORNEA                                  # cornea + scar = the corneal band
     if not band.any():
@@ -34,19 +50,44 @@ def regularize_cornea(label_ijk: np.ndarray, margin: int = 8, smooth: int = 25) 
             for ax in range(3)]
     depth = int(np.argmin(frac))
     moved = np.moveaxis(band, depth, 1)                   # (a, depth, b)
+    scar_moved = np.moveaxis(arr == SCAR, depth, 1)       # scar in the same (a, depth, b) frame
     na, nd, nb = moved.shape
     jcol = np.arange(nd, dtype=np.float32)
     jj = jcol[None, :, None]
-    jant = np.where(moved, jj, nd + 1).min(axis=1).astype(np.float32)     # first band voxel per A-line
-    jpost = np.where(moved, jj, -1.0).max(axis=1).astype(np.float32)      # last band voxel per A-line
-    valid = moved.any(axis=1)
-    medp, meda = float(np.median(jpost[valid])), float(np.median(jant[valid]))
-    post_sm = ndimage.median_filter(np.where(valid, jpost, medp), size=smooth)
-    ant_sm = ndimage.median_filter(np.where(valid, jant, meda), size=smooth)
-    within = (jj >= (ant_sm - margin)[:, None, :]) & (jj <= (post_sm + margin)[:, None, :])
+    jant = np.where(moved, jj, nd + 1.0).min(axis=1)      # first band voxel per A-line (a, b)
+    jpost = np.where(moved, jj, -1.0).max(axis=1)         # last band voxel per A-line  (a, b)
+    raw_foot = moved.any(axis=1)                          # A-lines that ACTUALLY contain cornea
+    if not raw_foot.any():
+        return arr
+    # Footprint to FILL = real cornea + only THIN streak-like enclosed gaps (never a wide clear cavity).
+    filled = ndimage.binary_fill_holes(raw_foot)
+    holes = filled & ~raw_foot
+    if holes.any():
+        thick = ndimage.binary_opening(holes, structure=np.ones((max_hole_w, max_hole_w), bool))
+        foot = raw_foot | (holes & ~thick)               # bridge thin gaps; leave real cavities empty
+    else:
+        foot = raw_foot
+    # Surfaces seeded from REAL cornea only: nearest-valid fill on the PRE-fill footprint (no sentinel leak).
+    idx = ndimage.distance_transform_edt(~raw_foot, return_distances=False, return_indices=True)
+    ant_f, post_f = jant[tuple(idx)], jpost[tuple(idx)]
+    ant_s = ndimage.gaussian_filter(ndimage.median_filter(ant_f, size=despike), smooth_sigma)
+    post_s = ndimage.gaussian_filter(ndimage.median_filter(post_f, size=despike), smooth_sigma)
+    ant_i = np.clip(np.rint(ant_s), 0, nd - 1).astype(np.int64)
+    post_i = np.clip(np.rint(post_s), 0, nd - 1).astype(np.int64)
+    # Enclosure clamp: never let the smoothed band exclude a retained scar voxel (keep scar ⊆ cornea).
+    has_scar = scar_moved.any(axis=1)
+    if has_scar.any():
+        sj_ant = np.where(scar_moved, jj, nd + 1.0).min(axis=1)
+        sj_post = np.where(scar_moved, jj, -1.0).max(axis=1)
+        ant_i = np.where(has_scar, np.minimum(ant_i, sj_ant.astype(np.int64)), ant_i)
+        post_i = np.where(has_scar, np.maximum(post_i, sj_post.astype(np.int64)), post_i)
+    post_i = np.maximum(post_i, ant_i)                    # never invert the band
+    rows = np.arange(nd, dtype=np.int64)[None, :, None]
+    within = (rows >= ant_i[:, None, :]) & (rows <= post_i[:, None, :]) & foot[:, None, :]
     keep = np.moveaxis(within, 1, depth)                  # back to original axis order
     out = arr.copy()
-    out[(arr == CORNEA) & ~keep] = BG                     # drop ONLY cornea spikes; scar untouched
+    out[keep & (out == BG)] = CORNEA                      # fill posterior notches + thin drop-outs
+    out[(out == CORNEA) & ~keep] = BG                     # trim spikes beyond the shell; SCAR untouched
     return out
 
 

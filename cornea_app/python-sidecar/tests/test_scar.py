@@ -264,7 +264,7 @@ def test_hysteresis_min_voxels_prunes_tiny_components():
     assert not mask.any()
 
 
-# ── regularize_cornea: clip protrusion spikes to a smooth shell (scar-safe) ──
+# ── regularize_cornea: reconstruct a SMOOTH cornea band (scar-safe) ──
 def test_regularize_cornea_clips_spike_keeps_band_and_scar():
     import scar as S
     nl, nd, nf = 40, 64, 30          # (lateral, depth, frame); depth = axis 1
@@ -272,20 +272,61 @@ def test_regularize_cornea_clips_spike_keeps_band_and_scar():
     L[:, 24:34, :] = S.CORNEA        # smooth cornea band, depth 24..33
     L[10:14, 24:34, 12:18] = S.SCAR  # a scar blob INSIDE the band
     L[20, 34:52, 15] = S.CORNEA      # a thin downward SPIKE at one A-line (the artifact)
-    out = S.regularize_cornea(L, margin=4, smooth=11)
-    # the spike BEYOND the smoothed posterior + margin (~depth 38..51) is removed (margin keeps a few voxels)
-    assert (out[20, 38:52, 15] == 0).all()
-    assert int((out[20, 34:52, 15] == S.CORNEA).sum()) <= 4   # at most ~margin voxels of the spike survive
-    # the smooth band is preserved
+    out = S.regularize_cornea(L)
+    # the spike beyond the smoothed posterior is removed entirely (snapped to the shell, no margin)
+    assert (out[20, 34:52, 15] == 0).all()
+    # the smooth band is preserved/filled
     assert (out[:, 24:34, :] >= S.CORNEA).all()
-    # scar is never clipped
+    # scar is never altered
     assert int((out == S.SCAR).sum()) == int((L == S.SCAR).sum())
     assert (out[10:14, 24:34, 12:18] == S.SCAR).all()
+
+
+def test_regularize_cornea_fills_posterior_notch():
+    import scar as S
+    nl, nd, nf = 40, 64, 30
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 24:34, :] = S.CORNEA        # smooth band depth 24..33
+    L[:, 30:34, 14:17] = 0           # carve a posterior NOTCH (under-segmentation) at a few frames
+    out = S.regularize_cornea(L)
+    # the notch is filled back up to the smoothed posterior surface (trim-only could not do this)
+    assert (out[:, 24:34, 14:17] == S.CORNEA).all()
 
 
 def test_regularize_cornea_noop_on_smooth_band():
     import scar as S
     L = np.zeros((30, 50, 20), np.uint8)
-    L[:, 20:30, :] = S.CORNEA        # already smooth → nothing to clip
-    out = S.regularize_cornea(L, margin=4, smooth=11)
+    L[:, 20:30, :] = S.CORNEA        # already smooth → reconstruct returns the same band
+    out = S.regularize_cornea(L)
     assert int((out == S.CORNEA).sum()) == int((L == S.CORNEA).sum())
+
+
+def test_regularize_cornea_never_orphans_scar():
+    # A deep spike whose tip is SCAR: despiking trims the cornea spike, but the band must be
+    # clamped to enclose the scar so scar stays connected to cornea (not floating in background).
+    import scar as S
+    from scipy import ndimage
+    nl, nd, nf = 60, 200, 60
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 90:106, :] = S.CORNEA            # smooth band depth 90..105
+    L[30, 106:140, 30] = S.CORNEA         # a deep cornea spike at one A-line
+    L[30, 135:140, 30] = S.SCAR           # scar at the spike tip (deep excursion)
+    out = S.regularize_cornea(L)
+    assert int((out == S.SCAR).sum()) == int((L == S.SCAR).sum())   # scar count untouched
+    lbl, _ = ndimage.label(out >= S.CORNEA)                          # cornea ∪ scar connectivity
+    scar_comps = set(np.unique(lbl[out == S.SCAR])) - {0}
+    main_comp = int(np.argmax(np.bincount(lbl[lbl > 0].ravel()))) if (lbl > 0).any() else 0
+    assert scar_comps == {main_comp}     # scar shares the single main component → never orphaned
+
+
+def test_regularize_cornea_leaves_wide_clear_cavity_empty():
+    # A genuine WIDE enclosed clear region (e.g. a central full-thickness defect) must NOT be
+    # fabricated into solid cornea — only thin streak-like gaps are bridged.
+    import scar as S
+    nl, nd, nf = 60, 80, 60
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 30:46, :] = S.CORNEA            # solid band
+    L[24:36, :, 24:36] = 0              # carve a 12×12 through-depth clear cavity (en-face)
+    out = S.regularize_cornea(L)
+    centre = out[28:32, :, 28:32]        # cavity core
+    assert int((centre == S.CORNEA).sum()) == 0   # core stays background, not fabricated cornea
