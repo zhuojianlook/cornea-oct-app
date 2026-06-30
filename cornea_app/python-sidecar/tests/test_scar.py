@@ -341,6 +341,33 @@ def test_regularize_cornea_never_orphans_scar():
     assert scar_comps == {main_comp}     # scar shares the single main component → never orphaned
 
 
+def test_regularize_cornea_keeps_genuine_thick_minority():
+    # A genuinely THICK region that is the spatial MINORITY must NOT be flattened to the thinner majority — a
+    # SYMMETRIC outlier-reject would collapse it, deleting real cornea. The posterior model is ASYMMETRIC:
+    # only too-THIN (under-segmented) A-lines are overridden; a reliable thick posterior is preserved.
+    import scar as S
+    nl, nd, nf = 120, 240, 40
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 40:100, :] = S.CORNEA            # baseline thickness 60 (depth 40..99)
+    L[50:70, 40:160, :] = S.CORNEA        # a thick block (thickness 120, width 20 > despike) — minority in win
+    out = S.regularize_cornea(L)
+    col = np.where(out[60, :, nf // 2] >= 1)[0]    # posterior at the thick block
+    assert col.max() >= 150                # retained near its true depth (~159), NOT pulled up to ~99
+
+
+def test_regularize_cornea_maintains_faint_lower_border():
+    # Where the posterior edge is faint/absent SAM2 under-segments (a NOTCH). The lower border must be
+    # MAINTAINED by carrying the corneal thickness in from the neighbouring good A-lines, not bitten into.
+    import scar as S
+    nl, nd, nf = 60, 240, 40
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 40:120, :] = S.CORNEA            # good band, thickness 80 (depth 40..119)
+    L[20:32, 100:120, :] = 0              # a faint-edge notch (thickness only 60) — the spatial minority
+    out = S.regularize_cornea(L)
+    col = np.where(out[26, :, nf // 2] >= 1)[0]    # posterior in the notch region
+    assert col.max() >= 114                # filled back down to ~the local thickness (~119), not left short
+
+
 def test_regularize_cornea_removes_anterior_streak_bump():
     # Specular-streak bump: the anterior is labelled ~20 voxels too SHALLOW over a compact ~13-wide
     # central region (cornea marked ABOVE the true epithelium). The despike window must EXCEED the

@@ -26,6 +26,45 @@ def _smooth_surface(surf: np.ndarray, despike: int, sigma: float) -> np.ndarray:
     return s[pw:-pw, pw:-pw]
 
 
+def _posterior_surface(ant_f: np.ndarray, post_f: np.ndarray, ant_s: np.ndarray,
+                       despike: int, sigma: float) -> np.ndarray:
+    """Posterior (endothelial / lower) surface over the (a, b) A-line grid.
+
+    Where SAM2 found a real posterior edge we simply smooth it (the reliable path — same as before). But the
+    endothelial boundary is frequently faint or absent in the OCT data — especially at the peripheral B-scan
+    frames — so at those A-lines SAM2 stops short and the posterior is UNDER-segmented (a "notch", thickness
+    far thinner than the local norm). There the edge is unreliable, so we fall back to the reliable ANTERIOR
+    plus an EXTRAPOLATED smooth corneal-thickness field (the corneal thickness varies smoothly, so it can be
+    carried in from the surrounding good A-lines), maintaining the lower border instead of biting into it.
+
+    ASYMMETRIC by design: we only distrust the TOO-THIN A-lines (faint/absent edge). We never override a
+    genuine reliable posterior with the thickness model — doing so symmetrically would flatten real tissue
+    (a thick region surrounded by thinner neighbours would be wrongly pulled up, and vice-versa). Specular
+    over-deep "fronds" (too-thick) are left to the reliable smoothing path, exactly as before this change.
+    The MAD floor is in VOXEL units so normal sub-voxel thickness wobble is NOT mistaken for a notch."""
+    post_reliable = _smooth_surface(post_f, despike, sigma)
+    T = np.asarray(post_f, dtype=np.float64) - np.asarray(ant_f, dtype=np.float64)
+    win = int(despike) * 2 + 1
+    med = ndimage.median_filter(T, size=win)
+    mad = ndimage.median_filter(np.abs(T - med), size=win) + 1.0   # floor in VOXELS, not 1e-3
+    deficit = med - T                                             # >0 where thinner than the local norm
+    # Soft distrust weight: 0 until the A-line is 3·MAD too thin, ramping to 1 by 6·MAD. Blending (vs a hard
+    # switch) avoids a visible seam where the notch fallback meets the reliable posterior.
+    w = np.clip((deficit - 3.0 * mad) / (3.0 * mad), 0.0, 1.0)
+    if not (w > 0).any():
+        return post_reliable
+    trusted = w <= 0.0                                            # A-lines with a reliable posterior edge
+    if not trusted.any():                                        # none reliable: global thickness prior
+        thick = np.full(T.shape, float(np.median(T)), dtype=np.float64)
+    else:                                                        # carry thickness in from the nearest trusted
+        Tg = np.where(trusted, T, np.nan)
+        ii = ndimage.distance_transform_edt(~np.isfinite(Tg), return_distances=False, return_indices=True)
+        thick = Tg[tuple(ii)]
+    fallback = ant_s + np.maximum(0.0, _smooth_surface(thick, despike, sigma * 1.6))
+    w = ndimage.gaussian_filter(w, sigma)                        # feather the blend boundary
+    return (1.0 - w) * post_reliable + w * fallback
+
+
 def regularize_cornea(label_ijk: np.ndarray, despike: int = 21, smooth_sigma: float = 2.5,
                       max_hole_w: int = 9) -> np.ndarray:
     """Reconstruct the cornea as a SMOOTH band between a smoothed anterior and posterior surface.
@@ -84,7 +123,11 @@ def regularize_cornea(label_ijk: np.ndarray, despike: int = 21, smooth_sigma: fl
     idx = ndimage.distance_transform_edt(~raw_foot, return_distances=False, return_indices=True)
     ant_f, post_f = jant[tuple(idx)], jpost[tuple(idx)]
     ant_s = _smooth_surface(ant_f, despike, smooth_sigma)
-    post_s = _smooth_surface(post_f, despike, smooth_sigma)
+    # Posterior: smooth the reliable SAM2 edge, but where it is faint/under-segmented (a notch) fall back to
+    # anterior + an extrapolated corneal-thickness so the lower border is MAINTAINED rather than bitten into
+    # (see _posterior_surface). The posterior may legitimately exceed the last row (thick periphery / clipped
+    # frame); the clip to nd-1 then lets the cornea fill to the bottom edge of the image there.
+    post_s = _posterior_surface(ant_f, post_f, ant_s, despike, smooth_sigma)
     ant_i = np.clip(np.rint(ant_s), 0, nd - 1).astype(np.int64)
     post_i = np.clip(np.rint(post_s), 0, nd - 1).astype(np.int64)
     # Enclosure clamp: never let the smoothed band exclude a retained scar voxel (keep scar ⊆ cornea).
