@@ -301,6 +301,28 @@ def test_regularize_cornea_noop_on_smooth_band():
     assert int((out == S.CORNEA).sum()) == int((L == S.CORNEA).sum())
 
 
+def test_regularize_cornea_preserves_edge_trend():
+    # The cornea deepens toward the peripheral frames; the surface smoothing must PRESERVE that trend at the
+    # first/last frames (odd-reflect/linear-extrapolation pad), not flatten it — a plain reflect boundary
+    # pulled the band UP ~10-15 vox at the start/end frames (the axial-edge displacement). Regression for that.
+    import scar as S
+    nl, nd, nf = 60, 220, 60
+    L = np.zeros((nl, nd, nf), np.uint8)
+    f = np.arange(nf, dtype=float)
+    centre = (90.0 + 0.045 * (f - nf / 2) ** 2).astype(int)   # cornea centre deepens toward both frame edges
+    th = 30
+    for fr in range(nf):
+        L[:, centre[fr] - th // 2: centre[fr] + th // 2, fr] = S.CORNEA
+    out = S.regularize_cornea(L)
+
+    def post(b, fr):
+        col = np.where(b[30, :, fr] >= 1)[0]
+        return int(col.max()) if col.size else -1
+    # the first/last frames' posterior must follow the (deeper) input, not be flattened up toward the centre
+    for fr in (0, nf - 1):
+        assert abs(post(out, fr) - post(L, fr)) <= 4
+
+
 def test_regularize_cornea_never_orphans_scar():
     # A deep spike whose tip is SCAR: despiking trims the cornea spike, but the band must be
     # clamped to enclose the scar so scar stays connected to cornea (not floating in background).

@@ -13,6 +13,19 @@ from scipy import ndimage
 BG, CORNEA, SCAR = 0, 1, 2
 
 
+def _smooth_surface(surf: np.ndarray, despike: int, sigma: float) -> np.ndarray:
+    """Median-despike + Gaussian-smooth a 2-D (lateral, frame) surface, padding with ODD reflection (=linear
+    extrapolation) so the genuine low-frequency TREND at the boundaries is PRESERVED, not flattened. The
+    cornea deepens toward the peripheral frames/laterals; a plain reflect/nearest boundary mirrors the trend
+    flat and pulls the band UP by ~10-15 voxels at the first/last frames (visible as a displaced cornea at the
+    start/end of the en-face B-scan scroll). Odd-reflect extends the slope through the edge → edge offset ≈ 0,
+    interior unchanged. (Validated on CS006 OS: peripheral-frame posterior offset -12 → 0.)"""
+    pw = int(despike) + int(3 * sigma) + 2
+    pp = np.pad(np.asarray(surf, dtype=np.float64), pw, mode="reflect", reflect_type="odd")
+    s = ndimage.gaussian_filter(ndimage.median_filter(pp, size=despike), sigma)
+    return s[pw:-pw, pw:-pw]
+
+
 def regularize_cornea(label_ijk: np.ndarray, despike: int = 21, smooth_sigma: float = 2.5,
                       max_hole_w: int = 9) -> np.ndarray:
     """Reconstruct the cornea as a SMOOTH band between a smoothed anterior and posterior surface.
@@ -70,8 +83,8 @@ def regularize_cornea(label_ijk: np.ndarray, despike: int = 21, smooth_sigma: fl
     # Surfaces seeded from REAL cornea only: nearest-valid fill on the PRE-fill footprint (no sentinel leak).
     idx = ndimage.distance_transform_edt(~raw_foot, return_distances=False, return_indices=True)
     ant_f, post_f = jant[tuple(idx)], jpost[tuple(idx)]
-    ant_s = ndimage.gaussian_filter(ndimage.median_filter(ant_f, size=despike), smooth_sigma)
-    post_s = ndimage.gaussian_filter(ndimage.median_filter(post_f, size=despike), smooth_sigma)
+    ant_s = _smooth_surface(ant_f, despike, smooth_sigma)
+    post_s = _smooth_surface(post_f, despike, smooth_sigma)
     ant_i = np.clip(np.rint(ant_s), 0, nd - 1).astype(np.int64)
     post_i = np.clip(np.rint(post_s), 0, nd - 1).astype(np.int64)
     # Enclosure clamp: never let the smoothed band exclude a retained scar voxel (keep scar ⊆ cornea).
