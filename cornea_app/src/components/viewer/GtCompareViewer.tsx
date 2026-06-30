@@ -84,7 +84,14 @@ export function GtCompareViewer({
     })()
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; nvRef.current = null; };
+    return () => {
+      cancelled = true;
+      // Free the WebGL2 context this viewer owns (matches OverlapViewer / OverlapPairViewer). Without this,
+      // each open/close of the GT-compare panel leaks a context; after the browser's ~8-16 live-context cap
+      // the comparison + main viewer render blank. VolumeCanvas mounts/unmounts this on every GT toggle.
+      try { (nv as unknown as { gl?: WebGLRenderingContext }).gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* best-effort */ }
+      nvRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId, name]);
 

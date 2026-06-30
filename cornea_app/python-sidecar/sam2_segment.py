@@ -256,7 +256,7 @@ def segment_plane(vol: np.ndarray, plane: str, work: Path) -> tuple[np.ndarray, 
             # propagate forward then backward from the prompt frame
             for rev in (False, True):
                 for fidx, _ids, logits in predictor.propagate_in_video(state, reverse=rev):
-                    msk = (logits[0] > 0.0).squeeze().cpu().numpy()
+                    msk = (logits[0] > 0.0).squeeze(0).cpu().numpy()   # drop ONLY the channel axis (1,H,W)->(H,W); a bare squeeze() would collapse a degenerate size-1 spatial dim
                     _scatter_mask(out, plane, fidx, msk)
     finally:
         # Always release SAM2 state + frames, even on a CUDA OOM mid-propagate, so the
@@ -326,7 +326,7 @@ def segment_plane_prompted(vol: np.ndarray, plane: str, work: Path, frame_points
                                                 points=arr[:, :2], labels=arr[:, 2].astype(np.int32))
             for rev in (False, True):
                 for fidx, _ids, logits in predictor.propagate_in_video(state, reverse=rev):
-                    out_msk = (logits[0] > 0.0).squeeze().cpu().numpy()
+                    out_msk = (logits[0] > 0.0).squeeze(0).cpu().numpy()   # drop ONLY the channel axis (see above)
                     _scatter_mask(out, plane, fidx, out_msk)
     finally:
         if state is not None:
@@ -400,6 +400,7 @@ def segment_scar_consensus(base_nifti: Path, labelmap_ijk: np.ndarray, seed_ijks
     EACH plane (as a video) at the brightness seed points — PLUS dim-stroma negative points on each
     prompted frame so SAM2 carves the scar rather than the whole reflective band — propagate in 3D
     (fwd+back), and keep the CONSENSUS (≥`vote` of 3 views) ∩ cornea. Returns (mask, meta)."""
+    planes = tuple(dict.fromkeys(planes))   # defence-in-depth: a duplicated plane would double-count its vote
     raw = np.asarray(nib.load(str(base_nifti)).dataobj).astype(np.float32)
     vol = gaussian_filter(raw, sigma=(1.0, 1.0, 0.4))
     work = Path(work); work.mkdir(parents=True, exist_ok=True)
@@ -442,6 +443,7 @@ def segment_volume(volume_nifti: Path, work: Path,
     `progress(phase, index, total)` is an optional callback invoked at the start of each plane
     (phase=the plane name) and before the 3D fuse (phase="fuse"), so a caller can surface live
     progress. Defaults to None so the standalone/__main__ and other callers are unaffected."""
+    planes = tuple(dict.fromkeys(planes))   # defence-in-depth: a duplicated plane would double-count its vote
     raw = np.asarray(nib.load(str(volume_nifti)).dataobj).astype(np.float32)
     vol = gaussian_filter(raw, sigma=(1.0, 1.0, 0.4))
     work = Path(work)

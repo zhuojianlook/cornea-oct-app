@@ -733,10 +733,17 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
     orch.ensure_case_dirs(case_id)
     if not req.planes:
         raise HTTPException(400, "Request at least one plane.")
+    # De-dupe (order-preserving) + validate plane names: each LIST ENTRY casts one vote in segment_volume, so a
+    # duplicated plane (e.g. ['axial','axial','coronal']) would let a SINGLE physical plane reach the 2-of-3
+    # threshold on its own — defeating the cross-plane consensus. Clamp the vote to the DISTINCT plane count.
+    planes = list(dict.fromkeys(req.planes))
+    bad = [p for p in planes if p not in ("axial", "coronal", "sagittal")]
+    if bad:
+        raise HTTPException(400, f"Unknown plane(s): {bad}. Use axial/coronal/sagittal.")
     base = _ensure_volume_nifti(case_id)            # SAM2 likes natural raw contrast
     work = orch.case_root(case_id) / "sam2_work"
-    vote = max(1, min(req.vote, len(req.planes)))   # vote can't exceed #planes (else always empty)
-    n_planes = len(req.planes)
+    vote = max(1, min(req.vote, len(planes)))       # vote can't exceed #DISTINCT planes (else always empty)
+    n_planes = len(planes)
 
     def _progress(phase, index, total):
         if phase == "fuse":
@@ -748,7 +755,7 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
     try:
         with _GPU_LOCK:                              # one SAM2/CUDA inference at a time
             label, meta = sam2_segment.segment_volume(
-                base, work, planes=tuple(req.planes), vote=vote, progress=_progress)
+                base, work, planes=tuple(planes), vote=vote, progress=_progress)
     except Exception:
         _sam2_progress_set(case_id, "error", "SAM2 failed", n_planes, n_planes)
         raise
