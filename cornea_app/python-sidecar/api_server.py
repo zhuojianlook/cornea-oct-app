@@ -3044,8 +3044,9 @@ def oct_surface_crop_preview(case_id: str, req: OctPreprocessRequest) -> dict:
     detected BOTTOM (posterior) edge — the guidance for cropped frames — and the reconstructed anterior surface
     (posterior continuity), which can extend ABOVE the frame (negative depth) where the apex is cropped. Body:
     {slice_index, surface_crop_frames}. Returns {top, bottom, recon, adopted, n_frames, depth_vox} (x=frame,
-    y=depth, depth 0 = TOP). Read-only; computed on the cached raw-border volume with the SAME
-    _crop_reconstruct_slice the warp uses (preview == result)."""
+    y=depth, depth 0 = TOP). Read-only; a GUIDANCE view of the bottom-edge match (the extend warp flattens to a
+    posterior parabola and extends the canvas upward, so the corrected volume is taller and not pixel-identical
+    to this reconstructed anterior)."""
     import numpy as np
     m = orch.read_manifest(case_id)
     if not (m.get("input_volume") or m.get("corrected_volume")):

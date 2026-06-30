@@ -474,21 +474,43 @@ def test_build_surface_crop_edges_returns_posterior_and_keeps_apex_above_frame()
     assert float(np.median(np.abs(posterior - post_true[None, :]))) < 8.0
 
 
-def test_surface_crop_warp_matches_posterior_without_truncation():
-    # End-to-end through smooth_volume's crop_target branch: a jagged posterior is flattened to a smooth
-    # per-slice curve with SMALL shifts (no columns cut off) and the clipped apex stays above the frame.
+def test_warp_surface_crop_extend_taller_canvas_no_truncation():
+    # The extend correction returns a TALLER volume (canvas grown UP) that keeps every column's acquired
+    # tissue (no truncation) and leaves the apex above the OLD top, with the posterior fit to a parabola.
+    sag, ant_true, post_true = _clipped_apex_sag()
+    n, depth, F = sag.shape
+    crop = [int(f) for f in range(F) if ant_true[f] < 0]
+    edges, posterior = M.build_surface_crop_edges(sag, crop, {}, workers=1)
+    out, pad, Pb, Pa, clamped = M.warp_surface_crop_extend(sag, posterior, crop, {}, workers=1)
+    assert pad > 0 and not clamped                                                  # clean clip → not pad-capped
+    assert out.shape[1] > depth and out.shape[0] == n and out.shape[2] == F
+    # the top-edge parabola apex sits ABOVE the old top (negative in original coords)
+    assert float(Pa.min()) < 0.0
+    # NO truncation: total tissue energy is preserved (every column's acquired rows are placed, none cut)
+    assert float(out.sum()) >= float(sag.sum()) * 0.999
+    # the posterior parabola is smooth (small 2nd difference) — the "bottom edge is a parabola"
+    assert float(np.nanmean(np.abs(np.diff(Pb[n // 2], 2)))) < 1.0
+
+
+def test_warp_surface_crop_extend_nan_posterior_no_crash():
+    # A non-finite posterior value (a degenerate detection) must not crash the warp (manual path has no
+    # try/except) — the NaN shift is zeroed, not rounded to a crash.
     sag, ant_true, post_true = _clipped_apex_sag()
     F = sag.shape[2]
     crop = [int(f) for f in range(F) if ant_true[f] < 0]
-    edges, posterior = M.build_surface_crop_edges(sag, crop, {}, workers=1)
-    posterior = posterior.copy()
-    posterior[:, 5] += 18.0                                    # inject a per-frame mis-lock spike to be smoothed out
+    _, posterior = M.build_surface_crop_edges(sag, crop, {}, workers=1)
+    posterior = posterior.copy(); posterior[0, 3] = np.nan; posterior[1, 7] = np.inf
+    out, pad, Pb, Pa, clamped = M.warp_surface_crop_extend(sag, posterior, crop, {}, workers=1)
+    assert np.isfinite(out).all() and out.shape[1] > sag.shape[1]
+
+
+def test_is_substantial_clip_gate():
+    # A few stray flagged frames on a normal dome must NOT auto-trigger; a real broad clip must.
     p = {**M.DEFAULT_PARAMS}
-    cm = int(p["crop_target_med"]); cs = float(p["crop_target_sigma"])
-    from scipy import ndimage
-    tgt = np.stack([ndimage.gaussian_filter1d(ndimage.median_filter(posterior[i].astype(float), size=cm), cs)
-                    for i in range(sag.shape[0])])
-    disp = (tgt - posterior) * float(p["corr_factor"])
-    disp = np.where(edges < 0, np.maximum(disp, 0.0), disp)    # never shift an above-frame column UP
-    assert float(np.abs(disp).mean()) < 6.0                    # SMALL shifts (the parabola target gave 6+ with 120+ peaks)
-    assert abs(float(disp[:, 5].mean())) > 3.0                 # ...but the injected spike IS corrected
+    n = 200
+    stray = {"frames": [40, 41], "counts": {40: 5, 41: 4}, "n_slices": n}
+    assert not M.is_substantial_clip(stray, p)                 # too few frames
+    broad = {"frames": list(range(30, 70)), "counts": {f: 80 for f in range(30, 70)}, "n_slices": n}
+    assert M.is_substantial_clip(broad, p)                     # many frames, flagged in 40% of slices
+    shallow = {"frames": list(range(30, 70)), "counts": {f: 4 for f in range(30, 70)}, "n_slices": n}
+    assert not M.is_substantial_clip(shallow, p)               # many frames but each in only 2% of slices
