@@ -181,13 +181,17 @@ export function hasVolume(): boolean {
 // (needed for Smart-fill/GrowCut) that maps to canonical 0 on save — it's drawn GREY (not the old orange,
 // which read like scar and vanished on save). Slightly muted + drawn translucent (drawOpacity). Index 0
 // (unpainted) is transparent.
+// Label 4 = AUTO-flooded background (fillBackgroundSeed) — rendered identically to user background (grey),
+// but kept DISTINCT internally so smart-fill can re-grow untouched auto-bg yet NEVER re-grow background the
+// user explicitly painted (label 2). Collapsed to 2 on export (see exportDrawing).
+const AUTO_BG = 4;
 const DRAW_CMAP = {
-  R: [0, 70, 142, 235],
-  G: [0, 160, 142, 95],
-  B: [0, 235, 147, 95],
-  A: [0, 255, 255, 255],
-  I: [0, 1, 2, 3],
-  labels: ["", "cornea", "background", "scar"],
+  R: [0, 70, 142, 235, 142],
+  G: [0, 160, 142, 95, 142],
+  B: [0, 235, 147, 95, 147],
+  A: [0, 255, 255, 255, 255],
+  I: [0, 1, 2, 3, 4],
+  labels: ["", "cornea", "background", "scar", "background"],
 };
 
 /** Load a label NIfTI as the editable drawing bitmap (no binarize → keep 1/2/3). */
@@ -211,7 +215,6 @@ export function endDrawing(): void {
   try { nv.closeDrawing(); } catch { /* no-op if no drawing */ }
   nv.drawScene();
   renderDrawOverlay();   // drawBitmap is gone now → clears the 2-D overlay
-  vetBaseline = null;    // leaving the paint session → drop the auto-partition snapshot (don't leak into another step)
 }
 
 /** Undo the last brush stroke / smart fill (niivue keeps a drawing undo stack). */
@@ -276,23 +279,20 @@ export function brushScreenSize(xCss: number, yCss: number): { w: number; h: num
 // Smart fill = CPU "Grow from seeds" in a WEB WORKER (ported from the annotator). niivue's GPU drawGrowCut
 // is unusably slow / hangs on the WebKitGTK + NVIDIA desktop stack (128 iterations × per-slice readPixels);
 // the worker runs a multi-source geodesic flood (Dijkstra/Dial buckets, O(N), off the main thread, with
-// progress) so the UI stays responsive. Seeds = the current drawBitmap labels (1 cornea, 2 background, 3
-// scar); every unlabelled voxel is assigned the geodesically-nearest seed's label.
-// Snapshot of the drawing taken right after fillBackgroundSeed = the AUTO cornea/background partition
-// (SAM2 cornea = 1, every other voxel flooded to background = 2). Smart fill uses it to tell the user's
-// EDITS apart from that auto-fill, so a painted cornea correction can re-grow ACROSS slices instead of
-// being trapped by the wall-to-wall background labelling (see smartFill). Invariant: set ONLY here, cleared
-// ONLY in endDrawing (every exit from a paint session calls endDrawing) → never leaks into another step.
-let vetBaseline: Uint8Array | null = null;
+// progress) so the UI stays responsive. Seeds = the current drawBitmap labels (1 cornea, 2 USER background,
+// 3 scar, 4 AUTO-flooded background); every unlabelled voxel is assigned the geodesically-nearest seed's
+// label. The 4-vs-2 distinction (fillBackgroundSeed floods 4) lets smart fill re-grow untouched auto-bg into
+// the cornea rim while treating user-painted background (2) as an absolute, never-re-grown barrier.
 
-/** Fill every UNPAINTED (0) voxel in the drawing with the BACKGROUND seed (pen 2) — used after SAM2 so the
- *  cornea-vet step shows a COMPLETE cornea/background partition to correct (and gives Smart fill a background
- *  seed). On save pen 2 → canonical background 0, so the labelmap is unchanged. */
+/** Fill every UNPAINTED (0) voxel in the drawing with the AUTO background seed (label 4, rendered grey) —
+ *  used after SAM2 so the cornea-vet step shows a COMPLETE cornea/background partition to correct (and gives
+ *  Smart fill a background seed). On save labels 2 and 4 → canonical background 0, so the labelmap is unchanged. */
 export function fillBackgroundSeed(): void {
   if (!nv || !nv.drawBitmap) return;
   const b = nv.drawBitmap as Uint8Array;
-  for (let i = 0; i < b.length; i++) if (b[i] === 0) b[i] = 2;
-  vetBaseline = b.slice();   // remember the auto partition so Smart fill can re-grow user cornea edits across slices
+  // Flood unlabelled → AUTO_BG (4), NOT plain background (2). Smart fill may re-grow auto-bg into the cornea
+  // rim, but background the user later PAINTS (label 2) is an absolute barrier it can never re-grow.
+  for (let i = 0; i < b.length; i++) if (b[i] === 0) b[i] = AUTO_BG;
   try { nv.refreshDrawing(true); } catch { /* */ }
   nv.drawScene();
   renderDrawOverlay();
@@ -356,27 +356,22 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
   // the scan edge, so anchoring faces would CLIP it; the abundant dark air/shadow provides the seeds instead.
   // Net: painted cornea grows from BOTH SAM2's region and the user's stroke into intensity-similar tissue across
   // slices, bounded by intensity edges and the dark seeds; cornea only grows (SAM2 stays hard) unless removed.
-  if (vetBaseline && vetBaseline.length === seeds.length) {
+  {
+    // darkCut = the cornea's 10th-percentile intensity (data-driven "definitely background" level).
     const hist = new Int32Array(256);
     let cN = 0;
-    for (let i = 0; i < seeds.length; i++) if (vetBaseline[i] === 1) { hist[q[i]]++; cN++; }
+    for (let i = 0; i < seeds.length; i++) if (seeds[i] === 1) { hist[q[i]]++; cN++; }
     let darkCut = 0;
     if (cN > 0) { const target = cN * 0.10; let acc = 0; for (let b = 0; b < 256; b++) { acc += hist[b]; if (acc >= target) { darkCut = b; break; } } }
-    // CONFINE re-growth to the cornea RIM: only soften bright auto-background within a few voxels of an actual
-    // cornea seed (SAM2 OR a user cornea stroke). This re-grows the corneal band SAM2 under-segmented (which
-    // follows the curvature) WITHOUT bloating into disconnected bright ARTIFACTS (specular/mirror bands below
-    // the cornea, saturation streaks) — even bright ones the user explicitly painted background, which the old
-    // "any bright auto-bg anywhere → re-growable" rule would re-grow as cornea regardless. dr=[n,nx,ny,nz].
+    // Re-grow ONLY AUTO-flooded background (AUTO_BG=4) that is bright AND on the cornea RIM (within a few voxels
+    // of a cornea seed) → it becomes re-growable so the fill recovers the corneal band SAM2 under-segmented
+    // (following the curvature). USER-painted background (label 2) is NEVER softened — an absolute barrier the
+    // fill can't cross, so painting away an artifact STICKS even when it abuts the cornea. Far/dark auto-bg
+    // stays a hard background seed (keeps the flood well-posed). dr=[n,nx,ny,nz].
     const near = _dilatedCorneaMask(seeds, dr[1], dr[2], dr[3], 3);
-    let softened = 0, bgLeft = 0;
     for (let i = 0; i < seeds.length; i++) {
-      if (seeds[i] !== 2) continue;
-      if (vetBaseline[i] === 2 && q[i] >= darkCut && near[i]) { seeds[i] = 0; softened++; }  // bright auto-bg ON THE RIM → re-growable
-      else bgLeft++;                                                                          // far/dark auto-bg or user-painted bg → hard seed
+      if (seeds[i] === AUTO_BG && q[i] >= darkCut && near[i]) seeds[i] = 0;   // bright auto-bg on the rim → re-growable
     }
-    // Safety: if softening left NO background seed (degenerate — e.g. no dark air), revert so the single-label
-    // flood can't run away / hang. Only the voxels we just softened are 0 here, so restore them to background.
-    if (bgLeft === 0 && softened > 0) for (let i = 0; i < seeds.length; i++) if (seeds[i] === 0) seeds[i] = 2;
   }
   let hasFg = false;
   for (let i = 0; i < seeds.length; i++) { const s = seeds[i]; if (s === 1 || s === 3) { hasFg = true; break; } }
@@ -442,6 +437,7 @@ const OVERLAY_RGBA: Record<number, [number, number, number, number]> = {
   1: [26, 178, 255, 150],
   2: [142, 142, 147, 110],
   3: [255, 69, 58, 160],
+  4: [142, 142, 147, 110],   // auto-flooded background — same grey as user background (label 2)
 };
 let _overlayScheduled = false;
 /** rAF-coalesced overlay re-render (one per frame) — used for the high-frequency paint/location stream. */
@@ -520,6 +516,10 @@ export function setDrawOpacity(opacity: number): void {
 /** Export the edited drawing bitmap as NIfTI bytes. */
 export async function exportDrawing(): Promise<Uint8Array | null> {
   if (!nv) return null;
+  // Collapse the auto-background sentinel (4) → plain background (2) so the saved labelmap is canonical
+  // (the backend maps drawing label 2 → 0 = background).
+  const d = nv.drawBitmap as Uint8Array | undefined;
+  if (d) for (let i = 0; i < d.length; i++) if (d[i] === AUTO_BG) d[i] = 2;
   const result = await nv.saveImage({ filename: "", isSaveDrawing: true, volumeByIndex: 0 });
   return result instanceof Uint8Array ? result : null;
 }
