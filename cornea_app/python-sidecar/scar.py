@@ -13,7 +13,7 @@ from scipy import ndimage
 BG, CORNEA, SCAR = 0, 1, 2
 
 
-def regularize_cornea(label_ijk: np.ndarray, despike: int = 15, smooth_sigma: float = 2.5,
+def regularize_cornea(label_ijk: np.ndarray, despike: int = 21, smooth_sigma: float = 2.5,
                       max_hole_w: int = 9) -> np.ndarray:
     """Reconstruct the cornea as a SMOOTH band between a smoothed anterior and posterior surface.
 

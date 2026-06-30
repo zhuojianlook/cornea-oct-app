@@ -319,6 +319,22 @@ def test_regularize_cornea_never_orphans_scar():
     assert scar_comps == {main_comp}     # scar shares the single main component → never orphaned
 
 
+def test_regularize_cornea_removes_anterior_streak_bump():
+    # Specular-streak bump: the anterior is labelled ~20 voxels too SHALLOW over a compact ~13-wide
+    # central region (cornea marked ABOVE the true epithelium). The despike window must EXCEED the
+    # bump's en-face width to reject it, without flattening the broad dome (regression for v0.0.103).
+    import scar as S
+    nl, nd, nf = 60, 120, 60
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 50:66, :] = S.CORNEA              # smooth band, true anterior = 50
+    L[24:37, 30:50, 24:37] = S.CORNEA      # 13×13 anterior bump up to depth 30 at the centre
+    out = S.regularize_cornea(L)           # default despike=21 > 13 → bump rejected
+    centre_ant = int(np.where(out[30, :, 30] == S.CORNEA)[0].min())
+    assert centre_ant >= 46                # anterior no longer pulled up to ~30 (dome ~50 preserved)
+    # away from the streak the surface is unchanged
+    assert int(np.where(out[5, :, 5] == S.CORNEA)[0].min()) == 50
+
+
 def test_regularize_cornea_leaves_wide_clear_cavity_empty():
     # A genuine WIDE enclosed clear region (e.g. a central full-thickness defect) must NOT be
     # fabricated into solid cornea — only thin streak-like gaps are bridged.
