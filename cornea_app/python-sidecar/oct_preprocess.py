@@ -139,6 +139,13 @@ DEFAULT_PARAMS: dict = {
     # reconstructs those frames by POSTERIOR CONTINUITY (build_surface_crop_edges) instead of the auto apex
     # extrapolation. A sticky oct_param, applied via the provided_edges warp path. 0 frames = feature inactive.
     "crop_min_slices": 3,
+    # AUTO crop-region (off-cornea NOISE): the slow scan can run OFF the cornea, leaving leading/trailing frames
+    # that are pure noise (no coherent cornea surface, ~zero edge contrast). Auto-detected + zeroed before SAM2
+    # (like the manual #9 crop). Only LONG boundary blocks are cut, so a faint cornea EDGE is never removed.
+    "auto_crop_region": True,
+    "crop_noise_frac": 0.20,   # a frame is "no cornea" if its edge contrast < this fraction of the cornea frames'
+    "crop_noise_min_run": 10,  # ...and only a contiguous boundary run of >= this many such frames is cropped
+    "crop_noise_max_frac": 0.75,  # safety: never auto-crop more than this fraction of frames (a failed scan)
     "crop_margin": 6.0,        # reconstruct a marked frame only where the posterior-continuity surface sits this
                                # many px ABOVE the detected anterior (the clip symptom) — a strict no-op elsewhere
     # surface-crop CORRECTION (auto + manual): a clipped cornea (apex and/or a whole edge ABOVE the acquisition
@@ -152,6 +159,10 @@ DEFAULT_PARAMS: dict = {
     "crop_auto_min_slices": 12,   # auto gate: AND the most-clipped frame flagged in >= this many slices (ABSOLUTE —
                                   # a central apex clip only spans the central lateral slices, so a fraction-of-all
                                   # test wrongly rejects it; a few stray flags on a normal dome stay well under this)
+    "crop_auto_max_span": 200,    # auto gate: AND the fitted posterior parabola spans <= this many depth-voxels
+                                  # across frames. A clean clip has a near-flat posterior (span ~70-90); a much
+                                  # larger span is a steep TILT / decentred scan (CS008 OD ~341) that the extend
+                                  # warp would mangle — AUTO skips it (→ normal pipeline). A MANUAL crop ignores this.
     "crop_target_med": 11,        # robust median window (frames) on the detected posterior before the shift
     "crop_slice_smooth": 2.0,     # cross-slice gaussian on the posterior parabola (3-D consistency)
     "crop_pad_margin": 8,         # extra rows above the highest above-old-top point (breathing room)
@@ -996,6 +1007,44 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     edges = _map_slices(_edge_worker, [(np.ascontiguousarray(sag[i]).astype(np.float32), p) for i in range(n)],
                         progress, 0.0, 1.0, workers)
     return np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
+
+
+def detect_noise_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
+                        detect: np.ndarray | None = None) -> list:
+    """AUTO crop-region: off-cornea NOISE frames at the scan boundary. The slow scan can run OFF the cornea,
+    leaving leading/trailing frames with NO coherent corneal surface (near-zero edge contrast — bright stroma
+    below a sharp boundary vs dark above). Returns the sorted frame indices to crop (zeroed before SAM2). A
+    normal full-cornea scan returns []. Only LONG (>= crop_noise_min_run) contiguous BOUNDARY runs of near-zero
+    contrast are cropped, so a faint cornea EDGE (a few low frames that quickly recover) is never removed; a
+    failed/all-noise scan (> crop_noise_max_frac) is left untouched for the user."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    det = detect if detect is not None else detect_surface_all(sag, p, workers=workers)
+    vs = ndimage.gaussian_filter(sag, (1.0, 2.0, 0.5))
+    nf = int(sag.shape[2])
+    con = np.array([_surface_confidence(vs[:, :, fr].T, det[:, fr])[0] for fr in range(nf)])
+    # Reference = the cornea frames' contrast, taken from the strictly-POSITIVE contrasts only (a noise frame
+    # scores ~0/negative). Using positive-only avoids a mostly-off-cornea scan poisoning the reference toward 0
+    # (which would disable cropping just when it's needed most).
+    pos = np.sort(con[con > 0])
+    if pos.size == 0:
+        return []
+    ref = float(np.median(pos[-max(5, pos.size // 4):]))
+    low = con < ref * float(p.get("crop_noise_frac", 0.20))
+    run = int(p.get("crop_noise_min_run", 10))
+    out: list[int] = []
+    f = 0; lead = []
+    while f < nf and low[f]:
+        lead.append(f); f += 1
+    if len(lead) >= run:
+        out += lead
+    f = nf - 1; trail = []
+    while f >= 0 and low[f]:
+        trail.append(f); f -= 1
+    if len(trail) >= run:
+        out += trail
+    if len(set(out)) > nf * float(p.get("crop_noise_max_frac", 0.75)):
+        return []                                                # a failed/all-noise scan — leave it to the user
+    return sorted(set(out))
 
 
 def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None) -> dict:
@@ -2014,6 +2063,22 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     Returns {out, passes, metrics, applied, stopped}."""
     vol = read_oct_zstack(oct_path, volume_index).astype(np.uint16)
     sp = _resolve_spacing(params, companion_txt, n_frames=vol.shape[0])
+    # AUTO crop-region: if no manual crop is set, auto-detect off-cornea NOISE frames (the slow scan ran off the
+    # cornea) and zero them via the same #9 crop path before surface detection + SAM2. A normal full-cornea scan
+    # detects none (no-op). Manual crop_region/crop_lateral overrides; the marched re-detect path is left alone.
+    _pcr = {**DEFAULT_PARAMS, **(params or {})}
+    _auto_cr = None                                                # auto crop-region box → surfaced in info → persisted
+    if provided_edges is None and _pcr.get("auto_crop_region", True) \
+            and (params or {}).get("crop_region") is None and (params or {}).get("crop_lateral") is None \
+            and str(_pcr.get("detector", "dp")).lower() != "legacy":
+        try:
+            _nz = detect_noise_frames(reformat_to_sagittal(vol), params, workers=workers)
+            if _nz:
+                params = dict(params or {})
+                params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
+                _auto_cr = params["crop_region"]                   # persist it (sticky) so re-runs don't un-crop it
+        except Exception:  # noqa: BLE001 — best-effort; fall back to no auto crop
+            pass
     # #9 Crop RE-DETECT: zero the cropped box on the RAW volume BEFORE surface detection, so the anterior-edge
     # DP detector + RANSAC parabola fit + warp are all computed on the TRUNCATED volume — the removed
     # frame-columns no longer pull the surface (the DP smoothly bridges the gap; RANSAC drops any residual as
@@ -2055,9 +2120,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         _, _posterior = build_surface_crop_edges(_sagv, _crop_frames, params, workers=workers)
         _out_sag, _pad, _Pb, _Pa, _clamped = warp_surface_crop_extend(_sagv, _posterior, _crop_frames, params,
                                                                       workers=workers, detect=_det)
-        if _auto_crop and _clamped:
-            # AUTO would need an extreme upward extension (> crop_max_pad) — a severe tilt / artifact, not a
-            # clean clip. Don't auto-mangle it: fall through to the normal pipeline (a manual crop still applies).
+        _lo, _hi = int(0.3 * _sagv.shape[0]), int(0.7 * _sagv.shape[0])
+        _pb_span = float(np.ptp(np.median(_Pb[_lo:_hi], axis=0)))      # posterior span across frames = TILT detector
+        if _auto_crop and (_clamped or _pb_span > float(_pc.get("crop_auto_max_span", 200))):
+            # AUTO: an extreme extension (> crop_max_pad) OR a large posterior span = a steep TILT / decentred
+            # scan or an artifact, not a clean clip — the extend warp would mangle it (CS008 OD span ~341).
+            # Don't auto-mangle: fall through to the normal pipeline (a manual crop still applies).
             _crop_frames = None
         else:
             corrected = revert_sagittal(_out_sag)              # (frames, depth+pad, lateral) — same per-voxel spacing
@@ -2080,6 +2148,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             # repeats by pose, not by header geometry (verified on the extended volume).
             write_volume_nifti(corrected, out_nifti, sp)
             info["out"] = str(out_nifti)
+            if _auto_cr:
+                info["auto_crop_region"] = _auto_cr
             return info
     if provided_edges is not None:
         # fix-columns marched re-detection: a SINGLE same-canvas warp that flattens to the user-validated
@@ -2097,6 +2167,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             info["crop"] = {"n_voxels": n_crop}
         write_volume_nifti(corrected, out_nifti, sp)
         info["out"] = str(out_nifti)
+        if _auto_cr:
+            info["auto_crop_region"] = _auto_cr
         return info
     # ── NATIVE AUTO-TUNE: the app tunes the DP detector to THIS scan before correcting (no user input). The
     # chosen dp_* are merged into params so the warp uses them AND surfaced in info["auto_tune"] so the caller
@@ -2151,6 +2223,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         info["crop"] = {"n_voxels": n_crop}
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
+    if _auto_cr:
+        info["auto_crop_region"] = _auto_cr
     return info
 
 

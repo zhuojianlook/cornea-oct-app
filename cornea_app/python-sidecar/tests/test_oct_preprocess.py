@@ -514,3 +514,31 @@ def test_is_substantial_clip_gate():
     assert M.is_substantial_clip(broad, p)                     # many frames, flagged in 40% of slices
     shallow = {"frames": list(range(30, 70)), "counts": {f: 4 for f in range(30, 70)}, "n_slices": n}
     assert not M.is_substantial_clip(shallow, p)               # many frames but each in only 2% of slices
+
+
+# ── auto crop-region: off-cornea NOISE frame detection (v0.0.107) ──
+def _cornea_in_frames(nl=60, nd=200, nf=60, last_cornea=35, rng_seed=0):
+    """Synthetic sag volume (lat, depth, frame): a bright coherent cornea band in frames [0, last_cornea],
+    pure speckle noise after — the 'slow scan ran off the cornea' pattern."""
+    rng = np.random.RandomState(rng_seed)
+    sag = (rng.rand(nl, nd, nf) * 40).astype(np.float32)
+    for fr in range(last_cornea + 1):
+        sag[:, 80:112, fr] += 1600.0          # bright stroma → sharp air/tissue edge at depth 80
+    return sag
+
+
+def test_detect_noise_frames_crops_offcornea_tail():
+    sag = _cornea_in_frames(last_cornea=35)
+    nf = sag.shape[2]
+    nz = M.detect_noise_frames(sag, {}, workers=1)
+    assert nz, "should detect the trailing noise block"
+    assert max(nz) == nf - 1                   # the run reaches the end boundary
+    assert len(nz) >= 18                        # a long block (frames ~38..59)
+    assert 0 not in nz and 20 not in nz         # cornea frames are never cropped
+
+
+def test_detect_noise_frames_none_on_full_cornea():
+    rng = np.random.RandomState(1)
+    sag = (rng.rand(60, 200, 60) * 40).astype(np.float32)
+    sag[:, 80:112, :] += 1600.0                # cornea band in EVERY frame
+    assert M.detect_noise_frames(sag, {}, workers=1) == []

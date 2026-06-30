@@ -2490,6 +2490,15 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     if isinstance(_tuned, dict) and _tuned:
         eff_params.update({k: v for k, v in _tuned.items() if k in
                            ("dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump")})
+    # AUTO crop-region: the worker auto-detected + zeroed off-cornea NOISE frames. PERSIST the box into
+    # oct_params so it is STICKY — re-applied on every later run (incl. a fix-columns redetect, which would
+    # otherwise resurrect the noise) and visible to scar-exclusion / consensus / the crop UI. A manual crop in
+    # THIS request still wins (the worker only auto-detects when no manual crop is set).
+    _acr = iter_info.get("auto_crop_region") if isinstance(iter_info, dict) else None
+    if isinstance(_acr, dict) and _acr.get("frames") and not eff_params.get("crop_region") \
+            and not eff_params.get("crop_lateral"):
+        eff_params["crop_region"] = {"lateral": [int(_acr["lateral"][0]), int(_acr["lateral"][1])],
+                                     "frames": sorted(int(f) for f in _acr["frames"]), "auto": True}
     # The corrected volume just changed → drop any segmentation built on the OLD correction so a
     # stale overlay can't show on the re-corrected volume (the user re-runs SAM2 next).
     seg_dir = orch.segmentation_preview_dir(case_id)
