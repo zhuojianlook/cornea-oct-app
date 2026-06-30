@@ -756,6 +756,10 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
         with _GPU_LOCK:                              # one SAM2/CUDA inference at a time
             label, meta = sam2_segment.segment_volume(
                 base, work, planes=tuple(planes), vote=vote, progress=_progress)
+        # Regularize the cornea to a SMOOTH shell — drops protrusion spikes where SAM2 follows the central
+        # specular/saturation streak past the true posterior surface (the user shouldn't have to paint these
+        # away slice-by-slice). Conservative + scar-safe; no-op on an already-smooth cornea.
+        label = scar_mod.regularize_cornea(label)
     except Exception:
         _sam2_progress_set(case_id, "error", "SAM2 failed", n_planes, n_planes)
         raise

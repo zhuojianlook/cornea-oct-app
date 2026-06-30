@@ -13,6 +13,43 @@ from scipy import ndimage
 BG, CORNEA, SCAR = 0, 1, 2
 
 
+def regularize_cornea(label_ijk: np.ndarray, margin: int = 8, smooth: int = 25) -> np.ndarray:
+    """Clip protrusion SPIKES from the cornea so its anterior + posterior boundaries form a SMOOTH shell.
+
+    The cornea is a smooth curved band; a thin downward (or upward) spike — e.g. where SAM2 follows the
+    central specular/saturation streak past the true posterior surface — is an artifact, not tissue. Per
+    A-line (along the DEPTH axis) the cornea is kept only between the MEDIAN-smoothed anterior and posterior
+    surfaces ± `margin` voxels; voxels beyond that (the spike) are dropped to background. The smoothed
+    surfaces follow genuine (smooth) curvature/thickness variation, so only sharp spikes are removed.
+
+    Conservative + scar-safe: SCAR voxels (label 2) are NEVER clipped (scar lives inside the band), only
+    cornea (label 1). The depth axis is detected automatically (the axis along which the cornea is thinnest)
+    so it works regardless of array orientation. Returns the regularized labelmap (same shape/dtype)."""
+    arr = np.rint(np.asarray(label_ijk)).astype(np.uint8)
+    band = arr >= CORNEA                                  # cornea + scar = the corneal band
+    if not band.any():
+        return arr
+    # Depth axis = the one along which the band is THINNEST relative to its size (the OCT axial axis).
+    frac = [int(band.any(axis=tuple(o for o in range(3) if o != ax)).sum()) / max(1, arr.shape[ax])
+            for ax in range(3)]
+    depth = int(np.argmin(frac))
+    moved = np.moveaxis(band, depth, 1)                   # (a, depth, b)
+    na, nd, nb = moved.shape
+    jcol = np.arange(nd, dtype=np.float32)
+    jj = jcol[None, :, None]
+    jant = np.where(moved, jj, nd + 1).min(axis=1).astype(np.float32)     # first band voxel per A-line
+    jpost = np.where(moved, jj, -1.0).max(axis=1).astype(np.float32)      # last band voxel per A-line
+    valid = moved.any(axis=1)
+    medp, meda = float(np.median(jpost[valid])), float(np.median(jant[valid]))
+    post_sm = ndimage.median_filter(np.where(valid, jpost, medp), size=smooth)
+    ant_sm = ndimage.median_filter(np.where(valid, jant, meda), size=smooth)
+    within = (jj >= (ant_sm - margin)[:, None, :]) & (jj <= (post_sm + margin)[:, None, :])
+    keep = np.moveaxis(within, 1, depth)                  # back to original axis order
+    out = arr.copy()
+    out[(arr == CORNEA) & ~keep] = BG                     # drop ONLY cornea spikes; scar untouched
+    return out
+
+
 # ── Strategy-2 PoC: direct scar mask inside the cornea ROI (no Slicer grow) ──
 
 def cornea_roi_smoothed(vol_ijk: np.ndarray, labelmap_ijk: np.ndarray,

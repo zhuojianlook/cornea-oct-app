@@ -262,3 +262,30 @@ def test_hysteresis_min_voxels_prunes_tiny_components():
         erode_surface=1, smooth=0.6, min_voxels=big_min,
         open_iter=0, close_iter=0)
     assert not mask.any()
+
+
+# ── regularize_cornea: clip protrusion spikes to a smooth shell (scar-safe) ──
+def test_regularize_cornea_clips_spike_keeps_band_and_scar():
+    import scar as S
+    nl, nd, nf = 40, 64, 30          # (lateral, depth, frame); depth = axis 1
+    L = np.zeros((nl, nd, nf), np.uint8)
+    L[:, 24:34, :] = S.CORNEA        # smooth cornea band, depth 24..33
+    L[10:14, 24:34, 12:18] = S.SCAR  # a scar blob INSIDE the band
+    L[20, 34:52, 15] = S.CORNEA      # a thin downward SPIKE at one A-line (the artifact)
+    out = S.regularize_cornea(L, margin=4, smooth=11)
+    # the spike BEYOND the smoothed posterior + margin (~depth 38..51) is removed (margin keeps a few voxels)
+    assert (out[20, 38:52, 15] == 0).all()
+    assert int((out[20, 34:52, 15] == S.CORNEA).sum()) <= 4   # at most ~margin voxels of the spike survive
+    # the smooth band is preserved
+    assert (out[:, 24:34, :] >= S.CORNEA).all()
+    # scar is never clipped
+    assert int((out == S.SCAR).sum()) == int((L == S.SCAR).sum())
+    assert (out[10:14, 24:34, 12:18] == S.SCAR).all()
+
+
+def test_regularize_cornea_noop_on_smooth_band():
+    import scar as S
+    L = np.zeros((30, 50, 20), np.uint8)
+    L[:, 20:30, :] = S.CORNEA        # already smooth → nothing to clip
+    out = S.regularize_cornea(L, margin=4, smooth=11)
+    assert int((out == S.CORNEA).sum()) == int((L == S.CORNEA).sum())
