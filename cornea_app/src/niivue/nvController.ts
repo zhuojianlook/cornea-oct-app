@@ -298,6 +298,26 @@ export function fillBackgroundSeed(): void {
   renderDrawOverlay();
 }
 
+/** Voxels within `r` (6-connected) of any cornea SEED (label 1) — the cornea RIM. Used to confine smart-fill
+ *  re-growth to the corneal band (curvature) so it can't bloat into disconnected bright ARTIFACTS. */
+function _dilatedCorneaMask(seeds: Uint8Array, nx: number, ny: number, nz: number, r: number): Uint8Array {
+  const N = nx * ny * nz, nxny = nx * ny;
+  let cur = new Uint8Array(N);
+  for (let i = 0; i < N; i++) if (seeds[i] === 1) cur[i] = 1;
+  for (let pass = 0; pass < r; pass++) {
+    const next = cur.slice();
+    for (let v = 0; v < N; v++) {
+      if (cur[v]) continue;
+      const z = (v / nxny) | 0, rem = v - z * nxny, y = (rem / nx) | 0, x = rem - y * nx;
+      if ((x > 0 && cur[v - 1]) || (x < nx - 1 && cur[v + 1]) ||
+          (y > 0 && cur[v - nx]) || (y < ny - 1 && cur[v + nx]) ||
+          (z > 0 && cur[v - nxny]) || (z < nz - 1 && cur[v + nxny])) next[v] = 1;
+    }
+    cur = next;
+  }
+  return cur;
+}
+
 /** Smart 3-D fill via the CPU worker. Resolves {ok, reason}; reports 0..100 via onProgress. Pushes a niivue
  *  undo bitmap first so the fill is undoable. Returns reason:"no-seeds" if no cornea/scar seed exists. */
 export async function smartFill(onProgress?: (pct: number) => void): Promise<{ ok: boolean; reason?: "no-volume" | "no-seeds" | "size-mismatch" }> {
@@ -342,11 +362,17 @@ export async function smartFill(onProgress?: (pct: number) => void): Promise<{ o
     for (let i = 0; i < seeds.length; i++) if (vetBaseline[i] === 1) { hist[q[i]]++; cN++; }
     let darkCut = 0;
     if (cN > 0) { const target = cN * 0.10; let acc = 0; for (let b = 0; b < 256; b++) { acc += hist[b]; if (acc >= target) { darkCut = b; break; } } }
+    // CONFINE re-growth to the cornea RIM: only soften bright auto-background within a few voxels of an actual
+    // cornea seed (SAM2 OR a user cornea stroke). This re-grows the corneal band SAM2 under-segmented (which
+    // follows the curvature) WITHOUT bloating into disconnected bright ARTIFACTS (specular/mirror bands below
+    // the cornea, saturation streaks) — even bright ones the user explicitly painted background, which the old
+    // "any bright auto-bg anywhere → re-growable" rule would re-grow as cornea regardless. dr=[n,nx,ny,nz].
+    const near = _dilatedCorneaMask(seeds, dr[1], dr[2], dr[3], 3);
     let softened = 0, bgLeft = 0;
     for (let i = 0; i < seeds.length; i++) {
       if (seeds[i] !== 2) continue;
-      if (vetBaseline[i] === 2 && q[i] >= darkCut) { seeds[i] = 0; softened++; }   // bright untouched auto-bg → re-growable
-      else bgLeft++;                                                               // dark auto-bg or user-painted bg → hard seed
+      if (vetBaseline[i] === 2 && q[i] >= darkCut && near[i]) { seeds[i] = 0; softened++; }  // bright auto-bg ON THE RIM → re-growable
+      else bgLeft++;                                                                          // far/dark auto-bg or user-painted bg → hard seed
     }
     // Safety: if softening left NO background seed (degenerate — e.g. no dark air), revert so the single-label
     // flood can't run away / hang. Only the voxels we just softened are 0 here, so restore them to background.

@@ -34,6 +34,13 @@ const set = (m: NonNullable<Manifest>, k: string) => m[k] != null && m[k] !== fa
 /** The current (highest) lifecycle step a scan's manifest has reached (Raw→Auto→Vetted→Classified→Cornea→
  *  Cornea✓→Subgroup→Scar→Aligned→Normalized→Corrected→Scheduled). Subgroup is assigned BEFORE scar so the
  *  per-subgroup strategy comparison is available at the Scar step. Cornea (SAM2) and Scar are separate steps. */
+/** A no-scar (control) scan: it contributes a cornea-only training label + the normal baseline, so the scar
+ *  steps (Subgroup 7, Scar 8, Aligned 9, Normalized 10, Corrected 11) do not apply — it goes Cornea✓ →
+ *  Scheduled. */
+export function isControl(m: Manifest): boolean {
+  return !!m && m["scar_classification"] === "control";
+}
+
 export function scanStep(m: Manifest): LifecycleStep {
   if (!m) return 0;
   if (!set(m, "input_volume") && !set(m, "corrected_volume")) return 0;
@@ -51,6 +58,9 @@ export function scanStep(m: Manifest): LifecycleStep {
   // case, not the member, so a member tops out at 9 (or 11/12 if its own labelmap was corrected / scheduled).
   if (set(m, "sam2_meta") || set(m, "consensus_case") || set(m, "corrected_labelmap")) {
     if (set(m, "training_scheduled")) return 12;            // scheduled (green)
+    // A CONTROL has no scar/subgroup/align/normalize/correct: once its cornea is vetted it is READY to
+    // schedule (steps 7-11 do not apply). It never advances to 7-11 (those flags are ignored for it).
+    if (isControl(m)) return set(m, "cornea_vetted") ? 6 : 5;
     if (set(m, "corrected_labelmap")) return 11;           // manually corrected (dark blue)
     if (set(m, "consensus_case")) return 9;                // aligned to the eye's consensus (teal)
     if (set(m, "scar_done")) return 8;                     // scar segmented (rose) — AFTER subgroup
@@ -74,6 +84,8 @@ export function lifecycleMeta(m: Manifest): StepMeta {
 export function stepReached(m: Manifest, i: LifecycleStep): boolean {
   if (!m) return false;
   if (set(m, "consensus_cases") || set(m, "consensus_report")) return i <= scanStep(m);
+  // A control skips the scar steps entirely — never colour 7-11 as reached for it (it goes Cornea✓ → Scheduled).
+  if (isControl(m) && i >= 7 && i <= 11) return false;
   switch (i) {
     case 1: return set(m, "input_volume") || set(m, "corrected_volume");
     case 2: return set(m, "oct_preprocessed");
@@ -93,6 +105,13 @@ export function stepReached(m: Manifest, i: LifecycleStep): boolean {
     case 12: return set(m, "training_scheduled");
     default: return false;
   }
+}
+
+/** Whether step `i` APPLIES to this scan. For a control the scar steps (7-11: Subgroup/Scar/Aligned/
+ *  Normalized/Corrected) are not applicable — the timeline shows them greyed/"—" and a control advances
+ *  Cornea✓ (6) → Scheduled (12). Everything applies to scar scans + consensus cases. */
+export function stepApplicable(m: Manifest, i: LifecycleStep): boolean {
+  return !(isControl(m) && i >= 7 && i <= 11);
 }
 
 /** Has SAM2 cornea segmentation been produced? (drives the Segmentation/Slices toggle greying.) */

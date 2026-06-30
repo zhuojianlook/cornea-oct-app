@@ -129,6 +129,10 @@ def main():
                           "sam2_meta": {"ok": True}, "cornea_vetted": True, "subgroup_confirmed": True,
                           "scar_subgroup": "1", "scar_done": True}, lab=_label(scar=True), seg=True, ctx=True)
 
+    # 6c) CONTROL (no scar), cornea vetted — steps 7-11 are N/A; it goes Cornea✓ (6) -> Scheduled (12).
+    make("case_zz_control", {"oct_preprocessed": True, "preproc_vetted": True, "scar_classification": "control",
+                             "sam2_meta": {"ok": True}, "cornea_vetted": True}, lab=_label(scar=False), seg=True, ctx=True)
+
     # Dedicated MUTABLE cases for the progression spec (so mutation tests don't couple to read-only ones):
     #   case_zz_vet       step 2 — Approve preprocessing -> classify
     #   case_zz_corrected step 11 — Schedule / Unschedule

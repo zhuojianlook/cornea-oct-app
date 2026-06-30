@@ -106,4 +106,18 @@ test.describe("lifecycle", () => {
     );
     expect(consoleErrors).toEqual([]);
   });
+
+  test("step 6 control (no scar): offers Schedule + marks scar steps 7-11 N/A", async ({ page, consoleErrors }) => {
+    await gotoApp(page);
+    await openCase(page, FIX.control);
+    const btns = await mainButtons(page);
+    // A control is READY after cornea vet → Schedule (+ Correct), NOT the scar/subgroup controls.
+    expect(btns).toEqual(expect.arrayContaining(["Schedule for training"]));
+    expect(btns).not.toContain("Confirm subgroup");
+    expect(btns).not.toContain("Detect scar (threshold)");
+    // Steps 7-11 (Subgroup/Scar/Aligned/Normalized/Corrected) render struck-through (not applicable).
+    const struck = (await page.locator('main span[style*="line-through"]').allInnerTexts()).join(" ");
+    for (const s of ["Subgroup", "Scar", "Aligned", "Normalized", "Corrected"]) expect(struck).toContain(s);
+    expect(consoleErrors).toEqual([]);
+  });
 });

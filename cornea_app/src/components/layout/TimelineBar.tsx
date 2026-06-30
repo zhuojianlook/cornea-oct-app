@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
-import { LIFECYCLE_STEPS, scanStep, stepReached, type LifecycleStep } from "../../api/lifecycle";
+import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, type LifecycleStep } from "../../api/lifecycle";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through 8 colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → Classified(scar/control) → SAM2(cornea
@@ -132,7 +132,8 @@ export function TimelineBar() {
   const strip = (
     <div className="flex items-center gap-1">
       {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as LifecycleStep[]).map((i) => {
-        const reached = stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
+        const applicable = stepApplicable(manifest, i);   // control: scar steps 7-11 are N/A
+        const reached = applicable && stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
         const viewing = viewStep === i;
         // Any reached step is clickable to inspect; NOT while a correction is in progress (switching the
@@ -142,7 +143,7 @@ export function TimelineBar() {
         const meta = LIFECYCLE_STEPS[i];
         return (
           <div key={i} className="flex items-center gap-1"
-            title={canView ? (current ? `“${meta.short}” (current step)` : `Inspect “${meta.short}” (read-only; roll back to edit)`) : meta.label}>
+            title={!applicable ? `“${meta.short}” — not applicable to a control (no-scar) scan` : canView ? (current ? `“${meta.short}” (current step)` : `Inspect “${meta.short}” (read-only; roll back to edit)`) : meta.label}>
             <span onClick={() => canView && selectStep(i === step ? null : i)} style={{
               display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, lineHeight: 1,
               padding: "3px 7px", borderRadius: 11, whiteSpace: "nowrap",
@@ -151,7 +152,8 @@ export function TimelineBar() {
               fontWeight: current ? 700 : 500,
               // solid white outline = the LIVE current step; dashed = the step you're inspecting.
               outline: current ? "2px solid #fff" : (viewing ? "2px dashed #fff" : "none"), outlineOffset: -1,
-              opacity: reached ? 1 : 0.7,
+              opacity: !applicable ? 0.3 : reached ? 1 : 0.7,
+              textDecoration: !applicable ? "line-through" : "none",
               cursor: canView ? "pointer" : "default",
             }}>
               <b style={{ opacity: 0.7 }}>{i}</b>{meta.short}
@@ -430,11 +432,11 @@ export function TimelineBar() {
     // is needed (the control baseline is eye-wide, control_cases() ignores subgroup) → skip straight to "no scar".
     actions = classification === "control" ? (
       <>
-        <Button size="small" variant="contained" color="secondary" disabled={busy} onClick={() => skipScar()}
-          title="This scan is a control (no scar). Controls are an eye-wide normal baseline (no lesion subgroup), so mark the scar step done and continue.">
-          ✓ No scar (control) — continue
-        </Button>
-        {sep}{Correct}
+        {/* A control (no scar) is READY once its cornea is vetted — the scar/subgroup/align/normalize/correct
+            steps (7-11) don't apply (greyed in the strip). Its cornea-only label is the training label + the
+            normal baseline, so the next action is Schedule. Correct stays available to touch up the cornea. */}
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Control (no scar) — cornea vetted; no scar/align/normalize needed.</span>
+        {ScheduleBtn}{sep}{Correct}
       </>
     ) : (
       <>

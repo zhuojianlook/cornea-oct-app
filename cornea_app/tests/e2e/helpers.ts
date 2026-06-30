@@ -7,6 +7,7 @@ export const FIX = {
   classified: "case_zz_classified",   // step 4
   cornea: "case_zz_cornea",           // step 5 (cornea segmented, awaiting vet)
   corneavet: "case_zz_corneavet",     // step 6 (cornea vetted, awaiting subgroup)
+  control: "case_zz_control",         // step 6 control (no scar) — steps 7-11 N/A
   subgroup: "case_zz_subgroup",       // step 7 (subgroup assigned)
   scar: "case_zz_scar",               // step 8 (scar segmented)
   vet: "case_zz_vet",                 // step 2 (MUTABLE — Approve preprocessing -> classify)
