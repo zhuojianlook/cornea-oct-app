@@ -346,6 +346,16 @@ export function TimelineBar() {
 
   const sep = <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />;
 
+  // Auto-populated scans reach Cornea (SAM2) WITHOUT a human approving the preprocessing (preproc_vetted unset,
+  // e.g. the batch populate). Offer a NON-destructive approve at the segmentation steps so the Vetted step can be
+  // filled without a rollback (which would clear SAM2). Null once vetted, so it never shows for the normal flow.
+  const ApprovePreproc = !manifest?.preproc_vetted ? (
+    <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => vetPreprocessing()}
+      title="Mark the preprocessing as manually vetted (fills the Vetted step). Non-destructive — keeps the SAM2 segmentation. Shown because this scan was segmented without an explicit preprocessing approval.">
+      ✓ Approve preprocessing
+    </Button>
+  ) : null;
+
   // ── actions ──
   let actions: React.ReactNode = null;
   if (inspecting) {
@@ -412,12 +422,14 @@ export function TimelineBar() {
   } else if (step === 4) {
     // cornea segmented (fuchsia) → VET the cornea/background (paint, scar pen hidden), then confirm → unlocks
     // classification. Scar detection is NOT shown here until cornea/background is confirmed AND the scan is classified.
-    actions = <>{CorneaVet}</>;
+    // Auto-populated scans also get a non-destructive "Approve preprocessing" here (their Vetted step was skipped).
+    actions = <>{ApprovePreproc && <>{ApprovePreproc}{sep}</>}{CorneaVet}</>;
   } else if (step === 5) {
     // cornea/background vetted (purple) → CLASSIFY scar/control. Moved here from before SAM2 (it only gates the
     // scar branch): a control schedules next; a scar scan proceeds to subgroup.
     actions = (
       <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
+        {ApprovePreproc && <>{ApprovePreproc}{sep}</>}
         <span className="flex items-center gap-1"
           title="Does this corrected volume have a scar? 'No scar' marks it a control (normal baseline). Replicates/controls are grouped in the sidebar.">
           Classify:
