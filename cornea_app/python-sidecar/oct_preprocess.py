@@ -1063,7 +1063,8 @@ def detect_noise_frames(sag: np.ndarray, params: dict | None = None, workers: in
     return sorted(set(out))
 
 
-def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None) -> dict:
+def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
+                               detect: np.ndarray | None = None) -> dict:
     """AUTO-SUGGEST the surface-CROPPED frames (B-scan columns whose corneal apex rises ABOVE the acquisition
     window, so the frame has no anterior surface). Runs the validated per-slice clip detector (_clip_mask) over
     every sagittal slice and counts, per frame, how many slices flag it clipped. Returns
@@ -1071,7 +1072,7 @@ def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, work
     slices (the default selection the user verifies/edits); `counts` drives a per-frame confidence bar. The
     posterior-continuity reconstruction (build_surface_crop_edges) is what actually corrects the confirmed set."""
     p = {**DEFAULT_PARAMS, **(params or {})}
-    edges = detect_surface_all(sag, p, workers=workers)
+    edges = detect if detect is not None else detect_surface_all(sag, p, workers=workers)
     n, depth_vox, F = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
     counts = np.zeros(F, dtype=int)
     for i in range(n):
@@ -2084,11 +2085,28 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # detects none (no-op). Manual crop_region/crop_lateral overrides; the marched re-detect path is left alone.
     _pcr = {**DEFAULT_PARAMS, **(params or {})}
     _auto_cr = None                                                # auto crop-region box → surfaced in info → persisted
+    # PERF: the noise-crop check and the surface-crop check BOTH run the ~12s anterior detector on the SAME raw
+    # volume with the SAME (pre-auto-tune) detector params. The detector output is independent of crop_region /
+    # crop_lateral (those only mask the volume via _apply_crop; they are NOT read by _edge_worker), so compute
+    # detect_surface_all ONCE and reuse it for both. The cache is CLEARED the instant _apply_crop mutates `vol`
+    # (then it recomputes on the cropped volume) — so a cropped scan is byte-identical, the common no-crop scan
+    # saves a full detect pass.
+    _det_cache: dict = {}
+
+    def _cur_sag_det(_p):
+        """(sag, anterior-detection) for the CURRENT `vol`, computed once and reused while `vol` is unchanged."""
+        if "det" not in _det_cache:
+            _s = reformat_to_sagittal(vol)
+            _det_cache["sag"] = _s
+            _det_cache["det"] = detect_surface_all(_s, _p, workers=workers)
+        return _det_cache["sag"], _det_cache["det"]
+
     if provided_edges is None and _pcr.get("auto_crop_region", True) \
             and (params or {}).get("crop_region") is None and (params or {}).get("crop_lateral") is None \
             and str(_pcr.get("detector", "dp")).lower() != "legacy":
         try:
-            _nz = detect_noise_frames(reformat_to_sagittal(vol), params, workers=workers)
+            _s0, _d0 = _cur_sag_det(params)
+            _nz = detect_noise_frames(_s0, params, workers=workers, detect=_d0)
             if _nz:
                 params = dict(params or {})
                 params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
@@ -2102,6 +2120,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # re-asserts it (idempotent). No-op when no crop is set, so non-cropped preprocessing is byte-unchanged.
     if params and (params.get("crop_region") or params.get("crop_lateral")):
         vol, _ = _apply_crop(vol, params)
+        _det_cache.clear()                                        # vol changed → shared anterior detection is stale
     # SURFACE-CROP (AUTO + manual): a clipped cornea (apex and/or a whole edge ABOVE the acquisition window) is
     # corrected by fitting the still-visible POSTERIOR (bottom) edge to a parabola, aligning each column to it,
     # and EXTENDING the depth canvas UPWARD so the above-old-top apex/edge + cut-off columns are kept (never
@@ -2114,7 +2133,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if provided_edges is None and _crop_frames is None and _pcc.get("auto_surface_crop", True) \
             and str(_pcc.get("detector", "dp")).lower() != "legacy":
         try:
-            _ci = detect_surface_crop_frames(reformat_to_sagittal(vol), params, workers=workers)
+            _s1, _d1 = _cur_sag_det(params)                       # reused from the noise check when no crop was applied
+            _ci = detect_surface_crop_frames(_s1, params, workers=workers, detect=_d1)
             if is_substantial_clip(_ci, params):
                 _crop_frames = _ci["frames"]; _auto_crop = True
         except Exception:  # noqa: BLE001 — auto detection is best-effort; fall back to the normal pipeline

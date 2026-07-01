@@ -542,3 +542,17 @@ def test_detect_noise_frames_none_on_full_cornea():
     sag = (rng.rand(60, 200, 60) * 40).astype(np.float32)
     sag[:, 80:112, :] += 1600.0                # cornea band in EVERY frame
     assert M.detect_noise_frames(sag, {}, workers=1) == []
+
+
+def test_shared_detection_matches_internal():
+    """PERF (v0.0.113): preprocess computes the anterior detection ONCE and passes it (detect=) to BOTH the
+    noise check and the surface-crop check — they run on the same volume with the same detector params, and the
+    detector output is independent of crop_region. Passing a precomputed detect= MUST be byte-identical to
+    letting each function recompute internally, else the shared cache would silently change the crop decisions."""
+    sag = _cornea_in_frames(last_cornea=35)
+    p = {**M.DEFAULT_PARAMS}
+    det = M.detect_surface_all(sag, p, workers=1)
+    assert M.detect_noise_frames(sag, p, workers=1, detect=det) == M.detect_noise_frames(sag, p, workers=1)
+    a = M.detect_surface_crop_frames(sag, p, workers=1, detect=det)
+    b = M.detect_surface_crop_frames(sag, p, workers=1)
+    assert a["frames"] == b["frames"] and a["counts"] == b["counts"]

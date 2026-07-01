@@ -2191,8 +2191,8 @@ def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict
         pass
     orch.write_manifest_value(case_id, {
         "input_volume": str(work), "corrected_volume": str(work),
-        "oct_preprocessed": preprocessed, "oct_spacing": spacing, **extra,
-    })
+        "oct_spacing": spacing, **extra,
+    })  # NB: oct_preprocessed is set LAST (below), only after volume.nii.gz is fully written — see there.
     if not preprocessed:
         # Showing a RAW capture (fresh scrub or a switched volume_index): drop any stale
         # segmentation from a prior capture so it can't be applied to the new volume (and
@@ -2221,6 +2221,11 @@ def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict
         if not _previews_fresh(ctx, base):
             postprocess.render_context_previews(base, ctx)
             (ctx / ".rev3").write_text("")
+    # Set the pipeline-gate flag LAST — only now that previews/volume.nii.gz is fully written (base, above).
+    # The interactive app is sequential so this ordering is invisible to it, but the streaming populate polls
+    # oct_preprocessed from a separate process to decide a scan is ready for SAM2; setting it before the volume
+    # write finished let a SAM2 worker read a half-written/empty volume.nii.gz ("Compressed file ended").
+    orch.write_manifest_value(case_id, {"oct_preprocessed": preprocessed})
     # The gallery pulls slices lazily via /previews + /preview-file, so don't base64 the (now
     # DENSE) context group into this response — it would inline tens of MB the frontend ignores.
     return {"case_info": orch.current_case_info(case_id), "spacing": spacing,
