@@ -17,9 +17,9 @@ export const LIFECYCLE_STEPS: { color: string; label: string; short: string }[] 
   { color: "#94a3b8", label: "Raw image", short: "Raw" },                          // 1 slate (idle)
   { color: "#f87171", label: "Preprocessed · automatic", short: "Auto" },          // 2 red (needs vetting)
   { color: "#f472b6", label: "Preprocessed · manually vetted", short: "Vetted" },  // 3 pink
-  { color: "#e879f9", label: "Scar / control classified", short: "Classified" },   // 4 fuchsia
-  { color: "#c084fc", label: "Cornea segmented (SAM2)", short: "Cornea" },         // 5 purple
-  { color: "#a78bfa", label: "Cornea/background vetted (paint)", short: "Cornea✓" }, // 6 violet
+  { color: "#e879f9", label: "Cornea segmented (SAM2)", short: "Cornea" },          // 4 fuchsia
+  { color: "#c084fc", label: "Cornea/background vetted (paint)", short: "Cornea✓" }, // 5 purple
+  { color: "#a78bfa", label: "Scar / control classified", short: "Classified" },    // 6 violet
   { color: "#818cf8", label: "Subgroup assigned", short: "Subgroup" },            // 7 indigo (BEFORE scar)
   { color: "#60a5fa", label: "Scar segmented", short: "Scar" },                    // 8 blue
   { color: "#38bdf8", label: "Replicates aligned", short: "Aligned" },            // 9 sky
@@ -31,8 +31,9 @@ export const LIFECYCLE_STEPS: { color: string; label: string; short: string }[] 
 type Manifest = Record<string, unknown> | null | undefined;
 const set = (m: NonNullable<Manifest>, k: string) => m[k] != null && m[k] !== false && m[k] !== "";
 
-/** The current (highest) lifecycle step a scan's manifest has reached (Raw→Auto→Vetted→Classified→Cornea→
- *  Cornea✓→Subgroup→Scar→Aligned→Normalized→Corrected→Scheduled). Subgroup is assigned BEFORE scar so the
+/** The current (highest) lifecycle step a scan's manifest has reached (Raw→Auto→Vetted→Cornea→Cornea✓→
+ *  Classified→Subgroup→Scar→Aligned→Normalized→Corrected→Scheduled). Classification (scar/control) comes AFTER
+ *  cornea-vetting — it gates only the scar branch, not SAM2. Subgroup is assigned BEFORE scar so the
  *  per-subgroup strategy comparison is available at the Scar step. Cornea (SAM2) and Scar are separate steps. */
 /** A no-scar (control) scan: it contributes a cornea-only training label + the normal baseline, so the scar
  *  steps (Subgroup 7, Scar 8, Aligned 9, Normalized 10, Corrected 11) do not apply — it goes Cornea✓ →
@@ -52,25 +53,26 @@ export function scanStep(m: Manifest): LifecycleStep {
     return 9;
   }
   if (!set(m, "oct_preprocessed")) return 1;                 // raw only
-  // A SEGMENTED per-scan scan: Cornea(5, sam2_meta) → Cornea/bg vetted(6, cornea_vetted) → Subgroup(7,
-  // subgroup_confirmed) → Scar(8, scar_done) → Aligned(9, consensus_case link). Subgroup is assigned BEFORE
-  // scar so the strategy comparison at the Scar step is per-subgroup. Normalize(10) acts on the consensus
-  // case, not the member, so a member tops out at 9 (or 11/12 if its own labelmap was corrected / scheduled).
+  // A SEGMENTED per-scan scan: Cornea(4, sam2_meta) → Cornea/bg vetted(5, cornea_vetted) → Classified(6,
+  // scar_classification) → Subgroup(7) → Scar(8) → Aligned(9). Classification now comes AFTER cornea-vetting
+  // (it gates only the scar branch, not SAM2): a control is READY to schedule once classified; a scar scan
+  // proceeds to subgroup. Normalize(10) acts on the consensus case, so a member tops out at 9 (or 11/12 if its
+  // own labelmap was corrected / scheduled).
   if (set(m, "sam2_meta") || set(m, "consensus_case") || set(m, "corrected_labelmap")) {
     if (set(m, "training_scheduled")) return 12;            // scheduled (green)
-    // A CONTROL has no scar/subgroup/align/normalize/correct: once its cornea is vetted it is READY to
-    // schedule (steps 7-11 do not apply). It never advances to 7-11 (those flags are ignored for it).
-    if (isControl(m)) return set(m, "cornea_vetted") ? 6 : 5;
-    if (set(m, "corrected_labelmap")) return 11;           // manually corrected (dark blue)
-    if (set(m, "consensus_case")) return 9;                // aligned to the eye's consensus (teal)
-    if (set(m, "scar_done")) return 8;                     // scar segmented (rose) — AFTER subgroup
-    if (set(m, "subgroup_confirmed")) return 7;            // subgroup assigned (purple) — BEFORE scar
-    if (set(m, "cornea_vetted")) return 6;                 // cornea/background paint-vetted (indigo)
-    return 5;                                               // cornea segmented, awaiting vet (light blue)
+    // A CONTROL has no scar/subgroup/align/normalize/correct: once classified it is READY to schedule (steps
+    // 7-11 do not apply). It never advances to 7-11 (those flags are ignored for it).
+    if (isControl(m)) return 6;                             // classified control (violet) → ready to schedule
+    if (set(m, "corrected_labelmap")) return 11;           // manually corrected (teal)
+    if (set(m, "consensus_case")) return 9;                // aligned to the eye's consensus (sky)
+    if (set(m, "scar_done")) return 8;                     // scar segmented (blue) — AFTER subgroup
+    if (set(m, "subgroup_confirmed")) return 7;            // subgroup assigned (indigo) — BEFORE scar
+    if (set(m, "scar_classification")) return 6;           // classified scar (violet) — next is subgroup
+    if (set(m, "cornea_vetted")) return 5;                 // cornea/background paint-vetted (purple)
+    return 4;                                               // cornea segmented, awaiting vet (fuchsia)
   }
   if (!set(m, "preproc_vetted")) return 2;                   // auto-preprocessed (red)
-  if (!set(m, "scar_classification")) return 3;              // vetted (orange)
-  return 4;                                                  // classified (yellow)
+  return 3;                                                  // vetted, awaiting SAM2 cornea (pink)
 }
 
 export function lifecycleMeta(m: Manifest): StepMeta {
@@ -90,10 +92,10 @@ export function stepReached(m: Manifest, i: LifecycleStep): boolean {
     case 1: return set(m, "input_volume") || set(m, "corrected_volume");
     case 2: return set(m, "oct_preprocessed");
     case 3: return set(m, "preproc_vetted");
-    case 4: return set(m, "scar_classification");
-    case 5: return set(m, "sam2_meta") || set(m, "corrected_labelmap") || set(m, "consensus_case");
-    // cornea/bg vetted — implied done once any LATER step (subgroup/scar/aligned/corrected) is reached
-    case 6: return set(m, "cornea_vetted") || set(m, "subgroup_confirmed") || set(m, "scar_done") || set(m, "consensus_case") || set(m, "corrected_labelmap");
+    case 4: return set(m, "sam2_meta") || set(m, "corrected_labelmap") || set(m, "consensus_case");   // cornea segmented
+    // cornea/bg vetted — implied done once any LATER scar-branch step (subgroup/scar/aligned/corrected) is reached
+    case 5: return set(m, "cornea_vetted") || set(m, "subgroup_confirmed") || set(m, "scar_done") || set(m, "consensus_case") || set(m, "corrected_labelmap");
+    case 6: return set(m, "scar_classification");   // classified (scar/control) — now AFTER cornea✓
     // subgroup (7) — its OWN flag, or a consensus (built per-subgroup implies it). NOT scar_done: a CONTROL
     // skips subgroup and sets scar_done directly, so scar_done must not falsely colour subgroup as reached.
     case 7: return set(m, "subgroup_confirmed") || set(m, "consensus_case");
@@ -119,7 +121,7 @@ export function hasSegmentation(m: Manifest): boolean {
   return !!m && (set(m, "sam2_meta") || set(m, "consensus_case") || set(m, "corrected_labelmap"));
 }
 
-/** Is the scan classified (scar/control set)? (gates running SAM2 — "wait to be labelled".) */
+/** Is the scan classified (scar/control set)? (gates the SCAR branch — Subgroup/Scar — not SAM2.) */
 export function isClassified(m: Manifest): boolean {
   return !!m && set(m, "scar_classification");
 }

@@ -28,7 +28,7 @@ export function VolumeCanvas() {
   const gtViewerClass = useWorkflowStore((s) => s.gtViewerClass);
   const wfSet = useWorkflowStore((s) => s.set);
   // #2/#3: the timeline step being viewed drives which viewer tools are available. The preprocessing tools
-  // (Before/after, Fix-columns, Steps) belong to the Auto→Vetted steps (2–3); from Classified (4) on, the
+  // (Before/after, Fix-columns, Steps) belong to the Auto→Vetted steps (2–3); from Cornea/SAM2 (4) on, the
   // viewer is Slices/Segmentation. Inspecting an earlier step is read-only (no border edits until rollback).
   const selectedStep = useWorkflowStore((s) => s.selectedStep);
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
@@ -182,8 +182,8 @@ export function VolumeCanvas() {
     return () => { cancelled = true; };
   }, [caseInfo?.case_id, volumeUrl]);
 
-  // #2/#3: when the VIEWED step is no longer a preprocessing step (e.g. after SAM2 advances it to 5, or
-  // the user inspects Classified+), close the preprocessing overlays so the niivue Slices/Segmentation
+  // #2/#3: when the VIEWED step is no longer a preprocessing step (e.g. after SAM2 advances it to 4, or
+  // the user inspects Cornea+), close the preprocessing overlays so the niivue Slices/Segmentation
   // view shows. (Fixes "after SAM2 the user is still in Fix-columns and can't see the segmentation".)
   useEffect(() => {
     if (!preprocStep) { setCompareView(false); setFixColsView(false); setStepsView(false); }

@@ -4,11 +4,11 @@ import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
 import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, type LifecycleStep } from "../../api/lifecycle";
 
-/* Per-scan lifecycle TIMELINE — the active scan's progress through 8 colour-coded steps, surfacing ONLY
-   the next action(s). Order: Raw → Preprocessed[auto] → Vetted → Classified(scar/control) → SAM2(cornea
-   +scar, one-go) → Aligned(replicates) → Corrected → Scheduled. SAM2 is gated until classified, and for
-   a scar-labelled scan "Run SAM2" also runs scar in one go. Click any REACHED earlier step to roll back
-   to it (clears the later steps). */
+/* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
+   the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
+   control) → Subgroup → Scar → Aligned → Normalized → Corrected → Scheduled. Classification comes AFTER
+   cornea-vetting (it gates only the scar branch, not SAM2), so a control can schedule straight after Cornea✓.
+   Click any REACHED earlier step to roll back to it (clears the later steps). */
 export function TimelineBar() {
   const segBusy = useWorkflowStore((s) => s.segBusy);
   const scarBusy = useWorkflowStore((s) => s.scarBusy);
@@ -389,16 +389,14 @@ export function TimelineBar() {
       </>
     );
   } else if (step === 3) {
+    // vetted (pink) → segment the CORNEA (SAM2). Classification (scar/control) is a LATER step now — it comes
+    // after cornea-vetting and gates only the scar branch, so SAM2 runs without it.
     actions = (
       <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
-        <span className="flex items-center gap-1"
-          title="Does this corrected volume have a scar? 'No scar' marks it a control (normal baseline). Replicates/controls are grouped in the sidebar.">
-          Classify:
-          <Button size="small" variant={classification === "scar" ? "contained" : "outlined"} color="error"
-            disabled={busy} onClick={() => setClassification(classification === "scar" ? null : "scar")}>Scar</Button>
-          <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
-            disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar (control)</Button>
-        </span>
+        <Button size="small" variant="contained" color="primary" disabled={busy || !!sam2RunningCaseId} onClick={() => runSam2()}
+          title="Run SAM2 cornea-vs-background segmentation. Scar/control classification and scar segmentation come in later steps.">
+          ▶ Run SAM2 (cornea)
+        </Button>
         {sep}
         {/* #10 — save the preprocessing correction as an MP4 grid (planes × passes, before↔after). */}
         <Button size="small" variant="outlined" disabled={busy || mp4Busy} onClick={() => exportCorrectionMp4()}
@@ -412,24 +410,28 @@ export function TimelineBar() {
       </div>
     );
   } else if (step === 4) {
-    // classified (yellow) → segment the CORNEA only (SAM2). Scar is the next, separate step.
-    actions = (
-      <>
-        <Button size="small" variant="contained" color="primary" disabled={busy || !!sam2RunningCaseId} onClick={() => runSam2()}
-          title="Run SAM2 cornea-vs-background segmentation. Scar is segmented in the next step.">
-          ▶ Run SAM2 (cornea)
-        </Button>
-        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>(classified as {classification})</span>
-      </>
-    );
-  } else if (step === 5) {
-    // #11 cornea segmented (light blue) → VET the cornea/background (paint, scar pen hidden), then confirm
-    // → unlocks the Scar step. Scar detection is NOT shown here until cornea/background is confirmed.
+    // cornea segmented (fuchsia) → VET the cornea/background (paint, scar pen hidden), then confirm → unlocks
+    // classification. Scar detection is NOT shown here until cornea/background is confirmed AND the scan is classified.
     actions = <>{CorneaVet}</>;
+  } else if (step === 5) {
+    // cornea/background vetted (purple) → CLASSIFY scar/control. Moved here from before SAM2 (it only gates the
+    // scar branch): a control schedules next; a scar scan proceeds to subgroup.
+    actions = (
+      <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
+        <span className="flex items-center gap-1"
+          title="Does this corrected volume have a scar? 'No scar' marks it a control (normal baseline). Replicates/controls are grouped in the sidebar.">
+          Classify:
+          <Button size="small" variant={classification === "scar" ? "contained" : "outlined"} color="error"
+            disabled={busy} onClick={() => setClassification(classification === "scar" ? null : "scar")}>Scar</Button>
+          <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
+            disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar (control)</Button>
+        </span>
+      </div>
+    );
   } else if (step === 6) {
-    // cornea/background vetted (indigo) → SUBGROUP step (moved BEFORE scar so the strategy comparison at the
-    // Scar step is per-subgroup). Scar scan: assign which lesion set it belongs to. Control: no lesion subgroup
-    // is needed (the control baseline is eye-wide, control_cases() ignores subgroup) → skip straight to "no scar".
+    // classified (violet) → SUBGROUP step (assigned BEFORE scar so the strategy comparison at the Scar step is
+    // per-subgroup). Scar scan: assign which lesion set it belongs to. Control: no lesion subgroup is needed
+    // (the control baseline is eye-wide, control_cases() ignores subgroup) → skip straight to "no scar".
     actions = classification === "control" ? (
       <>
         {/* A control (no scar) is READY once its cornea is vetted — the scar/subgroup/align/normalize/correct
