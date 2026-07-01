@@ -209,9 +209,14 @@ def segment_plane(vol: np.ndarray, plane: str, work: Path) -> tuple[np.ndarray, 
     from PIL import Image
 
     nframes, get = _frames_for_plane(vol, plane)
-    fdir = work / f"frames_{plane}"
+    # Frames scratch on RAM (tmpfs /dev/shm) when available: SAM2 reads them back each propagate step, so
+    # RAM-backing removes the JPEG disk round-trip. PID-scoped name so concurrent processes (parallel sweep)
+    # never collide. Falls back to `work` if /dev/shm isn't usable. Cleaned up in the finally below.
+    _shm = Path("/dev/shm")
+    _froot = _shm if (_shm.is_dir() and os.access(_shm, os.W_OK)) else work
+    fdir = _froot / f"sam2frames_{plane}_{os.getpid()}"
     if fdir.exists():
-        shutil.rmtree(fdir)
+        shutil.rmtree(fdir, ignore_errors=True)
     fdir.mkdir(parents=True)
     for f in range(nframes):
         Image.fromarray(np.repeat(_norm8(get(f))[:, :, None], 3, axis=2)).save(

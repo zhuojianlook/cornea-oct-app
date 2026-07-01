@@ -2044,6 +2044,8 @@ def consensus_build(req: ConsensusBuildRequest) -> dict:
 class OctPreprocessRequest(BaseModel):
     params: dict | None = None
     volume_index: int | None = None
+    skip_previews: bool | None = None   # batch/populate: skip the eager DENSE context-slice render (they
+                                        #   render lazily via /context-previews on open) — big populate speedup
     classification: str | None = None   # "scar" | "control" (no scar) | None
     scar_range: List[int] | None = None  # [start_frame, end_frame], 1-based
     patient: str | None = None  # user-corrected identity (group header edit); overrides filename parse
@@ -2308,7 +2310,8 @@ def oct_volume(case_id: str, req: OctPreprocessRequest) -> dict:
     # Render the slice PNGs the 2D gallery shows — but _oct_render_volume now CACHES them
     # (skips the render when up to date), so a repeat scrub is cheap while a first view still
     # gets its slices immediately (no extra on-demand round-trip).
-    out = _oct_render_volume(case_id, work, preprocessed=show_corrected, extra={"oct_volume_index": vi})
+    out = _oct_render_volume(case_id, work, preprocessed=show_corrected, extra={"oct_volume_index": vi},
+                             render_previews=not bool(req.skip_previews))
     out["n_frames"] = _nifti_frames(work)
     out["preprocessed"] = show_corrected
     return out

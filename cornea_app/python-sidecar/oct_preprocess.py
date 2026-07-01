@@ -206,7 +206,16 @@ def auto_workers(reserve: int = 1) -> int:
     """Per-slice parallel worker count for a SINGLE scan's processing — use ALL available cores (leaving
     `reserve` for the main/IO thread), with NO arbitrary upper cap, so the app scales to whatever machine it
     runs on (e.g. a 24-thread Ryzen → 23 workers). When several scans run concurrently the caller passes an
-    explicit, smaller `workers` so K scans × workers ≈ all cores (no oversubscription)."""
+    explicit, smaller `workers` so K scans × workers ≈ all cores (no oversubscription).
+
+    CORNEA_WORKERS env caps this — a parallel sweep sets it to cores/N so N concurrent scans don't
+    oversubscribe the CPU during preprocessing (the endpoint runs the CLI without an explicit worker count)."""
+    env = os.environ.get("CORNEA_WORKERS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
     return max(1, (os.cpu_count() or 2) - max(0, int(reserve)))
 
 
@@ -2190,13 +2199,17 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     params = dict(params or {})
     _pa = {**DEFAULT_PARAMS, **params}
     auto_tune_info: dict = {}
-    if _pa.get("auto_tune", True) and str(_pa.get("detector", "dp")).lower() != "legacy":
+    _dp_keys = ("dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump")
+    _cached_dp = all(k in params for k in _dp_keys)   # a prior tune already persisted these (re-run) → skip
+    if _pa.get("auto_tune", True) and str(_pa.get("detector", "dp")).lower() != "legacy" and not _cached_dp:
         try:
             best, sc = auto_tune_detector(reformat_to_sagittal(vol), params)
             params.update(best)
             auto_tune_info = {"params": best, "score": round(float(sc), 2)}
         except Exception:  # noqa: BLE001 — tuning is best-effort; fall back to the fixed defaults
             auto_tune_info = {}
+    elif _cached_dp:
+        auto_tune_info = {"cached": True}             # reuse persisted dp_* (deterministic tune → identical)
     clip_report: dict = {}
     if max_iterations and int(max_iterations) > 1:
         chain, best_idx, info = iterate_smooth_volume(
