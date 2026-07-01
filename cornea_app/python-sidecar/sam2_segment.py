@@ -476,29 +476,65 @@ def segment_volume(volume_nifti: Path, work: Path,
             progress("fuse", len(planes), len(planes))
         except Exception:  # noqa: BLE001
             pass
-    fused = votes >= vote
-    # keep the largest connected component, fill holes
-    lbl, n = ndimage.label(fused)
-    if n > 1:
-        sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
-        fused = lbl == int(np.argmax(sizes)) + 1
-    fused = ndimage.binary_fill_holes(fused)
-    # #13 — NO holes within the cornea thickness. The cornea is a single contiguous band along the A-scan
-    # (depth) direction, so any gap between its anterior and posterior surface in a column is a SAM2 vote
-    # dropout, not real anatomy. binary_fill_holes only fills FULLY-enclosed cavities (a gap that leaks to
-    # the edge survives), so additionally solid-fill each A-scan column between its first and last cornea
-    # voxel. Downstream scar detection/normalization assumes a solid cornea, so this must hold.
-    holes_before = int(fused.sum())
-    fused = _fill_cornea_thickness(fused)
-    thickness_filled = int(fused.sum()) - holes_before
-    label = fused.astype(np.uint8)
+    label, core_grow, thickness_filled = _fuse_votes(votes, vote)
     meta = {"per_plane": per_plane, "vote_threshold": vote,
             "cornea_voxels": int(label.sum()), "model": "sam2.1_hiera_small",
             "planes_failed": planes_failed,
             "thickness_filled_voxels": thickness_filled,   # #13 — how many in-thickness gaps were closed
+            "core_grow": core_grow,                        # peripheral-run recovery (core→contiguous union)
             "degraded": bool(planes_failed)}        # surfaced so a silent under-segment is visible
     _free_gpu()
     return label, meta
+
+
+def _finalize_vote_mask(m: np.ndarray):
+    """Largest connected component → fill enclosed holes → solid-fill each A-scan (depth) column between its
+    first/last cornea voxel (#13: the cornea is one contiguous band along depth, so an in-column gap is a SAM2
+    vote dropout, not anatomy; downstream scar code assumes a solid cornea). Returns (mask, n_thickness_filled)."""
+    lbl, n = ndimage.label(m)
+    if n > 1:
+        sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
+        m = lbl == int(np.argmax(sizes)) + 1
+    m = ndimage.binary_fill_holes(m)
+    before = int(m.sum())
+    m = _fill_cornea_thickness(m)
+    return m, int(m.sum()) - before
+
+
+def _fuse_votes(votes: np.ndarray, vote: int):
+    """Fuse the per-plane vote count into the final cornea label. Returns (label uint8, core_grow dict,
+    thickness_filled int).
+
+    CORE-GROW recovery: SAM2 tracks each plane as a video, so a plane can lose the cornea on a run of
+    PERIPHERAL frames and never recover — then the 2-of-3 vote collapses to empty there even though another
+    plane (which cuts ACROSS frames) still sees it (observed CS020 OS(2): frames 73-100 present only in the
+    axial plane → dropped). Recover by growing the high-confidence CORE (votes≥vote) through spatially-
+    CONTIGUOUS single-plane (union, votes≥1) evidence. The acceptance test is PER union-component and is judged
+    on the FINAL (thickness-filled) mass — because thickness-fill amplifies a deep/contiguous flood: a
+    component is kept only if, once finalized, it stays ≤2.5× the CORE MASS IT CONTAINS (a genuine peripheral
+    run runs ~1.5-2×; a single plane leaking into sclera, or a depth-leak that thickness-fill balloons, blows
+    past it). Per-component (not one global cap) so an unrelated over-cap blob can't veto a legitimate
+    recovery; an isolated single-plane blob never touches the core so is never grown. (surface-crop floods are
+    also gated upstream in oct_preprocess.)"""
+    core = votes >= vote
+    core_final, thickness_filled = _finalize_vote_mask(core)
+    fused = core_final
+    core_grow = {"applied": False, "core_vox": int(core.sum()), "grown_vox": int(core_final.sum())}
+    if vote > 1 and core.any():
+        union = votes >= 1
+        lbl_u, _n = ndimage.label(union)
+        recovered = core.copy()
+        for lab in set(int(v) for v in np.unique(lbl_u[core]) if v):
+            comp = lbl_u == lab
+            cc = int((comp & core).sum())
+            if cc and int(_finalize_vote_mask(comp)[0].sum()) <= 2.5 * cc:
+                recovered |= comp
+        if int(recovered.sum()) > int(core.sum()):
+            grown_final, tf_grown = _finalize_vote_mask(recovered)
+            fused, thickness_filled = grown_final, tf_grown
+            core_grow["applied"] = True
+            core_grow["grown_vox"] = int(grown_final.sum())
+    return fused.astype(np.uint8), core_grow, thickness_filled
 
 
 def _depth_axis(mask: np.ndarray) -> int:
