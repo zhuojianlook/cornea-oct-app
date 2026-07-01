@@ -523,11 +523,25 @@ def _fuse_votes(votes: np.ndarray, vote: int):
     if vote > 1 and core.any():
         union = votes >= 1
         lbl_u, _n = ndimage.label(union)
+        # Per-A-scan-column thickness of the CORE (voxels along the depth axis). A genuine peripheral-run
+        # recovery EXTENDS the band into more frames at ~the cornea's own thickness; a single-plane sclera/
+        # depth leak THICKENS columns (and thickness-fill amplifies it into a fat slab). So besides the mass
+        # cap, reject a component whose FINALIZED per-column thickness (95th pct) exceeds ~1.8× the core's
+        # median — a total-voxel ratio alone can't tell a lateral extension from a depth over-segmentation
+        # (both ~1.5-1.8× mass), but the thickness does. (Regression guard: CS001 OS(2) slab, mass 1.66×.)
+        depth = _depth_axis(core)
+        core_ct = core.sum(axis=depth)
+        core_med = float(np.median(core_ct[core_ct > 0])) if (core_ct > 0).any() else 0.0
         recovered = core.copy()
         for lab in set(int(v) for v in np.unique(lbl_u[core]) if v):
             comp = lbl_u == lab
             cc = int((comp & core).sum())
-            if cc and int(_finalize_vote_mask(comp)[0].sum()) <= 2.5 * cc:
+            if not cc:
+                continue
+            cand = _finalize_vote_mask(comp)[0]
+            cand_ct = cand.sum(axis=depth)
+            cand_p95 = float(np.percentile(cand_ct[cand_ct > 0], 95)) if (cand_ct > 0).any() else 0.0
+            if int(cand.sum()) <= 2.5 * cc and (core_med <= 0 or cand_p95 <= 1.8 * core_med):
                 recovered |= comp
         if int(recovered.sum()) > int(core.sum()):
             grown_final, tf_grown = _finalize_vote_mask(recovered)

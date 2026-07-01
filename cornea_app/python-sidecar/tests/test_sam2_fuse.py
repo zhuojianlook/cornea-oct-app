@@ -58,6 +58,21 @@ def test_fuse_rejects_contiguous_thick_flood():
     assert int(label[:, 45:62, :].sum()) < 0.3 * _band_vox(label)   # slab not adopted
 
 
+def test_fuse_rejects_deep_slab_under_mass_cap():
+    # The CS001 OS(2) regression: a single-plane deep slab in SOME frames (bridged to the band) keeps the
+    # TOTAL mass under the 2.5× cap, but thickness-fill balloons those columns into a fat slab. The per-column
+    # THICKNESS guard (not the mass cap) must reject it — a total-voxel ratio can't tell a lateral band
+    # extension from a depth over-segmentation.
+    votes = np.zeros((NL, ND, NF), np.uint8)
+    votes[:, BAND, :] = 2                                # core band (depth 30-40) all frames
+    votes[:, 55:65, :10] = 1                            # deep slab in frames 0-9 only (one plane)
+    votes[20, 40:55, :10] = 1                           # bridge band→slab in those frames
+    label, cg, _tf = S._fuse_votes(votes, vote=2)
+    # the deep slab frames must NOT be thickness-filled into a fat band
+    assert int(label[:, 45:65, :10].sum()) < 0.25 * _band_vox(label)
+    assert int(label[:, BAND, 20:].sum()) > 0          # the true band elsewhere is untouched
+
+
 def test_fuse_unrelated_blob_does_not_veto_recovery():
     # Main band needs a peripheral recovery (component A); a SEPARATE spurious 2-vote blob with a big 1-vote
     # halo (component B) sits elsewhere. A global cap would let B's halo veto the whole recovery; the
