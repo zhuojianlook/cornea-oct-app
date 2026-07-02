@@ -556,3 +556,28 @@ def test_shared_detection_matches_internal():
     a = M.detect_surface_crop_frames(sag, p, workers=1, detect=det)
     b = M.detect_surface_crop_frames(sag, p, workers=1)
     assert a["frames"] == b["frames"] and a["counts"] == b["counts"]
+
+
+def test_refine_freeze_periphery():
+    """Peripheral-spike fix (v0.0.117): the refinement 'freeze periphery' is a PER-SCAN opt-in. It must be a
+    strict NO-OP at refine_freeze_frac=0 (default → global pipeline byte-unchanged) and, when >0, must keep the
+    outer lateral slices at the INPUT geometry (disp=0 there) while the centre still warps. Only active on
+    refinement passes (_refine_pass); pass 1 / single-pass never carry the flag."""
+    rng = np.random.RandomState(3)
+    F, D, L = 24, 100, 90                                   # (frames, depth, lateral)
+    vol = (rng.rand(F, D, L) * 12).astype(np.float32)
+    for l in range(L):
+        for f in range(F):
+            # the warp flattens ALONG FRAMES per slice, so the surface must be wavy across FRAMES to warp
+            top = 40 + int(round(7 * np.sin(f / 3.5))) + int(round(3 * np.sin(l / 7.0)))
+            vol[f, top:top + 16, l] += 900.0
+    plain = M.smooth_volume(vol, {}, workers=1)
+    off = M.smooth_volume(vol, {"_refine_pass": True, "refine_freeze_frac": 0.0}, workers=1)
+    assert np.array_equal(plain, off)                       # frac=0 → strict no-op (no _refine_pass effect)
+    on = M.smooth_volume(vol, {"_refine_pass": True, "refine_freeze_frac": 0.2}, workers=1)
+    edge = int(round(L * 0.2))
+    # frozen outer laterals: disp forced to 0 → those A-scan columns are the UNWARPED input
+    assert np.array_equal(on[:, :, :max(1, edge - 1)], vol[:, :, :max(1, edge - 1)])
+    assert np.array_equal(on[:, :, L - max(1, edge - 1):], vol[:, :, L - max(1, edge - 1):])
+    # centre still warped (differs from the raw input there)
+    assert not np.array_equal(on[:, :, L // 2], vol[:, :, L // 2])
