@@ -50,13 +50,12 @@ DEFAULT_PARAMS: dict = {
     # boundary deviates < ~17px from its fit), so this is a no-op on well-detected columns — clean scans
     # are unchanged; only the pathological lateral runaway is tamed.
     "max_displacement": 40.0,
-    # Peripheral-spike fix ("freeze periphery in refinement"): PER-SCAN OPT-IN (default 0 = OFF, global pipeline
-    # byte-unchanged). Set >0 (e.g. 0.18) on a scan that shows a limbus warp-SPIKE: on REFINEMENT passes only
-    # (iterate pass>=2 + the axial ping-pong) the outer refine_freeze_frac of lateral slices is kept at pass-1's
-    # geometry by feathering the refinement displacement to 0 there, so the unreliable limbus can't tear a spike
-    # while the central cornea still refines. Left OFF by default because a BLANKET freeze mildly regresses ~1/3
-    # of clean scans (removes beneficial peripheral refinement); applied per-scan it fixes spikes with no such
-    # regression. Pass 1 / single-pass / provided-edges are always unaffected.
+    # Peripheral warp-spike fix ("logical limbus correction"): PER-SCAN OPT-IN (default 0 = OFF → global pipeline
+    # byte-unchanged). Set >0 (e.g. 0.18) on a scan showing a limbus warp SPIKE/STREAK: the outer
+    # refine_freeze_frac of lateral slices is warped to a LATERALLY-SMOOTH surface (a smooth continuation of the
+    # reliable central dome) instead of the noisy per-slice detection, in ALL passes — removing spikes AND
+    # single-column streaks without freezing/tearing. Off by default because a BLANKET application mildly regresses
+    # ~1/3 of clean scans; applied per-scan it corrects spike scans cleanly. provided-edges (fix-columns) exempt.
     "refine_freeze_frac": 0.0,
     # ── ping-pong axial refine (#2) ── After the sagittal correction, run the SAME correction in the
     # axial domain (flatten along lateral, per frame) and keep it per-frame where it makes the en-face
@@ -1741,21 +1740,34 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
             if zc.size:
                 disp_field[i][zc] = 0.0
 
-    # 3c) FREEZE PERIPHERY on refinement passes: keep the outer refine_freeze_frac of lateral slices (the limbus)
-    #     at pass-1's geometry by feathering the refinement displacement to 0 there (linear ramp = smooth, no seam;
-    #     warped once so no ghosting). The limbus re-detects unreliably on the filled+warped volume and tears a
-    #     spike; the central cornea still refines. No-op on pass 1 / single-pass (no _refine_pass flag).
-    if not use_provided and p.get("_refine_pass"):
+    # 3c) LOGICAL PERIPHERAL CORRECTION (refine_freeze_frac, PER-SCAN opt-in, default 0 = off): at the low-signal
+    #     LIMBUS (outer refine_freeze_frac of lateral slices) the per-slice surface detection is unreliable, so a
+    #     naive warp tears single-column streaks / wide spikes into the boundary. Instead of trusting the noisy
+    #     local detection there, warp the limbus to a LATERALLY-SMOOTH surface: replace the peripheral displacement
+    #     with a lateral-gaussian-smoothed version (a smooth continuation of the reliable central dome), feathered
+    #     into the precise per-slice warp in the centre. Applied to ALL passes of an opted-in scan (pass 1 +
+    #     refinement + axial) so the whole limbus is smoothly corrected — not frozen, not torn. Warped ONCE by the
+    #     blended field, so there is no ghosting/seam. Off by default → global pipeline byte-identical.
+    if not use_provided:
         _ff = float(p.get("refine_freeze_frac", 0.0) or 0.0)
         if _ff > 0 and n > 20:
-            _edge = max(1, int(round(n * _ff)))            # FULL-freeze band (disp=0) at each lateral end
-            _feath = min(30, max(5, _edge // 2))           # short feather back to full refinement
-            _w = np.ones(n, dtype=np.float64)
-            _w[:_edge] = 0.0
-            _w[_edge:_edge + _feath] = np.linspace(0.0, 1.0, _feath)
-            _w[-_edge:] = 0.0
-            _w[-_edge - _feath:-_edge] = np.linspace(1.0, 0.0, _feath)
-            disp_field = disp_field * _w[:, None]
+            _edge = max(1, int(round(n * _ff)))
+            _sig = max(4.0, _edge / 3.0)
+            _sm = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=_sig, axis=0, mode="nearest")
+            _feath = min(30, max(5, _edge // 2))
+            _w = np.zeros(n, dtype=np.float64)             # w=1 → smoothed limbus, 0 → precise centre
+            _w[:_edge] = 1.0
+            _w[-_edge:] = 1.0
+            _w[_edge:_edge + _feath] = np.linspace(1.0, 0.0, _feath)
+            _w[-_edge - _feath:-_edge] = np.linspace(0.0, 1.0, _feath)
+            disp_field = disp_field * (1.0 - _w[:, None]) + _sm * _w[:, None]
+            for i in range(n):                             # re-assert tissue-preservation clamps after smoothing
+                cc = clip_cols_list[i]
+                if cc.size:
+                    disp_field[i][cc] = np.maximum(disp_field[i][cc], 0.0)
+                zc = zero_cols_list[i]
+                if zc.size:
+                    disp_field[i][zc] = 0.0
     # 4) warp each slice by its guarded+smoothed displacement, then revert.
     warped = np.array([_warp_by_displacement(sag[i], disp_field[i]) for i in range(n)])
     if progress:
@@ -1818,8 +1830,6 @@ def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
         lo = k / max_iter
         hi = (k + 1) / max_iter
         pp = dict(base)
-        if k >= 1:
-            pp["_refine_pass"] = True     # pass>=2: freeze the limbus periphery (keep pass-1 geometry there)
         if inject_pass is not None and (k + 1) == int(inject_pass):
             pp["force_columns"] = [int(c) for c in (inject_force or [])]
             pp["good_columns"] = [int(c) for c in (inject_good or [])]
@@ -1892,7 +1902,6 @@ def _axial_smooth_volume(volume: np.ndarray, params: dict | None, workers: int |
     # axial pass (the sagittal pass already applied them). The axial pass runs a clean auto correction.
     _SAG_DOMAIN_KEYS = ("surface_cut", "force_columns", "good_columns", "border_anchors")
     pax = {k: v for k, v in (params or {}).items() if k not in _SAG_DOMAIN_KEYS}
-    pax["_refine_pass"] = True            # the axial ping-pong is a refinement → freeze periphery there too
     out = smooth_volume(vt, pax, workers=workers, detect_volume=_fill_black_bands(vt))
     return np.ascontiguousarray(out.transpose(*_FRAME_LATERAL_SWAP))
 

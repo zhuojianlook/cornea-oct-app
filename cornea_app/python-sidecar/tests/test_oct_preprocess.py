@@ -559,25 +559,22 @@ def test_shared_detection_matches_internal():
 
 
 def test_refine_freeze_periphery():
-    """Peripheral-spike fix (v0.0.117): the refinement 'freeze periphery' is a PER-SCAN opt-in. It must be a
-    strict NO-OP at refine_freeze_frac=0 (default → global pipeline byte-unchanged) and, when >0, must keep the
-    outer lateral slices at the INPUT geometry (disp=0 there) while the centre still warps. Only active on
-    refinement passes (_refine_pass); pass 1 / single-pass never carry the flag."""
+    """Peripheral warp-spike fix (v0.0.117): 'logical limbus correction' (refine_freeze_frac) is a PER-SCAN
+    opt-in. It must be a strict NO-OP at 0 (default → global pipeline byte-unchanged); when >0 it warps the outer
+    lateral slices to a LATERALLY-SMOOTH surface (changing the periphery) while the feathered CENTRE is byte-
+    identical to the ordinary warp."""
     rng = np.random.RandomState(3)
-    F, D, L = 24, 100, 90                                   # (frames, depth, lateral)
+    F, D, L = 24, 100, 100                                  # (frames, depth, lateral)
     vol = (rng.rand(F, D, L) * 12).astype(np.float32)
     for l in range(L):
         for f in range(F):
-            # the warp flattens ALONG FRAMES per slice, so the surface must be wavy across FRAMES to warp
-            top = 40 + int(round(7 * np.sin(f / 3.5))) + int(round(3 * np.sin(l / 7.0)))
+            top = 40 + int(round(7 * np.sin(f / 3.5)))      # wavy across frames so the warp does real work
+            if l < 8:
+                top += 12                                   # a peripheral lateral STEP the smoothing will pull in
             vol[f, top:top + 16, l] += 900.0
     plain = M.smooth_volume(vol, {}, workers=1)
-    off = M.smooth_volume(vol, {"_refine_pass": True, "refine_freeze_frac": 0.0}, workers=1)
-    assert np.array_equal(plain, off)                       # frac=0 → strict no-op (no _refine_pass effect)
-    on = M.smooth_volume(vol, {"_refine_pass": True, "refine_freeze_frac": 0.2}, workers=1)
-    edge = int(round(L * 0.2))
-    # frozen outer laterals: disp forced to 0 → those A-scan columns are the UNWARPED input
-    assert np.array_equal(on[:, :, :max(1, edge - 1)], vol[:, :, :max(1, edge - 1)])
-    assert np.array_equal(on[:, :, L - max(1, edge - 1):], vol[:, :, L - max(1, edge - 1):])
-    # centre still warped (differs from the raw input there)
-    assert not np.array_equal(on[:, :, L // 2], vol[:, :, L // 2])
+    off = M.smooth_volume(vol, {"refine_freeze_frac": 0.0}, workers=1)
+    assert np.array_equal(plain, off)                       # frac=0 → strict no-op (global pipeline byte-unchanged)
+    on = M.smooth_volume(vol, {"refine_freeze_frac": 0.25}, workers=1)
+    # the feathered CENTRE is byte-identical to the ordinary warp (only the limbus is re-smoothed)
+    assert np.array_equal(on[:, :, L // 2 - 4:L // 2 + 4], plain[:, :, L // 2 - 4:L // 2 + 4])
