@@ -128,6 +128,10 @@ export function BeforeAfterViewer({ orient, filter }: {
     objectFit: "contain",
     imageRendering: "pixelated",
     filter: filter || undefined,
+    // The 2-D sagittal PNGs lay frames out frame0→left, but niivue's sagittal render (the reference the user
+    // trusts) draws frame0 on the RIGHT (affine NIFTI_DIRECTION), so before/after looked LR-mirrored vs the
+    // niivue view. Flip the frame axis for sagittal so the 2-D apex sits on the same side as niivue.
+    transform: orient === "sagittal" ? "scaleX(-1)" : undefined,
   };
   const panelCol: React.CSSProperties = {
     flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 4,

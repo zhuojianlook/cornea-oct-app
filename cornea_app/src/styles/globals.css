@@ -68,3 +68,19 @@ input[type="number"]::-webkit-outer-spin-button {
     transform: rotate(360deg);
   }
 }
+
+/* Crop-approval GLOW: pink pulsing outline on the Fix-columns / Crop-region controls when an automatic
+   de-tilt/crop was DETECTED but not applied (manifest.oct_proposals) — draws the user in to review + approve. */
+@keyframes crop-proposal-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px #ff5db0, 0 0 4px 1px rgba(255, 93, 176, 0.55);
+  }
+  50% {
+    box-shadow: 0 0 0 2px #ff5db0, 0 0 10px 3px rgba(255, 93, 176, 0.85);
+  }
+}
+.crop-proposal-glow {
+  animation: crop-proposal-glow 1.4s ease-in-out infinite;
+  border-color: #ff5db0 !important;
+}

@@ -125,3 +125,58 @@ export function hasSegmentation(m: Manifest): boolean {
 export function isClassified(m: Manifest): boolean {
   return !!m && set(m, "scar_classification");
 }
+
+// ── crop-approval proposals ────────────────────────────────────────────────
+// Preprocessing may DETECT an auto de-tilt / off-cornea crop / clipped-apex surface-crop but leave the
+// output volume UNCORRECTED, recording the finding in manifest.oct_proposals for the user to approve. The UI
+// highlights the proposed crop region in pink + glows the Fix-columns / Crop-region controls, and the Approve
+// button re-preprocesses with apply_proposals:true (baking the corrections) before vetting. See the backend
+// contract in api_server.py (oct_proposals / apply_proposals).
+export interface OctProposals {
+  hasProposal: boolean;      // any of de-tilt / crop-region / surface-crop was detected but not applied
+  hasDetilt: boolean;        // an automatic de-tilt was proposed
+  hasCropRegion: boolean;    // an off-cornea lateral crop-region was proposed
+  hasSurfaceCrop: boolean;   // clipped-apex surface-crop frames were proposed
+  frames: number[];          // union of the proposed crop-region + surface-crop frame indices (slow axis)
+  cropLateral: [number, number] | null;  // the proposed crop-region's lateral [lo, hi] slice range, if any
+  reasons: string[];         // human-readable reason strings from the proposals (for the banner/tooltip)
+}
+
+/** Read manifest.oct_proposals into a flat, UI-friendly shape. Returns an all-empty proposal set when there
+ *  is nothing to approve (no manifest / null oct_proposals / all sub-proposals null), so a scan with no
+ *  proposal behaves exactly as before. */
+export function octProposals(m: Manifest): OctProposals {
+  const empty: OctProposals = { hasProposal: false, hasDetilt: false, hasCropRegion: false, hasSurfaceCrop: false, frames: [], cropLateral: null, reasons: [] };
+  const raw = m ? (m as Record<string, unknown>).oct_proposals : null;
+  if (!raw || typeof raw !== "object") return empty;
+  const p = raw as Record<string, unknown>;
+  const detilt = (p.detilt ?? null) as Record<string, unknown> | null;
+  const cropRegion = (p.crop_region ?? null) as Record<string, unknown> | null;
+  const surfaceCrop = (p.surface_crop ?? null) as Record<string, unknown> | null;
+  const frameSet = new Set<number>();
+  const readFrames = (o: Record<string, unknown> | null) => {
+    const fs = o && Array.isArray(o.frames) ? (o.frames as unknown[]) : [];
+    for (const f of fs) { const n = Number(f); if (Number.isFinite(n)) frameSet.add(Math.round(n)); }
+  };
+  readFrames(cropRegion);
+  readFrames(surfaceCrop);
+  let cropLateral: [number, number] | null = null;
+  if (cropRegion && Array.isArray(cropRegion.lateral) && (cropRegion.lateral as unknown[]).length === 2) {
+    const lo = Number((cropRegion.lateral as unknown[])[0]), hi = Number((cropRegion.lateral as unknown[])[1]);
+    if (Number.isFinite(lo) && Number.isFinite(hi)) cropLateral = [Math.round(lo), Math.round(hi)];
+  }
+  const reasons: string[] = [];
+  for (const o of [cropRegion, surfaceCrop]) {
+    const r = o && typeof o.reason === "string" ? (o.reason as string) : "";
+    if (r) reasons.push(r);
+  }
+  const hasDetilt = detilt != null;
+  const hasCropRegion = cropRegion != null;
+  const hasSurfaceCrop = surfaceCrop != null;
+  return {
+    hasProposal: hasDetilt || hasCropRegion || hasSurfaceCrop,
+    hasDetilt, hasCropRegion, hasSurfaceCrop,
+    frames: [...frameSet].sort((a, b) => a - b),
+    cropLateral, reasons,
+  };
+}

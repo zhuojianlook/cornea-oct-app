@@ -6,7 +6,7 @@ import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, type ViewName } from "../../niivue/nvController";
-import { scanStep, hasSegmentation } from "../../api/lifecycle";
+import { scanStep, hasSegmentation, octProposals } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
@@ -32,6 +32,10 @@ export function VolumeCanvas() {
   // viewer is Slices/Segmentation. Inspecting an earlier step is read-only (no border edits until rollback).
   const selectedStep = useWorkflowStore((s) => s.selectedStep);
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
+  // Crop-approval: an auto de-tilt / off-cornea crop / clipped-apex surface-crop was DETECTED but left
+  // UNAPPLIED (manifest.oct_proposals). When present we GLOW the Fix-columns button + show a pink banner over
+  // the basic viewer so the user reviews it in Fix-columns and Approves (which bakes in the corrections).
+  const proposals = octProposals(manifest);
   const manifestStep = scanStep(manifest);
   const effStep = selectedStep ?? manifestStep;
   const inspecting = selectedStep != null && selectedStep < manifestStep;
@@ -81,8 +85,10 @@ export function VolumeCanvas() {
   // #9 — Fix-columns "Crop region" mode is SAGITTAL-ONLY (the crop is defined in sagittal terms: frame
   // columns over a lateral-slice range), so force sagittal + disable the coronal option while it's active.
   const cropRegionMode = useWorkflowStore((s) => s.cropRegionMode);
+  // Fix-columns is SAGITTAL-ONLY: the coronal option did nothing there (the border edit + crop are defined in
+  // sagittal terms), so it's removed from the toolbar and the orientation is forced to sagittal in fix-columns.
   const orient2d: "axial" | "coronal" | "sagittal" = fixColsView
-    ? (cropRegionMode ? "sagittal" : (view === "coronal" ? "coronal" : "sagittal"))
+    ? "sagittal"
     : (view === "axial" || view === "coronal" || view === "sagittal") ? view : "sagittal";
   // Slices | Segmentation overlay toggle (Segmentation greyed until SAM2 has run). On the niivue path it
   // simply shows/hides the cornea/scar overlay by opacity; the 2-D gallery reads the same flag.
@@ -303,7 +309,7 @@ export function VolumeCanvas() {
         <ToggleButtonGroup size="small" exclusive value={overlay2d ? orient2d : view} onChange={onView}>
           {!overlay2d && <ToggleButton value="multi">Multi</ToggleButton>}
           {!fixColsView && <ToggleButton value="axial">Axial</ToggleButton>}
-          {!cropRegionMode && <ToggleButton value="coronal">Coronal</ToggleButton>}
+          {!cropRegionMode && !fixColsView && <ToggleButton value="coronal">Coronal</ToggleButton>}
           <ToggleButton value="sagittal">Sagittal</ToggleButton>
           {!overlay2d && <ToggleButton value="render">3D</ToggleButton>}
         </ToggleButtonGroup>
@@ -351,6 +357,8 @@ export function VolumeCanvas() {
             size="small"
             value="fix"
             selected={fixColsView}
+            // GLOW pink when an auto de-tilt/crop was proposed but not applied — draws the user in to review it.
+            className={proposals.hasProposal ? "crop-proposal-glow" : undefined}
             onChange={() => {
               // Fix-columns is COMBINABLE with Before/after (it doesn't clear it). Surface-crop is now a
               // mode WITHIN this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a sibling button.
@@ -360,7 +368,9 @@ export function VolumeCanvas() {
               else if (!on) void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
             }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-            title="Manually fix mis-aligned B-scan frames (edge/parabola drag, cut clipped surfaces, or detect surface-cropped frames), then re-run preprocessing"
+            title={proposals.hasProposal
+              ? "An automatic correction was DETECTED (de-tilt / crop) but not applied — open to review the pink crop region, then Approve to bake it in"
+              : "Manually fix mis-aligned B-scan frames (edge/parabola drag, cut clipped surfaces, or detect surface-cropped frames), then re-run preprocessing"}
           >
             ▥ Fix columns
           </ToggleButton>
@@ -402,6 +412,27 @@ export function VolumeCanvas() {
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full"
           style={{ cursor: painting ? "crosshair" : "default", filter: viewerFilter || undefined }} />
+        {/* Crop-approval PINK banner (basic view): a per-frame niivue voxel overlay is impractical, so a
+            clearly-visible pink pill over the viewer signals that an auto de-tilt/crop was proposed but not
+            applied — pointing the user to Fix-columns to review the pink region + Approve to bake it in. Shown
+            only on the plain niivue view (not while a 2-D overlay covers the canvas) at the preprocessing step. */}
+        {proposals.hasProposal && preprocStep && !overlay2d && !stepsView && (
+          <div className="absolute top-2 left-1/2 z-30 pointer-events-none"
+            style={{
+              transform: "translateX(-50%)", maxWidth: "92%",
+              display: "flex", alignItems: "center", gap: 8,
+              padding: "4px 12px", borderRadius: 999, fontSize: 12, lineHeight: 1.3,
+              color: "#fff", background: "rgba(255,93,176,0.22)", border: "1px solid #ff5db0",
+              boxShadow: "0 0 8px 1px rgba(255,93,176,0.6)", whiteSpace: "nowrap",
+              overflow: "hidden", textOverflow: "ellipsis",
+            }}
+            title={proposals.reasons.join(" · ") || "An automatic correction was detected but not applied."}>
+            <span style={{ color: "#ff5db0", fontWeight: 700 }}>⬤</span>
+            Auto-correction proposed
+            {(proposals.hasDetilt ? [" de-tilt"] : []).concat(proposals.frames.length ? [` crop ${proposals.frames.length} frame${proposals.frames.length === 1 ? "" : "s"}`] : []).join(" ·")}
+            {" — review in ▥ Fix columns and Approve to apply"}
+          </div>
+        )}
         {/* #paint — WebGL-independent 2-D drawing overlay: renders brush strokes that niivue's WebGL draw
             tile doesn't show on the WebKitGTK stack. pointer-events:none so paint clicks still hit niivue. */}
         <canvas ref={overlayRef} className="absolute inset-0 h-full w-full" style={{ pointerEvents: "none" }} />

@@ -56,7 +56,9 @@ DEFAULT_PARAMS: dict = {
     # reliable central dome) instead of the noisy per-slice detection, in ALL passes — removing spikes AND
     # single-column streaks without freezing/tearing. Off by default because a BLANKET application mildly regresses
     # ~1/3 of clean scans; applied per-scan it corrects spike scans cleanly. provided-edges (fix-columns) exempt.
-    "refine_freeze_frac": 0.0,
+    "refine_freeze_frac": 0.18,
+    # FIX limbus (a): lateral sigma multiplier for the peripheral blend (see smooth_volume 3c). 1.0 = original.
+    "refine_edge_sigma_mult": 2.0,
     # ── ping-pong axial refine (#2) ── After the sagittal correction, run the SAME correction in the
     # axial domain (flatten along lateral, per frame) and keep it per-frame where it makes the en-face
     # boundary smoother — cleans the 'hairy' axial boundary the sagittal pass leaves at noisy slice ends.
@@ -68,6 +70,17 @@ DEFAULT_PARAMS: dict = {
     # 0 = off) makes neighbours shift consistently → a smoother axial boundary, while the per-slice
     # quadratic still carries the real lateral curvature. Small sigma stays close to the per-slice fit.
     "interslice_smooth": 1.0,
+    # ── apex de-tear (#apex) ── Within ONE sagittal slice, the warp flattens the anterior to its smooth
+    # RANSAC quadratic via disp = (quad - edge), so ANY high-frequency jitter/STEP in the detected `edge`
+    # (frame axis) is injected straight into the warp. At the rough bright-speckle APEX the DP detector
+    # locks a few px shallower on one flank and deeper on the other, leaving a ~5-6px STEP in `edge` at
+    # the apex; the smooth quad then makes disp jump between adjacent frames, and the column-warp TEARS the
+    # tissue into a V-notch there. A light gaussian along the FRAME axis of the displacement field removes
+    # that injected 1-3-frame step (the true anterior surface is smooth, and a well-detected column already
+    # sits on its own quad so disp≈0 there → this is a no-op on smooth frames) while the parabolic bulk
+    # warp — which varies slowly over frames — is preserved. Mirrors interslice_smooth but along frames.
+    # 0 = off (byte-identical). Small sigma stays faithful; clip/cut clamps are re-asserted after.
+    "apex_frame_smooth": 1.5,
     # ── windowed re-detection (fix-columns "Confirm", tilt-aware surface prior) ── When a PRIOR surface
     # (per-frame expected depth) is supplied to detection, the gradient argmax is restricted to a small
     # window ±detect_window (depth voxels) around it per column, so a spurious peak (e.g. a reflection
@@ -91,6 +104,20 @@ DEFAULT_PARAMS: dict = {
     "dp_sigma_frame": 1.2,        # despeckle Gaussian sigma along FRAMES (lighter — keep real lateral shape)
     "dp_below": 24,               # depth window (px) just BELOW a candidate used for the "bright tissue below" gate
     "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
+    # ── specular-spike rejection (anterior) ── A thin ultra-bright VERTICAL specular reflection at the corneal
+    # apex (a narrow bright line rising above the true epithelial dome, present in the RAW data) has a strong
+    # dark→bright top edge with bright tissue below, so the DP path climbs onto it and warps a spike. This guard
+    # runs AFTER the DP path (auto detection only, prior=None): where the detected anterior rises ABOVE a
+    # laterally-robust median trend (which ignores narrow spikes) by > spike_min_height px over a CONTIGUOUS run
+    # no wider than spike_max_width frames, that narrow upward excursion is a specular streak → its frames are
+    # replaced by linear interpolation from the smooth surface on either side (the specular is left as a bright
+    # artifact ABOVE the corrected surface). ONE-SIDED (only upward/shallower) and NARROW-run gated, so a genuine
+    # wide/steep dome apex is untouched and a clean apex (edge already on the trend) is a strict no-op.
+    # spec_spike_reject=False disables.
+    "spec_spike_reject": True,
+    "spec_spike_max_width": 6,    # max contiguous frame run treated as a (narrow) specular spike (incl. boxy blocks)
+    "spec_spike_min_height": 8.0, # min px the edge must rise ABOVE the median trend to be a spike
+    "spec_spike_trend_win": 21,   # frames in the robust median trend (must exceed spike width to survive it)
     # ── NATIVE AUTO-TUNE ── The app tunes the DP params to EACH scan (no user input): a coordinate-descent
     # sweep scored by on-board surface confidence (contrast − weight·roughness) on sampled slices, run at the
     # start of preprocessing; the chosen dp_* are used for the warp AND persisted so the fix-columns baseline
@@ -193,6 +220,20 @@ DEFAULT_PARAMS: dict = {
     "dp_scar_min_run": 6,      # min contiguous run of deeper-than-tol frames to trigger (ignore isolated noise)
     "dp_scar_darker_margin": 0.05,  # adopt a pulled-back frame only if its above-band is this much DARKER (normalised)
                                # than the deep DP edge — confirms it's a true air->tissue surface, not a wrong fit
+    # ── GLOBAL DE-TILT pre-alignment (defect ④) ── A few acquisitions come out with the whole cornea acquired
+    # STRONGLY TILTED (a ~45° diagonal bright band, ~3 px/frame ≈ 300 px total across the frames) rather than a
+    # centred dome. The cornea is FULLY PRESENT and continuous in the raw data — it's just tilted — but the
+    # per-slice quadratic flatten fits each sagittal slice to ITS OWN tilted quadratic, so the tilt is PRESERVED,
+    # and the near-row-0 flank makes the clip/crop handling mis-fire → a hard SURFACE CUT / V-notch. Fix: BEFORE
+    # detection/flatten, robustly estimate the DOMINANT LINEAR tilt of the anterior surface in the FRAME direction
+    # (the slope is near-identical for every lateral slice — a pure acquisition tilt) and REMOVE it by rigidly
+    # shifting each frame's whole (depth,lateral) plane in depth, extending the depth canvas so nothing truncates.
+    # The cornea then sits near-horizontal → the normal detector/flatten produce a smooth centred dome with no cut.
+    # GATED so a normal near-centred scan is a strict NO-OP: only fires when the robust total linear tilt across the
+    # frames exceeds detilt_min_total px (a real dome's frame-direction linear component is ~0 by symmetry).
+    "auto_detilt": True,
+    "detilt_min_total": 150.0,  # min |robust linear tilt| (px, across all frames) to trigger de-tilt (else no-op)
+    "detilt_max_pad": 400,      # safety cap on the canvas extension (px) added top+bottom by the de-tilt shift
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
@@ -980,6 +1021,50 @@ def _dp_scar_guard(slice_img: np.ndarray, dp_edge: np.ndarray, p: dict) -> np.nd
     return out.astype(np.float32)
 
 
+def _reject_specular_spike(edge: np.ndarray, p: dict) -> np.ndarray:
+    """Remove a THIN specular spike from a detected anterior edge (depth 0 = TOP, so a spike rises = the edge
+    value DROPS below the smooth trend). A narrow ultra-bright vertical reflection at the apex lures the DP path
+    up onto it; here we detect the resulting narrow upward excursion and interpolate the smooth dome across it.
+
+    A laterally-robust MEDIAN trend (window > spike width) ignores the spike, so trend−edge is large only on the
+    spike frames. Frames where edge sits > spec_spike_min_height ABOVE the trend, in a CONTIGUOUS run no wider
+    than spec_spike_max_width, are replaced by a straight-line interpolation between the good frames bracketing
+    the run. One-sided (upward only) + narrow-run gated → a wide/steep real apex and a clean apex are no-ops."""
+    e = np.asarray(edge, dtype=np.float64)
+    F = e.size
+    win = int(p.get("spec_spike_trend_win", 15))
+    if F < 5 or win < 3:
+        return edge
+    win = win if win % 2 else win + 1                       # odd kernel for median_filter
+    trend = ndimage.median_filter(e, size=min(win, F if F % 2 else F - 1), mode="nearest")
+    above = trend - e                                        # > 0 where the edge is shallower (higher) than trend
+    cand = above > float(p.get("spec_spike_min_height", 8.0))
+    if not cand.any():
+        return edge                                         # no upward excursion anywhere → no-op
+    maxw = int(p.get("spec_spike_max_width", 4))
+    out = e.copy()
+    changed = False
+    f = 0
+    while f < F:
+        if not cand[f]:
+            f += 1
+            continue
+        g = f
+        while g < F and cand[g]:
+            g += 1                                          # [f, g) is a contiguous candidate run
+        if (g - f) <= maxw:                                 # NARROW upward run = a specular spike → interpolate
+            lo, hi = f - 1, g                               # bracketing good frames
+            if lo >= 0 and hi < F:
+                out[f:g] = np.interp(np.arange(f, g), [lo, hi], [e[lo], e[hi]])
+                changed = True
+            elif lo >= 0:                                   # run touches the right edge → hold the left good value
+                out[f:g] = e[lo]; changed = True
+            elif hi < F:                                    # run touches the left edge → hold the right good value
+                out[f:g] = e[hi]; changed = True
+        f = g
+    return out.astype(np.float32) if changed else edge
+
+
 def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
     """The per-slice corrected anterior boundary. Default detector = the native DP path (_detect_surface_dp,
     matches a manual trace so AUTO preprocessing needs minimal correction); set params['detector']='legacy'
@@ -993,6 +1078,9 @@ def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None =
         dp = _detect_surface_dp(slice_img, p, prior=prior)
         if prior is None and bool(p.get("dp_scar_guard", True)):
             dp = _dp_scar_guard(slice_img, dp, p)
+        # FIX specular: drop a thin bright vertical specular spike the DP climbed onto (auto detection only)
+        if prior is None and bool(p.get("spec_spike_reject", True)):
+            dp = _reject_specular_spike(dp, p)
         return dp
     return _legacy_surface(slice_img, p, prior=prior)
 
@@ -1721,6 +1809,25 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     # field so its meaning is unchanged by #3's inter-slice smoothing (which only affects the warp).
     disp_mean = float(np.mean(np.abs(disp_field))) if disp_field.size else 0.0
 
+    # 3a-apex) APEX DE-TEAR (#apex): smooth the displacement field along the FRAME axis (within each slice)
+    #   with a small Gaussian. The warp injects any high-frequency STEP in the detected edge (disp = quad -
+    #   edge) into the tissue; at the bright-speckle apex a ~5-6px edge step tears a V-notch. A light frame-
+    #   axis smoothing removes that 1-3-frame injected step while the slowly-varying parabolic bulk warp is
+    #   preserved (a well-detected column sits on its own quad → disp≈0 → no-op there). Applied BEFORE the
+    #   over-correction backstop is done (disp_field already guarded) and BEFORE interslice smoothing so the
+    #   two Gaussians (frame + lateral) compose. Skipped for provided_edges (the marched surface is exact).
+    #   Clip/cut tissue-preservation clamps are re-asserted after (a clipped apex must not be shifted UP).
+    afs = 0.0 if use_provided else float(p.get("apex_frame_smooth", 0.0) or 0.0)
+    if afs > 0 and disp_field.shape[1] > 2:
+        disp_field = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=afs, axis=1, mode="nearest")
+        for i in range(n):
+            cc = clip_cols_list[i]
+            if cc.size:
+                disp_field[i][cc] = np.maximum(disp_field[i][cc], 0.0)
+            zc = zero_cols_list[i]
+            if zc.size:
+                disp_field[i][zc] = 0.0
+
     # 3b) axial consistency (#3): smooth the displacement FIELD across the slice (lateral) axis so
     #     neighbouring sagittal slices shift consistently → a smoother en-face/axial boundary. The
     #     depth/frame axis is untouched (the per-slice quadratic governs it); sigma=0 → per-slice field.
@@ -1752,8 +1859,17 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         _ff = float(p.get("refine_freeze_frac", 0.0) or 0.0)
         if _ff > 0 and n > 20:
             _edge = max(1, int(round(n * _ff)))
-            _sig = max(4.0, _edge / 3.0)
-            _sm = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=_sig, axis=0, mode="nearest")
+            # FIX limbus (a): the lateral peripheral blend smooths the DISPLACEMENT field toward the reliable
+            # interior, but with sigma=_edge/3 and mode="nearest" the OUTERMOST few slices are still dominated
+            # by their own noisy displacement (the boundary padding reflects the edge value), so a bad extreme-
+            # lateral slice keeps its wobble. `refine_edge_sigma_mult` (default 2.0; 1.0 = original behaviour)
+            # scales this lateral sigma; a value >1 ties the extreme limbus more strongly to the interior, damping the
+            # residual peripheral wobble. `mode="reflect"` (was "nearest") stops the edge slice's own value
+            # from being over-weighted at the boundary. Both no-ops at their defaults (mult=1 keeps the sigma;
+            # reflect vs nearest is negligible in the interior where w<1), so central well-detected slices and
+            # the regression scans are essentially unchanged.
+            _sig = max(4.0, _edge / 3.0) * float(p.get("refine_edge_sigma_mult", 1.0) or 1.0)
+            _sm = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=_sig, axis=0, mode="reflect")
             _feath = min(30, max(5, _edge // 2))
             _w = np.zeros(n, dtype=np.float64)             # w=1 → smoothed limbus, 0 → precise centre
             _w[:_edge] = 1.0
@@ -2094,6 +2210,70 @@ def _apply_crop(corrected: np.ndarray, params: dict | None) -> tuple[np.ndarray,
     return corrected, int(zeroed)
 
 
+def estimate_global_tilt(det: np.ndarray, n_frames: int, p: dict):
+    """Robustly estimate the DOMINANT LINEAR tilt (px per frame) of the anterior surface in the FRAME direction
+    from the per-slice detection `det` (n_lateral, n_frames). Returns (slope, total_tilt, frame_depth) where
+    slope is px/frame, total_tilt = slope*(n_frames-1) (the tilt across the whole B-scan span), and frame_depth
+    is the robust median surface depth per frame (for diagnostics / gating).
+
+    The tilt is a PURE ACQUISITION tilt: identical for every lateral slice, so a per-frame median over lateral
+    slices is a very clean estimate. Only in-frame, positive edges contribute (a clipped/failed column reads ~0
+    or the frame top). The linear slope is a robust (Theil-Sen-style) median of pairwise slopes so an off-cornea
+    frame at either end can't skew it. A near-centred dome's frame-direction linear component is ~0 by symmetry."""
+    e = np.asarray(det, dtype=np.float64)
+    F = int(n_frames)
+    # robust per-frame surface depth = median over lateral slices of the VALID (in-frame) edges
+    valid = np.isfinite(e) & (e > 1.0) & (e < e.shape[1] * 1000)  # sanity; depth handled by caller's canvas
+    fd = np.full(F, np.nan)
+    for f in range(F):
+        col = e[:, f]
+        m = valid[:, f]
+        if int(m.sum()) >= max(5, e.shape[0] // 20):
+            fd[f] = float(np.median(col[m]))
+    good = np.isfinite(fd)
+    if int(good.sum()) < max(8, F // 3):
+        return 0.0, 0.0, fd
+    xs = np.arange(F, dtype=np.float64)[good]
+    ys = fd[good]
+    # Theil-Sen slope: median of pairwise slopes (robust to end frames running off the cornea)
+    n = xs.size
+    if n > 60:  # subsample pairs to bound cost while staying robust
+        idx = np.linspace(0, n - 1, 60).astype(int)
+        xs, ys = xs[idx], ys[idx]
+        n = xs.size
+    dx = xs[None, :] - xs[:, None]
+    dy = ys[None, :] - ys[:, None]
+    iu = np.triu_indices(n, k=1)
+    sl = dy[iu] / dx[iu]
+    slope = float(np.median(sl))
+    total = slope * (F - 1)
+    return slope, total, fd
+
+
+def apply_global_detilt(vol: np.ndarray, slope: float, p: dict):
+    """Remove a DOMINANT LINEAR FRAME-direction tilt from the raw volume (frames, depth, lateral) by rigidly
+    shifting each frame's whole (depth,lateral) plane in DEPTH by -round(slope*(f-f_center)), extending the depth
+    canvas top+bottom so no tissue is truncated. `slope` is px/frame (from estimate_global_tilt). Returns
+    (out_vol, pad_top, shifts) where out_vol has depth = old_depth + pad_top + pad_bot. Constant across lateral →
+    a pure rigid re-alignment that preserves the cornea's shape; only the per-frame depth offset changes."""
+    F, D, L = vol.shape
+    fc = (F - 1) / 2.0
+    shifts = np.round(-slope * (np.arange(F, dtype=np.float64) - fc)).astype(int)  # +ve = move that frame DOWN
+    cap = int(p.get("detilt_max_pad", 400))
+    # A frame with shift s>0 moves tissue DOWN by s → needs pad_bot rows at the bottom. shift s<0 moves UP → needs
+    # pad_top rows at the top. Clamp both to the safety cap so a runaway estimate can't inflate the canvas.
+    pad_bot = int(min(cap, max(0, int(np.max(shifts)))))
+    pad_top = int(min(cap, max(0, int(-np.min(shifts)))))
+    H2 = D + pad_top + pad_bot
+    out = np.zeros((F, H2, L), dtype=vol.dtype)
+    for f in range(F):
+        off = pad_top + int(shifts[f])                        # new top row of this frame's original row 0
+        lo = max(0, off); hi = min(H2, off + D)
+        if hi > lo:
+            out[f, lo:hi, :] = vol[f, lo - off:lo - off + (hi - lo), :]
+    return out, int(pad_top), shifts
+
+
 def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             params: dict | None = None, volume_index: int = 0,
                             progress=None, companion_txt: str | Path | None = None,
@@ -2136,6 +2316,42 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             _det_cache["det"] = detect_surface_all(_s, _p, workers=workers)
         return _det_cache["sag"], _det_cache["det"]
 
+    # ── FIX tilt (defect ④): GLOBAL DE-TILT pre-alignment. A strongly-tilted acquisition (~3 px/frame ≈ 300 px
+    # total) is flattened per-slice to its OWN tilted quadratic, so the tilt is preserved AND the near-row-0 flank
+    # trips the clip/crop handling into a hard cut/V-notch. Remove the dominant LINEAR frame-direction tilt FIRST,
+    # by rigidly shifting each frame in depth (canvas extended so nothing truncates) → the cornea is near-horizontal
+    # and the normal detector + surface-crop + flatten downstream produce a smooth centred dome with NO cut. GATED
+    # on the robust total tilt so a normal near-centred scan is a strict NO-OP (its frame-direction linear
+    # component is ~0). Runs only on the AUTO path (not fix-columns provided_edges, not manual crop/legacy).
+    # ── CROP-APPROVAL WORKFLOW ── auto de-tilt / crop-region / surface-crop are DETECTED here but only APPLIED
+    # when the user APPROVES (params["apply_proposals"]=True, set by the frontend's Approve-preprocessing button).
+    # Otherwise they are reported in info["proposals"] (uncorrected output kept) so the UI shows the proposed
+    # region PINK + glows the fix-columns / crop buttons — the user reviews/approves at the vetting step instead
+    # of a silent shift. A manually-set crop_region / surface_crop_frames is still applied directly (manual wins).
+    _approved = bool((params or {}).get("apply_proposals", False))
+    _proposals: dict = {"detilt": None, "crop_region": None, "surface_crop": None}
+    _detilt_info = None
+    if provided_edges is None and _pcr.get("auto_detilt", True) \
+            and str(_pcr.get("detector", "dp")).lower() != "legacy" \
+            and (params or {}).get("crop_region") is None and (params or {}).get("crop_lateral") is None \
+            and (params or {}).get("surface_crop_frames") is None:
+        try:
+            _sd, _dd = _cur_sag_det(params)
+            _slope, _total, _fd = estimate_global_tilt(_dd, vol.shape[0], _pcr)
+            if abs(_total) >= float(_pcr.get("detilt_min_total", 150.0)):
+                if _approved:
+                    vol, _pad_top, _shifts = apply_global_detilt(vol, _slope, _pcr)
+                    _det_cache.clear()                        # vol changed → shared anterior detection is stale
+                    _detilt_info = {"slope_per_frame": round(float(_slope), 4),
+                                    "total_tilt": round(float(_total), 1),
+                                    "pad_top": int(_pad_top),
+                                    "new_depth": int(vol.shape[1])}
+                else:                                         # PROPOSE: report it; leave the volume un-detilted
+                    _proposals["detilt"] = {"total_tilt": round(float(_total), 1),
+                                            "slope_per_frame": round(float(_slope), 4)}
+        except Exception:  # noqa: BLE001 — de-tilt is best-effort; fall back to the normal pipeline
+            _detilt_info = None
+
     if provided_edges is None and _pcr.get("auto_crop_region", True) \
             and (params or {}).get("crop_region") is None and (params or {}).get("crop_lateral") is None \
             and str(_pcr.get("detector", "dp")).lower() != "legacy":
@@ -2143,9 +2359,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             _s0, _d0 = _cur_sag_det(params)
             _nz = detect_noise_frames(_s0, params, workers=workers, detect=_d0)
             if _nz:
-                params = dict(params or {})
-                params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
-                _auto_cr = params["crop_region"]                   # persist it (sticky) so re-runs don't un-crop it
+                if _approved:
+                    params = dict(params or {})
+                    params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
+                    _auto_cr = params["crop_region"]           # persist it (sticky) so re-runs don't un-crop it
+                else:                                         # PROPOSE: report the off-cornea frames, don't crop
+                    _proposals["crop_region"] = {"frames": [int(f) for f in _nz],
+                                                 "lateral": [0, int(vol.shape[2]) - 1], "reason": "off-cornea noise"}
         except Exception:  # noqa: BLE001 — best-effort; fall back to no auto crop
             pass
     # #9 Crop RE-DETECT: zero the cropped box on the RAW volume BEFORE surface detection, so the anterior-edge
@@ -2171,7 +2391,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             _s1, _d1 = _cur_sag_det(params)                       # reused from the noise check when no crop was applied
             _ci = detect_surface_crop_frames(_s1, params, workers=workers, detect=_d1)
             if is_substantial_clip(_ci, params):
-                _crop_frames = _ci["frames"]; _auto_crop = True
+                if _approved:
+                    _crop_frames = _ci["frames"]; _auto_crop = True
+                else:                                         # PROPOSE: report the clipped frames, don't extend-warp
+                    _proposals["surface_crop"] = {"frames": [int(f) for f in _ci["frames"]], "reason": "clipped apex"}
         except Exception:  # noqa: BLE001 — auto detection is best-effort; fall back to the normal pipeline
             pass
     if provided_edges is None and _crop_frames:
@@ -2228,6 +2451,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             info["out"] = str(out_nifti)
             if _auto_cr:
                 info["auto_crop_region"] = _auto_cr
+            if _detilt_info:
+                info["detilt"] = _detilt_info
+            info["proposals"] = _proposals
             return info
     if provided_edges is not None:
         # fix-columns marched re-detection: a SINGLE same-canvas warp that flattens to the user-validated
@@ -2247,6 +2473,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         info["out"] = str(out_nifti)
         if _auto_cr:
             info["auto_crop_region"] = _auto_cr
+        info["proposals"] = _proposals
         return info
     # ── NATIVE AUTO-TUNE: the app tunes the DP detector to THIS scan before correcting (no user input). The
     # chosen dp_* are merged into params so the warp uses them AND surfaced in info["auto_tune"] so the caller
@@ -2307,6 +2534,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     info["out"] = str(out_nifti)
     if _auto_cr:
         info["auto_crop_region"] = _auto_cr
+    if _detilt_info:
+        info["detilt"] = _detilt_info
+    info["proposals"] = _proposals
     return info
 
 

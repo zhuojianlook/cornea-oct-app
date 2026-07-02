@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
-import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, type LifecycleStep } from "../../api/lifecycle";
+import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, type LifecycleStep } from "../../api/lifecycle";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
@@ -60,7 +60,7 @@ export function TimelineBar() {
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
   const setReviewFlags = useCaseStore((s) => s.setReviewFlags);
-  const vetPreprocessing = useCaseStore((s) => s.vetPreprocessing);
+  const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
   const caseBusy = useCaseStore((s) => s.busy);
@@ -70,6 +70,9 @@ export function TimelineBar() {
   const skipScar = useCaseStore((s) => s.skipScar);
   const scheduled = Boolean(manifest?.training_scheduled);
   const isConsensus = Boolean(manifest?.consensus_cases);
+  // Crop-approval: an auto de-tilt/crop/surface-crop was DETECTED but not applied — the Approve action bakes
+  // it in first (via approvePreprocessing), and the button relabels to make that clear.
+  const proposals = octProposals(manifest);
   const subgroup = String(manifest?.scar_subgroup ?? "1") || "1";
 
   const busy = segBusy || scarBusy || caseBusy;
@@ -351,9 +354,13 @@ export function TimelineBar() {
   // e.g. the batch populate). Offer a NON-destructive approve at the segmentation steps so the Vetted step can be
   // filled without a rollback (which would clear SAM2). Null once vetted, so it never shows for the normal flow.
   const ApprovePreproc = !manifest?.preproc_vetted ? (
-    <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => vetPreprocessing()}
-      title="Mark the preprocessing as manually vetted (fills the Vetted step). Non-destructive — keeps the SAM2 segmentation. Shown because this scan was segmented without an explicit preprocessing approval.">
-      ✓ Approve preprocessing
+    <Button size="small" variant="outlined" color="warning" disabled={busy}
+      onClick={() => { setBusyAction("approve"); approvePreprocessing(); }}
+      startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+      title={proposals.hasProposal
+        ? "Bake in the auto-detected de-tilt / crop (currently shown in pink, unapplied), then mark the preprocessing vetted. Re-warps from the raw .OCT and drops any segmentation."
+        : "Mark the preprocessing as manually vetted (fills the Vetted step). Non-destructive — keeps the SAM2 segmentation. Shown because this scan was segmented without an explicit preprocessing approval."}>
+      {busyAction === "approve" && caseBusy ? "Applying…" : proposals.hasProposal ? "✓ Approve & apply corrections" : "✓ Approve preprocessing"}
     </Button>
   ) : null;
 
@@ -401,10 +408,18 @@ export function TimelineBar() {
   } else if (step === 2) {
     actions = (
       <>
-        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Review the preprocessing (Before/after · Fix-columns), then:</span>
-        <Button size="small" variant="contained" color="warning" disabled={busy} onClick={() => vetPreprocessing()}
-          title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification.">
-          ✓ Approve preprocessing
+        <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
+          {proposals.hasProposal
+            ? "An auto-correction was detected (shown in pink) — review in Fix-columns, then:"
+            : "Review the preprocessing (Before/after · Fix-columns), then:"}
+        </span>
+        <Button size="small" variant="contained" color="warning" disabled={busy}
+          onClick={() => { setBusyAction("approve"); approvePreprocessing(); }}
+          startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title={proposals.hasProposal
+            ? "Bake in the auto-detected de-tilt / crop (currently shown in pink, unapplied), then mark the preprocessing vetted. Re-warps from the raw .OCT and drops any segmentation."
+            : "Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification."}>
+          {busyAction === "approve" && caseBusy ? "Applying…" : proposals.hasProposal ? "✓ Approve & apply corrections" : "✓ Approve preprocessing"}
         </Button>
         <Button size="small" variant="outlined" color="primary" disabled={busy} onClick={() => rerunPreprocess()}
           startIcon={caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}

@@ -9,6 +9,7 @@ import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { pxToIjk, brushVoxels } from "../../api/coords";
+import { octProposals } from "../../api/lifecycle";
 import type { PreviewImage } from "../../api/types";
 
 // A preview either carries an inline base64 data_url (segmentation/consensus) or a lazy `src`
@@ -280,6 +281,12 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
         ? { lo: Number(r.lateral[0]), hi: Number(r.lateral[1]), frames: new Set(r.frames.map(Number)) } : null;
     } catch { return null; }
   }, [persistedCropRegionSig]);
+  // Crop-approval: the auto de-tilt / off-cornea crop / clipped-apex surface-crop DETECTED but not applied
+  // (manifest.oct_proposals). Shown as a pink overlay here, glows the "⊟ Crop region" tab, and SEEDS the
+  // editable frame set when the user enters the crop tool with no manual crop yet — so "clicking the crop
+  // region lets them manipulate it".
+  const proposals = useMemo(() => octProposals(caseInfo?.manifest ?? null), [caseInfo?.manifest]);
+  const proposedFrames = useMemo(() => new Set(proposals.frames), [proposals]);
   const [latCropMode, setLatCropMode] = useState(false);
   const [latCropFrames, setLatCropFrames] = useState<Set<number>>(new Set());  // marked frame COLUMNS
   const [latCropLo, setLatCropLo] = useState<number | null>(null);             // lateral range start (slice index)
@@ -294,6 +301,14 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     setLatCropHi(persistedCropRegion?.hi ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [persistedCropRegion]);
+  // Seed the editable crop from the PROPOSED frames when entering the crop tool with no manual/persisted crop
+  // yet, so the auto-detected region is pre-marked and the user can immediately manipulate (add/remove) it.
+  const seedFromProposal = () => {
+    if (proposedFrames.size === 0) return;
+    if (latCropFrames.size > 0 || (persistedCropRegion?.frames.size ?? 0) > 0) return;  // don't clobber real edits
+    setLatCropFrames(new Set(proposedFrames));
+    if (proposals.cropLateral) { setLatCropLo(proposals.cropLateral[0]); setLatCropHi(proposals.cropLateral[1]); }
+  };
   const latCropDirty = useMemo(() => {
     const pf = persistedCropRegion?.frames ?? new Set<number>();
     const framesDiff = latCropFrames.size !== pf.size || [...latCropFrames].some((f) => !pf.has(f));
@@ -563,7 +578,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     if (orient !== "sagittal" || !curEdge || nFrames <= 1 || depthVox <= 1 || borderSliceIdx == null) return;
     const r = svg.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    const frame = Math.round(((clientX - r.left) / r.width) * nFrames - 0.5);
+    const frame = Math.round((1 - (clientX - r.left) / r.width) * nFrames - 0.5);   // mirrored panel: invert screen-x
     if (frame < 0 || frame >= nFrames || frame >= curEdge.length) return;
     const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
     const s = borderSliceIdx;
@@ -604,7 +619,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     if (orient !== "sagittal" || !curEdge || nFrames <= 1 || depthVox <= 1 || borderSliceIdx == null) return;
     const r = svg.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    const frame = Math.round(((clientX - r.left) / r.width) * nFrames - 0.5);
+    const frame = Math.round((1 - (clientX - r.left) / r.width) * nFrames - 0.5);   // mirrored panel: invert screen-x
     if (frame < 0 || frame >= nFrames) return;
     const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
     setParaAnchors((prev) => {
@@ -623,7 +638,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     const r = svg.getBoundingClientRect();
     if (r.width <= 0) return null;
     // viewBox x spans [0, nFrames); frame f occupies the band [f, f+1) → floor maps a screen x to its column.
-    return Math.max(0, Math.min(nFrames - 1, Math.floor(((clientX - r.left) / r.width) * nFrames)));
+    return Math.max(0, Math.min(nFrames - 1, Math.floor((1 - (clientX - r.left) / r.width) * nFrames)));
   };
   const paintCrop = (clientX: number, svg: Element) => {
     const f = frameAtBorder(clientX, svg);
@@ -677,7 +692,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
         const d = Math.round(Math.max(0, Math.min(depthVox - 1, ((e.clientY - r.top) / r.height) * depthVox)));
         setCut((c) => ({ ...c, top: d }));
       } else {
-        const f = Math.round(Math.max(0, Math.min(nFrames - 1, ((e.clientX - r.left) / r.width) * nFrames)));
+        const f = Math.round(Math.max(0, Math.min(nFrames - 1, (1 - (e.clientX - r.left) / r.width) * nFrames)));
         setCut((c) => {
           if (cutDragRef.current === "left") {        // keep left < right with ≥5 in-frame columns between
             const rightEff = c.right > 0 ? c.right : nFrames - 1;
@@ -1220,7 +1235,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const borderPanel = (inputSrc && curEdge && curFit && nFrames > 1 && depthVox > 1) ? (
     <div style={{ position: "relative",
                   ...(bSized ? { width: bDispW, height: bDispH } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
-                  transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom})`, transformOrigin: "center center" }}>
+                  // scaleX(-1): flip the frame axis so the fix-columns editor matches the niivue sagittal view
+                  // (frame0 on the RIGHT). Image + SVG overlay are children, so they flip together and stay
+                  // aligned; the four screen-x→frame conversions invert the fraction (1 - fx) to compensate.
+                  transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom}) scaleX(-1)`, transformOrigin: "center center" }}>
       <img src={inputSrc} alt="pass input" draggable={false}
         style={bSized
           ? { display: "block", width: "100%", height: "100%", objectFit: "fill", imageRendering: "pixelated", filter: enhanceFilter }
@@ -1308,6 +1326,14 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
               fill="rgba(255,170,40,0.34)" stroke="none" pointerEvents="none" />
           ))}
         </>)}
+        {/* CROP-APPROVAL: the PROPOSED (auto-detected but unapplied) crop-region + surface-crop frames as a
+            PINK overlay so the user can see + approve the auto crop. Drawn in the crop-region tool (latCropMode)
+            behind the user's own blue marks; suppressed for frames the user has already marked (blue wins). */}
+        {latCropMode && proposals.hasProposal && [...proposedFrames].filter((f) => !latCropFrames.has(f)).map((f) => (
+          <rect key={`pp${f}`} x={f} y={0} width={1} height={depthVox}
+            fill="rgba(255,93,176,0.28)" stroke="#ff5db0" strokeWidth={0.3} strokeDasharray="1 1"
+            vectorEffect="non-scaling-stroke" pointerEvents="none" />
+        ))}
         {/* #9 CROP REGION: the marked FRAME columns (blue bands), shown ONLY on slices INSIDE the marked
             lateral range. Until "Mark end" is clicked the range is just the start slice (Mark start sets
             lo=hi), so the bands appear on the start slice alone — not on every slice. Before any range is
@@ -1408,7 +1434,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                     if (v === "crop") {
                       setCropMode(true); setCutMode(false); setLatCropMode(false);
                       if (cropCols.size === 0 && Object.keys(cropCounts).length === 0) void detectCrop();
-                    } else if (v === "latcrop") { setLatCropMode(true); setCropMode(false); setCutMode(false); }
+                    } else if (v === "latcrop") { setLatCropMode(true); setCropMode(false); setCutMode(false); seedFromProposal(); }
                     else if (v === "cut") { setCutMode(true); setCropMode(false); setLatCropMode(false); }
                     else { setCutMode(false); setCropMode(false); setLatCropMode(false); setBorderMode(v); }
                   }}>
@@ -1421,7 +1447,12 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                   <ToggleButton value="crop" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
                     title="Detect surface-cropped frames (apex above the window) and re-run — those frames are aligned by their visible BOTTOM edge (posterior continuity), not the missing top">✛ Surface crop</ToggleButton>
                   <ToggleButton value="latcrop" sx={{ py: 0.25, px: 1, fontSize: 11, textTransform: "none" }}
-                    title="Crop away problematic COLUMNS within the slice (drag to mark frame-columns) over a RANGE of sagittal slices (Mark start/end), then Confirm & re-run. Sagittal-only. The box is removed before SAM2 and excluded from scar-alignment (crop-aware).">⊟ Crop region</ToggleButton>
+                    // GLOW pink when an off-cornea crop was auto-detected but not applied — the proposed frames
+                    // are pre-seeded on entry so the user can manipulate/approve them.
+                    className={proposals.hasProposal ? "crop-proposal-glow" : undefined}
+                    title={proposals.hasProposal
+                      ? "An automatic crop was DETECTED but not applied — click to load the pink proposed region, adjust it, then Confirm & re-run (or Approve preprocessing)"
+                      : "Crop away problematic COLUMNS within the slice (drag to mark frame-columns) over a RANGE of sagittal slices (Mark start/end), then Confirm & re-run. Sagittal-only. The box is removed before SAM2 and excluded from scar-alignment (crop-aware)."}>⊟ Crop region</ToggleButton>
                 </ToggleButtonGroup>
                 <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :

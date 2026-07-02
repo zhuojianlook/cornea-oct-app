@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
 import { api, checkHealth, resourceUrl } from "../api/client";
 import type { AppConfig, CaseInfo } from "../api/types";
+import { octProposals } from "../api/lifecycle";
 import { useWorkflowStore } from "./workflowStore";
 
 // The last case openCase() actually switched to — so we only reset the per-case
@@ -38,6 +39,10 @@ interface CaseState {
   setClassification: (cls: "scar" | "control" | null) => Promise<void>;
   // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
   vetPreprocessing: () => Promise<void>;
+  // Crop-approval: approve the preprocessing. When the case has auto-detected-but-unapplied proposals
+  // (manifest.oct_proposals: de-tilt / crop / surface-crop), FIRST re-preprocess with apply_proposals:true to
+  // bake the corrections in, THEN vet. With no proposal this is just vetPreprocessing() (as today).
+  approvePreprocessing: () => Promise<void>;
   // Reviewer issue flags (#A/#B/#C) set during the cybernetic loop; persisted to manifest.review_flags
   // so the assistant can find flagged scans. Metadata only — does not affect the volume/segmentation.
   setReviewFlags: (flags: string[]) => Promise<void>;
@@ -128,6 +133,35 @@ export const useCaseStore = create<CaseState>()(
         await api.json(`/api/case/${id}/vet-preprocessing`, "POST", "{}");
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    approvePreprocessing: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      const hasProposal = octProposals(get().caseInfo?.manifest ?? null).hasProposal;
+      // No proposal → identical to today's non-destructive vet (fast, optimistic; no reload needed).
+      if (!hasProposal) { await get().vetPreprocessing(); return; }
+      // A proposal exists → BAKE IN the auto de-tilt/crop/surface-crop first (one-shot apply_proposals, not
+      // sticky), then vet. This re-warps from the raw .OCT, so reload the corrected volume + previews.
+      set((s) => { s.busy = true; s.apiError = null; });
+      useWorkflowStore.getState().set("status", { kind: "working", title: "Applying auto-corrections",
+        detail: "Baking in the detected de-tilt / crop and re-warping from the raw .OCT — this can take a minute." });
+      try {
+        // apply_proposals is merged into this ONE run's params server-side (popped before persist), so it
+        // bakes the corrections without becoming a sticky param.
+        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ params: { apply_proposals: true } }));
+        await api.json(`/api/case/${id}/vet-preprocessing`, "POST", "{}");
+        await get().openCase();                 // reload the now-corrected working volume (cache-busted URL)
+        const wf = useWorkflowStore.getState();  // refresh previews + reflect the dropped segmentation
+        wf.set("segVersion", wf.segVersion + 1);
+        wf.set("status", { kind: "done", title: "Corrections applied", detail: "Auto de-tilt / crop baked in and preprocessing approved." });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        set((s) => { s.apiError = m; });
+        useWorkflowStore.getState().set("status", { kind: "error", title: "Approve failed", detail: m });
+      } finally {
+        set((s) => { s.busy = false; });
       }
     },
 

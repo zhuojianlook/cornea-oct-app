@@ -2354,6 +2354,10 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # sticks, so the user's column fix survives later re-runs). A normal preprocess (full params
     # from the loader, no force_columns) keeps its prior behaviour.
     eff_params = {**(m.get("oct_params") or {}), **(req.params or {})}
+    # apply_proposals is a ONE-SHOT approve action (bake in the detected de-tilt/crop/surface-crop), NOT a sticky
+    # oct_param — pop it so it isn't persisted (a later fresh auto-preprocess proposes again for re-review); it's
+    # re-injected only into the worker params for this run.
+    _apply_prop = bool(eff_params.pop("apply_proposals", False))
     # Auto-tune OFF must mean the FIXED DEFAULTS: drop any dp_* the auto-tuner persisted on a prior run, so the
     # warp falls back to DEFAULT_PARAMS instead of silently freezing the last auto-tuned surface (review MEDIUM).
     if not eff_params.get("auto_tune", True):
@@ -2488,7 +2492,8 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         extra += ["--inject-pass", str(int(inject_pass)),
                   "--inject-force", json.dumps(_int_list(req.force_columns)),
                   "--inject-good", json.dumps(_int_list(req.good_columns))]
-    worker_out = _run_oct_worker("preprocess", src, work, eff_params, vi,
+    worker_out = _run_oct_worker("preprocess", src, work,
+                                 ({**eff_params, "apply_proposals": True} if _apply_prop else eff_params), vi,
                                  companion=m.get("companion_txt"), extra=extra)
     iter_info = _parse_iter_info(worker_out)
     # NATIVE AUTO-TUNE: the worker tuned the DP detector to this scan; persist the chosen dp_* into the case's
@@ -2518,6 +2523,10 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     orch.case_qa_json(case_id).unlink(missing_ok=True)
     extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None,
              "oct_max_iterations": max_it, "oct_iter": iter_info,
+             # Crop-approval workflow: the auto de-tilt / crop-region / surface-crop the preprocessing DETECTED
+             # but did NOT apply (unless apply_proposals). The UI shows these (pink + glowing fix-cols/crop
+             # buttons) so the user reviews/approves them at the vetting step. null/empty → nothing proposed.
+             "oct_proposals": (iter_info.get("proposals") if isinstance(iter_info, dict) else None),
              # a fresh preprocessing (auto OR a Fix-columns re-run) invalidates the manual-vetting and
              # training-schedule flags → the per-scan timeline drops back to "Preprocessed [Auto]" (red)
              # and the user re-approves. scar_classification is kept (it's scan content, not geometry).
