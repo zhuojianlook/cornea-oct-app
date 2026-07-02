@@ -408,8 +408,17 @@ export function OctLoader() {
         const r = await api.json<{ cases: LoadedCase[] }>("/api/cases/list");
         if (stop || !r.cases) return;
         const byId = new Map(r.cases.map((c) => [c.case_id, c]));
-        setScans((cur) => cur.map((s) => { const c = s.caseId ? byId.get(s.caseId) : undefined;
-          return c ? { ...s, passes: c.passes ?? s.passes, life: c.life ?? s.life } : s; }));
+        // The OPEN scan's review_flags are authoritative in the live manifest (a just-toggled /review-flag POST
+        // may not be on disk yet, so cases/list can return stale []). Preserve them so the ⚑ chip doesn't flicker.
+        const live = useCaseStore.getState().caseInfo;
+        const liveFlags = live?.manifest ? (live.manifest as Record<string, unknown>).review_flags : undefined;
+        setScans((cur) => cur.map((s) => {
+          const c = s.caseId ? byId.get(s.caseId) : undefined;
+          if (!c) return s;
+          let life = c.life ?? s.life;
+          if (life && s.caseId === live?.case_id && Array.isArray(liveFlags)) life = { ...life, review_flags: liveFlags };
+          return { ...s, passes: c.passes ?? s.passes, life };
+        }));
       } catch { /* best-effort */ }
     })();
     return () => { stop = true; };
@@ -906,6 +915,11 @@ export function OctLoader() {
                           <span style={{ color: s.status === "error" ? "var(--c-red)" : lifeColor ?? (done ? "var(--c-green)" : "var(--c-text-dim)") }}>
                             {s.status === "error" ? "failed" : lifeColor ? LIFECYCLE_STEPS[lifeStep].short : s.status}
                           </span>
+                          {Array.isArray(s.life?.review_flags) && (s.life!.review_flags as string[]).length > 0 && (
+                            <span title="Flagged for review (manifest.review_flags)" style={{ color: "#f59e0b", fontWeight: 700, flex: "none" }}>
+                              ⚑{(s.life!.review_flags as string[]).join("")}
+                            </span>
+                          )}
                           {done && s.caseId && (
                             <button title="Download this preprocessed scan (.nii.gz) for manual segmentation"
                               onClick={(e) => { e.stopPropagation(); void downloadPreprocessed(s.caseId!, s.filename, downloadPass && downloadPass <= (s.passes ?? 1) ? downloadPass : null); }}

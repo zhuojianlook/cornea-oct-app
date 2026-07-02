@@ -59,6 +59,7 @@ export function TimelineBar() {
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
+  const setReviewFlags = useCaseStore((s) => s.setReviewFlags);
   const vetPreprocessing = useCaseStore((s) => s.vetPreprocessing);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
@@ -356,6 +357,25 @@ export function TimelineBar() {
     </Button>
   ) : null;
 
+  // Reviewer ISSUE FLAGS (#A/#B/#C) for the cybernetic loop — toggle to mark a scan for the assistant's
+  // attention; persisted to manifest.review_flags (the assistant reads them). Multi-select; independent of the
+  // lifecycle step. Shown at the cornea-review steps (4/5), where the user inspects the SAM2 result.
+  const reviewFlags: string[] = Array.isArray(manifest?.review_flags) ? (manifest!.review_flags as string[]) : [];
+  const toggleFlag = (f: string) => {
+    const next = reviewFlags.includes(f) ? reviewFlags.filter((x) => x !== f) : [...reviewFlags, f];
+    void setReviewFlags(next.slice().sort());
+  };
+  const FlagButtons = (
+    <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
+      title="Flag an issue on this scan for the cybernetic loop — the assistant reads manifest.review_flags. Toggle #A/#B/#C.">
+      ⚑ Flag:
+      {(["A", "B", "C"] as const).map((f) => (
+        <Button key={f} size="small" variant={reviewFlags.includes(f) ? "contained" : "outlined"} color="warning"
+          disabled={busy} onClick={() => toggleFlag(f)} sx={{ minWidth: 32, px: 0.8 }}>#{f}</Button>
+      ))}
+    </span>
+  );
+
   // ── actions ──
   let actions: React.ReactNode = null;
   if (inspecting) {
@@ -423,7 +443,7 @@ export function TimelineBar() {
     // cornea segmented (fuchsia) → VET the cornea/background (paint, scar pen hidden), then confirm → unlocks
     // classification. Scar detection is NOT shown here until cornea/background is confirmed AND the scan is classified.
     // Auto-populated scans also get a non-destructive "Approve preprocessing" here (their Vetted step was skipped).
-    actions = <>{ApprovePreproc && <>{ApprovePreproc}{sep}</>}{CorneaVet}</>;
+    actions = <>{ApprovePreproc && <>{ApprovePreproc}{sep}</>}{CorneaVet}{sep}{FlagButtons}</>;
   } else if (step === 5) {
     // cornea/background vetted (purple) → CLASSIFY scar/control. Moved here from before SAM2 (it only gates the
     // scar branch): a control schedules next; a scar scan proceeds to subgroup.
@@ -438,6 +458,7 @@ export function TimelineBar() {
           <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
             disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar (control)</Button>
         </span>
+        {sep}{FlagButtons}
       </div>
     );
   } else if (step === 6) {

@@ -8,6 +8,11 @@ import { useWorkflowStore } from "./workflowStore";
 // workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
 let _lastOpenedCase: string | null = null;
 
+// Per-case serialization of review-flag writes: each toggle POSTs the FULL flag set, so rapid toggles must
+// land on disk IN CLICK ORDER (out-of-order arrival on the sidecar threadpool would let an older/smaller set
+// win and silently drop a flag on reload). Mirrors OctLoader's persistClassification chain.
+const _reviewFlagChain = new Map<string, Promise<unknown>>();
+
 interface CaseState {
   config: AppConfig | null;
   healthy: boolean;
@@ -33,6 +38,9 @@ interface CaseState {
   setClassification: (cls: "scar" | "control" | null) => Promise<void>;
   // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
   vetPreprocessing: () => Promise<void>;
+  // Reviewer issue flags (#A/#B/#C) set during the cybernetic loop; persisted to manifest.review_flags
+  // so the assistant can find flagged scans. Metadata only — does not affect the volume/segmentation.
+  setReviewFlags: (flags: string[]) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
   // Before/after "Use original (raw)": discard the correction, make the raw .OCT the working volume +
   // mark it vetted (drops any segmentation; reloads the volume).
@@ -121,6 +129,21 @@ export const useCaseStore = create<CaseState>()(
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }
+    },
+
+    setReviewFlags: async (flags) => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).review_flags = flags; });
+      // Chain after this case's previous flag write so rapid toggles land on disk in the clicked order (the
+      // newest full set is always the last to reach the manifest); avoids an out-of-order clobber dropping a flag.
+      const prev = _reviewFlagChain.get(id) ?? Promise.resolve();
+      const next = prev
+        .catch(() => undefined)
+        .then(() => api.json(`/api/case/${id}/review-flag`, "POST", JSON.stringify({ flags }))
+          .catch((e) => { set((s) => { s.apiError = e instanceof Error ? e.message : String(e); }); }));
+      _reviewFlagChain.set(id, next);
+      await next;
     },
 
     scheduleTraining: async (scheduled) => {

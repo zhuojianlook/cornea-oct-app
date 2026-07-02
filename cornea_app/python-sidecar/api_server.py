@@ -2670,6 +2670,21 @@ def vet_preprocessing(case_id: str) -> dict:
     return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted"))}
 
 
+class ReviewFlagRequest(BaseModel):
+    flags: list[str] = []
+
+
+@app.post("/api/case/{case_id}/review-flag")
+def set_review_flags(case_id: str, req: ReviewFlagRequest) -> dict:
+    """Reviewer ISSUE FLAGS (#A/#B/#C) the user toggles during the cybernetic loop to mark a scan for the
+    assistant's attention. Manifest-only metadata (review_flags = sorted subset of {A,B,C}); the assistant
+    finds flagged scans by reading manifest.review_flags. Does not touch the volume, segmentation or lifecycle."""
+    allowed = {"A", "B", "C"}
+    flags = sorted({str(f).strip().upper() for f in (req.flags or []) if str(f).strip().upper() in allowed})
+    m = orch.write_manifest_value(_require_case(case_id), {"review_flags": flags})
+    return {"ok": True, "review_flags": m.get("review_flags", [])}
+
+
 class SubgroupRequest(BaseModel):
     subgroup: str | None = None   # e.g. "1" (default), "posterior", "inferior"
 
@@ -3530,6 +3545,7 @@ def cases_list() -> dict:
                 "normalized": bool(m.get("normalized")),
                 "corrected_labelmap": bool(m.get("corrected_labelmap")),
                 "training_scheduled": bool(m.get("training_scheduled")),
+                "review_flags": (list(m.get("review_flags")) if isinstance(m.get("review_flags"), list) else []),
             },
         })
     return {"cases": out}
