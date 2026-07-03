@@ -435,6 +435,7 @@ export function TimelineBar() {
           title="Use the ORIGINAL (raw) scan as the working volume instead of the correction. Drops any segmentation; also marks it vetted.">
           {busyAction === "useraw" ? "Loading…" : "↩ Use original (raw)"}
         </Button>
+        {sep}{FlagButtons}
       </>
     );
   } else if (step === 3) {
@@ -456,6 +457,7 @@ export function TimelineBar() {
         {correctionMp4Url && !mp4Busy && (
           <a href={correctionMp4Url} download style={{ color: "var(--c-accent)", fontSize: 12 }} title={correctionMp4Info}>⤓ Download MP4</a>
         )}
+        {sep}{FlagButtons}
       </div>
     );
   } else if (step === 4) {
