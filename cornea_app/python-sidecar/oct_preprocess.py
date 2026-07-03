@@ -105,7 +105,14 @@ DEFAULT_PARAMS: dict = {
     "dp_sigma_depth": 3.0,        # despeckle Gaussian sigma along DEPTH (heavier — speckle is fine-grained)
     "dp_sigma_frame": 1.2,        # despeckle Gaussian sigma along FRAMES (lighter — keep real lateral shape)
     "dp_below": 24,               # depth window (px) just BELOW a candidate used for the "bright tissue below" gate
+    "dp_above_gate": True,        # gate the DP score on boundary CONTRAST (below − above) not (below − med): keeps
+                                  #   the epithelium (dark air above) over a deeper second layer (bright above) at a
+                                  #   specular apex → removes the apex V-notch (CS001 OS3). Verified to CORRECT the
+                                  #   same deep-lock notch on the vetted scans (improvement, not degrade). False = legacy.
     "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
+    "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
+                                  #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
+                                  #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
     # ── specular-spike rejection (anterior) ── A thin ultra-bright VERTICAL specular reflection at the corneal
     # apex (a narrow bright line rising above the true epithelial dome, present in the RAW data) has a strong
     # dark→bright top edge with bright tissue below, so the DP path climbs onto it and warps a spike. This guard
@@ -138,6 +145,14 @@ DEFAULT_PARAMS: dict = {
     "apex_lat_min_height": 8.0,   # min px the surface must rise ABOVE the lateral trend to trigger
     "apex_lat_max_width": 18,     # max contiguous lateral run of up-spike triggers treated as a specular band
     "apex_lat_pad": 4,            # lateral px padded around each triggered run (absorbs the induced jitter flanks)
+    "apex_lat_reject_down": False,  # OFF (byte-identical to legacy upward-only). A lateral down-notch reset can't
+                                  #   cleanly fix the CS001 apex V-notch: the notch is at the apex→flank transition
+                                  #   (guarding flanks also protects the notch) AND is a generic apex-specular
+                                  #   feature the vetted scans share (unguarded → steps the vetted flanks). The
+                                  #   proper fix is DP-detector-level (stop the deep lock at the specular apex).
+    "apex_lat_down_min_height": 10.0,  # min px the surface must sit BELOW the lateral trend to trigger a down-notch reset
+    "apex_lat_dip_recover": 5.0,  # a down-notch resets ONLY if the surface returns to within this px of the trend on
+                                  #   BOTH sides of the run (true local dip); a descent (one side stays deep) is a no-op
     # ── AXIAL-CONSISTENCY pass ── final per-FRAME lateral clean-up of the anterior surface (kills slice-to-slice
     # waviness/spikes only visible in the AXIAL B-scan); strictly gated → strict NO-OP on an already-smooth scan.
     "axial_consistency": True,
@@ -870,6 +885,12 @@ def _dp_min_cost_path(score: np.ndarray, p: dict) -> np.ndarray:
     cost = (-score).astype(np.float32)
     maxj = max(1, min(int(p.get("dp_max_jump", 10)), D - 1))   # clamp to depth so offsets stay in-range (tiny D)
     offs = np.arange(-maxj, maxj + 1)
+    # SMOOTHNESS PENALTY (dp_smooth_weight): the hard max-jump cap alone leaves ANY step ≤ maxj "free", so at a
+    # shoulder the path hops maxj px between frames onto a deeper coherent layer → the apex/flank V-notch (CS001
+    # OS3). Penalising the step MAGNITUDE (λ·|step|, score is per-frame ∈[0,1]) makes the DP prefer a smooth
+    # descent, only taking a big step when the score gain justifies it. 0 = OFF (byte-identical hard-cap-only).
+    sw = float(p.get("dp_smooth_weight", 0.0) or 0.0)
+    step_pen = (sw * np.abs(offs)).astype(np.float32)[:, None] if sw > 0 else None
     dp = cost[:, 0].copy()
     back = np.empty((D, F), dtype=np.int32)
     for f in range(1, F):
@@ -881,6 +902,8 @@ def _dp_min_cost_path(score: np.ndarray, p: dict) -> np.ndarray:
                 cand[k, :D - o] = dp[o:]
             else:
                 cand[k, :] = dp
+        if step_pen is not None:
+            cand = cand + step_pen                                # add λ·|step| to every transition (broadcast over depth)
         kbest = np.argmin(cand, axis=0)
         dp = cand[kbest, np.arange(D)] + cost[:, f]
         back[:, f] = np.arange(D) + offs[kbest]
@@ -956,7 +979,18 @@ def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None 
     med = float(np.median(img))
     bw = max(2, int(p.get("dp_below", 24)))
     below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))   # mean of ~bw px BELOW each point
-    score = gy * np.maximum(below - med, 0.0)                      # strong edge AND bright tissue below
+    # ABOVE-DARK gate (dp_above_gate): the TRUE anterior surface has bright tissue BELOW and DARK air ABOVE; a
+    # deeper internal/second-reflection layer (e.g. at a specular apex, CS001 OS3) has bright tissue on BOTH
+    # sides. Gating on the boundary CONTRAST (below − above) instead of (below − med) suppresses the deeper layer
+    # (small contrast) and keeps the epithelium (large contrast) → the DP no longer dives to the deeper layer and
+    # steps at the apex. `above` = mean of ~bw px ABOVE each point. Default OFF → byte-identical (below − med).
+    if bool(p.get("dp_above_gate", False)):
+        # mean of ~bw px ABOVE each point = the "below" filter on the depth-reversed slice, flipped back (same
+        # trick as _detect_bottom_edge, so the origin stays valid).
+        above = ndimage.uniform_filter1d(img[::-1], size=bw, axis=0, origin=-(bw // 2))[::-1]
+        score = gy * np.maximum(below - above, 0.0)               # dark→bright edge with bright BELOW and DARK ABOVE
+    else:
+        score = gy * np.maximum(below - med, 0.0)                  # strong edge AND bright tissue below (legacy)
     # restrict to a window around a prior, if supplied (fix-columns tilt-aware re-detection)
     win = p.get("detect_window") if prior is not None else None
     no_signal = None
@@ -1164,15 +1198,21 @@ def _reject_apex_lateral_spike(edges: np.ndarray, p: dict) -> np.ndarray:
     min_h = float(p.get("apex_lat_min_height", 8.0))
     maxw = int(p.get("apex_lat_max_width", 18))
     pad = int(p.get("apex_lat_pad", 4))
-    out = e.copy()
-    changed = False
-    for f in range(F):
-        col = e[:, f]
-        trend = ndimage.median_filter(col, size=ksize, mode="nearest")
-        cand = (trend - col) > min_h                              # surface shallower than trend = climbed a streak
-        if not cand.any():
-            continue                                             # clean column → no-op
-        band = np.zeros(L, dtype=bool)
+    # FIX apexnotch (CS001 OSbase/OS3 apex): the apex defect the user marked is NOT the DP climbing a streak UP;
+    # it is scattered per-sagittal-slice DOWNWARD jitter — a handful of laterals lock ~15px too DEEP (into the
+    # stroma) at the apex frame, on an otherwise-smooth lateral surface. The original reject was upward-only
+    # (surface shallower) so it never fired (measured 0.0px change on those apex notches). Add a symmetric
+    # DOWNWARD branch: narrow lateral runs sitting > down_min_h px DEEPER than the robust median trend are the
+    # same specular/jitter class and are reset to the trend. Gated separately (apex_lat_reject_down) and with its
+    # own (slightly higher) height so a broad genuine curvature / a real posterior dip is a strict no-op; the
+    # NARROW-run width gate keeps a sustained steep limbus flank (a long run) untouched.
+    down = bool(p.get("apex_lat_reject_down", True))
+    down_min_h = float(p.get("apex_lat_down_min_height", 10.0))
+    recov = float(p.get("apex_lat_dip_recover", 5.0))
+
+    def _narrow_run_band(cand: np.ndarray) -> np.ndarray:
+        """Boolean mask of the NARROW (<= maxw) contiguous True-runs of `cand`, padded by `pad`."""
+        b = np.zeros(L, dtype=bool)
         i = 0
         while i < L:
             if not cand[i]:
@@ -1180,10 +1220,45 @@ def _reject_apex_lateral_spike(edges: np.ndarray, p: dict) -> np.ndarray:
                 continue
             j = i
             while j < L and cand[j]:
-                j += 1                                           # [i, j) contiguous up-spike run
-            if (j - i) <= maxw:                                  # NARROW lateral run = specular band → reset to trend
-                band[max(0, i - pad):min(L, j + pad)] = True
+                j += 1                                           # [i, j) contiguous run
+            if (j - i) <= maxw:                                  # NARROW lateral run = specular/jitter → reset to trend
+                b[max(0, i - pad):min(L, j + pad)] = True
             i = j
+        return b
+
+    def _local_dip_band(cand: np.ndarray, dev: np.ndarray) -> np.ndarray:
+        """Like _narrow_run_band but for DOWN-notches (dev = surface − trend, +ve = deeper): accept a run ONLY if
+        the surface RECOVERS to within `recov` px of the trend on BOTH lateral sides within a short window — a
+        true LOCAL dip. A monotonic flank descent keeps one side deep (dev > recov) → rejected (never stepped)."""
+        b = np.zeros(L, dtype=bool)
+        i = 0
+        while i < L:
+            if not cand[i]:
+                i += 1
+                continue
+            j = i
+            while j < L and cand[j]:
+                j += 1
+            if (j - i) <= maxw:
+                look = pad + 4
+                lo_ok = any((i - k) >= 0 and dev[i - k] <= recov for k in range(1, look + 1))
+                hi_ok = any((j + k) < L and dev[j + k] <= recov for k in range(0, look + 1))
+                if lo_ok and hi_ok:                              # recovers on BOTH sides = isolated dip, not a slope
+                    b[max(0, i - pad):min(L, j + pad)] = True
+            i = j
+        return b
+
+    out = e.copy()
+    changed = False
+    for f in range(F):
+        col = e[:, f]
+        trend = ndimage.median_filter(col, size=ksize, mode="nearest")
+        dev = col - trend                                        # +ve = surface DEEPER than trend
+        cand_up = (trend - col) > min_h                          # surface shallower than trend = climbed a streak
+        cand_dn = (dev > down_min_h) if down else np.zeros(L, dtype=bool)  # deeper = candidate down-notch
+        if not (cand_up.any() or cand_dn.any()):
+            continue                                             # clean column → no-op
+        band = _narrow_run_band(cand_up) | _local_dip_band(cand_dn, dev)
         if band.any():
             out[band, f] = trend[band]
             changed = True
