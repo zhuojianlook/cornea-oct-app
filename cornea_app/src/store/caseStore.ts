@@ -51,10 +51,17 @@ interface CaseState {
   setClassification: (cls: "scar" | "control" | null) => Promise<void>;
   // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
   vetPreprocessing: () => Promise<void>;
-  // Crop-approval: approve the preprocessing. When the case has auto-detected-but-unapplied proposals
-  // (manifest.oct_proposals: de-tilt / crop / surface-crop), FIRST re-preprocess with apply_proposals:true to
-  // bake the corrections in, THEN vet. With no proposal this is just vetPreprocessing() (as today).
+  // Approve the preprocessing AS-IS: mark it vetted WITHOUT applying any auto-detected proposals (the user is
+  // accepting the current output and declining the de-tilt/crop/surface-crop). Non-destructive — identical to
+  // vetPreprocessing(); kept as a distinct name so the button intent is explicit. (Applying corrections is the
+  // SEPARATE applyCorrections() action, so an unwanted/false proposal never blocks a plain approve — e.g. a
+  // spurious de-tilt on an off-centre dome.)
   approvePreprocessing: () => Promise<void>;
+  // Apply the auto-detected proposals (manifest.oct_proposals: de-tilt / crop / surface-crop): re-preprocess
+  // with apply_proposals:true to BAKE the corrections into a fresh warped output. Does NOT auto-vet — the new
+  // output resets to "Preprocessed [Auto]" (red) so the user re-inspects it, then approves as-is. Separate from
+  // approvePreprocessing so approve and apply are independent actions (the OS(4) fix).
+  applyCorrections: () => Promise<void>;
   // Reviewer issue flags (#A/#B/#C) set during the cybernetic loop; persisted to manifest.review_flags
   // so the assistant can find flagged scans. Metadata only — does not affect the volume/segmentation.
   setReviewFlags: (flags: string[]) => Promise<void>;
@@ -153,30 +160,34 @@ export const useCaseStore = create<CaseState>()(
       }
     },
 
+    // Approve AS-IS: vet the current output WITHOUT applying any proposals (declining the auto de-tilt/crop/
+    // surface-crop). Non-destructive; keeps any segmentation. Applying corrections is the separate action below.
     approvePreprocessing: async () => {
+      await get().vetPreprocessing();
+    },
+
+    // Apply the auto-detected corrections (bake in de-tilt/crop/surface-crop) as a fresh warp. Does NOT auto-vet
+    // — the re-preprocessed output resets to "Preprocessed [Auto]" so the user re-inspects it, then approves.
+    applyCorrections: async () => {
       const id = get().caseId;
       if (!id) return;
       const hasProposal = octProposals(get().caseInfo?.manifest ?? null).hasProposal;
-      // No proposal → identical to today's non-destructive vet (fast, optimistic; no reload needed).
-      if (!hasProposal) { await get().vetPreprocessing(); return; }
-      // A proposal exists → BAKE IN the auto de-tilt/crop/surface-crop first (one-shot apply_proposals, not
-      // sticky), then vet. This re-warps from the raw .OCT, so reload the corrected volume + previews.
+      if (!hasProposal) return;                 // nothing to apply
       set((s) => { s.busy = true; s.apiError = null; });
       useWorkflowStore.getState().set("status", { kind: "working", title: "Applying auto-corrections",
-        detail: "Baking in the detected de-tilt / crop and re-warping from the raw .OCT — this can take a minute." });
+        detail: "Baking in the detected de-tilt / crop / surface-crop and re-warping from the raw .OCT — this can take a minute." });
       try {
         // apply_proposals is merged into this ONE run's params server-side (popped before persist), so it
-        // bakes the corrections without becoming a sticky param.
+        // bakes the corrections without becoming a sticky param. No vet — the fresh output is re-reviewed.
         await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ params: { apply_proposals: true } }));
-        await api.json(`/api/case/${id}/vet-preprocessing`, "POST", "{}");
         await get().openCase();                 // reload the now-corrected working volume (cache-busted URL)
         const wf = useWorkflowStore.getState();  // refresh previews + reflect the dropped segmentation
         wf.set("segVersion", wf.segVersion + 1);
-        wf.set("status", { kind: "done", title: "Corrections applied", detail: "Auto de-tilt / crop baked in and preprocessing approved." });
+        wf.set("status", { kind: "done", title: "Corrections applied", detail: "Corrections baked in — re-inspect the fresh output, then Approve preprocessing." });
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         set((s) => { s.apiError = m; });
-        useWorkflowStore.getState().set("status", { kind: "error", title: "Approve failed", detail: m });
+        useWorkflowStore.getState().set("status", { kind: "error", title: "Apply corrections failed", detail: m });
       } finally {
         set((s) => { s.busy = false; });
       }

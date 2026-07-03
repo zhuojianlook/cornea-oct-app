@@ -2589,6 +2589,20 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             and not eff_params.get("crop_lateral"):
         eff_params["crop_region"] = {"lateral": [int(_acr["lateral"][0]), int(_acr["lateral"][1])],
                                      "frames": sorted(int(f) for f in _acr["frames"]), "auto": True}
+    # STALE-CROP RECONCILE: the worker's crop guard refused to destructively zero CLIPPED-APEX frames (routing
+    # them to surface-crop reconstruction instead). Mirror that in the PERSISTED crop_region so a stale/
+    # mis-classified crop_region doesn't linger in the manifest — otherwise it is re-applied AND painted red by
+    # the crop-shade on every later run. Drop exactly the frames the guard reported removing; clear the box if
+    # it becomes empty (an entirely-clipped-apex "crop" that is really a surface-crop).
+    _guard_removed = set(int(f) for f in (iter_info.get("crop_guard_removed_frames") or [])) \
+        if isinstance(iter_info, dict) else set()
+    if _guard_removed and isinstance(eff_params.get("crop_region"), dict):
+        _cr0 = eff_params["crop_region"]
+        _kept0 = [int(f) for f in (_cr0.get("frames") or []) if int(f) not in _guard_removed]
+        if _kept0:
+            eff_params["crop_region"] = {**_cr0, "frames": _kept0}
+        else:
+            eff_params.pop("crop_region", None)
     # The corrected volume just changed → drop any segmentation built on the OLD correction so a
     # stale overlay can't show on the re-corrected volume (the user re-runs SAM2 next).
     seg_dir = orch.segmentation_preview_dir(case_id)

@@ -62,6 +62,7 @@ export function TimelineBar() {
   const setDifficult = useCaseStore((s) => s.setDifficult);
   const markDefectMode = useWorkflowStore((s) => s.markDefectMode);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
+  const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
   const caseBusy = useCaseStore((s) => s.busy);
@@ -358,10 +359,8 @@ export function TimelineBar() {
     <Button size="small" variant="outlined" color="warning" disabled={busy}
       onClick={() => { setBusyAction("approve"); approvePreprocessing(); }}
       startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-      title={proposals.hasProposal
-        ? "Bake in the auto-detected de-tilt / crop (currently shown in pink, unapplied), then mark the preprocessing vetted. Re-warps from the raw .OCT and drops any segmentation."
-        : "Mark the preprocessing as manually vetted (fills the Vetted step). Non-destructive — keeps the SAM2 segmentation. Shown because this scan was segmented without an explicit preprocessing approval."}>
-      {busyAction === "approve" && caseBusy ? "Applying…" : proposals.hasProposal ? "✓ Approve & apply corrections" : "✓ Approve preprocessing"}
+      title="Mark the preprocessing as manually vetted (fills the Vetted step). Non-destructive — keeps the SAM2 segmentation. Does NOT apply any auto-detected corrections. Shown because this scan was segmented without an explicit preprocessing approval.">
+      {busyAction === "approve" && caseBusy ? "Approving…" : "✓ Approve preprocessing"}
     </Button>
   ) : null;
 
@@ -414,17 +413,23 @@ export function TimelineBar() {
       <>
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
           {proposals.hasProposal
-            ? "An auto-correction was detected (shown in pink) — review in Fix-columns, then:"
+            ? "An auto-correction was detected (shown in pink). Approve the output as-is, or apply the correction first:"
             : "Review the preprocessing (Before/after · Fix-columns), then:"}
         </span>
         <Button size="small" variant="contained" color="warning" disabled={busy}
           onClick={() => { setBusyAction("approve"); approvePreprocessing(); }}
           startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title={proposals.hasProposal
-            ? "Bake in the auto-detected de-tilt / crop (currently shown in pink, unapplied), then mark the preprocessing vetted. Re-warps from the raw .OCT and drops any segmentation."
-            : "Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification."}>
-          {busyAction === "approve" && caseBusy ? "Applying…" : proposals.hasProposal ? "✓ Approve & apply corrections" : "✓ Approve preprocessing"}
+          title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification. Accepts the CURRENT output as-is; does NOT apply any auto-detected correction.">
+          {busyAction === "approve" && caseBusy ? "Approving…" : "✓ Approve preprocessing"}
         </Button>
+        {proposals.hasProposal && (
+          <Button size="small" variant="outlined" color="secondary" disabled={busy}
+            onClick={() => { setBusyAction("apply"); applyCorrections(); }}
+            startIcon={busyAction === "apply" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+            title="Bake in the auto-detected de-tilt / crop / surface-crop (shown in pink) and re-warp from the raw .OCT. Produces a fresh output to re-inspect (resets to Preprocessed · Auto); drops any segmentation. Approve it after reviewing.">
+            {busyAction === "apply" && caseBusy ? "Applying…" : "⟳ Apply corrections"}
+          </Button>
+        )}
         <Button size="small" variant="outlined" color="primary" disabled={busy} onClick={() => rerunPreprocess()}
           startIcon={caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Re-run the full auto preprocessing on the raw .OCT again (fresh surface detect + warp). Keeps this scan's params/classification; drops the current correction's segmentation.">

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Cornea OCT",
-  "version": "0.0.130",
+  "version": "0.0.131",
   "identifier": "com.cornea.oct",
   "build": {
     "frontendDist": "../dist",

@@ -281,10 +281,19 @@ DEFAULT_PARAMS: dict = {
     # (the slope is near-identical for every lateral slice — a pure acquisition tilt) and REMOVE it by rigidly
     # shifting each frame's whole (depth,lateral) plane in depth, extending the depth canvas so nothing truncates.
     # The cornea then sits near-horizontal → the normal detector/flatten produce a smooth centred dome with no cut.
-    # GATED so a normal near-centred scan is a strict NO-OP: only fires when the robust total linear tilt across the
-    # frames exceeds detilt_min_total px (a real dome's frame-direction linear component is ~0 by symmetry).
+    # GATED so a normal scan is a strict NO-OP. NOTE: the frame-direction linear slope is NOT a reliable tilt signal
+    # on its own — an OFF-CENTRE dome (apex captured at a non-central frame, e.g. frame ~10-20) has a large net
+    # linear slope purely from geometry, indistinguishable from acquisition tilt by the anterior parabola alone
+    # (tilt and apex-offset are the SAME linear term). So the ONLY honest discriminator is de-tilt's PURPOSE: it
+    # only helps when the tilt runs the surface OFF THE TOP of the window (near row 0) at a frame end — that is the
+    # clip/V-notch it exists to prevent. A dome that stays comfortably in-frame needs no de-tilt regardless of slope.
+    # Hence the gate = (|total linear tilt| >= detilt_min_total) AND (>= detilt_clip_min_frames frames whose surface
+    # sits within detilt_clip_row px of the top). This makes off-centre domes with no clip (the false positives) a
+    # strict NO-OP while keeping de-tilt as the pre-step for a genuinely clipped, tilted acquisition.
     "auto_detilt": True,
     "detilt_min_total": 150.0,  # min |robust linear tilt| (px, across all frames) to trigger de-tilt (else no-op)
+    "detilt_clip_row": 30.0,    # a frame surface within this many px of the top counts as clipped (tilt ran off-top)
+    "detilt_clip_min_frames": 3,  # need >= this many clipped frames for de-tilt to apply (else the slope is dome geometry)
     "detilt_max_pad": 400,      # safety cap on the canvas extension (px) added top+bottom by the de-tilt shift
 }
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
@@ -2658,6 +2667,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # of a silent shift. A manually-set crop_region / surface_crop_frames is still applied directly (manual wins).
     _approved = bool((params or {}).get("apply_proposals", False))
     _proposals: dict = {"detilt": None, "crop_region": None, "surface_crop": None}
+    _crop_guard_removed: list[int] = []   # clipped-apex frames the guard pulled OUT of a destructive crop_region
     _detilt_info = None
     if provided_edges is None and _pcr.get("auto_detilt", True) \
             and str(_pcr.get("detector", "dp")).lower() != "legacy" \
@@ -2666,7 +2676,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         try:
             _sd, _dd = _cur_sag_det(params)
             _slope, _total, _fd = estimate_global_tilt(_dd, vol.shape[0], _pcr)
-            if abs(_total) >= float(_pcr.get("detilt_min_total", 150.0)):
+            # CLIP GATE: a large linear slope alone is NOT tilt — an off-centre dome has one purely from geometry.
+            # De-tilt only helps when the tilt runs the surface off the TOP of the window (near row 0) at a frame
+            # end (the clip/V-notch it exists to prevent). If the surface stays comfortably in-frame everywhere,
+            # the slope is dome geometry → strict NO-OP (fixes the false de-tilt proposals on off-centre domes).
+            _clip_ct = int(np.sum(np.isfinite(_fd) & (_fd < float(_pcr.get("detilt_clip_row", 30.0)))))
+            if abs(_total) >= float(_pcr.get("detilt_min_total", 150.0)) \
+                    and _clip_ct >= int(_pcr.get("detilt_clip_min_frames", 3)):
                 if _approved:
                     vol, _pad_top, _shifts = apply_global_detilt(vol, _slope, _pcr)
                     _det_cache.clear()                        # vol changed → shared anterior detection is stale
@@ -2696,6 +2712,31 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                 params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
                 _auto_cr = params["crop_region"]               # persist it (sticky) so re-runs don't un-crop it
         except Exception:  # noqa: BLE001 — best-effort; fall back to no auto crop
+            pass
+    # STALE / MISCLASSIFIED-CROP GUARD: a crop_region must NEVER destructively zero frames that actually hold a
+    # CLIPPED-APEX cornea. An old auto-crop (or a stale crop_region carried in params from a previous algorithm
+    # version, e.g. one lacking the "auto" flag) that mis-fired on a clipped apex would otherwise (a) destroy real
+    # corneal tissue and (b) SUPPRESS the surface-crop reconstruction — that block only sees frames still present,
+    # so a zeroed frame is never rebuilt. Before applying any crop, drop clipped-apex frames from its frame list so
+    # surface-crop rebuilds them instead. A genuine off-cornea NOISE crop (blink/runout) has no coherent clipped
+    # surface, so detect_surface_crop_frames does not flag it → it is kept intact (OD blink crops unaffected).
+    if provided_edges is None and params and params.get("crop_region") \
+            and str(_pcr.get("detector", "dp")).lower() != "legacy":
+        try:
+            _cr = params["crop_region"]
+            _crf = [int(f) for f in (_cr.get("frames") or [])]
+            if _crf:
+                _sg, _dg = _cur_sag_det(params)
+                _clip = set(detect_surface_crop_frames(_sg, params, workers=workers, detect=_dg)["frames"])
+                _keep = [f for f in _crf if f not in _clip]
+                if len(_keep) != len(_crf):
+                    _crop_guard_removed = [f for f in _crf if f in _clip]  # → caller drops these from persisted crop
+                    params = dict(params)
+                    if _keep:
+                        params["crop_region"] = {**_cr, "frames": _keep}
+                    else:
+                        params.pop("crop_region", None)           # entirely a clipped apex → surface-crop handles it
+        except Exception:  # noqa: BLE001 — guard is best-effort; fall back to applying the crop as given
             pass
     # #9 Crop RE-DETECT: zero the cropped box on the RAW volume BEFORE surface detection, so the anterior-edge
     # DP detector + RANSAC parabola fit + warp are all computed on the TRUNCATED volume — the removed
@@ -2783,6 +2824,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if _detilt_info:
                 info["detilt"] = _detilt_info
             info["proposals"] = _proposals
+            if _crop_guard_removed:
+                info["crop_guard_removed_frames"] = list(_crop_guard_removed)
             return info
     if provided_edges is not None:
         # fix-columns marched re-detection: a SINGLE same-canvas warp that flattens to the user-validated
@@ -2803,6 +2846,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         if _auto_cr:
             info["auto_crop_region"] = _auto_cr
         info["proposals"] = _proposals
+        if _crop_guard_removed:
+            info["crop_guard_removed_frames"] = list(_crop_guard_removed)
         return info
     # ── NATIVE AUTO-TUNE: the app tunes the DP detector to THIS scan before correcting (no user input). The
     # chosen dp_* are merged into params so the warp uses them AND surfaced in info["auto_tune"] so the caller
@@ -2873,6 +2918,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if _detilt_info:
         info["detilt"] = _detilt_info
     info["proposals"] = _proposals
+    if _crop_guard_removed:
+        info["crop_guard_removed_frames"] = list(_crop_guard_removed)
     return info
 
 
