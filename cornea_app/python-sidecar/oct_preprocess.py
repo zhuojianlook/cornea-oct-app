@@ -69,7 +69,12 @@ DEFAULT_PARAMS: dict = {
     # the per-column displacement FIELD across the slice (lateral) axis with this Gaussian sigma (px,
     # 0 = off) makes neighbours shift consistently → a smoother axial boundary, while the per-slice
     # quadratic still carries the real lateral curvature. Small sigma stays close to the per-slice fit.
-    "interslice_smooth": 1.0,
+    "interslice_smooth": 3.0,     # (raised 1→3 with subpixel_warp) smooth the per-slice displacement across slices
+                                  #   more, reducing slice-to-slice apex ripple; validated to also SMOOTH approved scans
+    "subpixel_warp": True,        # flatten warp shifts columns by the FRACTIONAL displacement (linear interp in
+                                  #   depth) instead of int-truncate → removes the 1-px lateral STAIRCASE ripple in
+                                  #   the anterior boundary. Interp is confined to the <1px depth shift (lateral/
+                                  #   frame crispness untouched). False = legacy int-truncate warp.
     # ── apex de-tear (#apex) ── Within ONE sagittal slice, the warp flattens the anterior to its smooth
     # RANSAC quadratic via disp = (quad - edge), so ANY high-frequency jitter/STEP in the detected `edge`
     # (frame axis) is injected straight into the warp. At the rough bright-speckle APEX the DP detector
@@ -823,8 +828,30 @@ def _extrapolate_fit(edge: np.ndarray, clip_cols: np.ndarray, residual_threshold
             return None
 
 
-def _warp_by_displacement(img: np.ndarray, displacement: np.ndarray) -> np.ndarray:
+def _warp_by_displacement(img: np.ndarray, displacement: np.ndarray, subpixel: bool = False) -> np.ndarray:
     H, W = img.shape
+    if subpixel:
+        # SUB-PIXEL warp (subpixel_warp): shift each column by the FRACTIONAL displacement via linear
+        # interpolation in depth, instead of truncating to int. The int-truncate warp quantises the
+        # sub-pixel-detected surface into a 1-px lateral STAIRCASE (the "ripples" the user sees at zoom); the
+        # fractional shift removes it, giving a smooth anterior boundary. Interpolation is confined to the
+        # 1-D depth shift (<1 px), so lateral/frame crispness is untouched. out[r] = img[r − s] (linear).
+        disp = np.asarray(displacement, dtype=np.float64)
+        rows = np.arange(H, dtype=np.float64)
+        src = rows[:, None] - disp[None, :]                       # (H, W) source row for each output (row, col)
+        lo = np.floor(src).astype(np.int64)
+        frac = src - lo
+        cols = np.arange(W)[None, :]
+        m0 = (lo >= 0) & (lo <= H - 1)
+        m1 = (lo + 1 >= 0) & (lo + 1 <= H - 1)
+        f = img.astype(np.float64)
+        v0 = np.where(m0, f[np.clip(lo, 0, H - 1), cols], 0.0)
+        v1 = np.where(m1, f[np.clip(lo + 1, 0, H - 1), cols], 0.0)
+        out = v0 * (1.0 - frac) + v1 * frac
+        out[~(m0 | m1)] = 0.0                                     # fully out-of-range rows → 0 (vacated, like the int path)
+        if np.issubdtype(img.dtype, np.integer):
+            out = np.rint(out)
+        return out.astype(img.dtype)
     warped = np.zeros_like(img)
     for x in range(W):
         shift = int(displacement[x])   # truncate toward zero (faithful to warp_image_by_edge)
@@ -2067,8 +2094,10 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
                 zc = zero_cols_list[i]
                 if zc.size:
                     disp_field[i][zc] = 0.0
-    # 4) warp each slice by its guarded+smoothed displacement, then revert.
-    warped = np.array([_warp_by_displacement(sag[i], disp_field[i]) for i in range(n)])
+    # 4) warp each slice by its guarded+smoothed displacement, then revert. sub-pixel (subpixel_warp) removes the
+    #    int-truncate lateral staircase in the flattened anterior boundary (the "ripples" seen at zoom).
+    _subpx = bool(p.get("subpixel_warp", False))
+    warped = np.array([_warp_by_displacement(sag[i], disp_field[i], subpixel=_subpx) for i in range(n)])
     if progress:
         progress(1.0)
     corrected = revert_sagittal(warped)
