@@ -240,28 +240,42 @@ export function VolumeCanvas() {
   const curMarkCols: number[] = defectOrient
     ? (allMarks.find((m) => m.orient === defectOrient && m.slice === sliceIdx)?.cols ?? [])
     : [];
-  const dragRef = useRef<{ startCol: number; base: number[] } | null>(null);
-  const [dragCols, setDragCols] = useState<number[] | null>(null);   // live preview during a drag
+  // Workflow: DRAW a column selection (drag over the slice) → it stays PENDING (light pink). Commit it to just
+  // this frame ("This frame") OR across a slice RANGE: click "Start" on one slice, scrub, click "End" on
+  // another — the pending columns apply to every slice in between. Pending shows on EVERY slice while open, so
+  // scrubbing previews where the range will land.
+  const [pendingCols, setPendingCols] = useState<number[]>([]);
+  const [rangeStart, setRangeStart] = useState<number | null>(null);
+  const dragRef = useRef<{ startCol: number } | null>(null);
 
-  // Push the current slice's marked columns (or the live drag preview) to the overlay renderer as pink bands.
-  // Cleared when mark mode is off so normal viewing is untouched.
   useEffect(() => {
     if (!markActive || !defectOrient) { setDefectBands(null, null); return; }
-    setDefectBands(view, dragCols ?? curMarkCols);
+    setDefectBands(view, curMarkCols, pendingCols);   // committed = solid, pending selection = light preview
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [markActive, defectOrient, view, sliceIdx, dragCols, JSON.stringify(curMarkCols)]);
-  // Also clear the bands on unmount / when leaving mark mode.
+  }, [markActive, defectOrient, view, sliceIdx, JSON.stringify(pendingCols), JSON.stringify(curMarkCols)]);
   useEffect(() => () => setDefectBands(null, null), []);
+  // Leaving mark mode / switching orientation / changing case resets the transient selection + range anchor.
+  useEffect(() => { setPendingCols([]); setRangeStart(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [markDefectMode, view, caseInfo?.case_id]);
 
-  // Commit a set of columns as THIS scan's marks for the current (orient, slice): merge with the other slices'
-  // marks, replace this slice's entry, drop empty entries, persist. Empty cols removes the slice's mark.
-  const commitCols = (cols: number[]) => {
-    if (!defectOrient) return;
-    const uniq = Array.from(new Set(cols)).filter((c) => c >= 0).sort((a, b) => a - b);
-    const others = allMarks.filter((m) => !(m.orient === defectOrient && m.slice === sliceIdx));
-    const next = uniq.length ? [...others, { orient: defectOrient, slice: sliceIdx, cols: uniq }] : others;
+  // Union `cols` onto EVERY slice in [s0,s1] for this orient (keeping any existing marks there), then persist.
+  const commitRange = (s0: number, s1: number, cols: number[]) => {
+    if (!defectOrient || !cols.length) return;
+    const lo = Math.min(s0, s1), hi = Math.max(s0, s1);
+    const byKey = new Map<number, Set<number>>();
+    for (const m of allMarks) if (m.orient === defectOrient) byKey.set(m.slice, new Set(m.cols));
+    for (let s = lo; s <= hi; s++) {
+      const set = byKey.get(s) ?? new Set<number>();
+      for (const c of cols) if (c >= 0) set.add(c);
+      byKey.set(s, set);
+    }
+    const next: DefectMark[] = allMarks.filter((m) => m.orient !== defectOrient);
+    byKey.forEach((set, s) => { if (set.size) next.push({ orient: defectOrient, slice: s, cols: [...set].sort((a, b) => a - b) }); });
     void setDefectMarks(next);
   };
+  const commitThisFrame = () => { if (pendingCols.length) { commitRange(sliceIdx, sliceIdx, pendingCols); setPendingCols([]); setRangeStart(null); } };
+  const commitEnd = () => { if (pendingCols.length && rangeStart != null) { commitRange(rangeStart, sliceIdx, pendingCols); setPendingCols([]); setRangeStart(null); } };
 
   const onMarkDown = (e: React.PointerEvent) => {
     if (!markActive) return;
@@ -269,8 +283,8 @@ export function VolumeCanvas() {
     const col = screenToColumn(e.clientX - r.left, e.clientY - r.top, view);
     if (col == null) return;
     e.currentTarget.setPointerCapture?.(e.pointerId);
-    dragRef.current = { startCol: col, base: curMarkCols };
-    setDragCols([...curMarkCols, col]);
+    dragRef.current = { startCol: col };
+    setPendingCols([col]);
   };
   const onMarkMove = (e: React.PointerEvent) => {
     const d = dragRef.current;
@@ -281,29 +295,29 @@ export function VolumeCanvas() {
     const lo = Math.min(d.startCol, col), hi = Math.max(d.startCol, col);
     const range: number[] = [];
     for (let c = lo; c <= hi; c++) range.push(c);
-    setDragCols([...d.base, ...range]);   // preview: existing marks + the dragged range
+    setPendingCols(range);
   };
-  const onMarkUp = () => {
-    const d = dragRef.current;
-    if (!d) return;
-    dragRef.current = null;
-    if (dragCols) commitCols(dragCols);   // persist the previewed columns
-    setDragCols(null);
-  };
-  // RIGHT-CLICK to clear ONE defect: remove the contiguous marked column-run under the cursor on this slice.
+  const onMarkUp = () => { dragRef.current = null; };   // the drawn selection stays PENDING until you commit it
+  // RIGHT-CLICK: clear the committed band-run under the cursor on this slice (or drop the pending selection).
   const onMarkContext = (e: React.MouseEvent) => {
-    if (!markActive) return;
+    if (!markActive || !defectOrient) return;
     e.preventDefault();
     const r = e.currentTarget.getBoundingClientRect();
     const col = screenToColumn(e.clientX - r.left, e.clientY - r.top, view);
     if (col == null) return;
     const set = new Set(curMarkCols);
-    if (!set.has(col)) return;                       // not on a marked band → nothing to clear
-    let lo = col, hi = col;                           // expand to the full contiguous run
+    if (!set.has(col)) { setPendingCols([]); setRangeStart(null); return; }   // not on a band → just drop pending
+    let lo = col, hi = col;
     while (set.has(lo - 1)) lo--;
     while (set.has(hi + 1)) hi++;
-    commitCols(curMarkCols.filter((c) => c < lo || c > hi));
+    const remaining = curMarkCols.filter((c) => c < lo || c > hi);
+    const others = allMarks.filter((m) => !(m.orient === defectOrient && m.slice === sliceIdx));
+    void setDefectMarks(remaining.length ? [...others, { orient: defectOrient, slice: sliceIdx, cols: remaining }] : others);
   };
+
+  const mb = (on: boolean): React.CSSProperties => ({ background: on ? "rgba(255,93,176,0.28)" : "none",
+    border: "1px solid #ff5db0", borderRadius: 4, color: on ? "#fff" : "#ff9fd0", opacity: on ? 1 : 0.45,
+    cursor: on ? "pointer" : "default", fontSize: 11, padding: "1px 7px", fontWeight: 600 });
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -527,20 +541,27 @@ export function VolumeCanvas() {
           onPointerUp={markActive ? onMarkUp : undefined}
           onPointerLeave={markActive ? onMarkUp : undefined}
           onContextMenu={markActive ? onMarkContext : undefined} />
-        {/* Defect-mark readout: current marks count + a one-click clear for this scan (only in mark mode). */}
+        {/* Defect-mark toolbar (only in mark mode): drag to select columns → commit to this frame OR a slice
+            range (start → scrub → end). Pending selection shows light-pink on every slice; committed = solid. */}
         {markActive && (
-          <div className="absolute top-2 right-2 z-30 flex items-center gap-2 pointer-events-auto"
-            style={{ padding: "3px 10px", borderRadius: 999, fontSize: 12, color: "#fff",
-              background: "rgba(255,93,176,0.22)", border: "1px solid #ff5db0" }}
-            title="Drag over the current slice to mark WRONG columns. Marks accumulate across slices/frames and save to manifest.defect_marks.">
-            <span style={{ color: "#ff5db0", fontWeight: 700 }}>⚑</span>
-            {allMarks.length} mark{allMarks.length === 1 ? "" : "s"}
-            {allMarks.length > 0 && (
-              <button onClick={() => void setDefectMarks([])}
-                style={{ background: "none", border: "1px solid #ff5db0", borderRadius: 4, color: "#ff9fd0", cursor: "pointer", fontSize: 11, padding: "0 6px" }}>
-                clear
-              </button>
+          <div className="absolute top-2 right-2 z-30 flex items-center gap-1.5 pointer-events-auto flex-wrap justify-end"
+            style={{ maxWidth: "78%", padding: "4px 9px", borderRadius: 12, fontSize: 12, color: "#fff",
+              background: "rgba(20,20,24,0.7)", border: "1px solid #ff5db0" }}>
+            <span style={{ color: "#ff5db0", fontWeight: 700 }}
+              title="Drag over the slice to select WRONG columns, then commit to this frame or a slice range. Right-click a band to remove it.">⚑ {view}</span>
+            <span style={{ opacity: 0.9 }}>{pendingCols.length ? `${pendingCols.length} col${pendingCols.length === 1 ? "" : "s"} selected` : "drag to select"}</span>
+            {rangeStart != null && <span style={{ color: "#ffd0e8" }}>· start@{rangeStart + 1}</span>}
+            <button disabled={!pendingCols.length} onClick={commitThisFrame} style={mb(pendingCols.length > 0)}
+              title="Save the selected columns on THIS slice only.">this frame</button>
+            <button disabled={!pendingCols.length} onClick={() => setRangeStart(sliceIdx)} style={mb(pendingCols.length > 0)}
+              title="Set the START slice of a range; scrub to another slice, then click End.">start</button>
+            <button disabled={!pendingCols.length || rangeStart == null} onClick={commitEnd} style={mb(pendingCols.length > 0 && rangeStart != null)}
+              title="Apply the selected columns to every slice from Start to the current slice.">end</button>
+            {(pendingCols.length > 0 || rangeStart != null) && (
+              <button onClick={() => { setPendingCols([]); setRangeStart(null); }} style={mb(true)} title="Discard the current selection/range.">×sel</button>
             )}
+            <span style={{ opacity: 0.85 }}>· {allMarks.length} saved</span>
+            {allMarks.length > 0 && <button onClick={() => void setDefectMarks([])} style={mb(true)} title="Clear ALL marks on this scan.">clear all</button>}
           </div>
         )}
         {showBrush && (

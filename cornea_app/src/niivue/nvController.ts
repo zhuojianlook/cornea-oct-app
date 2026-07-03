@@ -506,9 +506,12 @@ export function scheduleOverlay(): void {
 // translucent PINK vertical bands over the matching single-plane tile — same overlay canvas as the paint,
 // but drawn on top (after putImageData). Columns are voxel indices along this view's non-depth in-plane
 // axis (see screenToColumn). Cleared to null when mark mode is off so normal viewing is untouched.
-let _defectBands: { view: ViewName; cols: Set<number> } | null = null;
-export function setDefectBands(view: ViewName | null, cols: number[] | null): void {
-  _defectBands = view && cols && cols.length ? { view, cols: new Set(cols) } : null;
+let _defectBands: { view: ViewName; cols: Set<number>; light: Set<number> } | null = null;
+// cols = COMMITTED marks (solid pink); light = the PENDING selection / range preview (lighter pink).
+export function setDefectBands(view: ViewName | null, cols: number[] | null, light?: number[] | null): void {
+  const c = cols && cols.length ? new Set(cols) : new Set<number>();
+  const l = light && light.length ? new Set(light) : new Set<number>();
+  _defectBands = view && (c.size || l.size) ? { view, cols: c, light: l } : null;
   renderDrawOverlay();
 }
 /** Draw the current defect-mark columns as pink vertical bands on the overlay 2-D context (affine-exact). */
@@ -533,14 +536,14 @@ function renderDefectBands(ctx: CanvasRenderingContext2D, W: number, H: number):
     // Per screen column, map its centre → column voxel index (affine via screenXY2TextureFrac) and shade
     // if marked. One f2f call per device-x column (cheap); handles any mirror/scale of the tile exactly.
     const yc = (ly + lh / 2) | 0;
-    ctx.fillStyle = "rgba(255,93,176,0.30)";
     for (let px = x0; px < x1; px++) {
       const frac = f2f.call(nv, px, yc, ti);
       if (!frac) continue;
       const f = frac[colAx];
       if (f == null || !Number.isFinite(f)) continue;
       const col = Math.max(0, Math.min(nCol - 1, Math.round(f * nCol - 0.5)));
-      if (bands.cols.has(col)) ctx.fillRect(px, y0, 1, y1 - y0);
+      if (bands.cols.has(col)) { ctx.fillStyle = "rgba(255,93,176,0.44)"; ctx.fillRect(px, y0, 1, y1 - y0); }
+      else if (bands.light.has(col)) { ctx.fillStyle = "rgba(255,93,176,0.16)"; ctx.fillRect(px, y0, 1, y1 - y0); }
     }
   }
 }
