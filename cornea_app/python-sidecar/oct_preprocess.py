@@ -120,6 +120,36 @@ DEFAULT_PARAMS: dict = {
     "spec_spike_max_width": 6,    # max contiguous frame run treated as a (narrow) specular spike (incl. boxy blocks)
     "spec_spike_min_height": 8.0, # min px the edge must rise ABOVE the median trend to be a spike
     "spec_spike_trend_win": 21,   # frames in the robust median trend (must exceed spike width to survive it)
+    # ── FIX apexspec: LATERAL (across-slice) specular-spike rejection on the ASSEMBLED surface ── The per-slice
+    # spec_spike_reject above runs along FRAMES for each fixed lateral, so a narrow ultra-bright VERTICAL specular
+    # streak at the corneal APEX — which sits at a fixed lateral band and spans a run of frames — is only partly
+    # caught (each lateral slice climbs the streak independently, and a per-frame interpolation cannot make the
+    # LATERAL profile smooth). The result is a jagged spike in the AXIAL (fixed-frame) B-scan where the detected
+    # surface follows the streak. This guard runs on detect_surface_all's full (lateral, frame) surface: for each
+    # FRAME column it takes a LATERALLY-ROBUST median trend (window > streak width, so it ignores the spike and
+    # follows the true dome), finds NARROW contiguous lateral runs that rise ABOVE the trend by > min_height (the
+    # specular streak lures the DP up = shallower), and replaces a small padded band around each such run with the
+    # median trend — removing the up-spike AND the adjacent jitter the streak induces while the true smooth dome
+    # (which the wide-window median already follows) is preserved. ONE-SIDED (upward-triggered) + NARROW-run gated
+    # → a clean apex (surface already on the lateral trend) is a strict no-op. Auto detection only (prior=None).
+    # apex_lateral_reject=False disables.
+    "apex_lateral_reject": True,
+    "apex_lat_trend_win": 41,     # lateral px in the robust median trend (must exceed the streak's lateral width)
+    "apex_lat_min_height": 8.0,   # min px the surface must rise ABOVE the lateral trend to trigger
+    "apex_lat_max_width": 18,     # max contiguous lateral run of up-spike triggers treated as a specular band
+    "apex_lat_pad": 4,            # lateral px padded around each triggered run (absorbs the induced jitter flanks)
+    # ── AXIAL-CONSISTENCY pass ── final per-FRAME lateral clean-up of the anterior surface (kills slice-to-slice
+    # waviness/spikes only visible in the AXIAL B-scan); strictly gated → strict NO-OP on an already-smooth scan.
+    "axial_consistency": True,
+    "axcons_med_win": 15,         # lateral median-filter width (px) for the smooth target (kills spikes, keeps dome)
+    "axcons_two_sided": False,    # correct only DOWNWARD notches (detector locked too deep); True also lifts up-spikes
+    "axcons_gate": 3.0,           # px: correct only lateral columns deviating from the smooth target by more than this
+    "axcons_max_shift": 10.0,     # px: hard clamp on the per-column depth nudge (bounded, never a re-flatten)
+    "axcons_strength": 1.0,       # fraction of the gated deviation removed per column
+    "axcons_min_frac": 0.02,      # frame no-op unless > this frac of lateral cols exceed the gate (ignore specks)
+    "axcons_max_frac": 0.18,      # frame no-op if MORE than this frac of in-cornea cols exceed the gate (rough/off-cornea)
+    "axcons_min_coverage": 0.5,   # frame no-op unless the cornea fills >= this frac of the lateral span
+    "axcons_iters": 2,            # detect→nudge repeats (a deep notch needs 2; a smooth frame stays no-op)
     # ── NATIVE AUTO-TUNE ── The app tunes the DP params to EACH scan (no user input): a coordinate-descent
     # sweep scored by on-board surface confidence (contrast − weight·roughness) on sampled slices, run at the
     # start of preprocessing; the chosen dp_* are used for the warp AND persisted so the fix-columns baseline
@@ -1108,6 +1138,58 @@ def _redetect_one_slice(sl: np.ndarray, prior: np.ndarray, window: float, p: dic
     return _smooth_median(corrected, size=int(p["median_filter_size"]))
 
 
+def _reject_apex_lateral_spike(edges: np.ndarray, p: dict) -> np.ndarray:
+    """FIX apexspec: remove a narrow apex specular streak from the ASSEMBLED (lateral, frame) surface by making
+    each FRAME column laterally smooth where a narrow up-spike (the DP climbing the streak) sits above a
+    laterally-robust median trend. edges = (n_lateral, n_frames), depth 0 = TOP (a spike rising = value DROPS).
+
+    Per frame column: a MEDIAN trend over `apex_lat_trend_win` laterals (wider than the streak) follows the true
+    dome and ignores the spike. Contiguous lateral runs where (trend − surface) > apex_lat_min_height (surface is
+    SHALLOWER = climbed the streak), no wider than apex_lat_max_width, are the specular band; a small pad
+    (apex_lat_pad) around each is reset to the trend (absorbing the jitter the streak induces on its flanks). The
+    kept-away specular pixels are left in the volume ABOVE the corrected surface (per the user's decision). Strictly
+    one-sided (upward-triggered) + narrow-run gated, so a clean apex (surface already on the lateral trend) and a
+    genuinely wide/steep dome are strict no-ops. apex_lateral_reject=False disables."""
+    if not bool(p.get("apex_lateral_reject", True)):
+        return edges
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2:
+        return edges
+    L, F = e.shape
+    win = int(p.get("apex_lat_trend_win", 41))
+    if L < 5 or win < 3:
+        return edges
+    win = win if win % 2 else win + 1
+    ksize = min(win, L if L % 2 else L - 1)
+    min_h = float(p.get("apex_lat_min_height", 8.0))
+    maxw = int(p.get("apex_lat_max_width", 18))
+    pad = int(p.get("apex_lat_pad", 4))
+    out = e.copy()
+    changed = False
+    for f in range(F):
+        col = e[:, f]
+        trend = ndimage.median_filter(col, size=ksize, mode="nearest")
+        cand = (trend - col) > min_h                              # surface shallower than trend = climbed a streak
+        if not cand.any():
+            continue                                             # clean column → no-op
+        band = np.zeros(L, dtype=bool)
+        i = 0
+        while i < L:
+            if not cand[i]:
+                i += 1
+                continue
+            j = i
+            while j < L and cand[j]:
+                j += 1                                           # [i, j) contiguous up-spike run
+            if (j - i) <= maxw:                                  # NARROW lateral run = specular band → reset to trend
+                band[max(0, i - pad):min(L, j + pad)] = True
+            i = j
+        if band.any():
+            out[band, f] = trend[band]
+            changed = True
+    return out.astype(np.float32) if changed else edges
+
+
 def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
                        progress=None) -> np.ndarray:
     """The robust auto-detected corneal surface for EVERY sagittal slice (n_slices, n_frames) — the same
@@ -1119,7 +1201,13 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
         workers = auto_workers()
     edges = _map_slices(_edge_worker, [(np.ascontiguousarray(sag[i]).astype(np.float32), p) for i in range(n)],
                         progress, 0.0, 1.0, workers)
-    return np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
+    out = np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
+    # FIX apexspec: LATERAL specular-spike reject on the assembled (lateral, frame) surface. Auto detection only;
+    # a supplied per-slice prior means fix-columns re-detection, which carries its own user-seeded surface and must
+    # not be laterally re-smoothed here (the per-worker _edge_worker never receives a prior, so this is the auto path).
+    if bool(p.get("spec_spike_reject", True)):
+        out = _reject_apex_lateral_spike(out, p)
+    return out
 
 
 def detect_noise_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
@@ -1708,6 +1796,14 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         #    where the surface is already flattened, so skipping the (costly) per-slice legacy there is safe.
         pe = {**p, "dp_scar_guard": False} if detect_volume is not None else p
         edges = np.array(_map_slices(_edge_worker, [(det[i], pe) for i in range(n)], progress, 0.0, 0.5, workers))
+        # FIX apexspec: LATERAL specular-spike reject on the assembled (lateral, frame) edge that actually drives
+        # the WARP — the per-slice _edge_worker climbs a narrow apex vertical specular streak independently per
+        # lateral, leaving a jagged spike in the AXIAL/en-face surface that a per-frame reject can't smooth. Runs
+        # on the auto path only (never provided_edges — handled in the use_provided branch); safe on every pass
+        # (gated no-op where the surface already sits on the lateral trend). detect on a filled/warped copy
+        # (detect_volume is not None) already sits flattened, so this is a no-op there too.
+        if bool(p.get("spec_spike_reject", True)):
+            edges = _reject_apex_lateral_spike(edges, p)
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
@@ -2075,6 +2171,122 @@ def axial_refine_volume(v_sag: np.ndarray, params: dict | None = None, workers: 
                      "surf_rms_before": rms_before, "surf_rms_after": rms_after, "applied": True}
     return v_sag, {"frames_refined": 0, "n_frames": int(B_sag.shape[0]),
                    "surf_rms_before": rms_before, "surf_rms_after": rms_before, "applied": False}
+
+
+# ── AXIAL-CONSISTENCY pass (# FIX axialcons) ────────────────────────────────────────────────────────
+# The sagittal flatten corrects each of the 513 lateral columns independently (only 101 frame samples
+# each), so their depth shifts are inconsistent → the anterior surface WAVES / spikes / notches across
+# the LATERAL axis, visible ONLY in the AXIAL (B-scan) view. This pass takes the SAME per-sagittal-slice
+# surface the label/validation uses (detect_surface_all → S[lateral, frame]); for each FRAME it laterally
+# SMOOTHS that surface and applies a SMALL gated per-lateral-column DEPTH shift toward the smooth target,
+# so the RED (pipeline) surface becomes laterally consistent. It NEVER re-flattens (max_shift clamp) and
+# is a strict NO-OP where the surface is already smooth (gate) — so it can't regress good scans.
+def _axcons_shift_from_edge(edge: np.ndarray, depth: int, p: dict) -> np.ndarray:
+    """Given ONE frame's lateral surface profile `edge` (length = lateral; the detect_surface_all column for
+    this frame) return the GATED per-lateral-column depth shift that pulls each jittery column onto the
+    laterally-smoothed target. Returns 0 everywhere if the frame is already smooth / off-cornea (no-op)."""
+    edge = np.asarray(edge, dtype=np.float64)
+    L = edge.size
+    sigma = float(p.get("axcons_sigma", 8.0) or 0.0)
+    gate = float(p.get("axcons_gate", 2.0) or 0.0)
+    max_shift = float(p.get("axcons_max_shift", 6.0) or 0.0)
+    strength = float(p.get("axcons_strength", 1.0) or 0.0)
+    min_frac = float(p.get("axcons_min_frac", 0.02) or 0.0)
+    max_frac = float(p.get("axcons_max_frac", 0.25) or 1.0)
+    min_cov = float(p.get("axcons_min_coverage", 0.5) or 0.0)
+    if sigma <= 0 or max_shift <= 0 or strength <= 0 or L < 8:
+        return np.zeros(L, dtype=np.float64)
+    # A column with no cornea (all padding → edge at 0 or the frame top) must not vote or move. Treat only
+    # in-frame, positive edges as valid; smooth the target over the VALID columns only (so off-cornea
+    # limbus/background can't drag the smooth target).
+    valid = np.isfinite(edge) & (edge > 1.0) & (edge < depth - 1)
+    # COVERAGE GATE: a TRAILING/off-cornea frame (the slow scan ran off the eye) has the cornea covering only
+    # a small part of the lateral span; its detected surface is not a smooth dome, so smoothing it makes a
+    # meaningless target and forcing columns onto it tears tissue. Require the cornea to fill most of the
+    # frame — otherwise leave the frame exactly as the sagittal pass left it (no-op). This is what keeps the
+    # off-cornea limbus frames (the source of the regression) untouched.
+    if int(valid.sum()) < max(8, int(min_cov * L)):
+        return np.zeros(L, dtype=np.float64)
+    xs = np.arange(L, dtype=np.float64)
+    e_valid = np.interp(xs, xs[valid], edge[valid])           # fill invalid columns by lateral interpolation
+    # TARGET = a robust lateral-smoothed surface: a wide MEDIAN filter (kills narrow spikes, keeps broad dome
+    # curvature) FOLLOWED by a Gaussian (removes the median's own staircase). A genuinely smooth dome (any
+    # width) reads deviation ≈ 0 → no-op; only the per-slice detector's narrow jitter deviates.
+    med_win = int(p.get("axcons_med_win", 15) or 15)
+    if med_win % 2 == 0:
+        med_win += 1
+    target = ndimage.median_filter(e_valid, size=med_win, mode="nearest")
+    if sigma > 0:
+        target = ndimage.gaussian_filter1d(target, sigma=sigma, mode="nearest")
+    dev = e_valid - target                                   # + = surface sits DEEPER than the smooth target (a down-notch)
+    # ONLY-DOWN option: the sagittal detector jitter that produces the AXIAL notches is a column locking a few
+    # px too DEEP (into internal stroma) — a downward excursion. Correcting only downward notches (never
+    # pushing a column deeper) avoids fighting a genuine shallow dome apex. axcons_two_sided=True corrects both.
+    if not bool(p.get("axcons_two_sided", False)):
+        dev = np.maximum(dev, 0.0)
+    # GATE = SOFT-THRESHOLD: leave a gate-width dead-band untouched (a small wobble ≤ gate is genuine dome
+    # micro-texture, NOT jitter → strict no-op), but apply the FULL excess beyond it so a real notch/spike
+    # is pulled all the way onto the smooth target. corr = sign(dev)·max(|dev|−gate, 0).
+    mag = np.abs(dev)
+    excess = np.maximum(mag - gate, 0.0)
+    corr = np.sign(dev) * excess
+    corr[~valid] = 0.0                                        # never move an off-cornea / interpolated column
+    n_over = float(np.count_nonzero(corr != 0.0))
+    # Whole-frame no-op unless a real RUN of columns exceeds the gate (ignore a few stray specks → clean
+    # frames untouched). A well-detected, laterally-smooth scan has 0 columns over the gate → strict no-op.
+    if n_over <= min_frac * L:
+        return np.zeros(L, dtype=np.float64)
+    # MAX-FRAC GATE: genuine lateral JITTER is a SMALL fraction of spike columns on an otherwise-smooth dome.
+    # If a LARGE fraction of columns deviate, the frame is fundamentally rough / off-cornea / mis-detected —
+    # NOT jitter — so the smooth target is untrustworthy and flattening to it would tear tissue (this was the
+    # regression on the trailing limbus frames). Leave such a frame untouched.
+    if n_over > max_frac * max(1, int(valid.sum())):
+        return np.zeros(L, dtype=np.float64)
+    # shift = move each column toward the smooth target (depth). disp>0 shifts tissue DOWN (deeper); to pull
+    # a too-deep column (dev>0) UP we need a NEGATIVE depth shift, so shift = -strength·corr, clamped small.
+    shift = -strength * corr
+    shift = np.clip(shift, -max_shift, max_shift)
+    shift = np.round(shift)                                   # the warp truncates to int; round so a sub-px notch still moves
+    return shift.astype(np.float64)
+
+
+def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """FINAL lateral clean-up (# FIX axialcons): using the SAME per-sagittal-slice surface the label uses
+    (detect_surface_all), apply a small GATED per-lateral-column depth shift per frame so the anterior
+    surface is laterally consistent (no wave/spike/notch in the AXIAL view), keeping the sagittal flatten.
+    Strict no-op on an already-smooth scan (gate). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    n_frames = int(volume.shape[0])
+    depth = int(volume.shape[1])
+    iters = max(1, int(p.get("axcons_iters", 2) or 1))
+    out = volume.copy()
+    moved = np.zeros(n_frames, dtype=bool)
+    n_moved_cols = 0
+    # Iterate detect→nudge: a deep notch needs a couple of passes (the detector re-locks slightly after a
+    # warp). Each pass re-detects the label surface on the CURRENT volume, so a frame that has become smooth
+    # returns an all-zero shift and stops moving — the loop self-terminates on a good scan (strict no-op).
+    for _ in range(iters):
+        # detect on a black-band-filled copy so the sagittal warp's zero padding can't fool detection; use
+        # the EXACT surface the label/validation reads (detect_surface_all → S[lateral, frame]).
+        surf = detect_surface_all(reformat_to_sagittal(_fill_black_bands(out)), p, workers=workers)  # (lateral, frames)
+        any_move = False
+        for f in range(n_frames):
+            sh = _axcons_shift_from_edge(surf[:, f], depth, p)
+            if not np.any(sh != 0.0):
+                continue
+            # warp the B-scan (depth × lateral) by the per-lateral-column depth shift — SAME primitive as the
+            # sagittal warp (_warp_by_displacement warps rows=depth by a per-column shift), applied laterally.
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), sh)
+            moved[f] = True
+            n_moved_cols += int(np.count_nonzero(sh != 0.0))
+            any_move = True
+        if not any_move:
+            break
+    n_moved_frames = int(moved.sum())
+    return out, {"applied": bool(n_moved_frames), "frames_adjusted": n_moved_frames,
+                 "n_frames": n_frames, "cols_adjusted": int(n_moved_cols)}
 
 
 def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
@@ -2534,6 +2746,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("axial_refine", True):
         corrected, ref = axial_refine_volume(corrected, params, workers=workers)
         info["axial_refine"] = ref
+    # FIX axialcons: final AXIAL-consistency pass — the sagittal flatten corrects the 513 lateral columns
+    # independently, so their shifts are inconsistent → lateral WAVINESS/spikes/notches visible only in the
+    # AXIAL (B-scan) view. Per B-scan, apply a SMALL GATED per-column depth nudge onto a laterally-smoothed
+    # surface. Strict no-op on an already-smooth scan (gate), so it can't regress good scans.
+    if p_all.get("axial_consistency", True):
+        corrected, axc = axial_consistency_volume(corrected, params, workers=workers)
+        info["axial_consistency"] = axc
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")
