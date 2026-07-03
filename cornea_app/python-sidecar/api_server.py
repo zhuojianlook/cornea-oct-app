@@ -280,7 +280,7 @@ def _invalidate_derived_volume(case_id: str) -> None:
     mtime '<' comparison that can wrongly serve a stale conversion when the source
     is re-pointed at a different (or in-place replaced) file."""
     previews = orch.case_root(case_id) / "previews"
-    for name in ("volume.nii.gz", "preprocessed.nii.gz"):
+    for name in ("volume.nii.gz", "preprocessed.nii.gz", "volume_display.nii.gz"):
         try:
             (previews / name).unlink()
         except FileNotFoundError:
@@ -377,7 +377,13 @@ def _pass_volume_path(case_id: str, pass_num: int | None) -> Path:
 
 @app.get("/api/case/{case_id}/volume.nii.gz")
 def get_volume_nifti(case_id: str) -> FileResponse:
-    dst = _working_volume(case_id)
+    base = _working_volume(case_id)
+    # CROP-SHADE: serve the dim-crop DISPLAY volume to the viewer when present + current — it shows the
+    # cropped-out (uncorrected) tissue at reduced intensity so the user can see what was removed. The pipeline
+    # / SAM2 read _working_volume (the FILE, crop zeroed) directly, so segmentation is unaffected; the display
+    # volume has the SAME shape/affine (only the crop-region intensity differs) so any overlay still aligns.
+    disp = orch.case_root(case_id) / "previews" / "volume_display.nii.gz"
+    dst = disp if (disp.exists() and disp.stat().st_mtime >= base.stat().st_mtime) else base
     return FileResponse(str(dst), media_type="application/gzip", filename="volume.nii.gz")
 
 
@@ -2232,6 +2238,46 @@ def _oct_render_volume(case_id: str, work: Path, preprocessed: bool, extra: dict
             "geometry_warnings": geom_warnings, "images": []}
 
 
+def _write_crop_shade_display(case_id: str, oct_src: str, vi: int,
+                              crop_region: dict | None, crop_lateral: list | None,
+                              dim: float = 0.35) -> None:
+    """CROP-SHADE: write previews/volume_display.nii.gz = the corrected volume with the CROPPED region filled by
+    the RAW (uncorrected) tissue at `dim`× intensity, so the viewer (get_volume_nifti) shows what was cropped in
+    a distinct dim shade. The pipeline/SAM2 volume (previews/volume.nii.gz) is left untouched. No-op (display
+    removed) when there's no crop or the canvas was extended (surface-crop) so the shapes can't align."""
+    import nibabel as nib
+    disp_path = orch.case_root(case_id) / "previews" / "volume_display.nii.gz"
+    frames = [int(f) for f in ((crop_region or {}).get("frames") or [])]
+    lat = (crop_region or {}).get("lateral") or [0, -1]
+    legacy = [int(l) for l in (crop_lateral or [])]
+    if not frames and not legacy:
+        disp_path.unlink(missing_ok=True)
+        return
+    try:
+        cimg = nib.load(str(_working_volume(case_id)))
+        corr = np.asanyarray(cimg.dataobj)                       # (lateral, depth, frame)
+        raw = np.transpose(oct_mod.read_oct_zstack(oct_src, vi), (2, 1, 0)).astype(np.float32)  # → (lat, depth, frame)
+        if corr.shape != raw.shape:                              # extended canvas → can't align; no crop-shade
+            disp_path.unlink(missing_ok=True)
+            return
+        L = corr.shape[0]
+        out = corr.astype(np.float32).copy()
+        lo = max(0, int(lat[0])); hi = min(L - 1, int(lat[1]) if int(lat[1]) >= 0 else L - 1)
+        for f in frames:
+            if 0 <= f < corr.shape[2]:
+                out[lo:hi + 1, :, f] = raw[lo:hi + 1, :, f] * dim
+        for l in legacy:
+            if 0 <= l < L:
+                out[l, :, :] = raw[l, :, :] * dim
+        if np.issubdtype(corr.dtype, np.integer):
+            out = np.rint(out).astype(corr.dtype)
+        else:
+            out = out.astype(corr.dtype)
+        nib.save(nib.Nifti1Image(out, cimg.affine, cimg.header), str(disp_path))
+    except Exception:  # noqa: BLE001 — display convenience; never block preprocessing
+        disp_path.unlink(missing_ok=True)
+
+
 @app.post("/api/oct/upload")
 async def oct_upload(files: List[UploadFile] = File(...)) -> dict:
     """Upload .OCT files (+ optional companion .txt). One case per .OCT; metadata is
@@ -2562,6 +2608,13 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         if eye in ("OD", "OS"):
             extra["eye"] = eye
     out = _oct_render_volume(case_id, work, preprocessed=True, extra=extra)
+    # CROP-SHADE: build the dim-crop DISPLAY volume so the viewer shows the cropped-out (uncorrected) tissue in
+    # a distinct shade instead of black (best-effort; never blocks preprocess). Uses the manual crop or the
+    # auto-detected off-cornea/blink crop; a no-op (display cleared) when nothing was cropped.
+    _write_crop_shade_display(
+        case_id, str(src), vi,
+        (eff_params.get("crop_region") or (iter_info.get("auto_crop_region") if isinstance(iter_info, dict) else None)),
+        eff_params.get("crop_lateral"))
     # Render EVERY corrected pass (V1..Vm) so the user can step through all of them in the before/
     # after viewer and SEE which is best: pass 0 = context_raw, pass k = context_iter{k}; the chosen
     # best (oct_iter.best_pass) is the working "context"/volume. Best-effort — a render failure never
