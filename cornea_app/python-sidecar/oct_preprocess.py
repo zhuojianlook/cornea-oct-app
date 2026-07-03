@@ -2713,29 +2713,36 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                 _auto_cr = params["crop_region"]               # persist it (sticky) so re-runs don't un-crop it
         except Exception:  # noqa: BLE001 — best-effort; fall back to no auto crop
             pass
-    # STALE / MISCLASSIFIED-CROP GUARD: a crop_region must NEVER destructively zero frames that actually hold a
-    # CLIPPED-APEX cornea. An old auto-crop (or a stale crop_region carried in params from a previous algorithm
-    # version, e.g. one lacking the "auto" flag) that mis-fired on a clipped apex would otherwise (a) destroy real
-    # corneal tissue and (b) SUPPRESS the surface-crop reconstruction — that block only sees frames still present,
-    # so a zeroed frame is never rebuilt. Before applying any crop, drop clipped-apex frames from its frame list so
-    # surface-crop rebuilds them instead. A genuine off-cornea NOISE crop (blink/runout) has no coherent clipped
-    # surface, so detect_surface_crop_frames does not flag it → it is kept intact (OD blink crops unaffected).
-    if provided_edges is None and params and params.get("crop_region") \
+    # STALE / MISCLASSIFIED-CROP GUARD: a FULL-WIDTH auto crop_region must NEVER destructively zero frames that
+    # actually hold cornea. An old auto noise-crop (or a stale crop_region carried in params from a previous
+    # algorithm version, e.g. one lacking the "auto" flag) that mis-fired on real cornea (a clipped apex, or just a
+    # frame the old detector scored low) would otherwise (a) destroy real corneal tissue and (b) SUPPRESS the
+    # surface-crop reconstruction — that block only sees frames still present, so a zeroed frame is never rebuilt.
+    # RE-VALIDATE against the CURRENT noise detector: a frame survives the crop ONLY if detect_noise_frames still
+    # flags it as genuine off-cornea noise (blink/runout). Everything else is cornea (clipped or normal) → pulled
+    # OUT of the crop so it is preserved (and a clipped apex then flows to the surface-crop proposal). A real blink
+    # crop (OD runout) is re-flagged by the current detector → kept intact. GATED to FULL-WIDTH crops (lateral spans
+    # the whole frame = the auto/stale signature); a MANUAL sub-lateral box crop is left exactly as the user drew it
+    # (its frames aren't full-frame noise, so a noise re-check would wrongly drop them).
+    _cr0 = (params or {}).get("crop_region") if params else None
+    if provided_edges is None and isinstance(_cr0, dict) and _cr0.get("frames") \
             and str(_pcr.get("detector", "dp")).lower() != "legacy":
         try:
-            _cr = params["crop_region"]
-            _crf = [int(f) for f in (_cr.get("frames") or [])]
-            if _crf:
+            _lat = _cr0.get("lateral") or []
+            _nlat = int(vol.shape[2])
+            _full_width = len(_lat) == 2 and int(_lat[0]) <= 0 and int(_lat[1]) >= _nlat - 1
+            _crf = [int(f) for f in (_cr0.get("frames") or [])]
+            if _full_width and _crf:
                 _sg, _dg = _cur_sag_det(params)
-                _clip = set(detect_surface_crop_frames(_sg, params, workers=workers, detect=_dg)["frames"])
-                _keep = [f for f in _crf if f not in _clip]
+                _noise = set(detect_noise_frames(_sg, params, workers=workers, detect=_dg))
+                _keep = [f for f in _crf if f in _noise]          # keep ONLY still-genuine-noise frames
                 if len(_keep) != len(_crf):
-                    _crop_guard_removed = [f for f in _crf if f in _clip]  # → caller drops these from persisted crop
+                    _crop_guard_removed = [f for f in _crf if f not in _noise]  # cornea → caller drops from persisted crop
                     params = dict(params)
                     if _keep:
-                        params["crop_region"] = {**_cr, "frames": _keep}
+                        params["crop_region"] = {**_cr0, "frames": _keep}
                     else:
-                        params.pop("crop_region", None)           # entirely a clipped apex → surface-crop handles it
+                        params.pop("crop_region", None)           # no genuine noise left → surface-crop handles any clip
         except Exception:  # noqa: BLE001 — guard is best-effort; fall back to applying the crop as given
             pass
     # #9 Crop RE-DETECT: zero the cropped box on the RAW volume BEFORE surface detection, so the anterior-edge
