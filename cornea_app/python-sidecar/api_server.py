@@ -387,6 +387,37 @@ def get_volume_nifti(case_id: str) -> FileResponse:
     return FileResponse(str(dst), media_type="application/gzip", filename="volume.nii.gz")
 
 
+@app.get("/api/case/{case_id}/crop-mask.nii.gz")
+def get_crop_mask(case_id: str) -> FileResponse:
+    """CROP-SHADE (red highlight): a binary mask = 1 over the cropped (blink / off-cornea) region, 0 elsewhere,
+    same shape/affine as the working volume. The viewer overlays it in RED so the cropped region is highlighted
+    (over the dim cropped tissue served by /volume.nii.gz). 404 when nothing was cropped."""
+    import nibabel as nib
+    m = orch.read_manifest(case_id)
+    cr = (m.get("oct_params") or {}).get("crop_region") or m.get("auto_crop_region")
+    cl = (m.get("oct_params") or {}).get("crop_lateral")
+    base = _working_volume(case_id)
+    if not base.exists():
+        raise HTTPException(404, "no volume")
+    img = nib.load(str(base))
+    shp = img.shape                                              # (lateral, depth, frame)
+    mask = np.zeros(shp, dtype=np.uint8)
+    frames = [int(f) for f in ((cr or {}).get("frames") or [])]
+    lat = (cr or {}).get("lateral") or [0, shp[0] - 1]
+    lo = max(0, int(lat[0])); hi = min(shp[0] - 1, int(lat[1]) if int(lat[1]) >= 0 else shp[0] - 1)
+    for f in frames:
+        if 0 <= f < shp[2]:
+            mask[lo:hi + 1, :, f] = 1
+    for l in (cl or []):
+        if 0 <= int(l) < shp[0]:
+            mask[int(l), :, :] = 1
+    if int(mask.sum()) == 0:
+        raise HTTPException(404, "no crop")
+    out = orch.case_root(case_id) / "previews" / "crop_mask.nii.gz"
+    nib.save(nib.Nifti1Image(mask, img.affine, img.header), str(out))
+    return FileResponse(str(out), media_type="application/gzip", filename="crop-mask.nii.gz")
+
+
 def _scan_filename_stem(case_id: str) -> str:
     """A human-recognizable download stem: the ORIGINAL source scan filename (what the user sees in
     the loader, e.g. 'CS001_14145_3D Cornea_OD_2024-07-11'), minus its extension. Falls back to the

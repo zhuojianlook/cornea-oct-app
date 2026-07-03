@@ -656,6 +656,23 @@ export function setSegmentationOpacity(opacity: number): void {
   nv.setOpacity(nv.volumes.length - 1, opacity);
 }
 
+// CROP-SHADE red highlight: overlay the crop-mask (1 over the cropped/blink region) in RED so the cropped area
+// is highlighted over its dim tissue. Loaded in the PREPROCESSING view (no segmentation yet); loadSegmentation
+// clears it at the SAM2 stage (both are "volumes past the base"), so they never coexist.
+let cropUrl: string | null = null;
+export async function loadCropMask(url: string): Promise<void> {
+  if (!nv) return;
+  while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);   // drop a prior overlay
+  await nv.addVolumeFromUrl({ url, colormap: "red", opacity: 0.45, cal_min: 0.5, cal_max: 1.0 });
+  cropUrl = url;
+  nv.updateGLVolume();
+}
+export function removeCropMask(): void {
+  if (!nv || cropUrl == null) return;
+  while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
+  cropUrl = null;
+}
+
 export function removeSegmentation(): void {
   if (!nv) return;
   while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);

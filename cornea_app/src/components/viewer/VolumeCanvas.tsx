@@ -5,7 +5,16 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, loadCropMask, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, type ViewName } from "../../niivue/nvController";
+
+/** True if this scan had a region cropped out (blink / off-cornea) — used to overlay the crop-mask in red. */
+function hasCrop(m: Record<string, unknown> | null): boolean {
+  if (!m) return false;
+  const op = (m["oct_params"] as Record<string, unknown> | undefined) ?? {};
+  const cr = (op["crop_region"] ?? m["auto_crop_region"]) as { frames?: unknown[] } | undefined;
+  const cl = op["crop_lateral"] as unknown[] | undefined;
+  return (Array.isArray(cr?.frames) && cr!.frames!.length > 0) || (Array.isArray(cl) && cl.length > 0);
+}
 import type { DefectMark } from "../../store/caseStore";
 import { scanStep, hasSegmentation, octProposals } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
@@ -170,6 +179,9 @@ export function VolumeCanvas() {
         // isn't there yet and logs a 404 on every open; the overlay correctly stays hidden either way.
         const liveManifest = useCaseStore.getState().caseInfo?.manifest as Record<string, unknown> | null;
         if (hasSegmentation(liveManifest)) useWorkflowStore.getState().tryLoadExistingSegmentation();
+        // CROP-SHADE: overlay the cropped (blink/off-cornea) region in RED so it's highlighted. Only in the
+        // preprocessing view (no segmentation yet); the seg overlay replaces it later. Best-effort (404 → skip).
+        else if (hasCrop(liveManifest)) loadCropMask(volumeUrl.replace("volume.nii.gz", "crop-mask.nii.gz")).catch(() => {});
       })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
