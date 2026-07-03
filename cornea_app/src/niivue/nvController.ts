@@ -303,7 +303,10 @@ export function screenToColumn(xCss: number, yCss: number, view: ViewName): numb
   const colAx = COLUMN_AXIS[view];
   if (!nv || colAx == null || !nv.volumes.length) return null;
   const dr = nv.volumes?.[0]?.dimsRAS as number[] | undefined;
-  const sliceAx = VIEW_AXIS[view];   // this view's held-constant niivue axis → its screenSlices tile
+  // FIX: the tile is identified by its niivue SLICE_TYPE (axCorSag: axial=0, coronal=1, sagittal=2), which is
+  // SLICE[view] — NOT VIEW_AXIS (the held-constant VOXEL axis). Using VIEW_AXIS made sagittal (axis 0) never
+  // match its tile (axCorSag 2), so screenToColumn returned null and sagittal marking silently did nothing.
+  const sliceAx = SLICE[view] as unknown as number;
   const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number; leftTopWidthHeight: number[] }> }).screenSlices;
   const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => number[] | null }).screenXY2TextureFrac;
   if (!dr || !slices || typeof f2f !== "function") return null;
@@ -513,7 +516,7 @@ function renderDefectBands(ctx: CanvasRenderingContext2D, W: number, H: number):
   const bands = _defectBands;
   if (!nv || !bands) return;
   const colAx = COLUMN_AXIS[bands.view];
-  const sliceAx = VIEW_AXIS[bands.view];
+  const sliceAx = SLICE[bands.view] as unknown as number;   // tile axCorSag = niivue SLICE_TYPE (see screenToColumn)
   const dr = nv.volumes?.[0]?.dimsRAS as number[] | undefined;
   const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number; leftTopWidthHeight: number[] }> }).screenSlices;
   const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => number[] | null }).screenXY2TextureFrac;

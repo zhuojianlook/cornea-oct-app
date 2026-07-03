@@ -290,6 +290,20 @@ export function VolumeCanvas() {
     if (dragCols) commitCols(dragCols);   // persist the previewed columns
     setDragCols(null);
   };
+  // RIGHT-CLICK to clear ONE defect: remove the contiguous marked column-run under the cursor on this slice.
+  const onMarkContext = (e: React.MouseEvent) => {
+    if (!markActive) return;
+    e.preventDefault();
+    const r = e.currentTarget.getBoundingClientRect();
+    const col = screenToColumn(e.clientX - r.left, e.clientY - r.top, view);
+    if (col == null) return;
+    const set = new Set(curMarkCols);
+    if (!set.has(col)) return;                       // not on a marked band → nothing to clear
+    let lo = col, hi = col;                           // expand to the full contiguous run
+    while (set.has(lo - 1)) lo--;
+    while (set.has(hi + 1)) hi++;
+    commitCols(curMarkCols.filter((c) => c < lo || c > hi));
+  };
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -511,7 +525,8 @@ export function VolumeCanvas() {
           onPointerDown={markActive ? onMarkDown : undefined}
           onPointerMove={markActive ? onMarkMove : undefined}
           onPointerUp={markActive ? onMarkUp : undefined}
-          onPointerLeave={markActive ? onMarkUp : undefined} />
+          onPointerLeave={markActive ? onMarkUp : undefined}
+          onContextMenu={markActive ? onMarkContext : undefined} />
         {/* Defect-mark readout: current marks count + a one-click clear for this scan (only in mark mode). */}
         {markActive && (
           <div className="absolute top-2 right-2 z-30 flex items-center gap-2 pointer-events-auto"
