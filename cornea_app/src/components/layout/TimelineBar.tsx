@@ -59,7 +59,8 @@ export function TimelineBar() {
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
-  const setReviewFlags = useCaseStore((s) => s.setReviewFlags);
+  const setDifficult = useCaseStore((s) => s.setDifficult);
+  const markDefectMode = useWorkflowStore((s) => s.markDefectMode);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
@@ -364,22 +365,25 @@ export function TimelineBar() {
     </Button>
   ) : null;
 
-  // Reviewer ISSUE FLAGS (#A/#B/#C) for the cybernetic loop — toggle to mark a scan for the assistant's
-  // attention; persisted to manifest.review_flags (the assistant reads them). Multi-select; independent of the
-  // lifecycle step. Shown at the cornea-review steps (4/5), where the user inspects the SAM2 result.
-  const reviewFlags: string[] = Array.isArray(manifest?.review_flags) ? (manifest!.review_flags as string[]) : [];
-  const toggleFlag = (f: string) => {
-    const next = reviewFlags.includes(f) ? reviewFlags.filter((x) => x !== f) : [...reviewFlags, f];
-    void setReviewFlags(next.slice().sort());
-  };
+  // DEFECT-MARKING (replaces the old #A/#B/#C issue flags): a "⚑ Mark defect" TOGGLE that puts the main
+  // viewer into column-marking mode (drag over a sagittal/axial slice to mark the WRONG columns → persisted to
+  // manifest.defect_marks so the assistant reads exactly which frames/columns are wrong), plus a "⚠ Difficult"
+  // TOGGLE bound to manifest.difficult_scan (this scan needs manual help). Shown at the cornea-review steps (4/5).
+  const defectMarks: unknown[] = Array.isArray(manifest?.defect_marks) ? (manifest!.defect_marks as unknown[]) : [];
+  const markCount = defectMarks.length;
+  const difficult = Boolean(manifest?.difficult_scan);
   const FlagButtons = (
-    <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}
-      title="Flag an issue on this scan for the cybernetic loop — the assistant reads manifest.review_flags. Toggle #A/#B/#C.">
-      ⚑ Flag:
-      {(["A", "B", "C"] as const).map((f) => (
-        <Button key={f} size="small" variant={reviewFlags.includes(f) ? "contained" : "outlined"} color="warning"
-          disabled={busy} onClick={() => toggleFlag(f)} sx={{ minWidth: 32, px: 0.8 }}>#{f}</Button>
-      ))}
+    <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}>
+      <Button size="small" variant={markDefectMode ? "contained" : "outlined"} color="warning" disabled={busy}
+        onClick={() => set("markDefectMode", !markDefectMode)}
+        title="Mark WRONG columns: toggle on, then drag over the current sagittal/axial slice in the main viewer to mark the bad columns. Marks accumulate across slices and are saved to manifest.defect_marks (the assistant reads them).">
+        ⚑ Mark defect{markCount > 0 ? ` (${markCount})` : ""}
+      </Button>
+      <Button size="small" variant={difficult ? "contained" : "outlined"} color="error" disabled={busy}
+        onClick={() => void setDifficult(!difficult)}
+        title="Mark this scan as a DIFFICULT SCAN needing manual help — persisted to manifest.difficult_scan so the assistant knows to hand-correct it.">
+        ⚠ Difficult
+      </Button>
     </span>
   );
 

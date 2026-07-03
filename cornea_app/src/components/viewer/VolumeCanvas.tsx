@@ -5,7 +5,8 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, type ViewName } from "../../niivue/nvController";
+import type { DefectMark } from "../../store/caseStore";
 import { scanStep, hasSegmentation, octProposals } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
@@ -50,6 +51,10 @@ export function VolumeCanvas() {
   const paintMode = useWorkflowStore((s) => s.paintMode);
   const penLabel = useWorkflowStore((s) => s.penLabel);
   const penSize = useWorkflowStore((s) => s.penSize);
+  // Defect-marking: when ON, the main single-plane viewer becomes interactive and the user drags to mark the
+  // WRONG columns of the current sagittal/axial slice → manifest.defect_marks (read/written via caseStore).
+  const markDefectMode = useWorkflowStore((s) => s.markDefectMode);
+  const setDefectMarks = useCaseStore((s) => s.setDefectMarks);
   const [view, setViewState] = useState<ViewName>("multi");
   // #2 — visible slice scrollbar for the single-plane (axial/coronal/sagittal) niivue views.
   const [sliceIdx, setSliceIdx] = useState(0);
@@ -221,6 +226,70 @@ export function VolumeCanvas() {
     }, 160);
     return () => window.clearInterval(id);
   }, [singlePlane, view, volumeUrl, loading]);
+
+  // ── Defect-marking (mark WRONG columns of the current sagittal/axial slice) ────────────────────────────
+  // Active ONLY in mark mode on a single-plane sagittal/axial view; otherwise the overlay is inert (today's
+  // behaviour). Marks are the manifest.defect_marks list, keyed by (orient, slice); drag over the slice to
+  // add a column range, click to add one column. Persisted via caseStore (optimistic manifest update + POST).
+  const defectOrient: "sagittal" | "axial" | null =
+    view === "sagittal" || view === "axial" ? view : null;
+  const markActive = markDefectMode && singlePlane && defectOrient != null;
+  const allMarks: DefectMark[] = Array.isArray(manifest?.defect_marks)
+    ? (manifest!.defect_marks as DefectMark[]) : [];
+  // Columns already marked on the CURRENT (orient, slice) — rendered as pink bands + extended by a new drag.
+  const curMarkCols: number[] = defectOrient
+    ? (allMarks.find((m) => m.orient === defectOrient && m.slice === sliceIdx)?.cols ?? [])
+    : [];
+  const dragRef = useRef<{ startCol: number; base: number[] } | null>(null);
+  const [dragCols, setDragCols] = useState<number[] | null>(null);   // live preview during a drag
+
+  // Push the current slice's marked columns (or the live drag preview) to the overlay renderer as pink bands.
+  // Cleared when mark mode is off so normal viewing is untouched.
+  useEffect(() => {
+    if (!markActive || !defectOrient) { setDefectBands(null, null); return; }
+    setDefectBands(view, dragCols ?? curMarkCols);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [markActive, defectOrient, view, sliceIdx, dragCols, JSON.stringify(curMarkCols)]);
+  // Also clear the bands on unmount / when leaving mark mode.
+  useEffect(() => () => setDefectBands(null, null), []);
+
+  // Commit a set of columns as THIS scan's marks for the current (orient, slice): merge with the other slices'
+  // marks, replace this slice's entry, drop empty entries, persist. Empty cols removes the slice's mark.
+  const commitCols = (cols: number[]) => {
+    if (!defectOrient) return;
+    const uniq = Array.from(new Set(cols)).filter((c) => c >= 0).sort((a, b) => a - b);
+    const others = allMarks.filter((m) => !(m.orient === defectOrient && m.slice === sliceIdx));
+    const next = uniq.length ? [...others, { orient: defectOrient, slice: sliceIdx, cols: uniq }] : others;
+    void setDefectMarks(next);
+  };
+
+  const onMarkDown = (e: React.PointerEvent) => {
+    if (!markActive) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const col = screenToColumn(e.clientX - r.left, e.clientY - r.top, view);
+    if (col == null) return;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    dragRef.current = { startCol: col, base: curMarkCols };
+    setDragCols([...curMarkCols, col]);
+  };
+  const onMarkMove = (e: React.PointerEvent) => {
+    const d = dragRef.current;
+    if (!markActive || !d) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const col = screenToColumn(e.clientX - r.left, e.clientY - r.top, view);
+    if (col == null) return;
+    const lo = Math.min(d.startCol, col), hi = Math.max(d.startCol, col);
+    const range: number[] = [];
+    for (let c = lo; c <= hi; c++) range.push(c);
+    setDragCols([...d.base, ...range]);   // preview: existing marks + the dragged range
+  };
+  const onMarkUp = () => {
+    const d = dragRef.current;
+    if (!d) return;
+    dragRef.current = null;
+    if (dragCols) commitCols(dragCols);   // persist the previewed columns
+    setDragCols(null);
+  };
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
@@ -434,8 +503,31 @@ export function VolumeCanvas() {
           </div>
         )}
         {/* #paint — WebGL-independent 2-D drawing overlay: renders brush strokes that niivue's WebGL draw
-            tile doesn't show on the WebKitGTK stack. pointer-events:none so paint clicks still hit niivue. */}
-        <canvas ref={overlayRef} className="absolute inset-0 h-full w-full" style={{ pointerEvents: "none" }} />
+            tile doesn't show on the WebKitGTK stack. pointer-events:none so paint clicks still hit niivue —
+            EXCEPT in defect-mark mode, where it becomes interactive so the user can drag to mark WRONG columns
+            (the same canvas also renders the pink defect bands via setDefectBands). */}
+        <canvas ref={overlayRef} className="absolute inset-0 h-full w-full"
+          style={{ pointerEvents: markActive ? "auto" : "none", cursor: markActive ? "col-resize" : "default" }}
+          onPointerDown={markActive ? onMarkDown : undefined}
+          onPointerMove={markActive ? onMarkMove : undefined}
+          onPointerUp={markActive ? onMarkUp : undefined}
+          onPointerLeave={markActive ? onMarkUp : undefined} />
+        {/* Defect-mark readout: current marks count + a one-click clear for this scan (only in mark mode). */}
+        {markActive && (
+          <div className="absolute top-2 right-2 z-30 flex items-center gap-2 pointer-events-auto"
+            style={{ padding: "3px 10px", borderRadius: 999, fontSize: 12, color: "#fff",
+              background: "rgba(255,93,176,0.22)", border: "1px solid #ff5db0" }}
+            title="Drag over the current slice to mark WRONG columns. Marks accumulate across slices/frames and save to manifest.defect_marks.">
+            <span style={{ color: "#ff5db0", fontWeight: 700 }}>⚑</span>
+            {allMarks.length} mark{allMarks.length === 1 ? "" : "s"}
+            {allMarks.length > 0 && (
+              <button onClick={() => void setDefectMarks([])}
+                style={{ background: "none", border: "1px solid #ff5db0", borderRadius: 4, color: "#ff9fd0", cursor: "pointer", fontSize: 11, padding: "0 6px" }}>
+                clear
+              </button>
+            )}
+          </div>
+        )}
         {showBrush && (
           // Brush-size cursor (approx — actual voxels depend on zoom): shows the active pen + size.
           <div

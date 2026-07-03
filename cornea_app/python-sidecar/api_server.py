@@ -2694,6 +2694,47 @@ def set_review_flags(case_id: str, req: ReviewFlagRequest) -> dict:
     return {"ok": True, "review_flags": m.get("review_flags", [])}
 
 
+class DefectMark(BaseModel):
+    orient: str                       # "sagittal" | "axial" (the shown single-plane view)
+    slice: int                        # slice index within that view
+    cols: list[int] = []              # column voxel indices (non-depth in-plane axis) that are WRONG
+
+
+class DefectMarksRequest(BaseModel):
+    marks: list[DefectMark] = []
+
+
+@app.post("/api/case/{case_id}/defect-marks")
+def set_defect_marks(case_id: str, req: DefectMarksRequest) -> dict:
+    """Precise DEFECT LOCATIONS the user marked live in the viewer: for a sagittal/axial slice, which COLUMNS
+    (frame indices for sagittal, lateral indices for axial) are wrong. Persisted to manifest.defect_marks (a
+    list of {orient, slice, cols}) so the assistant reads exactly which frames/columns to fix. Manifest-only
+    metadata — does not touch the volume, segmentation or lifecycle. Mirrors the review-flag pattern."""
+    marks: list[dict] = []
+    for mk in (req.marks or []):
+        orient = str(mk.orient).strip().lower()
+        if orient not in ("sagittal", "axial"):
+            continue
+        cols = sorted({int(c) for c in (mk.cols or []) if int(c) >= 0})
+        if not cols:
+            continue
+        marks.append({"orient": orient, "slice": int(mk.slice), "cols": cols})
+    m = orch.write_manifest_value(_require_case(case_id), {"defect_marks": marks})
+    return {"ok": True, "defect_marks": m.get("defect_marks", [])}
+
+
+class DifficultRequest(BaseModel):
+    difficult: bool = True
+
+
+@app.post("/api/case/{case_id}/difficult")
+def set_difficult_scan(case_id: str, req: DifficultRequest) -> dict:
+    """Flag this scan as a DIFFICULT SCAN needing manual help (persisted to manifest.difficult_scan). Toggle
+    the user sets in the viewer; the assistant reads it to know which scans to hand-correct. Manifest-only."""
+    m = orch.write_manifest_value(_require_case(case_id), {"difficult_scan": bool(req.difficult)})
+    return {"ok": True, "difficult_scan": bool(m.get("difficult_scan"))}
+
+
 class SubgroupRequest(BaseModel):
     subgroup: str | None = None   # e.g. "1" (default), "posterior", "inferior"
 
@@ -3555,6 +3596,10 @@ def cases_list() -> dict:
                 "corrected_labelmap": bool(m.get("corrected_labelmap")),
                 "training_scheduled": bool(m.get("training_scheduled")),
                 "review_flags": (list(m.get("review_flags")) if isinstance(m.get("review_flags"), list) else []),
+                # Defect-marking feature: precise wrong-column marks + a "needs manual help" flag, surfaced so
+                # both the sidebar and the assistant can see them (count only for the marks, to keep the list light).
+                "defect_marks": (len(m.get("defect_marks")) if isinstance(m.get("defect_marks"), list) else 0),
+                "difficult_scan": bool(m.get("difficult_scan")),
             },
         })
     return {"cases": out}

@@ -276,6 +276,57 @@ export function brushScreenSize(xCss: number, yCss: number): { w: number; h: num
   return null;
 }
 
+// ── Screen → voxel COLUMN mapping for defect-marking ─────────────────────────────────────────────────
+// Reuses the SAME screen→texture-frac path as the 2-D drawing overlay (screenXY2TextureFrac → per-niivue-axis
+// 0..1 frac → voxel index), so defect marks land on the exact voxels the user sees. For a single-plane view
+// we return the in-plane NON-DEPTH ("column") voxel index: sagittal shows the B-scan-frame axis (niivue
+// coronal/axis 1), axial shows the lateral axis (niivue sagittal/axis 0). Depth is niivue axis 2 in both
+// (these OCT volumes' B-scan depth runs along niivue's I-S axis) — so the column is the other in-plane axis.
+const COLUMN_AXIS: Partial<Record<ViewName, number>> = { sagittal: 1, axial: 0 };
+/** True when this view supports column-marking (a single-plane sagittal/axial slice with a defined column axis). */
+export function viewHasColumns(view: ViewName): boolean {
+  return COLUMN_AXIS[view] != null;
+}
+/** Number of columns (the non-depth in-plane axis) for a markable view, or 0. */
+export function columnCount(view: ViewName): number {
+  const ax = COLUMN_AXIS[view];
+  if (!nv || ax == null || nv.volumes.length === 0) return 0;
+  const d = (nv.volumes[0] as unknown as { dimsRAS?: number[] }).dimsRAS;
+  return d && d.length >= 4 ? Math.max(0, Math.round(d[ax + 1])) : 0;
+}
+/**
+ * Map a CSS pointer position over the viewer to the COLUMN voxel index for the given single-plane view,
+ * or null when the pointer is not over that view's 2-D tile. Mirrors the overlay renderer's affine
+ * (screenXY2TextureFrac per tile), so it stays orientation-safe with no bespoke geometry.
+ */
+export function screenToColumn(xCss: number, yCss: number, view: ViewName): number | null {
+  const colAx = COLUMN_AXIS[view];
+  if (!nv || colAx == null || !nv.volumes.length) return null;
+  const dr = nv.volumes?.[0]?.dimsRAS as number[] | undefined;
+  const sliceAx = VIEW_AXIS[view];   // this view's held-constant niivue axis → its screenSlices tile
+  const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number; leftTopWidthHeight: number[] }> }).screenSlices;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => number[] | null }).screenXY2TextureFrac;
+  if (!dr || !slices || typeof f2f !== "function") return null;
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const xd = xCss * dpr, yd = yCss * dpr;
+  const nCol = dr[colAx + 1] || 0;
+  if (nCol <= 0) return null;
+  for (let ti = 0; ti < slices.length; ti++) {
+    const s = slices[ti];
+    if (s.axCorSag !== sliceAx) continue;              // only this view's 2-D tile
+    const [lx, ly, lw, lh] = s.leftTopWidthHeight;
+    if (lw <= 0 || lh <= 0) continue;
+    if (xd < lx || yd < ly || xd > lx + lw || yd > ly + lh) continue;   // pointer outside the tile
+    const frac = f2f.call(nv, xd, yd, ti);
+    if (!frac) return null;
+    const f = frac[colAx];
+    if (f == null || !Number.isFinite(f)) return null;
+    const col = Math.round(f * nCol - 0.5);
+    return Math.max(0, Math.min(nCol - 1, col));
+  }
+  return null;
+}
+
 // Smart fill = CPU "Grow from seeds" in a WEB WORKER (ported from the annotator). niivue's GPU drawGrowCut
 // is unusably slow / hangs on the WebKitGTK + NVIDIA desktop stack (128 iterations × per-slice readPixels);
 // the worker runs a multi-source geodesic flood (Dijkstra/Dial buckets, O(N), off the main thread, with
@@ -446,6 +497,51 @@ export function scheduleOverlay(): void {
   _overlayScheduled = true;
   requestAnimationFrame(() => { _overlayScheduled = false; renderDrawOverlay(); });
 }
+
+// ── Defect-mark bands (defect-marking feature) ────────────────────────────────────────────────────────
+// While Mark-defect mode is ON, VolumeCanvas pushes the CURRENT view's marked columns here and we draw
+// translucent PINK vertical bands over the matching single-plane tile — same overlay canvas as the paint,
+// but drawn on top (after putImageData). Columns are voxel indices along this view's non-depth in-plane
+// axis (see screenToColumn). Cleared to null when mark mode is off so normal viewing is untouched.
+let _defectBands: { view: ViewName; cols: Set<number> } | null = null;
+export function setDefectBands(view: ViewName | null, cols: number[] | null): void {
+  _defectBands = view && cols && cols.length ? { view, cols: new Set(cols) } : null;
+  renderDrawOverlay();
+}
+/** Draw the current defect-mark columns as pink vertical bands on the overlay 2-D context (affine-exact). */
+function renderDefectBands(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+  const bands = _defectBands;
+  if (!nv || !bands) return;
+  const colAx = COLUMN_AXIS[bands.view];
+  const sliceAx = VIEW_AXIS[bands.view];
+  const dr = nv.volumes?.[0]?.dimsRAS as number[] | undefined;
+  const slices = (nv as unknown as { screenSlices?: Array<{ axCorSag: number; leftTopWidthHeight: number[] }> }).screenSlices;
+  const f2f = (nv as unknown as { screenXY2TextureFrac?: (x: number, y: number, t: number) => number[] | null }).screenXY2TextureFrac;
+  if (colAx == null || !dr || !slices || typeof f2f !== "function") return;
+  const nCol = dr[colAx + 1] || 0;
+  if (nCol <= 0) return;
+  for (let ti = 0; ti < slices.length; ti++) {
+    const s = slices[ti];
+    if (s.axCorSag !== sliceAx) continue;              // only this view's 2-D tile
+    const [lx, ly, lw, lh] = s.leftTopWidthHeight;
+    if (lw <= 2 || lh <= 2) continue;
+    const x0 = Math.max(0, Math.floor(lx)), x1 = Math.min(W, Math.ceil(lx + lw));
+    const y0 = Math.max(0, Math.floor(ly)), y1 = Math.min(H, Math.ceil(ly + lh));
+    // Per screen column, map its centre → column voxel index (affine via screenXY2TextureFrac) and shade
+    // if marked. One f2f call per device-x column (cheap); handles any mirror/scale of the tile exactly.
+    const yc = (ly + lh / 2) | 0;
+    ctx.fillStyle = "rgba(255,93,176,0.30)";
+    for (let px = x0; px < x1; px++) {
+      const frac = f2f.call(nv, px, yc, ti);
+      if (!frac) continue;
+      const f = frac[colAx];
+      if (f == null || !Number.isFinite(f)) continue;
+      const col = Math.max(0, Math.min(nCol - 1, Math.round(f * nCol - 0.5)));
+      if (bands.cols.has(col)) ctx.fillRect(px, y0, 1, y1 - y0);
+    }
+  }
+}
+
 export function renderDrawOverlay(): void {
   const cv = overlayCanvas;
   if (!nv || !cv) return;
@@ -460,7 +556,8 @@ export function renderDrawOverlay(): void {
   if (cv.width !== W) cv.width = W;
   if (cv.height !== H) cv.height = H;
   ctx.clearRect(0, 0, W, H);
-  if (!d || !dr || !slices || typeof f2f !== "function") return;   // nothing being edited → overlay clears
+  // Defect bands render independently of the paint bitmap (mark mode can be on with no drawing loaded).
+  if (!d || !dr || !slices || typeof f2f !== "function") { renderDefectBands(ctx, W, H); return; }
   const nx = dr[1], ny = dr[2], nz = dr[3], nxny = nx * ny;
   const nvAny = nv as unknown as { drawOpacity?: number; opts?: { drawOpacity?: number } };
   const op = Math.max(0.15, Math.min(1, nvAny.drawOpacity ?? nvAny.opts?.drawOpacity ?? 0.5));
@@ -504,6 +601,7 @@ export function renderDrawOverlay(): void {
     }
   }
   if (any) ctx.putImageData(img, 0, 0);
+  renderDefectBands(ctx, W, H);   // draw defect-mark bands ON TOP of the paint overlay
 }
 
 export function setDrawOpacity(opacity: number): void {

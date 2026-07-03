@@ -13,6 +13,18 @@ let _lastOpenedCase: string | null = null;
 // land on disk IN CLICK ORDER (out-of-order arrival on the sidecar threadpool would let an older/smaller set
 // win and silently drop a flag on reload). Mirrors OctLoader's persistClassification chain.
 const _reviewFlagChain = new Map<string, Promise<unknown>>();
+// Same per-case serialization for defect-mark writes (each write POSTs the FULL mark list, so rapid marks
+// across slices must land on disk in order — an out-of-order clobber would drop marks on reload).
+const _defectMarkChain = new Map<string, Promise<unknown>>();
+
+// A single defect mark: the columns of one sagittal/axial slice the user flagged as WRONG (columns = the
+// non-depth in-plane axis: frame indices for sagittal, lateral indices for axial). Persisted to
+// manifest.defect_marks so the assistant reads exactly which frames/columns to fix.
+export interface DefectMark {
+  orient: "sagittal" | "axial";
+  slice: number;
+  cols: number[];
+}
 
 interface CaseState {
   config: AppConfig | null;
@@ -46,6 +58,11 @@ interface CaseState {
   // Reviewer issue flags (#A/#B/#C) set during the cybernetic loop; persisted to manifest.review_flags
   // so the assistant can find flagged scans. Metadata only — does not affect the volume/segmentation.
   setReviewFlags: (flags: string[]) => Promise<void>;
+  // Defect-marking: persist the full list of per-slice wrong-column marks to manifest.defect_marks so the
+  // assistant reads exactly which frames/columns are wrong. Optimistic + serialized per case (mirrors flags).
+  setDefectMarks: (marks: DefectMark[]) => Promise<void>;
+  // "Difficult scan" toggle → manifest.difficult_scan (needs manual help). Optimistic, mirrors setReviewFlags.
+  setDifficult: (difficult: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
   // Before/after "Use original (raw)": discard the correction, make the raw .OCT the working volume +
   // mark it vetted (drops any segmentation; reloads the volume).
@@ -178,6 +195,32 @@ export const useCaseStore = create<CaseState>()(
           .catch((e) => { set((s) => { s.apiError = e instanceof Error ? e.message : String(e); }); }));
       _reviewFlagChain.set(id, next);
       await next;
+    },
+
+    setDefectMarks: async (marks) => {
+      const id = get().caseId;
+      if (!id) return;
+      // optimistic: reflect the marks in the manifest immediately (the viewer + sidebar read from there)
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).defect_marks = marks; });
+      // Serialize per case so rapid marks across slices land on disk in order (newest full list wins last).
+      const prev = _defectMarkChain.get(id) ?? Promise.resolve();
+      const next = prev
+        .catch(() => undefined)
+        .then(() => api.json(`/api/case/${id}/defect-marks`, "POST", JSON.stringify({ marks }))
+          .catch((e) => { set((s) => { s.apiError = e instanceof Error ? e.message : String(e); }); }));
+      _defectMarkChain.set(id, next);
+      await next;
+    },
+
+    setDifficult: async (difficult) => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).difficult_scan = difficult; });
+      try {
+        await api.json(`/api/case/${id}/difficult`, "POST", JSON.stringify({ difficult }));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
     },
 
     scheduleTraining: async (scheduled) => {

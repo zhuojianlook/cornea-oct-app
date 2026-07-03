@@ -113,6 +113,11 @@ interface WorkflowState {
   subgroupProposal: SubgroupProposal | null;       // last auto subgroup-assignment proposal (bright-spot)
   subgroupBusy: boolean;
 
+  // Defect-marking: when ON, the main single-plane viewer becomes interactive so the user drags to mark the
+  // WRONG columns of the current sagittal/axial slice. Marks live in manifest.defect_marks (caseStore); this
+  // is just the transient viewer toggle. Off by default → viewer behaves exactly as today.
+  markDefectMode: boolean;
+
   // SAM2 scar hints (click to guide)
   hintMode: boolean;
   hintPositive: boolean; // current click polarity (scar vs not-scar)
@@ -237,6 +242,8 @@ export const useWorkflowStore = create<WorkflowState>()(
     subgroupProposal: null,
     subgroupBusy: false,
 
+    markDefectMode: false,
+
     hintMode: false,
     hintPositive: true,
     scarHints: [],
@@ -294,6 +301,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         s.correcting = false;
         s.corneaOnlyPaint = false;
         s.cropRegionMode = false;
+        s.markDefectMode = false;
         s.hintMode = false;
         s.scarHints = [];
         s.scarEditMode = false;
