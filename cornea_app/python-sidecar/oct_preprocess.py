@@ -81,6 +81,8 @@ DEFAULT_PARAMS: dict = {
     # warp — which varies slowly over frames — is preserved. Mirrors interslice_smooth but along frames.
     # 0 = off (byte-identical). Small sigma stays faithful; clip/cut clamps are re-asserted after.
     "apex_frame_smooth": 1.5,
+    "apex_smooth_gate": 3.0,   # px: apex frame-smoothing applies ONLY where the displacement deviates from its
+                               # 5-frame median by more than this (a detector-jump TEAR); a smooth apex is a no-op
     # ── windowed re-detection (fix-columns "Confirm", tilt-aware surface prior) ── When a PRIOR surface
     # (per-frame expected depth) is supplied to detection, the gradient argmax is restricted to a small
     # window ±detect_window (depth voxels) around it per column, so a spurious peak (e.g. a reflection
@@ -1819,7 +1821,17 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     #   Clip/cut tissue-preservation clamps are re-asserted after (a clipped apex must not be shifted UP).
     afs = 0.0 if use_provided else float(p.get("apex_frame_smooth", 0.0) or 0.0)
     if afs > 0 and disp_field.shape[1] > 2:
-        disp_field = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=afs, axis=1, mode="nearest")
+        dsm = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=afs, axis=1, mode="nearest")
+        # GATE (regression fix): apply the frame smoothing ONLY where the raw per-column displacement has a
+        # genuine frame-direction JUMP/JITTER (the detector-jump that TEARS the apex into a V-notch on F/I) —
+        # NOT everywhere. On a well-detected scan the displacement is already smooth along frames (deviation
+        # from its 5-frame median < apex_smooth_gate px), so w=0 → strict NO-OP → the good-scan output is
+        # byte-restored to the un-smoothed flatten. Only jittery (torn) apex columns are blended to the smooth
+        # field, feathered by how far they exceed the gate — so the tear is removed without perturbing clean scans.
+        _gate = float(p.get("apex_smooth_gate", 3.0))
+        _med = ndimage.median_filter(disp_field.astype(np.float64), size=(1, 5), mode="nearest")
+        _w = np.clip((np.abs(disp_field - _med) - _gate) / max(_gate, 1e-6), 0.0, 1.0)
+        disp_field = disp_field.astype(np.float64) * (1.0 - _w) + dsm * _w
         for i in range(n):
             cc = clip_cols_list[i]
             if cc.size:
@@ -2359,13 +2371,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             _s0, _d0 = _cur_sag_det(params)
             _nz = detect_noise_frames(_s0, params, workers=workers, detect=_d0)
             if _nz:
-                if _approved:
-                    params = dict(params or {})
-                    params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
-                    _auto_cr = params["crop_region"]           # persist it (sticky) so re-runs don't un-crop it
-                else:                                         # PROPOSE: report the off-cornea frames, don't crop
-                    _proposals["crop_region"] = {"frames": [int(f) for f in _nz],
-                                                 "lateral": [0, int(vol.shape[2]) - 1], "reason": "off-cornea noise"}
+                # AUTO-APPLY off-cornea NOISE removal (NOT a proposal): zeroing junk frames with no cornea is
+                # cleanup, not a "shift" of the cornea, and leaving it un-applied leaves garbage/spikes in the
+                # peripheral frames (regressed CS001_OD scans). Only the cornea-RESHAPING corrections (surface-
+                # crop, de-tilt) are proposals — the user reviews those. detect_noise_frames must not fire on a
+                # cornea-out-the-top runout (that is a surface-crop, handled below), so real cornea is never cut.
+                params = dict(params or {})
+                params["crop_region"] = {"frames": _nz, "lateral": [0, int(vol.shape[2]) - 1], "auto": True}
+                _auto_cr = params["crop_region"]               # persist it (sticky) so re-runs don't un-crop it
         except Exception:  # noqa: BLE001 — best-effort; fall back to no auto crop
             pass
     # #9 Crop RE-DETECT: zero the cropped box on the RAW volume BEFORE surface detection, so the anterior-edge
