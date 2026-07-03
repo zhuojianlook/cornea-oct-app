@@ -2531,6 +2531,12 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
              # training-schedule flags → the per-scan timeline drops back to "Preprocessed [Auto]" (red)
              # and the user re-approves. scar_classification is kept (it's scan content, not geometry).
              "preproc_vetted": False, "training_scheduled": False,
+             # CYBERNETIC-LOOP step-3 RESET: the just-produced volume is a NEW algorithm's output, so the user's
+             # defect_marks (which point at the OLD output's wrong columns) are stale → clear them; the user
+             # re-inspects the fresh output and re-marks anything still wrong (step 4b). difficult_scan is NOT
+             # cleared here — a "too damaged for auto" judgement is stable across algorithm iterations (persists;
+             # the batch can still grow, and the user un-flags it manually if a later algorithm fixes it).
+             "defect_marks": [],
              # The segmentation files were just deleted above; CLEAR their manifest flags too, else
              # scanStep (which keys off sam2_meta/corrected_labelmap/consensus_case BEFORE preproc_vetted)
              # would keep reporting the scan as segmented while its overlay 404s. (Mirrors _STEP_RESET_FLAGS.)
