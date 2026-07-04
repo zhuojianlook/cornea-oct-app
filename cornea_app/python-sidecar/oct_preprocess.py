@@ -121,7 +121,10 @@ DEFAULT_PARAMS: dict = {
     # jagged warp (marked CS002 OS(2)-(4), axial slice 1-2). Replace their surface with a linear extrapolation
     # from the interior (the raw shape is smooth across frames) so the warp flattens them smoothly. 0 = disabled.
     "boundary_extrap_nb": 4,      # frames at EACH end to replace with the interior extrapolation
-    "boundary_extrap_span": 18,   # interior frames used for the linear fit adjacent to each boundary
+    "boundary_extrap_degree": 2,  # 2=QUADRATIC (follows corneal curvature); 1=linear tangent (wrong edge angle)
+    "boundary_extrap_max_dev": 15.0,  # clamp |extrap − nearest interior| (px) so the quadratic can't OVERSHOOT the
+                                  #   few extrapolated frames off the cornea (a 4-frame descent is well under this)
+    "boundary_extrap_span": 18,   # interior frames used for the fit adjacent to each boundary
     "boundary_extrap_lat_sigma": 6.0,  # cross-slice (lateral) gaussian on the boundary frames (3-D consistency)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
@@ -1264,20 +1267,26 @@ def _extrapolate_boundary_edges(edges: np.ndarray, p: dict) -> np.ndarray:
     if F < 2 * nb + 4 or L < 8:
         return edges
     span = min(span, (F - 2 * nb) // 2) if F - 2 * nb > 0 else span
+    deg = int(p.get("boundary_extrap_degree", 2))                # QUADRATIC follows the corneal CURVATURE (a linear
+    #   tangent puts the edge frames at the WRONG ANGLE vs the dome — the marked CS002 OS(2)/(3) defect)
+    dev = float(p.get("boundary_extrap_max_dev", 25.0))          # clamp |extrap − nearest interior| so a spurious
+    #   interior curvature can't OVERSHOOT the few extrapolated frames off the cornea
     for l in range(L):
         a = e[l]; vld = a > 1.0
         ff = [f for f in range(nb, nb + span) if vld[f]]
-        if len(ff) >= 6:
-            co = np.polyfit(ff, a[ff], 1)                        # linear = robust, no extrapolation overshoot
+        if len(ff) >= max(6, deg + 3):
+            co = np.polyfit(ff, a[ff], deg)
+            anchor = a[nb] if vld[nb] else np.polyval(co, nb)
             for f in range(nb):
                 if vld[f]:
-                    e[l, f] = np.polyval(co, f)
+                    e[l, f] = float(np.clip(np.polyval(co, f), anchor - dev, anchor + dev))
         lf = [f for f in range(F - nb - span, F - nb) if vld[f]]
-        if len(lf) >= 6:
-            co = np.polyfit(lf, a[lf], 1)
+        if len(lf) >= max(6, deg + 3):
+            co = np.polyfit(lf, a[lf], deg)
+            anchor = a[F - nb - 1] if vld[F - nb - 1] else np.polyval(co, F - nb - 1)
             for f in range(F - nb, F):
                 if vld[f]:
-                    e[l, f] = np.polyval(co, f)
+                    e[l, f] = float(np.clip(np.polyval(co, f), anchor - dev, anchor + dev))
     sig = float(p.get("boundary_extrap_lat_sigma", 6.0) or 0.0)
     if sig > 0:
         xs = np.arange(L)
