@@ -258,6 +258,8 @@ DEFAULT_PARAMS: dict = {
                                   # pipeline). A MANUAL crop ignores this. Below crop_max_pad (the clamp cap).
     "crop_target_med": 11,        # robust median window (frames) on the detected posterior before the shift
     "crop_slice_smooth": 2.0,     # cross-slice gaussian on the posterior parabola (3-D consistency)
+    "crop_disp_smooth_slice": 6.0,  # anti-streak: gaussian on the per-column warp shift ACROSS slices (kills the
+    "crop_disp_smooth_frame": 1.5,  # comb artifact from a faint/noisy posterior); across frames. 0 = disabled.
     "crop_pad_margin": 8,         # extra rows above the highest above-old-top point (breathing room)
     "crop_max_pad": 120,          # safety cap on the upward extension (rows). A required pad above this means a
                                   # SEVERE tilt / artifact, not a clean clip: AUTO skips it (→ normal pipeline);
@@ -1509,6 +1511,15 @@ def warp_surface_crop_extend(sag: np.ndarray, posterior: np.ndarray, crop_frames
     post_rob = np.stack([ndimage.median_filter(posterior[i].astype(np.float64), size=int(p.get("crop_target_med", 11)))
                          for i in range(n)])
     disp = np.nan_to_num(np.clip(Pb - post_rob, -md, md), nan=0.0, posinf=md, neginf=-md)  # never round a NaN shift
+    # DISP SMOOTHING (anti-streak): the per-column shift = Pb(smooth) − posterior; when the posterior edge is FAINT
+    # (a low-contrast bottom edge), its per-slice detection is noisy, so `disp` varies erratically slice-to-slice →
+    # adjacent lateral columns shift by very different amounts → a vertical COMB artifact that mangles the extended
+    # volume (even unclipped frames). A 2-D Gaussian over (slices, frames) removes that high-frequency noise while
+    # preserving the low-frequency correction (recovering the clipped apex/edge as a coherent surface). On a
+    # crisp-posterior scan `disp` is already smooth, so this is a near-no-op. Set the sigmas to 0 to disable.
+    _ss = float(p.get("crop_disp_smooth_slice", 6.0)); _sf = float(p.get("crop_disp_smooth_frame", 1.5))
+    if _ss > 0 or _sf > 0:
+        disp = ndimage.gaussian_filter(disp, sigma=(_ss, _sf))
     Pa = np.nan_to_num(Pa, nan=0.0)
     raw_pad = int(np.ceil(max(0.0, -float(np.min(Pa)), -float(np.min(disp))))) + int(p.get("crop_pad_margin", 8))
     cap = int(p.get("crop_max_pad", 120))
