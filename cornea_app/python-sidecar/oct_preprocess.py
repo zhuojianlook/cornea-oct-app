@@ -108,7 +108,9 @@ DEFAULT_PARAMS: dict = {
     # then sub-voxel refined. detector="dp" (default) | "legacy" (the old _merged_side_edge).
     "detector": "dp",
     "dp_sigma_depth": 3.0,        # despeckle Gaussian sigma along DEPTH (heavier — speckle is fine-grained)
-    "dp_sigma_frame": 1.2,        # despeckle Gaussian sigma along FRAMES (lighter — keep real lateral shape)
+    "dp_sigma_frame": 3.0,        # despeckle Gaussian sigma along FRAMES. RAISED 1.2→3.0: a low value let the DP
+                                  #   surface follow frame-to-frame speckle → COLUMN-LEVEL edge jitter/notches (the
+                                  #   marked CS002 OS(2) defect: a stale auto-tuned 0.8 gave a 5px notch; 3.0 → 0.4px)
     "dp_below": 24,               # depth window (px) just BELOW a candidate used for the "bright tissue below" gate
     "dp_above_gate": True,        # gate the DP score on boundary CONTRAST (below − above) not (below − med): keeps
                                   #   the epithelium (dark air above) over a deeper second layer (bright above) at a
@@ -158,6 +160,19 @@ DEFAULT_PARAMS: dict = {
     "apex_lat_down_min_height": 10.0,  # min px the surface must sit BELOW the lateral trend to trigger a down-notch reset
     "apex_lat_dip_recover": 5.0,  # a down-notch resets ONLY if the surface returns to within this px of the trend on
                                   #   BOTH sides of the run (true local dip); a descent (one side stays deep) is a no-op
+    # ── 2-D SURFACE-REFINE pass ── final robust clean-up of LOCAL column-level edge-detection errors (patches a
+    # few px off the smooth dome in BOTH lateral and frame directions — the axial_consistency pass only looks
+    # laterally within a frame and with a narrow window, so a wider/frame-narrow notch slips through). Robust 2-D
+    # median target + hard deviation gate → strict NO-OP on an already-smooth surface (approved scans unchanged).
+    "surface_refine_2d": False,   # DEFAULT OFF: degraded a smooth approved scan by ~17px in testing (its 2-D
+                                  #   median target flattens genuine curvature at frame edges). Under investigation.
+    "srf_dev_thresh": 2.5,        # px: a column deviating MORE than this from the smooth 2-D target is corrected
+    "srf_lat_med": 9,             # lateral median window (px) for the smooth target
+    "srf_frame_med": 9,           # FRAME median window (frames) — catches a frame-narrow notch axcons cannot
+    "srf_gauss": 1.5,             # light Gaussian on the target (removes the median's staircase)
+    "srf_max_shift": 12.0,        # cap the per-column correction (px) so a mis-fit target can't tear tissue
+    "srf_iters": 2,               # detect→correct passes (self-terminates when nothing exceeds the gate)
+    "srf_min_coverage": 0.5,      # a frame with less cornea than this fraction is left untouched (off-eye guard)
     # ── AXIAL-CONSISTENCY pass ── final per-FRAME lateral clean-up of the anterior surface (kills slice-to-slice
     # waviness/spikes only visible in the AXIAL B-scan); strictly gated → strict NO-OP on an already-smooth scan.
     "axial_consistency": True,
@@ -1580,7 +1595,9 @@ def auto_tune_detector(sag: np.ndarray, params: dict | None = None, n_sample: in
         k = max(1, len(slices))
         return cs / k - sw * (rs / k)
 
-    grid = {"dp_sigma_depth": [2.0, 3.0, 4.0], "dp_sigma_frame": [0.8, 1.2, 2.0],
+    # dp_sigma_frame floor RAISED 0.8→2.0 (min): a low frame-despeckle sigma let the DP surface chase frame-to-
+    # frame speckle → column-level edge jitter (marked on CS002 OS(2)). 3.0 is the sweet spot; 4.0 over-smooths.
+    grid = {"dp_sigma_depth": [2.0, 3.0, 4.0], "dp_sigma_frame": [2.0, 3.0, 4.0],
             "dp_below": [16, 24, 32], "dp_max_jump": [6, 10, 16]}
     # DETERMINISTIC: always start from the fixed DEFAULTS (not any persisted/incoming dp_*) and run coordinate
     # descent to a STABLE local optimum (idempotent), so the same raw scan always tunes to the same dp_* —
@@ -2413,6 +2430,61 @@ def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, wor
                  "n_frames": n_frames, "cols_adjusted": int(n_moved_cols)}
 
 
+def surface_refine_2d(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """FINAL robust 2-D surface refinement (# FIX column-level edge errors). The anterior surface, detected as
+    S(lateral, frame), is a SMOOTH 2-D dome. Bad edge detection leaves LOCAL PATCHES where the surface locks a
+    few px off (a column into the stroma, or onto a bright fleck) — e.g. CS002 OS(2) lat ~360-380 × frames 16-18
+    sit ~4px too deep. These slip past axial_consistency, whose lateral median window (15px) is NARROWER than the
+    patch AND which never looks along frames; a patch 20-lat wide × 3-frame deep is invisible to it. Here the
+    smooth target is a robust 2-D median over BOTH axes (frame window catches the frame-narrow notch, lateral
+    window the lateral-narrow one) + a light Gaussian; every column whose surface deviates > srf_dev_thresh px is
+    pulled fully onto the target via the same depth-warp primitive. HARD-gated on the deviation, so an already-
+    smooth surface reads dev≈0 → strict NO-OP (approved scans byte-unchanged). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    nf, depth = int(volume.shape[0]), int(volume.shape[1])
+    thr = float(p.get("srf_dev_thresh", 2.5) or 0.0)
+    cap = float(p.get("srf_max_shift", 12.0) or 0.0)
+    lm = int(p.get("srf_lat_med", 9) or 1); fm = int(p.get("srf_frame_med", 9) or 1)
+    gs = float(p.get("srf_gauss", 1.5) or 0.0)
+    iters = max(1, int(p.get("srf_iters", 2) or 1))
+    min_cov = float(p.get("srf_min_coverage", 0.5) or 0.0)
+    if thr <= 0 or cap <= 0:
+        return volume, {"applied": False, "frames_adjusted": 0, "cols_adjusted": 0}
+    out = volume.copy(); moved = np.zeros(nf, dtype=bool); n_cols = 0
+    for _ in range(iters):
+        S = detect_surface_all(reformat_to_sagittal(_fill_black_bands(out)), p, workers=workers)  # (lateral, frames)
+        nl = int(S.shape[0])
+        valid = np.isfinite(S) & (S > 1.0) & (S < depth - 1)
+        Sf = S.astype(np.float64)
+        # per-frame lateral interpolation of invalid columns so the 2-D median/gaussian aren't poisoned by NaNs;
+        # a frame with too little cornea (off-eye) is left out of the correction (its target is meaningless).
+        cov = valid.sum(axis=0)
+        for f in range(nf):
+            m = valid[:, f]
+            if int(m.sum()) >= max(8, int(min_cov * nl)):
+                Sf[~m, f] = np.interp(np.where(~m)[0], np.where(m)[0], Sf[m, f]) if m.any() else Sf[~m, f]
+        target = ndimage.median_filter(Sf, size=(lm, fm), mode="nearest")
+        if gs > 0:
+            target = ndimage.gaussian_filter(target, sigma=gs, mode="nearest")
+        dev = Sf - target                                        # + = surface DEEPER than the smooth 2-D target
+        okframe = (cov >= np.maximum(8, int(min_cov * nl)))[None, :]
+        shift = np.where((np.abs(dev) > thr) & valid & okframe, -np.clip(dev, -cap, cap), 0.0)  # pull outliers onto target
+        if not np.any(shift != 0.0):
+            break
+        any_move = False
+        for f in range(nf):
+            sh = shift[:, f]
+            if not np.any(sh != 0.0):
+                continue
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), sh, subpixel=True)
+            moved[f] = True; n_cols += int(np.count_nonzero(sh != 0.0)); any_move = True
+        if not any_move:
+            break
+    return out, {"applied": bool(moved.sum()), "frames_adjusted": int(moved.sum()), "cols_adjusted": int(n_cols)}
+
+
 def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
     """#2 fix-columns drag-to-correct: shift a specific frame (B-scan) UP/DOWN in DEPTH by an explicit
     pixel offset the annotator dragged in the fix-columns view — a per-frame manual ground-truth nudge
@@ -2874,8 +2946,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     _pa = {**DEFAULT_PARAMS, **params}
     auto_tune_info: dict = {}
     _dp_keys = ("dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump")
-    _cached_dp = all(k in params for k in _dp_keys)   # a prior tune already persisted these (re-run) → skip
+    # AUTO-HEAL stale tune: a prior run persisted dp_* → normally reuse (deterministic). BUT params tuned by an
+    # OLD grid can carry a now-out-of-range dp_sigma_frame (e.g. the 0.8 that caused the column-jitter defect);
+    # a value below the current grid floor (2.0) means the tune predates the fix → RE-TUNE instead of freezing it.
+    _cached_dp = all(k in params for k in _dp_keys) and float(params.get("dp_sigma_frame", 0.0) or 0.0) >= 2.0
     if _pa.get("auto_tune", True) and str(_pa.get("detector", "dp")).lower() != "legacy" and not _cached_dp:
+        # a stale cached set (fails the floor check) must be DROPPED so the fresh tune's choice isn't overridden
+        for _k in _dp_keys:
+            params.pop(_k, None)
         try:
             best, sc = auto_tune_detector(reformat_to_sagittal(vol), params)
             params.update(best)
@@ -2920,6 +2998,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("axial_consistency", True):
         corrected, axc = axial_consistency_volume(corrected, params, workers=workers)
         info["axial_consistency"] = axc
+    # FIX column-level edge errors: a final robust 2-D surface-refine pass (both lateral AND frame directions)
+    # that pulls LOCAL patches where the edge detector locked a few px off (invisible to the lateral-only
+    # axial_consistency) onto the smooth 2-D dome. Hard-gated on deviation → strict no-op on a smooth scan.
+    if p_all.get("surface_refine_2d", True):
+        corrected, srf = surface_refine_2d(corrected, params, workers=workers)
+        info["surface_refine_2d"] = srf
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")
