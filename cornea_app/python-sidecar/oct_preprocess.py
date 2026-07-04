@@ -117,6 +117,12 @@ DEFAULT_PARAMS: dict = {
                                   #   specular apex → removes the apex V-notch (CS001 OS3). Verified to CORRECT the
                                   #   same deep-lock notch on the vetted scans (improvement, not degrade). False = legacy.
     "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
+    # ── BOUNDARY EXTRAPOLATION ── the first/last few frames are low-signal (acquisition edge) → noisy detection →
+    # jagged warp (marked CS002 OS(2)-(4), axial slice 1-2). Replace their surface with a linear extrapolation
+    # from the interior (the raw shape is smooth across frames) so the warp flattens them smoothly. 0 = disabled.
+    "boundary_extrap_nb": 4,      # frames at EACH end to replace with the interior extrapolation
+    "boundary_extrap_span": 18,   # interior frames used for the linear fit adjacent to each boundary
+    "boundary_extrap_lat_sigma": 6.0,  # cross-slice (lateral) gaussian on the boundary frames (3-D consistency)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -176,6 +182,17 @@ DEFAULT_PARAMS: dict = {
     # ── AXIAL-CONSISTENCY pass ── final per-FRAME lateral clean-up of the anterior surface (kills slice-to-slice
     # waviness/spikes only visible in the AXIAL B-scan); strictly gated → strict NO-OP on an already-smooth scan.
     "axial_consistency": True,
+    # ── FRAME-BOUNDARY lateral smoothing ── the first/last B-scans (acquisition edge) are low-signal, so their
+    # anterior detection is jagged laterally and axial_consistency's gate skips them. Force lateral consistency on
+    # just those `fbls_nb` edge frames (wide median + gaussian). No-op elsewhere → interior/approved scans unchanged.
+    "frame_boundary_smooth": False,  # DEFAULT OFF: warping to a smoothed edge can't beat the ~3-4px detection-noise
+                                  #   floor at the LOW-SIGNAL acquisition-edge frames (the raw border is smooth but
+                                  #   fuzzy — half the mid-frame contrast); only marginal in testing. Kept for reuse.
+    "fbls_nb": 4,                 # number of frames at EACH end to lateral-smooth (feathered toward the interior)
+    "fbls_med": 31,               # lateral median window (px) — wide enough to erase the low-signal jag
+    "fbls_gauss": 12.0,           # lateral gaussian on the smooth target (clean curve)
+    "fbls_max_shift": 16.0,       # cap the per-column correction (px)
+    "fbls_min_coverage": 0.4,     # skip an edge frame with less cornea than this fraction (off-eye guard)
     "axcons_med_win": 15,         # lateral median-filter width (px) for the smooth target (kills spikes, keeps dome)
     "axcons_two_sided": False,    # correct only DOWNWARD notches (detector locked too deep); True also lifts up-spikes
     "axcons_gate": 3.0,           # px: correct only lateral columns deviating from the smooth target by more than this
@@ -1229,6 +1246,50 @@ def _redetect_one_slice(sl: np.ndarray, prior: np.ndarray, window: float, p: dic
     return _smooth_median(corrected, size=int(p["median_filter_size"]))
 
 
+def _extrapolate_boundary_edges(edges: np.ndarray, p: dict) -> np.ndarray:
+    """Replace the FIRST/LAST `boundary_extrap_nb` frames' per-slice surface with a robust frame-direction LINEAR
+    extrapolation from the adjacent interior frames, then smooth the boundary frames across slices. The low-signal
+    acquisition-edge frames detect noisily; the raw corneal shape is smooth across frames, so the interior
+    extrapolation matches the true band position and gives the warp a smooth, cross-slice-consistent surface there
+    (removes the jagged edge B-scans). edges = (n_lateral, n_frames), depth 0 = top. Strict no-op when the surface
+    is already smooth (extrapolation ≈ detection) or nb<=0."""
+    nb = int(p.get("boundary_extrap_nb", 4) or 0)
+    if nb <= 0:
+        return edges
+    e = np.asarray(edges, dtype=np.float64).copy()
+    if e.ndim != 2:
+        return edges
+    L, F = e.shape
+    span = int(p.get("boundary_extrap_span", 18))
+    if F < 2 * nb + 4 or L < 8:
+        return edges
+    span = min(span, (F - 2 * nb) // 2) if F - 2 * nb > 0 else span
+    for l in range(L):
+        a = e[l]; vld = a > 1.0
+        ff = [f for f in range(nb, nb + span) if vld[f]]
+        if len(ff) >= 6:
+            co = np.polyfit(ff, a[ff], 1)                        # linear = robust, no extrapolation overshoot
+            for f in range(nb):
+                if vld[f]:
+                    e[l, f] = np.polyval(co, f)
+        lf = [f for f in range(F - nb - span, F - nb) if vld[f]]
+        if len(lf) >= 6:
+            co = np.polyfit(lf, a[lf], 1)
+            for f in range(F - nb, F):
+                if vld[f]:
+                    e[l, f] = np.polyval(co, f)
+    sig = float(p.get("boundary_extrap_lat_sigma", 6.0) or 0.0)
+    if sig > 0:
+        xs = np.arange(L)
+        for f in list(range(nb)) + list(range(F - nb, F)):
+            col = e[:, f]; m = col > 1.0
+            if int(m.sum()) > 20:
+                filled = np.interp(xs, xs[m], col[m])
+                sm = ndimage.gaussian_filter1d(filled, sigma=sig, mode="nearest")
+                e[m, f] = sm[m]
+    return e.astype(edges.dtype)
+
+
 def _reject_apex_lateral_spike(edges: np.ndarray, p: dict) -> np.ndarray:
     """FIX apexspec: remove a narrow apex specular streak from the ASSEMBLED (lateral, frame) surface by making
     each FRAME column laterally smooth where a narrow up-spike (the DP climbing the streak) sits above a
@@ -1947,6 +2008,14 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # (detect_volume is not None) already sits flattened, so this is a no-op there too.
         if bool(p.get("spec_spike_reject", True)):
             edges = _reject_apex_lateral_spike(edges, p)
+        # FIX jagged edge B-scans (marked CS002 OS(2)-(4) at axial slice 1-2): the FIRST/LAST few frames are
+        # low-signal (acquisition edge), so their direct per-slice detection is noisy → a jagged warp. The raw
+        # corneal shape is SMOOTH across frames, so replace those frames' surface with a frame-direction
+        # extrapolation from the reliable INTERIOR frames (+ cross-slice smoothing) — the warp then flattens them
+        # to the smooth interior-consistent shape. On a filled/warped later pass the surface already sits flat, so
+        # it is a near-no-op there; on a genuinely smooth scan it is a strict no-op. boundary_extrap_nb=0 disables.
+        if not use_provided and int(p.get("boundary_extrap_nb", 4) or 0) > 0:
+            edges = _extrapolate_boundary_edges(edges, p)
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
@@ -2432,6 +2501,47 @@ def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, wor
     n_moved_frames = int(moved.sum())
     return out, {"applied": bool(n_moved_frames), "frames_adjusted": n_moved_frames,
                  "n_frames": n_frames, "cols_adjusted": int(n_moved_cols)}
+
+
+def frame_boundary_lat_smooth(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """FIX the jagged border on the first/last B-scans (acquisition-edge frames). Those frames are LOW-SIGNAL, so
+    the per-slice anterior detection wiggles laterally → the axial (B-scan) border looks jagged (the marked
+    CS002 OS(2)-(4) defect at axial slice 1-2). The sagittal warp flattens WITHIN each slice but does not enforce
+    CROSS-SLICE (lateral) consistency, and axial_consistency's "too-rough → skip" gate bails out on these very
+    jagged frames — so they stay jagged. Here, ONLY on the first/last `fbls_nb` frames, force lateral consistency:
+    take the detected surface across laterals, smooth it hard (wide median kills the jag + Gaussian), and shift
+    each column so its border lands on that smooth curve (feathered toward the interior so there is no step). The
+    smooth curve is the frame's OWN robust lateral trend, so real curvature is kept; only the jag is removed.
+    Strict no-op when fbls_nb<=0 or a frame has too little cornea. Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    nb = int(p.get("fbls_nb", 4) or 0)
+    if nb <= 0:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    med = int(p.get("fbls_med", 31) or 1); gs = float(p.get("fbls_gauss", 12.0) or 0.0)
+    cap = float(p.get("fbls_max_shift", 16.0) or 0.0); min_cov = float(p.get("fbls_min_coverage", 0.4) or 0.0)
+    S = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lateral, frames)
+    L, F = S.shape; depth = int(volume.shape[1])
+    if med % 2 == 0:
+        med += 1
+    out = volume.copy(); nadj = 0
+    for f in list(range(min(nb, F))) + list(range(max(0, F - nb), F)):
+        a = S[:, f].astype(np.float64); vld = np.isfinite(a) & (a > 1.0) & (a < depth - 1)
+        if int(vld.sum()) < max(20, int(min_cov * L)):
+            continue
+        xs = np.arange(L)
+        interp = np.interp(xs, xs[vld], a[vld])
+        tgt = ndimage.median_filter(interp, size=med, mode="nearest")       # wide median removes the lateral jag
+        if gs > 0:
+            tgt = ndimage.gaussian_filter1d(tgt, sigma=gs, mode="nearest")   # + gaussian for a clean smooth curve
+        w = 1.0 - (min(f, F - 1 - f) / max(1, nb))                          # full at the very edge frame, taper in
+        shift = np.where(vld, np.clip((tgt - a) * w, -cap, cap), 0.0)        # move each column's border onto tgt
+        if not np.any(shift != 0.0):
+            continue
+        out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), shift, subpixel=True)
+        nadj += 1
+    return out, {"applied": bool(nadj), "frames_adjusted": nadj}
 
 
 def surface_refine_2d(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
@@ -3010,6 +3120,11 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("surface_refine_2d", True):
         corrected, srf = surface_refine_2d(corrected, params, workers=workers)
         info["surface_refine_2d"] = srf
+    # FIX jagged edge B-scans: lateral-smooth ONLY the first/last few (low-signal acquisition-edge) frames, whose
+    # jagged border axial_consistency's gate leaves untouched. Gated to the boundary frames → no-op on the interior.
+    if p_all.get("frame_boundary_smooth", True):
+        corrected, fbs = frame_boundary_lat_smooth(corrected, params, workers=workers)
+        info["frame_boundary_smooth"] = fbs
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")
