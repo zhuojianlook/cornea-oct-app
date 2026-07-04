@@ -117,15 +117,29 @@ DEFAULT_PARAMS: dict = {
                                   #   specular apex → removes the apex V-notch (CS001 OS3). Verified to CORRECT the
                                   #   same deep-lock notch on the vetted scans (improvement, not degrade). False = legacy.
     "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
-    # ── BOUNDARY EXTRAPOLATION ── the first/last few frames are low-signal (acquisition edge) → noisy detection →
-    # jagged warp (marked CS002 OS(2)-(4), axial slice 1-2). Replace their surface with a linear extrapolation
-    # from the interior (the raw shape is smooth across frames) so the warp flattens them smoothly. 0 = disabled.
-    "boundary_extrap_nb": 4,      # frames at EACH end to replace with the interior extrapolation
+    # ── BOUNDARY EXTRAPOLATION (RETIRED, default OFF) ── replaced the first/last few frames' surface with a
+    # frame-direction quadratic extrapolation from the interior. The user marked this as introducing a WRONG
+    # EDGE ANGLE vs the general corneal curvature (CS002 OS(2)/(3) "sagital right edge corrected to a wrong
+    # angle"): extrapolating along the frame axis projects the interior parabola and can leave the tissue.
+    # SUPERSEDED by _lateral_smooth_by_confidence (cross-SLICE smoothing that stays ON the detected tissue).
+    # nb>0 re-enables the legacy behaviour.
+    "boundary_extrap_nb": 0,      # frames at EACH end to replace with the interior extrapolation (0 = disabled)
     "boundary_extrap_degree": 2,  # 2=QUADRATIC (follows corneal curvature); 1=linear tangent (wrong edge angle)
     "boundary_extrap_max_dev": 15.0,  # clamp |extrap − nearest interior| (px) so the quadratic can't OVERSHOOT the
                                   #   few extrapolated frames off the cornea (a 4-frame descent is well under this)
     "boundary_extrap_span": 18,   # interior frames used for the fit adjacent to each boundary
     "boundary_extrap_lat_sigma": 6.0,  # cross-slice (lateral) gaussian on the boundary frames (3-D consistency)
+    # ── CONFIDENCE-TAPERED LATERAL SMOOTHING ── the acquisition-edge frames (low SNR at the slow-scan extremes)
+    # detect the anterior surface with cross-SLICE (lateral) jitter → a jagged B-scan top contour (marked CS002
+    # OS(2) f99/100, OS(3) f0-20). Smooth the detected surface ACROSS SLICES with a gaussian whose sigma is
+    # tapered by each frame's detection CONFIDENCE: strong on the noisy low-confidence edge frames, a strict
+    # NO-OP on high-confidence interior frames (real anterior detail + approved scans preserved). Unlike the
+    # retired frame-direction extrapolation this stays ON the detected tissue, so it cannot create a wrong edge
+    # angle; the specular column + stromal opacities sit BELOW the surface and are untouched. False = disabled.
+    "lat_conf_smooth": True,
+    "lat_conf_sigma_max": 9.0,    # max cross-slice gaussian sigma (laterals) applied to the lowest-confidence frame
+    "lat_conf_lo": 0.35,          # confidence (relative to the interior high-signal median) at/below which full smoothing
+    "lat_conf_hi": 0.80,          # confidence at/above which NO smoothing (interior frames → strict no-op)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1409,7 +1423,59 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # not be laterally re-smoothed here (the per-worker _edge_worker never receives a prior, so this is the auto path).
     if bool(p.get("spec_spike_reject", True)):
         out = _reject_apex_lateral_spike(out, p)
+    if bool(p.get("lat_conf_smooth", True)):
+        out = _lateral_smooth_by_confidence(out, sag, p)
     return out
+
+
+def _lateral_smooth_by_confidence(out: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarray:
+    """Cross-SLICE (lateral) smoothing of the detected anterior surface, with the gaussian sigma TAPERED by
+    each frame's detection confidence. The low-signal acquisition-edge frames (slow-scan extremes) detect
+    the surface with lateral jitter → a jagged B-scan top contour; the high-signal interior frames detect
+    cleanly. So smooth ACROSS SLICES only where confidence is low, easing to a strict NO-OP on confident
+    frames (real anterior detail + already-approved scans untouched). This stays ON the detected tissue —
+    unlike a frame-direction extrapolation it cannot put the edge at a wrong angle. The specular column and
+    stromal opacities sit BELOW the surface, so they are preserved. out=(n_slices, n_frames); depth 0 = top.
+    Strict no-op when every frame is confident, or L/F too small, or lat_conf_smooth=False."""
+    e = np.asarray(out, dtype=np.float64)
+    if e.ndim != 2:
+        return out
+    L, F = e.shape
+    if L < 16 or F < 5:
+        return out
+    sig_max = float(p.get("lat_conf_sigma_max", 9.0) or 0.0)
+    if sig_max <= 0:
+        return out
+    lo = float(p.get("lat_conf_lo", 0.35))
+    hi = float(p.get("lat_conf_hi", 0.80))
+    if hi <= lo:
+        hi = lo + 1e-3
+    # per-FRAME confidence = anterior CONTRAST (bright below − dark above) on the B-scan at that frame; a
+    # low-signal edge frame scores near 0. sag=(n_slices, depth, n_frames) → B-scan at fr is sag[:, :, fr].T.
+    con = np.zeros(F, dtype=np.float64)
+    for fr in range(F):
+        bs = np.ascontiguousarray(sag[:, :, fr]).astype(np.float32).T   # (depth, n_slices)
+        con[fr] = _surface_confidence(bs, e[:, fr])[0]
+    pos = con[con > 0]
+    if pos.size < 3:
+        return out
+    ref = float(np.median(np.sort(pos)[-max(5, pos.size // 4):]))       # interior/high-signal reference
+    if ref <= 0:
+        return out
+    conf_norm = np.clip(con / ref, 0.0, 1.0)                            # 1 ≈ as clean as the interior; ~0 = noisy edge
+    e2 = e.copy()
+    xs = np.arange(L)
+    for fr in range(F):
+        w = float(np.clip((hi - conf_norm[fr]) / (hi - lo), 0.0, 1.0))  # smoothing weight: 1 below lo, 0 above hi
+        if w <= 0.01:
+            continue
+        col = e[:, fr]; m = col > 1.0
+        if int(m.sum()) < max(20, L // 8):
+            continue
+        filled = np.interp(xs, xs[m], col[m])
+        sm = ndimage.gaussian_filter1d(filled, sigma=sig_max * w, mode="nearest")
+        e2[m, fr] = (1.0 - w) * col[m] + w * sm[m]                      # blend eases the seam to the interior
+    return e2.astype(out.dtype)
 
 
 def detect_noise_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
@@ -2025,6 +2091,14 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # it is a near-no-op there; on a genuinely smooth scan it is a strict no-op. boundary_extrap_nb=0 disables.
         if not use_provided and int(p.get("boundary_extrap_nb", 4) or 0) > 0:
             edges = _extrapolate_boundary_edges(edges, p)
+        # FIX jagged edge B-scans (the SUCCESSOR to the retired boundary extrapolation; marked CS002 OS(2)
+        # f99/100, OS(3) f0-20): the low-signal acquisition-edge frames detect the surface with cross-SLICE
+        # jitter → a jagged B-scan top contour. Smooth the assembled (lateral, frame) edge ACROSS SLICES with
+        # a sigma tapered by each frame's detection confidence — strong on the noisy edge frames, a strict
+        # NO-OP on confident interior frames. Stays ON the detected tissue (no wrong edge angle). On a
+        # filled/warped later pass the surface is already flat (high confidence) → near-no-op there too.
+        if not use_provided and bool(p.get("lat_conf_smooth", True)):
+            edges = _lateral_smooth_by_confidence(edges, det, p)
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
