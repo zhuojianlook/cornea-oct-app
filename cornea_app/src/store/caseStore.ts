@@ -24,6 +24,9 @@ export interface DefectMark {
   orient: "sagittal" | "axial";
   slice: number;
   cols: number[];
+  // Defect TYPE the user tagged this region with (so the assistant knows which KIND of problem it is):
+  // "edge_detection" | "curvature" | "surface_roughness" | any free-text. Absent on older (untagged) marks.
+  tag?: string;
 }
 
 interface CaseState {

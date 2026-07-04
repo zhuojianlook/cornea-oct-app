@@ -63,7 +63,10 @@ export function VolumeCanvas() {
   // Defect-marking: when ON, the main single-plane viewer becomes interactive and the user drags to mark the
   // WRONG columns of the current sagittal/axial slice → manifest.defect_marks (read/written via caseStore).
   const markDefectMode = useWorkflowStore((s) => s.markDefectMode);
+  const defectTag = useWorkflowStore((s) => s.defectTag);
+  const setWf = useWorkflowStore((s) => s.set);
   const setDefectMarks = useCaseStore((s) => s.setDefectMarks);
+  const [customTag, setCustomTag] = useState("");
   const [view, setViewState] = useState<ViewName>("multi");
   // #2 — visible slice scrollbar for the single-plane (axial/coronal/sagittal) niivue views.
   const [sliceIdx, setSliceIdx] = useState(0);
@@ -249,8 +252,9 @@ export function VolumeCanvas() {
   const allMarks: DefectMark[] = Array.isArray(manifest?.defect_marks)
     ? (manifest!.defect_marks as DefectMark[]) : [];
   // Columns already marked on the CURRENT (orient, slice) — rendered as pink bands + extended by a new drag.
+  // union of ALL tags' cols on this slice (display shows every marked column regardless of tag)
   const curMarkCols: number[] = defectOrient
-    ? (allMarks.find((m) => m.orient === defectOrient && m.slice === sliceIdx)?.cols ?? [])
+    ? [...new Set(allMarks.filter((m) => m.orient === defectOrient && m.slice === sliceIdx).flatMap((m) => m.cols))].sort((a, b) => a - b)
     : [];
   // Workflow: DRAW a column selection (drag over the slice) → it stays PENDING (light pink). Commit it to just
   // this frame ("This frame") OR across a slice RANGE: click "Start" on one slice, scrub, click "End" on
@@ -275,15 +279,18 @@ export function VolumeCanvas() {
   const commitRange = (s0: number, s1: number, cols: number[]) => {
     if (!defectOrient || !cols.length) return;
     const lo = Math.min(s0, s1), hi = Math.max(s0, s1);
+    const tag = defectTag || "edge_detection";
+    // Merge into the marks of THIS orient+tag only (keyed by slice); marks of a DIFFERENT tag (or orient) are kept
+    // untouched so several defect types can coexist on the same slice, each tagged.
     const byKey = new Map<number, Set<number>>();
-    for (const m of allMarks) if (m.orient === defectOrient) byKey.set(m.slice, new Set(m.cols));
+    for (const m of allMarks) if (m.orient === defectOrient && (m.tag ?? "") === tag) byKey.set(m.slice, new Set(m.cols));
     for (let s = lo; s <= hi; s++) {
       const set = byKey.get(s) ?? new Set<number>();
       for (const c of cols) if (c >= 0) set.add(c);
       byKey.set(s, set);
     }
-    const next: DefectMark[] = allMarks.filter((m) => m.orient !== defectOrient);
-    byKey.forEach((set, s) => { if (set.size) next.push({ orient: defectOrient, slice: s, cols: [...set].sort((a, b) => a - b) }); });
+    const next: DefectMark[] = allMarks.filter((m) => !(m.orient === defectOrient && (m.tag ?? "") === tag));
+    byKey.forEach((set, s) => { if (set.size) next.push({ orient: defectOrient, slice: s, cols: [...set].sort((a, b) => a - b), tag }); });
     void setDefectMarks(next);
   };
   const commitThisFrame = () => { if (pendingCols.length) { commitRange(sliceIdx, sliceIdx, pendingCols); setPendingCols([]); setRangeStart(null); } };
@@ -322,9 +329,16 @@ export function VolumeCanvas() {
     let lo = col, hi = col;
     while (set.has(lo - 1)) lo--;
     while (set.has(hi + 1)) hi++;
-    const remaining = curMarkCols.filter((c) => c < lo || c > hi);
-    const others = allMarks.filter((m) => !(m.orient === defectOrient && m.slice === sliceIdx));
-    void setDefectMarks(remaining.length ? [...others, { orient: defectOrient, slice: sliceIdx, cols: remaining }] : others);
+    // remove the band [lo,hi] from EVERY tag's mark on this slice (keep each tag's remaining cols)
+    const rm = (c: number) => c >= lo && c <= hi;
+    const next: DefectMark[] = [];
+    for (const m of allMarks) {
+      if (m.orient === defectOrient && m.slice === sliceIdx) {
+        const keptCols = m.cols.filter((c) => !rm(c));
+        if (keptCols.length) next.push({ ...m, cols: keptCols });
+      } else next.push(m);
+    }
+    void setDefectMarks(next);
   };
 
   const mb = (on: boolean): React.CSSProperties => ({ background: on ? "rgba(255,93,176,0.28)" : "none",
@@ -561,6 +575,17 @@ export function VolumeCanvas() {
               background: "rgba(20,20,24,0.7)", border: "1px solid #ff5db0" }}>
             <span style={{ color: "#ff5db0", fontWeight: 700 }}
               title="Drag over the slice to select WRONG columns, then commit to this frame or a slice range. Right-click a band to remove it.">⚑ {view}</span>
+            {/* Defect-TYPE tag: newly committed marks carry this type (persisted per-mark for the assistant). */}
+            <span style={{ opacity: 0.8 }}>type:</span>
+            {([["edge_detection", "Edge"], ["curvature", "Curvature"], ["surface_roughness", "Roughness"]] as const).map(([k, lbl]) => (
+              <button key={k} onClick={() => setWf("defectTag", k)} style={mb(defectTag === k)}
+                title={`Tag new marks as “${lbl}”. Existing marks of other types stay.`}>{lbl}</button>
+            ))}
+            <input value={customTag} placeholder="other…"
+              onChange={(e) => { const t = e.target.value; setCustomTag(t); if (t.trim()) setWf("defectTag", t.trim()); }}
+              style={{ width: 78, background: "rgba(255,255,255,0.08)", border: `1px solid ${defectTag === customTag.trim() && customTag.trim() ? "#fff" : "#ff5db0"}`,
+                borderRadius: 4, color: "#fff", fontSize: 11, padding: "1px 6px" }}
+              title="Type a custom defect type — new marks use it (overrides the preset until you click one)." />
             <span style={{ opacity: 0.9 }}>{pendingCols.length ? `${pendingCols.length} col${pendingCols.length === 1 ? "" : "s"} selected` : "drag to select"}</span>
             {rangeStart != null && <span style={{ color: "#ffd0e8" }}>· start@{rangeStart + 1}</span>}
             <button disabled={!pendingCols.length} onClick={commitThisFrame} style={mb(pendingCols.length > 0)}
@@ -572,7 +597,9 @@ export function VolumeCanvas() {
             {(pendingCols.length > 0 || rangeStart != null) && (
               <button onClick={() => { setPendingCols([]); setRangeStart(null); }} style={mb(true)} title="Discard the current selection/range.">×sel</button>
             )}
-            <span style={{ opacity: 0.85 }}>· {allMarks.length} saved</span>
+            <span style={{ opacity: 0.85 }}>· {allMarks.length} saved{allMarks.length > 0 && ` (${
+              Object.entries(allMarks.reduce((a, m) => { const t = m.tag ?? "untagged"; a[t] = (a[t] || 0) + 1; return a; }, {} as Record<string, number>))
+                .map(([t, n]) => `${({ edge_detection: "edge", curvature: "curv", surface_roughness: "rough" } as Record<string, string>)[t] || t}:${n}`).join(" ")})`}</span>
             {allMarks.length > 0 && <button onClick={() => void setDefectMarks([])} style={mb(true)} title="Clear ALL marks on this scan.">clear all</button>}
           </div>
         )}

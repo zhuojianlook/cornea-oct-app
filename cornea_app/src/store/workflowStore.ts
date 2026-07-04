@@ -117,6 +117,9 @@ interface WorkflowState {
   // WRONG columns of the current sagittal/axial slice. Marks live in manifest.defect_marks (caseStore); this
   // is just the transient viewer toggle. Off by default → viewer behaves exactly as today.
   markDefectMode: boolean;
+  // The defect TYPE tag applied to newly committed marks (persisted per-mark in manifest.defect_marks.tag so the
+  // assistant knows which KIND of problem each region is). Built-ins + any free-text the user types.
+  defectTag: string;
 
   // SAM2 scar hints (click to guide)
   hintMode: boolean;
@@ -243,6 +246,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     subgroupBusy: false,
 
     markDefectMode: false,
+    defectTag: "edge_detection",
 
     hintMode: false,
     hintPositive: true,

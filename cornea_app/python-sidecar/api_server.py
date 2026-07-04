@@ -2802,6 +2802,7 @@ class DefectMark(BaseModel):
     orient: str                       # "sagittal" | "axial" (the shown single-plane view)
     slice: int                        # slice index within that view
     cols: list[int] = []              # column voxel indices (non-depth in-plane axis) that are WRONG
+    tag: str | None = None            # defect TYPE: "edge_detection" | "curvature" | "surface_roughness" | free-text
 
 
 class DefectMarksRequest(BaseModel):
@@ -2822,7 +2823,11 @@ def set_defect_marks(case_id: str, req: DefectMarksRequest) -> dict:
         cols = sorted({int(c) for c in (mk.cols or []) if int(c) >= 0})
         if not cols:
             continue
-        marks.append({"orient": orient, "slice": int(mk.slice), "cols": cols})
+        entry = {"orient": orient, "slice": int(mk.slice), "cols": cols}
+        tag = (mk.tag or "").strip()
+        if tag:
+            entry["tag"] = tag[:60]                       # defect TYPE the user tagged (bounded free-text)
+        marks.append(entry)
     m = orch.write_manifest_value(_require_case(case_id), {"defect_marks": marks})
     return {"ok": True, "defect_marks": m.get("defect_marks", [])}
 
