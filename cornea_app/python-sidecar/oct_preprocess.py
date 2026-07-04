@@ -272,11 +272,15 @@ DEFAULT_PARAMS: dict = {
                                   # discriminator (frac/span overlap), so AUTO skips a too-large pad (→ normal
                                   # pipeline). A MANUAL crop ignores this. Below crop_max_pad (the clamp cap).
     "crop_target_med": 11,        # robust median window (frames) on the detected posterior before the shift
-    "crop_slice_smooth": 2.0,     # cross-slice gaussian on the posterior parabola (3-D consistency)
-    "crop_disp_smooth_slice": 6.0,  # anti-streak: gaussian on the per-column warp shift ACROSS slices (kills the
-    "crop_disp_smooth_frame": 1.5,  # comb artifact from a faint/noisy posterior); across frames. 0 = disabled.
+    "crop_slice_smooth": 20.0,    # cross-slice gaussian on the posterior parabola. RAISED 2→20: a weak value let
+                                  #   the per-slice parabola fit WOBBLE slice-to-slice → a low-frequency LATERAL
+                                  #   UNDULATION ("very wavy" reconstruction); the cornea's curve is consistent
+                                  #   across slices, so heavy cross-slice smoothing recovers that consistent shape.
+    "crop_disp_smooth_slice": 40.0,  # anti-wave: gaussian on the per-column warp shift ACROSS slices. RAISED 6→40
+                                  #   for the same reason — kills the lateral wave from a faint/noisy posterior.
+    "crop_disp_smooth_frame": 1.5,  # across frames (lighter — real frame-direction shape is kept). 0 = disabled.
     "crop_pad_margin": 8,         # extra rows above the highest above-old-top point (breathing room)
-    "crop_max_pad": 120,          # safety cap on the upward extension (rows). A required pad above this means a
+    "crop_max_pad": 160,          # safety cap on the upward extension (rows). A required pad above this means a
                                   # SEVERE tilt / artifact, not a clean clip: AUTO skips it (→ normal pipeline);
                                   # a MANUAL crop is applied but clamped here (best-effort, no pathological volume)
     # ── DP scar-guard ── cross-check the DP anterior edge against the legacy ('old method') RANSAC-quadratic
@@ -2851,10 +2855,11 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             _s1, _d1 = _cur_sag_det(params)                       # reused from the noise check when no crop was applied
             _ci = detect_surface_crop_frames(_s1, params, workers=workers, detect=_d1)
             if is_substantial_clip(_ci, params):
-                if _approved:
-                    _crop_frames = _ci["frames"]; _auto_crop = True
-                else:                                         # PROPOSE: report the clipped frames, don't extend-warp
-                    _proposals["surface_crop"] = {"frames": [int(f) for f in _ci["frames"]], "reason": "clipped apex"}
+                # AUTO-APPLY (was: propose, apply only if the user approved). The clip detector is reliable (no
+                # false-fire on non-clipped scans) and — with the strong cross-slice smoothing above — the
+                # reconstruction is now clean, so a detected clip is corrected AUTOMATICALLY with no human confirm.
+                # A pathological over-clip is still refused by the frac-frames sanity check below.
+                _crop_frames = _ci["frames"]; _auto_crop = True
         except Exception:  # noqa: BLE001 — auto detection is best-effort; fall back to the normal pipeline
             pass
     if provided_edges is None and _crop_frames:
@@ -2875,13 +2880,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         _out_sag, _pad, _Pb, _Pa, _clamped = warp_surface_crop_extend(_sagv, _posterior, _crop_frames, params,
                                                                       workers=workers, detect=_det)
         _lo, _hi = int(0.3 * _sagv.shape[0]), int(0.7 * _sagv.shape[0])
-        _pb_span = float(np.ptp(np.median(_Pb[_lo:_hi], axis=0)))      # posterior span across frames = TILT detector
-        if _auto_crop and (_clamped or _pb_span > float(_pc.get("crop_auto_max_span", 200))
-                           or int(_pad) > int(_pc.get("crop_auto_max_pad", 75))):
-            # AUTO: an extreme extension (clamped, or pad > crop_auto_max_pad) OR a large posterior span = a
-            # steep TILT / decentred / artefacted scan, not a clean localized clip — the extend warp would
-            # mangle it (CS008 OD span ~341; CS005 OD(6) pad 100 & CS011 OD(3) pad 110 → SAM2 floods the
-            # extended canvas). Don't auto-mangle: fall through to the normal pipeline (a manual crop applies).
+        _pb_span = float(np.ptp(np.median(_Pb[_lo:_hi], axis=0)))      # posterior span across frames (diagnostic)
+        _frac = len(list(_crop_frames)) / max(1, int(_sagv.shape[2]))
+        if _auto_crop and _frac > float(_pc.get("crop_auto_max_frac", 0.5)):
+            # SANITY only: if MORE than half the frames are flagged clipped, this is a failed / fully-off-axis scan,
+            # NOT a localized apex clip — reconstructing it is meaningless, so fall through to the normal pipeline
+            # (keep-clipped). The old pad/span/clamped rejection is GONE: it existed because the un-smoothed warp
+            # mangled large/steep clips, but the strong cross-slice smoothing now reconstructs them cleanly (OS0
+            # span 302 / pad 120 reconstructs smooth), so a clean localized clip of any size is auto-corrected.
             _crop_frames = None
         else:
             corrected = revert_sagittal(_out_sag)              # (frames, depth+pad, lateral) — same per-voxel spacing
