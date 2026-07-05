@@ -140,6 +140,16 @@ DEFAULT_PARAMS: dict = {
     "lat_conf_sigma_max": 9.0,    # max cross-slice gaussian sigma (laterals) applied to the lowest-confidence frame
     "lat_conf_lo": 0.35,          # confidence (relative to the interior high-signal median) at/below which full smoothing
     "lat_conf_hi": 0.80,          # confidence at/above which NO smoothing (interior frames → strict no-op)
+    # ── LATERAL DESPIKE ── remove NARROW, LARGE cross-slice surface excursions (the DP diving into a shadow/
+    # dropout notch or climbing a reflection; marked CS002 OS3 f0 ~35px dive + f6 notch). A run of <= max_w
+    # laterals deviating > dev px from a robust lateral median trend is a detection artifact (a smooth cornea
+    # never produces one) → reset to the trend. Width-gated so a real limbus flank / smooth dome is a strict
+    # no-op. Independent of frame confidence (catches a local spike on an otherwise-confident frame). False disables.
+    "despike_lateral": True,
+    "despike_win": 31,            # lateral median-trend window (odd; wider than any real narrow spike)
+    "despike_dev": 13.0,          # |surface − trend| px above which a narrow run is a spike/notch
+    "despike_max_w": 12,          # max lateral run width treated as a spike (a real limbus flank is longer → kept)
+    "despike_pad": 2,             # laterals padded around each reset run (absorb flank jitter)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1423,9 +1433,64 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # not be laterally re-smoothed here (the per-worker _edge_worker never receives a prior, so this is the auto path).
     if bool(p.get("spec_spike_reject", True)):
         out = _reject_apex_lateral_spike(out, p)
+    if bool(p.get("despike_lateral", True)):
+        out = _despike_lateral_surface(out, p)
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
     return out
+
+
+def _despike_lateral_surface(edges: np.ndarray, p: dict) -> np.ndarray:
+    """Remove NARROW, LARGE lateral surface excursions (spikes/notches) from the assembled (lateral, frame)
+    surface. The anterior corneal surface is smooth across slices, so a contiguous run of <= despike_max_w
+    laterals that deviates > despike_dev px (either direction) from a robust lateral MEDIAN trend is a
+    detection artifact — the DP dove into a shadow/dropout notch (marked CS002 OS3 f0 ~35px dive, f6 notch)
+    or climbed a reflection — NOT anatomy. Reset those runs to the trend. This is deliberately LESS
+    conservative than _reject_apex_lateral_spike's two-sided-recovery down-branch (which mis-gates on the
+    cluttered low-signal edge frames and let these through) but stays SAFE via two invariants: (a) the
+    median trend follows a real smooth dome / steep limbus, so a genuine surface gives dev≈0 → strict
+    no-op; (b) the WIDTH gate excludes a real limbus flank (a LONG monotonic run) — only NARROW runs, which
+    a smooth cornea never produces, are reset. Independent of frame confidence, so it catches a local spike
+    on an otherwise-high-confidence frame (which the frame-level lat_conf taper misses). despike_lateral=False
+    disables. edges=(n_lateral, n_frames); depth 0 = top."""
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2:
+        return edges
+    L, F = e.shape
+    win = int(p.get("despike_win", 31)); win = win if win % 2 else win + 1
+    ksize = min(win, L if L % 2 else L - 1)
+    if L < 16 or ksize < 5:
+        return edges
+    dev_t = float(p.get("despike_dev", 13.0))
+    maxw = int(p.get("despike_max_w", 12))
+    pad = int(p.get("despike_pad", 2))
+    out = e.copy()
+    changed = False
+    for f in range(F):
+        col = e[:, f]
+        valid = col > 1.0
+        if int(valid.sum()) < 16:
+            continue
+        trend = ndimage.median_filter(col, size=ksize, mode="nearest")
+        cand = (np.abs(col - trend) > dev_t) & valid                 # narrow-or-wide excursion candidates
+        if not cand.any():
+            continue
+        band = np.zeros(L, dtype=bool)
+        i = 0
+        while i < L:
+            if not cand[i]:
+                i += 1
+                continue
+            j = i
+            while j < L and cand[j]:
+                j += 1                                               # [i, j) contiguous run
+            if (j - i) <= maxw:                                      # NARROW run only → artifact, reset to trend
+                band[max(0, i - pad):min(L, j + pad)] = True
+            i = j
+        if band.any():
+            out[band, f] = trend[band]
+            changed = True
+    return out.astype(edges.dtype) if changed else edges
 
 
 def _lateral_smooth_by_confidence(out: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarray:
@@ -2091,6 +2156,13 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # it is a near-no-op there; on a genuinely smooth scan it is a strict no-op. boundary_extrap_nb=0 disables.
         if not use_provided and int(p.get("boundary_extrap_nb", 4) or 0) > 0:
             edges = _extrapolate_boundary_edges(edges, p)
+        # FIX residual edge_detection (marked CS002 OS3 f0 ~35px dive + f6 notch): remove NARROW, LARGE
+        # lateral surface excursions the DP baked in by diving into a shadow/dropout notch. Runs on the WARP
+        # surface (a spiked surface → the warp pulls tissue up into a spike), independent of frame confidence
+        # (a local spike can sit on an otherwise-high-confidence frame that lat_conf skips). Width-gated so a
+        # real limbus flank / smooth dome is a strict no-op.
+        if not use_provided and bool(p.get("despike_lateral", True)):
+            edges = _despike_lateral_surface(edges, p)
         # FIX jagged edge B-scans (the SUCCESSOR to the retired boundary extrapolation; marked CS002 OS(2)
         # f99/100, OS(3) f0-20): the low-signal acquisition-edge frames detect the surface with cross-SLICE
         # jitter → a jagged B-scan top contour. Smooth the assembled (lateral, frame) edge ACROSS SLICES with
