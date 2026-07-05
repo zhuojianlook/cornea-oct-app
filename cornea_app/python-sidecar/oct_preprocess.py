@@ -159,6 +159,17 @@ DEFAULT_PARAMS: dict = {
     "dip2d_thresh": 7.0,          # px deviation from the 2-D dome trend above which a point is a detection dip/bump
     "dip2d_lat_win": 41,          # lateral median window (odd)
     "dip2d_frame_win": 9,         # frame median window (odd)
+    # ── POCKET-ROBUST DOME ── dark intra-stromal POCKETS (disease variant, user directive) must be ridden OVER
+    # by the epithelial surface, not dipped into. Iterative ONE-SIDED robust gaussian smoothing pulls points
+    # that dived DEEPER than the smooth dome back up to it, so the surface bridges pockets smoothly. One-sided
+    # → apex + correct surface are strict no-ops; gentle curvature preserved. Applied uniformly (the true
+    # epithelium is smooth on every scan). Handles the moderate/wide pocket-dips the median-clip dip2d cannot
+    # (its trend gets contaminated by the dip). False disables.
+    "robust_dome": True,
+    "robust_dome_sig_lat": 15.0,  # lateral gaussian sigma for the smooth-dome estimate
+    "robust_dome_sig_frame": 5.0, # frame gaussian sigma for the smooth-dome estimate
+    "robust_dome_thr": 3.5,       # px DEEPER-than-dome above which a point is a pocket-dip → pulled up
+    "robust_dome_iters": 4,       # robust re-estimation passes (de-contaminates the dome from the dip)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1446,9 +1457,48 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
         out = _despike_lateral_surface(out, p)
     if bool(p.get("dip2d_suppress", True)):
         out = _suppress_surface_dips_2d(out, p)
+    if bool(p.get("robust_dome", True)):
+        out = _robust_dome_smooth(out, p)
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
     return out
+
+
+def _robust_dome_smooth(edges: np.ndarray, p: dict) -> np.ndarray:
+    """POCKET-ROBUST anterior surface: keep the epithelial surface a SMOOTH DOME that rides gracefully OVER
+    dark intra-stromal POCKETS (part of the disease variant — user directive), instead of dipping into them.
+    The epithelium is a smooth continuous boundary and pockets sit BELOW it, so a local DOWNWARD excursion
+    (surface deeper than the smooth dome) is the detector being pulled into a pocket — a detection error, not
+    anatomy. Iterative ONE-SIDED robust smoothing: estimate the smooth dome (gaussian over lateral+frame),
+    pull only the DEEPER-than-dome points up to it, and repeat so the dome estimate de-contaminates from the
+    dip each pass. One-sided → the APEX (shallowest) and a correctly-placed surface are strict no-ops; the
+    gentle corneal curvature means the dome estimate follows the real shape (incl. the steep limbus flank,
+    a monotonic descent) so genuine curvature is preserved. Applied UNIFORMLY (the true surface is smooth on
+    every scan, so this only removes pocket-dips + jitter, never real epithelial structure). robust_dome=False
+    disables. edges=(n_lateral, n_frames); depth 0 = top."""
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2:
+        return edges
+    L, F = e.shape
+    if L < 24 or F < 5:
+        return edges
+    sig_lat = float(p.get("robust_dome_sig_lat", 15.0))
+    sig_fr = float(p.get("robust_dome_sig_frame", 5.0))
+    thr = float(p.get("robust_dome_thr", 3.5))
+    iters = int(p.get("robust_dome_iters", 4))
+    if thr <= 0 or iters <= 0 or (sig_lat <= 0 and sig_fr <= 0):
+        return edges
+    out = e.copy()
+    valid = e > 1.0
+    changed = False
+    for _ in range(iters):
+        trend = ndimage.gaussian_filter(out, (max(0.0, sig_lat), max(0.0, sig_fr)), mode="nearest")
+        dip = ((out - trend) > thr) & valid                # deeper than the smooth dome → dived into a pocket
+        if not dip.any():
+            break
+        out[dip] = trend[dip]
+        changed = True
+    return out.astype(edges.dtype) if changed else edges
 
 
 def _suppress_surface_dips_2d(edges: np.ndarray, p: dict) -> np.ndarray:
@@ -2211,6 +2261,12 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # moderate-WIDTH dips the 1-D despike misses where the surface is pulled toward a stromal scar/opacity.
         if not use_provided and bool(p.get("dip2d_suppress", True)):
             edges = _suppress_surface_dips_2d(edges, p)
+        # POCKET-ROBUST dome (user directive: dark intra-stromal pockets are part of the disease and the
+        # epithelial surface must ride smoothly OVER them, not dip in): iterative one-sided robust smoothing
+        # pulls surface points that dived DEEPER than the smooth dome (into a pocket) back up to it. Runs on
+        # the WARP surface every iterative pass; a correctly-placed surface + the apex are strict no-ops.
+        if not use_provided and bool(p.get("robust_dome", True)):
+            edges = _robust_dome_smooth(edges, p)
         # FIX jagged edge B-scans (the SUCCESSOR to the retired boundary extrapolation; marked CS002 OS(2)
         # f99/100, OS(3) f0-20): the low-signal acquisition-edge frames detect the surface with cross-SLICE
         # jitter → a jagged B-scan top contour. Smooth the assembled (lateral, frame) edge ACROSS SLICES with
