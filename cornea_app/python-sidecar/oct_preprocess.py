@@ -170,6 +170,8 @@ DEFAULT_PARAMS: dict = {
     "robust_dome_sig_frame": 5.0, # frame gaussian sigma for the smooth-dome estimate
     "robust_dome_thr": 3.5,       # px DEEPER-than-dome above which a point is a pocket-dip → pulled up
     "robust_dome_iters": 4,       # robust re-estimation passes (de-contaminates the dome from the dip)
+    "robust_dome_max_pull": 6.0,  # CLAMP px: cap the per-point lift so a large-pocket gaussian can't run away
+                                  #   and FLATTEN a real steep frame-direction descent (marked CS002 OS3 curvature)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1486,8 +1488,14 @@ def _robust_dome_smooth(edges: np.ndarray, p: dict) -> np.ndarray:
     sig_fr = float(p.get("robust_dome_sig_frame", 5.0))
     thr = float(p.get("robust_dome_thr", 3.5))
     iters = int(p.get("robust_dome_iters", 4))
+    max_pull = float(p.get("robust_dome_max_pull", 6.0))   # CLAMP: cap the per-point lift so the gaussian's
+    #   global reach (needed to lift a large pocket) cannot RUN AWAY and flatten a real steep frame-direction
+    #   curvature (the acquisition-edge descent, frames ~91-100 — marked as a "curvature" defect on CS002 OS3
+    #   when it was uncapped: the far-frame descent was pulled up ~25px). Pocket-dips are small (≤~6px) so they
+    #   are fully corrected; a real steep descent is protected.
     if thr <= 0 or iters <= 0 or (sig_lat <= 0 and sig_fr <= 0):
         return edges
+    e0 = e.copy()
     out = e.copy()
     valid = e > 1.0
     changed = False
@@ -1498,7 +1506,11 @@ def _robust_dome_smooth(edges: np.ndarray, p: dict) -> np.ndarray:
             break
         out[dip] = trend[dip]
         changed = True
-    return out.astype(edges.dtype) if changed else edges
+    if not changed:
+        return edges
+    if max_pull > 0:                                       # clamp total displacement from the original detection
+        out = np.where(valid, np.clip(out, e0 - max_pull, e0 + max_pull), e0)
+    return out.astype(edges.dtype)
 
 
 def _suppress_surface_dips_2d(edges: np.ndarray, p: dict) -> np.ndarray:
