@@ -150,6 +150,15 @@ DEFAULT_PARAMS: dict = {
     "despike_dev": 13.0,          # |surface − trend| px above which a narrow run is a spike/notch
     "despike_max_w": 12,          # max lateral run width treated as a spike (a real limbus flank is longer → kept)
     "despike_pad": 2,             # laterals padded around each reset run (absorb flank jitter)
+    # ── 2-D DOME-TREND DIP SUPPRESSION ── the moderate-width dips the 1-D despike misses: the anterior surface
+    # pulled ~6-10px toward a sub-surface stromal opacity on the low-signal flank (marked CS002 OS3 lat 294-389
+    # × frames 0-45). Clip points deviating > dip2d_thresh from a robust 2-D (lateral×frame) median dome trend
+    # back to it. The trend follows the real smooth dome + steep limbus (monotonic → median = true value, no
+    # lag) and the gentle corneal curvature keeps the apex un-flattened. False disables.
+    "dip2d_suppress": True,
+    "dip2d_thresh": 7.0,          # px deviation from the 2-D dome trend above which a point is a detection dip/bump
+    "dip2d_lat_win": 41,          # lateral median window (odd)
+    "dip2d_frame_win": 9,         # frame median window (odd)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1435,9 +1444,43 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
         out = _reject_apex_lateral_spike(out, p)
     if bool(p.get("despike_lateral", True)):
         out = _despike_lateral_surface(out, p)
+    if bool(p.get("dip2d_suppress", True)):
+        out = _suppress_surface_dips_2d(out, p)
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
     return out
+
+
+def _suppress_surface_dips_2d(edges: np.ndarray, p: dict) -> np.ndarray:
+    """Clip LOCAL surface excursions that deviate from a robust 2-D (lateral × frame) MEDIAN trend of the
+    dome by > dip2d_thresh px, in EITHER direction, back to the trend. This catches the moderate-WIDTH dips
+    the 1-D _despike_lateral_surface misses — the anterior surface being pulled ~6-10px toward a sub-surface
+    stromal opacity on the low-signal flank (marked CS002 OS3 lat 294-389 × frames 0-45). The epithelium is
+    a smooth dome that rides over stromal scars, so a LOCAL deviation from the 2-D trend is a detection error;
+    the median trend follows the real smooth dome + steep limbus flank (a monotonic descent → median = the
+    true centre value, no lag) and the cornea's gentle curvature means the apex is NOT flattened (median lag
+    << thresh over the window). Uses the FRAME axis too, so a dip wide in one axis but localized in the other
+    still stands out against the trend. dip2d_suppress=False disables. edges=(n_lateral, n_frames)."""
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2:
+        return edges
+    L, F = e.shape
+    thr = float(p.get("dip2d_thresh", 7.0))
+    if L < 24 or F < 5 or thr <= 0:
+        return edges
+    lw = int(p.get("dip2d_lat_win", 41)); lw = lw if lw % 2 else lw + 1
+    fw = int(p.get("dip2d_frame_win", 9)); fw = fw if fw % 2 else fw + 1
+    lw = min(lw, L if L % 2 else L - 1)
+    fw = min(fw, F if F % 2 else F - 1)
+    valid = e > 1.0
+    trend = ndimage.median_filter(e, size=(lw, fw), mode="nearest")
+    dev = e - trend
+    mask = (np.abs(dev) > thr) & valid
+    if not mask.any():
+        return edges
+    out = e.copy()
+    out[mask] = trend[mask]
+    return out.astype(edges.dtype)
 
 
 def _despike_lateral_surface(edges: np.ndarray, p: dict) -> np.ndarray:
@@ -2163,6 +2206,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # real limbus flank / smooth dome is a strict no-op.
         if not use_provided and bool(p.get("despike_lateral", True)):
             edges = _despike_lateral_surface(edges, p)
+        # FIX flank dips toward sub-surface opacities (marked CS002 OS3 lat 294-389 × frames 0-45): clip local
+        # surface excursions >dip2d_thresh px from a robust 2-D (lateral×frame) dome trend back to it — the
+        # moderate-WIDTH dips the 1-D despike misses where the surface is pulled toward a stromal scar/opacity.
+        if not use_provided and bool(p.get("dip2d_suppress", True)):
+            edges = _suppress_surface_dips_2d(edges, p)
         # FIX jagged edge B-scans (the SUCCESSOR to the retired boundary extrapolation; marked CS002 OS(2)
         # f99/100, OS(3) f0-20): the low-signal acquisition-edge frames detect the surface with cross-SLICE
         # jitter → a jagged B-scan top contour. Smooth the assembled (lateral, frame) edge ACROSS SLICES with
