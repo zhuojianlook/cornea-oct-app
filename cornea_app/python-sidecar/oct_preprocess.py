@@ -172,6 +172,14 @@ DEFAULT_PARAMS: dict = {
     "robust_dome_iters": 4,       # robust re-estimation passes (de-contaminates the dome from the dip)
     "robust_dome_max_pull": 6.0,  # CLAMP px: cap the per-point lift so a large-pocket gaussian can't run away
                                   #   and FLATTEN a real steep frame-direction descent (marked CS002 OS3 curvature)
+    # POCKET DARKNESS GATE: apply the dome lift ONLY where the tissue below is dark (a genuine pocket), so a
+    # HEALTHY cornea (bright stroma below the epithelium everywhere) is a STRICT NO-OP and its natural
+    # curvature is preserved — the ungated dome flattened the healthy CS003 OD start-frame curvature. frac
+    # tuned so healthy scans lift ~0 pts while a pocket scan (CS002 OS3) lifts a meaningful set.
+    "robust_dome_pocket_gate": True,
+    "robust_dome_pocket_frac": 0.72,  # below-surface brightness < frac × frame-median stroma ⇒ pocket
+    "robust_dome_below_lo": 4,    # depth px below the surface where the sub-surface sampling band starts
+    "robust_dome_below_hi": 30,   # depth px below the surface where it ends
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1460,24 +1468,29 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     if bool(p.get("dip2d_suppress", True)):
         out = _suppress_surface_dips_2d(out, p)
     if bool(p.get("robust_dome", True)):
-        out = _robust_dome_smooth(out, p)
+        out = _robust_dome_smooth(out, p, vol=sag)          # sag=(lat,depth,frames) → pocket-darkness gate
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
     return out
 
 
-def _robust_dome_smooth(edges: np.ndarray, p: dict) -> np.ndarray:
+def _robust_dome_smooth(edges: np.ndarray, p: dict, vol: np.ndarray | None = None) -> np.ndarray:
     """POCKET-ROBUST anterior surface: keep the epithelial surface a SMOOTH DOME that rides gracefully OVER
     dark intra-stromal POCKETS (part of the disease variant — user directive), instead of dipping into them.
     The epithelium is a smooth continuous boundary and pockets sit BELOW it, so a local DOWNWARD excursion
     (surface deeper than the smooth dome) is the detector being pulled into a pocket — a detection error, not
-    anatomy. Iterative ONE-SIDED robust smoothing: estimate the smooth dome (gaussian over lateral+frame),
-    pull only the DEEPER-than-dome points up to it, and repeat so the dome estimate de-contaminates from the
-    dip each pass. One-sided → the APEX (shallowest) and a correctly-placed surface are strict no-ops; the
-    gentle corneal curvature means the dome estimate follows the real shape (incl. the steep limbus flank,
-    a monotonic descent) so genuine curvature is preserved. Applied UNIFORMLY (the true surface is smooth on
-    every scan, so this only removes pocket-dips + jitter, never real epithelial structure). robust_dome=False
-    disables. edges=(n_lateral, n_frames); depth 0 = top."""
+    anatomy. Iterative ONE-SIDED robust smoothing estimates the smooth dome (gaussian over lateral+frame) and
+    pulls DEEPER-than-dome points up to it (clamped by max_pull so a large-pocket gaussian can't run away and
+    flatten a steep frame-edge descent).
+
+    POCKET GATE (critical — vol given): the raw gaussian lift also fires on a HEALTHY cornea's normal
+    curvature (the gaussian trend lags the natural acquisition-edge descent), which FLATTENS a healthy
+    surface (marked as a 'curvature' defect on the healthy CS003 OD start-frames). So the lift is APPLIED
+    ONLY where the tissue just BELOW the original surface is DARK (< robust_dome_pocket_frac × the frame's
+    median sub-surface brightness) — i.e. a genuine pocket. On a healthy cornea (bright stroma everywhere
+    below the epithelium) the gate is empty → STRICT NO-OP → curvature preserved; over a dark pocket it fires
+    → the surface rides over it. vol=None (no gate) keeps the legacy uniform behaviour. robust_dome=False
+    disables. edges=(n_lateral, n_frames); vol=(n_lateral, depth, n_frames); depth 0 = top."""
     e = np.asarray(edges, dtype=np.float64)
     if e.ndim != 2:
         return edges
@@ -1488,11 +1501,7 @@ def _robust_dome_smooth(edges: np.ndarray, p: dict) -> np.ndarray:
     sig_fr = float(p.get("robust_dome_sig_frame", 5.0))
     thr = float(p.get("robust_dome_thr", 3.5))
     iters = int(p.get("robust_dome_iters", 4))
-    max_pull = float(p.get("robust_dome_max_pull", 6.0))   # CLAMP: cap the per-point lift so the gaussian's
-    #   global reach (needed to lift a large pocket) cannot RUN AWAY and flatten a real steep frame-direction
-    #   curvature (the acquisition-edge descent, frames ~91-100 — marked as a "curvature" defect on CS002 OS3
-    #   when it was uncapped: the far-frame descent was pulled up ~25px). Pocket-dips are small (≤~6px) so they
-    #   are fully corrected; a real steep descent is protected.
+    max_pull = float(p.get("robust_dome_max_pull", 6.0))
     if thr <= 0 or iters <= 0 or (sig_lat <= 0 and sig_fr <= 0):
         return edges
     e0 = e.copy()
@@ -1510,6 +1519,33 @@ def _robust_dome_smooth(edges: np.ndarray, p: dict) -> np.ndarray:
         return edges
     if max_pull > 0:                                       # clamp total displacement from the original detection
         out = np.where(valid, np.clip(out, e0 - max_pull, e0 + max_pull), e0)
+    # POCKET GATE: keep the lift ONLY where there is a dark pocket just below the original surface. On a
+    # healthy cornea this is empty → no-op (its natural curvature is preserved, not flattened).
+    if vol is not None and bool(p.get("robust_dome_pocket_gate", True)):
+        v3 = np.asarray(vol)
+        if v3.ndim == 3 and v3.shape[0] == L and v3.shape[2] == F:
+            D = v3.shape[1]
+            frac = float(p.get("robust_dome_pocket_frac", 0.72))
+            lo = int(p.get("robust_dome_below_lo", 4)); hi = int(p.get("robust_dome_below_hi", 30))
+            lifted = (e0 - out) > 0.5                       # points the dome pulled up (now shallower)
+            keep = np.zeros((L, F), dtype=bool)
+            for f in range(F):
+                idx = np.where(lifted[:, f])[0]
+                if idx.size == 0:
+                    continue
+                vf = v3[:, :, f]
+                d = np.clip(np.round(e0[:, f]).astype(int), 0, max(0, D - hi - 1))
+                below = np.array([vf[l, d[l] + lo:d[l] + hi].mean() if e0[l, f] > 1 else np.inf for l in range(L)])
+                fin = below[np.isfinite(below)]
+                if fin.size == 0:
+                    continue
+                bref = float(np.median(fin))
+                for l in idx:
+                    if below[l] < frac * bref:             # dark below → genuine pocket → keep the lift
+                        keep[l, f] = True
+            out = np.where(keep, out, e0)
+            if not keep.any():
+                return edges
     return out.astype(edges.dtype)
 
 
@@ -2275,10 +2311,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
             edges = _suppress_surface_dips_2d(edges, p)
         # POCKET-ROBUST dome (user directive: dark intra-stromal pockets are part of the disease and the
         # epithelial surface must ride smoothly OVER them, not dip in): iterative one-sided robust smoothing
-        # pulls surface points that dived DEEPER than the smooth dome (into a pocket) back up to it. Runs on
-        # the WARP surface every iterative pass; a correctly-placed surface + the apex are strict no-ops.
+        # pulls surface points that dived DEEPER than the smooth dome (into a pocket) back up to it, but ONLY
+        # where the tissue below is DARK (a genuine pocket) — so on a HEALTHY cornea it is a strict no-op and
+        # its natural curvature is preserved (the gate uses `det`, the detection volume).
         if not use_provided and bool(p.get("robust_dome", True)):
-            edges = _robust_dome_smooth(edges, p)
+            edges = _robust_dome_smooth(edges, p, vol=det)
         # FIX jagged edge B-scans (the SUCCESSOR to the retired boundary extrapolation; marked CS002 OS(2)
         # f99/100, OS(3) f0-20): the low-signal acquisition-edge frames detect the surface with cross-SLICE
         # jitter → a jagged B-scan top contour. Smooth the assembled (lateral, frame) edge ACROSS SLICES with
