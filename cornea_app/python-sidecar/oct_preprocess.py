@@ -203,7 +203,12 @@ DEFAULT_PARAMS: dict = {
     "frame_edge_nb": 10,          # first/last N frames eligible for the clamp (covers a motion-step block)
     "frame_edge_gap": 4,          # frames skipped PAST the block before the interior fit window (avoids contamination)
     "frame_edge_reach": 16,       # length of the robust deg-1 interior fit window (frames)
-    "frame_edge_dev": 3.0,        # px deadband: only clamp an edge deeper than the extrapolated trend by MORE than this
+    "frame_edge_dev": 3.0,        # px deadband: only lift an edge deeper than the extrapolated trend by MORE than this
+    "frame_edge_soft": 5.0,       # px over which the blend weight ramps 0→1 (soft gate, no hard threshold)
+    "frame_edge_lat_smooth": 12.0,   # gaussian sigma ACROSS slices on the lift field → smooth en-face/axial edge (no fuzz)
+    "frame_edge_frame_smooth": 1.2,  # gaussian sigma ALONG frames on the lift field → no wavy sagittal edge
+    "frame_edge_conf_frac": 0.5,     # do-no-harm gate: keep the lift only where surface tissue-contrast ≥ frac× the
+                                     #   frame's typical contrast → the cap never invents an edge in a no-signal region
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -2271,7 +2276,7 @@ def _disp_worker(packed):
 
 
 def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
-                      clip_cols_list, zero_cols_list, p: dict) -> np.ndarray:
+                      clip_cols_list, zero_cols_list, p: dict, vol: np.ndarray | None = None) -> np.ndarray:
     """FRAME-EDGE OVER-DESCENT CAP (v149) — the recurring "edges too downward".
 
     The per-slice flatten target is a RANSAC QUADRATIC across frames. The cornea is parabolic only over
@@ -2285,29 +2290,45 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
 
     Method (the crux is HOW the target is built): fit a robust deg-1 trend to `active` (= the INPUT/raw
     detected surface) over a window placed PAST the motion-step block (start = nb+gap, so a flat block
-    at frames 0..~7 does not contaminate the fit — the earlier bug), and EXTRAPOLATE it across the edge
+    at frames 0..~7 does not contaminate the fit — an earlier bug), and EXTRAPOLATE it across the edge
     frames → `expected`. `expected` is FLAT where the true periphery is flat (a motion-step edge → the
     over-descended output is pulled back up to the flat level, fixing the marked defect) and DESCENDS
-    where the limbus genuinely descends (→ expected ≈ the real tissue → no lift → NO upward hook). Then
-    soft-clamp the SMOOTH output `cur` one-sided: out_surface = min(cur, expected+dev). Clamping the
-    already-smooth `cur` (not the blocky `active`) keeps the result smooth; the dev deadband + the
-    per-frame gate feather the transition into the interior (where cur≈expected → no-op). Per-slice
-    NO-OP when no edge frame is over-descended → healthy/already-smooth scans + the interior untouched.
-    Clip/user-cut columns exempt. frame_edge_cap=False disables."""
+    where the limbus genuinely descends (→ expected ≈ the real tissue → no lift → NO upward hook).
+
+    SMOOTH 2-D BLEND (v149a — fixes the fuzzy en-face edge + wavy sagittal edge a hard per-column clamp
+    caused): build a blend weight w = smoothstep((over-dev)/soft) and the target `expected` for the WHOLE
+    edge block (all slices × edge frames) as 2-D fields, then GAUSSIAN-SMOOTH both across the slice
+    (lateral) axis AND lightly across the frame axis before blending out_surface = (1-w)·cur + w·expected.
+    A hard `min(cur, expected+dev)` per (slice,frame) alternated between cur and the clamp wherever cur
+    crossed the threshold → a WAVE along frames + jaggedness across slices (the en-face boundary un-smooth
+    at the very frames the cross-slice smoother had just fixed). Smoothing w+expected first makes the lift
+    a coherent field → the lifted edge is smooth in BOTH directions, while w≈0 off the over-descent keeps
+    it one-sided and a strict no-op on the interior / already-on-trend slices. Clip/user-cut cols exempt.
+    frame_edge_cap=False disables."""
     if not bool(p.get("frame_edge_cap", True)):
         return disp_field
     fe_nb = int(p.get("frame_edge_nb", 10))          # edge frames eligible for the lift (covers the block)
     gap = int(p.get("frame_edge_gap", 4))            # frames skipped past the block before the fit window
     reach = int(p.get("frame_edge_reach", 16))       # length of the interior fit window
-    dev = float(p.get("frame_edge_dev", 3.0))        # px deadband: only clamp an edge deeper than expected by > this
+    dev = float(p.get("frame_edge_dev", 3.0))        # px deadband before any lift
+    soft = float(p.get("frame_edge_soft", 5.0))      # px over which the blend weight ramps 0→1 (soft gate)
+    sig_lat = float(p.get("frame_edge_lat_smooth", 12.0))    # gaussian sigma ACROSS slices (kills en-face fuzz)
+    sig_frame = float(p.get("frame_edge_frame_smooth", 1.2)) # gaussian sigma ALONG frames (kills the sagittal wave)
     n, F = disp_field.shape[0], disp_field.shape[1]
     if fe_nb <= 0 or F < 2 * (fe_nb + gap + reach) + 4:
         return disp_field
+    A = np.asarray(active, dtype=np.float64)
     out = disp_field.astype(np.float64).copy()
+    CUR = A + out                                    # current (smooth) output surface field = flatten quad
+    exempt = np.zeros((n, F), dtype=bool)
+    for i in range(n):
+        cc = clip_cols_list[i]; zc = zero_cols_list[i]
+        if cc.size: exempt[i, cc] = True
+        if zc.size: exempt[i, zc] = True
 
     def _fit(bx, bv):
         co = np.polyfit(bx, bv, 1)
-        for _ in range(2):                            # robust: drop any residual block/outlier frames, refit
+        for _ in range(2):                           # robust: drop any residual block/outlier frames, refit
             r = bv - np.polyval(co, bx); sd = np.std(r) + 1e-6
             keep = np.abs(r) < 2.0 * sd
             if keep.sum() < 4 or keep.all():
@@ -2315,37 +2336,60 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
             co = np.polyfit(bx[keep], bv[keep], 1)
         return co
 
-    for i in range(n):
-        a = np.asarray(active[i], dtype=np.float64)
-        cur = a + out[i]                              # current (smooth) output surface = flatten quad
-        exempt = np.zeros(F, dtype=bool)
-        cc = clip_cols_list[i]; zc = zero_cols_list[i]
-        if cc.size: exempt[cc] = True
-        if zc.size: exempt[zc] = True
-        for lead in (True, False):
-            if lead:
-                idx = np.arange(0, fe_nb)
-                base = np.arange(fe_nb + gap, fe_nb + gap + reach)
-            else:
-                idx = np.arange(F - fe_nb, F)
-                base = np.arange(F - fe_nb - gap - reach, F - fe_nb - gap)
+    for lead in (True, False):
+        if lead:
+            idx = np.arange(0, fe_nb)
+            base = np.arange(fe_nb + gap, fe_nb + gap + reach)
+        else:
+            idx = np.arange(F - fe_nb, F)
+            base = np.arange(F - fe_nb - gap - reach, F - fe_nb - gap)
+        EXP = CUR[:, idx].copy()                     # default expected = cur → no change where a slice can't fit
+        W = np.zeros((n, idx.size), dtype=np.float64)
+        for i in range(n):
+            a = A[i]
             valid = (a[base] > 1.0) & np.isfinite(a[base])
             if valid.sum() < max(4, reach // 2):
                 continue
             co = _fit(base[valid].astype(np.float64), a[base][valid].astype(np.float64))
-            expected = np.polyval(co, idx.astype(np.float64))     # true-shape extrapolation across the edge
-            over = cur[idx] - expected
-            fire = (a[idx] > 1.0) & (over > dev) & (~exempt[idx])
-            if not np.any(fire):                                  # edge already on-trend → strict no-op
-                continue
-            newsurf = np.minimum(cur[idx], expected + dev)        # one-sided soft clamp toward the true shape
-            for j, f in enumerate(idx):
-                if fire[j]:
-                    out[i, f] = newsurf[j] - a[f]                 # disp that lands the surface at the clamp
-        if cc.size:
-            out[i][cc] = np.maximum(out[i][cc], 0.0)
-        if zc.size:
-            out[i][zc] = disp_field[i][zc]
+            ex = np.polyval(co, idx.astype(np.float64))
+            EXP[i] = ex
+            over = CUR[i, idx] - ex
+            w = np.clip((over - dev) / max(soft, 1e-3), 0.0, 1.0)
+            w[(a[idx] <= 1.0) | exempt[i, idx]] = 0.0
+            W[i] = w
+        # DO-NO-HARM CONFIDENCE GATE (v150): at the extreme edge frames the surface signal is often
+        # near-absent (the scan ran off the cornea into noise), so `active` floats in air there; lifting
+        # THAT toward the interior trend manufactures a spike hanging in the dark (seen on approved OD1/
+        # CS002 OS3 frame-0). Gate the lift by the tissue CONTRAST at the current surface (bright below −
+        # dark above): keep the lift only where there is a real boundary, ramp it to 0 where the surface is
+        # unreliable → the cap never invents an edge in a no-signal region (it leaves the pre-existing fuzz
+        # rather than adding a new artifact). Reference is the per-edge-frame high-contrast level across
+        # laterals, so a frame that is mostly real tissue gates out only its floating outliers.
+        if vol is not None and idx.size:
+            D = vol.shape[1]
+            conf = np.zeros((n, idx.size), dtype=np.float64)
+            for i in range(n):
+                r = np.clip(np.round(A[i, idx]).astype(int), 6, D - 7)
+                colv = vol[i]
+                below = np.mean([colv[r + j, idx] for j in range(1, 7)], axis=0)
+                above = np.mean([colv[r - j, idx] for j in range(1, 7)], axis=0)
+                conf[i] = below - above
+            ref = np.maximum(np.percentile(conf, 60, axis=0), 1e-3)     # typical real-tissue contrast per frame
+            frac = float(p.get("frame_edge_conf_frac", 0.5))
+            gate = np.clip(conf / (frac * ref), 0.0, 1.0)               # →0 where no tissue under the surface
+            W = W * gate
+        # SMOOTH the weight + target as 2-D fields so the lift is coherent (no en-face fuzz / sagittal wave)
+        EXP = ndimage.gaussian_filter(EXP, sigma=(sig_lat, sig_frame), mode="nearest")
+        W = ndimage.gaussian_filter(W, sigma=(sig_lat, sig_frame), mode="nearest")
+        newsurf = (1.0 - W) * CUR[:, idx] + W * EXP
+        newsurf = np.minimum(newsurf, CUR[:, idx])   # strictly one-sided (lift only, never push deeper)
+        for k, f in enumerate(idx):
+            col = ~exempt[:, f]
+            out[col, f] = newsurf[col, k] - A[col, f]
+    for i in range(n):                               # re-assert tissue-preservation clamps
+        cc = clip_cols_list[i]; zc = zero_cols_list[i]
+        if cc.size: out[i][cc] = np.maximum(disp_field[i][cc], 0.0)
+        if zc.size: out[i][zc] = disp_field[i][zc]
     return out
 
 
@@ -2688,7 +2732,7 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     #     over-descended edge back to the interior trend, one-sided (never pushes down → cannot recreate the
     #     retired parabola_edge margin shelf), gated + feathered (a slice already on-trend is a strict no-op).
     if not use_provided:
-        disp_field = _cap_edge_descent(disp_field, active, clip_cols_list, zero_cols_list, p)
+        disp_field = _cap_edge_descent(disp_field, active, clip_cols_list, zero_cols_list, p, vol=det)
     # 4) warp each slice by its guarded+smoothed displacement, then revert. sub-pixel (subpixel_warp) removes the
     #    int-truncate lateral staircase in the flattened anterior boundary (the "ripples" seen at zoom).
     _subpx = bool(p.get("subpixel_warp", False))
