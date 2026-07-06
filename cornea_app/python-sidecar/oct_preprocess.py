@@ -193,6 +193,17 @@ DEFAULT_PARAMS: dict = {
     "parabola_edge": False,
     "parabola_edge_nb": 4,        # frames at EACH end snapped to the interior parabola
     "parabola_edge_deg": 2,       # 2 = parabola (the corneal cross-section model)
+    # ── FRAME-EDGE OVER-DESCENT CAP (v149) ── the flatten quadratic over-descends the acquisition-edge frames
+    # (~10-28px deeper than the true interior level; the cornea flattens at the limbus + a frame-0 inter-frame
+    # MOTION STEP). Fit a robust deg-1 trend to the RAW interior PAST the motion-step block, extrapolate across
+    # the edge, and one-sided soft-clamp the output to it (min(cur, expected+dev)): FLAT edge → lifted back up
+    # (fixes it); genuinely DESCENDING limbus → expected descends with it → no-op (no upward hook). Per-slice
+    # no-op when the edge is already on-trend. False disables.
+    "frame_edge_cap": True,
+    "frame_edge_nb": 10,          # first/last N frames eligible for the clamp (covers a motion-step block)
+    "frame_edge_gap": 4,          # frames skipped PAST the block before the interior fit window (avoids contamination)
+    "frame_edge_reach": 16,       # length of the robust deg-1 interior fit window (frames)
+    "frame_edge_dev": 3.0,        # px deadband: only clamp an edge deeper than the extrapolated trend by MORE than this
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -2259,6 +2270,85 @@ def _disp_worker(packed):
                                clip_cols=clip_cols, clip_fit=clip_fit, zero_cols=zero_cols)
 
 
+def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
+                      clip_cols_list, zero_cols_list, p: dict) -> np.ndarray:
+    """FRAME-EDGE OVER-DESCENT CAP (v149) — the recurring "edges too downward".
+
+    The per-slice flatten target is a RANSAC QUADRATIC across frames. The cornea is parabolic only over
+    the reliable interior; toward the acquisition edge the surface FLATTENS (limbus) and, worse, the
+    first frames often carry an inter-frame MOTION STEP (a flat block acquired at a different axial eye
+    position). The quadratic extrapolates the dome descent and pushes the output surface of those edge
+    frames ~10-25px DEEPER than the true interior level (measured CS003 OD: raw frame-0 sits on-trend,
+    but the warped output is +10..+28px). This is NOT the retired parabola_edge shelf (that pushed edges
+    DOWN onto an over-descending parabola); here we only LIFT an over-descended edge back to the
+    interior, one-sided, so it can never manufacture a downward step or an upward hook.
+
+    Method (the crux is HOW the target is built): fit a robust deg-1 trend to `active` (= the INPUT/raw
+    detected surface) over a window placed PAST the motion-step block (start = nb+gap, so a flat block
+    at frames 0..~7 does not contaminate the fit — the earlier bug), and EXTRAPOLATE it across the edge
+    frames → `expected`. `expected` is FLAT where the true periphery is flat (a motion-step edge → the
+    over-descended output is pulled back up to the flat level, fixing the marked defect) and DESCENDS
+    where the limbus genuinely descends (→ expected ≈ the real tissue → no lift → NO upward hook). Then
+    soft-clamp the SMOOTH output `cur` one-sided: out_surface = min(cur, expected+dev). Clamping the
+    already-smooth `cur` (not the blocky `active`) keeps the result smooth; the dev deadband + the
+    per-frame gate feather the transition into the interior (where cur≈expected → no-op). Per-slice
+    NO-OP when no edge frame is over-descended → healthy/already-smooth scans + the interior untouched.
+    Clip/user-cut columns exempt. frame_edge_cap=False disables."""
+    if not bool(p.get("frame_edge_cap", True)):
+        return disp_field
+    fe_nb = int(p.get("frame_edge_nb", 10))          # edge frames eligible for the lift (covers the block)
+    gap = int(p.get("frame_edge_gap", 4))            # frames skipped past the block before the fit window
+    reach = int(p.get("frame_edge_reach", 16))       # length of the interior fit window
+    dev = float(p.get("frame_edge_dev", 3.0))        # px deadband: only clamp an edge deeper than expected by > this
+    n, F = disp_field.shape[0], disp_field.shape[1]
+    if fe_nb <= 0 or F < 2 * (fe_nb + gap + reach) + 4:
+        return disp_field
+    out = disp_field.astype(np.float64).copy()
+
+    def _fit(bx, bv):
+        co = np.polyfit(bx, bv, 1)
+        for _ in range(2):                            # robust: drop any residual block/outlier frames, refit
+            r = bv - np.polyval(co, bx); sd = np.std(r) + 1e-6
+            keep = np.abs(r) < 2.0 * sd
+            if keep.sum() < 4 or keep.all():
+                break
+            co = np.polyfit(bx[keep], bv[keep], 1)
+        return co
+
+    for i in range(n):
+        a = np.asarray(active[i], dtype=np.float64)
+        cur = a + out[i]                              # current (smooth) output surface = flatten quad
+        exempt = np.zeros(F, dtype=bool)
+        cc = clip_cols_list[i]; zc = zero_cols_list[i]
+        if cc.size: exempt[cc] = True
+        if zc.size: exempt[zc] = True
+        for lead in (True, False):
+            if lead:
+                idx = np.arange(0, fe_nb)
+                base = np.arange(fe_nb + gap, fe_nb + gap + reach)
+            else:
+                idx = np.arange(F - fe_nb, F)
+                base = np.arange(F - fe_nb - gap - reach, F - fe_nb - gap)
+            valid = (a[base] > 1.0) & np.isfinite(a[base])
+            if valid.sum() < max(4, reach // 2):
+                continue
+            co = _fit(base[valid].astype(np.float64), a[base][valid].astype(np.float64))
+            expected = np.polyval(co, idx.astype(np.float64))     # true-shape extrapolation across the edge
+            over = cur[idx] - expected
+            fire = (a[idx] > 1.0) & (over > dev) & (~exempt[idx])
+            if not np.any(fire):                                  # edge already on-trend → strict no-op
+                continue
+            newsurf = np.minimum(cur[idx], expected + dev)        # one-sided soft clamp toward the true shape
+            for j, f in enumerate(idx):
+                if fire[j]:
+                    out[i, f] = newsurf[j] - a[f]                 # disp that lands the surface at the clamp
+        if cc.size:
+            out[i][cc] = np.maximum(out[i][cc], 0.0)
+        if zc.size:
+            out[i][zc] = disp_field[i][zc]
+    return out
+
+
 def _axial_roughness(edges: np.ndarray) -> float:
     """Mean |first-difference of the detected corneal boundary ACROSS sagittal slices| (axis 0) — i.e.
     how jagged the en-face / AXIAL boundary is. Per-slice correction is independent, so inconsistent
@@ -2592,6 +2682,13 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
                 zc = zero_cols_list[i]
                 if zc.size:
                     disp_field[i][zc] = 0.0
+    # 3d) FRAME-EDGE OVER-DESCENT CAP (#edgecap, v149): the flatten quadratic extrapolates the dome parabola and
+    #     pushes the first/last acquisition-edge frames ~10px DEEPER than the reliable interior trend (the cornea
+    #     flattens at the limbus, it is not a parabola there) — the user's recurring "edges too downward". LIFT an
+    #     over-descended edge back to the interior trend, one-sided (never pushes down → cannot recreate the
+    #     retired parabola_edge margin shelf), gated + feathered (a slice already on-trend is a strict no-op).
+    if not use_provided:
+        disp_field = _cap_edge_descent(disp_field, active, clip_cols_list, zero_cols_list, p)
     # 4) warp each slice by its guarded+smoothed displacement, then revert. sub-pixel (subpixel_warp) removes the
     #    int-truncate lateral staircase in the flattened anterior boundary (the "ripples" seen at zoom).
     _subpx = bool(p.get("subpixel_warp", False))
