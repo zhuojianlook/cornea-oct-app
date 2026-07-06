@@ -213,11 +213,13 @@ DEFAULT_PARAMS: dict = {
                                      #   the frame_edge_max_shift clamp is the real safety net against no-signal columns
     "frame_edge_max_shift": 15.0,    # px: hard cap on the per-column surface shift (de-bump + rawcap) → a floating
                                      #   no-tissue column can never shove tissue out of frame (black bands); gate stays relaxed
-    "frame_edge_rawcap": True,       # POST-HOC cap of the frame-edge over-descent to the pre-flatten REFERENCE boundary
-                                     #   shape + margin (fixes the "very steep curvature near the ends": the flatten quad
-                                     #   extrapolates the dome past the real limbus plateau → output plunges deeper than the
-                                     #   tissue). Runs ONCE on the final volume (frame_edge_overdescent_cap), NOT per-iteration
-                                     #   (that leaks into the interior). One-sided DOWN→UP so it never manufactures a hook
+    "frame_edge_rawcap": False,      # RETIRED v0.0.156 (was the v0.0.155 "very steep curvature near the ends" fix). The
+                                     #   post-hoc over-descent cap DEGRADED approved scans: lifting the last ~10 frames toward a
+                                     #   less-steep target FLATTENED the natural smooth trailing descent AND injected a KINK/step
+                                     #   at the cap's engagement boundary (~frame 90) — the SAME boundary-step failure that
+                                     #   retired parabola_edge (⑯). Verified on the actual app previews (rep1 trailing, v154 smooth
+                                     #   vs v155 kinked). The steep peripheral descent is REAL smooth tissue; do not lift it.
+                                     #   Kept the code (frame_edge_overdescent_cap) but default OFF so it never runs.
     "frame_edge_rawcap_nb": 16,      # first/last N frames the over-descent cap covers (spans the limbus plateau zone)
     "frame_edge_rawcap_gap": 4,      # frames skipped past the edge band before the clean-interior anchor window
     "frame_edge_rawcap_margin": 3.0, # px: how far above the reference the lifted edge lands (small residual deadband)
