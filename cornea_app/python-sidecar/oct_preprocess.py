@@ -227,6 +227,18 @@ DEFAULT_PARAMS: dict = {
                                      #   only a steep od2-type over-plunge (large excess vs the pre-flatten reference) fires
     "frame_edge_rawcap_ramp": 6.0,   # px over which the fire gate ramps 0→1 (soft, so no lateral on/off jag)
     "frame_edge_rawcap_max_shift": 14.0,  # px: hard cap on the per-column lift → tissue can never be shoved out of frame
+    "frame_edge_curve_snap": False,  # CONDITIONAL edge→overall-corneal-curve snap — RETIRED default OFF (tested, not
+                                     #   shipped): the per-slice frame-direction snap toward the corneal arc barely reduces
+                                     #   the edge stair-steps (the detector re-finds them) AND re-ROUGHENS the en-face/axial
+                                     #   boundary (undoes frame_boundary_lat_smooth) — a fundamental frame-vs-lateral
+                                     #   tradeoff, same class of failure as the v155 over-descent cap. Code kept for reference
+    "frame_edge_snap_nb": 18,        # first/last N edge frames considered
+    "frame_edge_snap_thresh": 4.0,   # px: minimum deviation from the curve to start correcting (defines "obviously")
+    "frame_edge_snap_soft": 3.0,     # px over which the correction gate ramps 0→1
+    "frame_edge_snap_max_shift": 18.0,   # px: hard cap on the per-column snap shift
+    "frame_edge_snap_deg": 3,        # degree of the robust overall-corneal-curve polynomial fit
+    "frame_edge_snap_lat_med": 9,    # lateral median window on the deviation (kills isolated per-slice spikes)
+    "frame_edge_snap_conf_frac": 0.20,   # tissue-contrast gate: skip columns that ran off the cornea (no reliable curve)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -289,9 +301,14 @@ DEFAULT_PARAMS: dict = {
     # ── FRAME-BOUNDARY lateral smoothing ── the first/last B-scans (acquisition edge) are low-signal, so their
     # anterior detection is jagged laterally and axial_consistency's gate skips them. Force lateral consistency on
     # just those `fbls_nb` edge frames (wide median + gaussian). No-op elsewhere → interior/approved scans unchanged.
-    "frame_boundary_smooth": False,  # DEFAULT OFF: warping to a smoothed edge can't beat the ~3-4px detection-noise
-                                  #   floor at the LOW-SIGNAL acquisition-edge frames (the raw border is smooth but
-                                  #   fuzzy — half the mid-frame contrast); only marginal in testing. Kept for reuse.
+    "frame_boundary_smooth": True,   # v0.0.157 DEFAULT ON (user-requested): the START/END acquisition-edge frames
+                                  #   (first/last fbls_nb) carry a WAVY corneal top edge — the low-signal per-lateral
+                                  #   detection jitters, so the warped band doesn't align to a smooth corneal curve
+                                  #   ("poor alignment of corneal edge to curve at the start/ends of axial slices").
+                                  #   frame_boundary_lat_smooth aligns those edge frames to a wide-median+gaussian
+                                  #   lateral arc → cleaner en-face edge. Verified: edge-frame lateral roughness DROPS
+                                  #   (rep1 0.75→0.64, rep3 1.16→0.70) — improves BOTH marked and approved scans; local
+                                  #   to the edge frames (interior untouched). Earlier default-off was too conservative.
     "fbls_nb": 4,                 # number of frames at EACH end to lateral-smooth (feathered toward the interior)
     "fbls_med": 31,               # lateral median window (px) — wide enough to erase the low-signal jag
     "fbls_gauss": 12.0,           # lateral gaussian on the smooth target (clean curve)
@@ -3201,6 +3218,93 @@ def frame_edge_overdescent_cap(volume: np.ndarray, ref_surface: np.ndarray | Non
     return out, {"applied": bool(nadj), "frames_adjusted": nadj}
 
 
+def frame_edge_curve_snap(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """POST-HOC CONDITIONAL frame-edge correction to the OVERALL corneal curve (v0.0.157).
+
+    User's criterion (verbatim): "it should be conditional — if the edges are obviously deviating from the
+    overall corneal curve it should be corrected"; and a real cornea's curvature gradient near the end has
+    "very few if any cases where it does a change in direction … (physically unlikely)". So: the acquisition-
+    edge frames sometimes carry stair-steps / gradient-direction REVERSALS where the detected border departs
+    from the smooth convex corneal arc — physically implausible; correct THOSE toward the arc, and ONLY those.
+
+    Per slice, fit a robust smooth OVERALL corneal curve (deg-3 poly, iterative 2σ outlier reject → the fit
+    represents the reliable cornea and the deviating steps are the rejected outliers; verified stable, no edge
+    blow-up because the fit is dominated by the smooth interior). In the first/last `nb` edge frames, measure
+    the signed deviation dev = surface − curve; SOFT-GATE by |dev| so a small (on-curve) deviation is a strict
+    NO-OP (an approved scan whose edges follow the curve is unchanged — verified near-no-op on CS003 OD rep1);
+    where it OBVIOUSLY deviates, warp the column toward the curve (two-sided: an edge bumping ABOVE or plunging
+    BELOW the arc is pulled back). A raised-cosine DISTANCE feather takes the correction to 0 at the interior
+    boundary of the edge band, and the deviation itself is ~0 there, so the correction can NEVER create a
+    boundary step/kink (the failure that retired parabola_edge ⑯ and the v155 cap ⑲ — a kink is itself a
+    gradient reversal). A light lateral MEDIAN on the deviation kills isolated per-slice spikes so the snapped
+    en-face boundary stays coherent. Only edge frames are warped → interior untouched by construction. A
+    tissue-contrast gate skips columns where the scan ran off the cornea (no reliable curve there). Returns
+    (volume, info). frame_edge_curve_snap=False disables."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("frame_edge_curve_snap", True)):
+        return volume, {"applied": False, "frames_adjusted": 0}
+    if workers is None:
+        workers = auto_workers()
+    nb = int(p.get("frame_edge_snap_nb", 18) or 0)
+    thresh = float(p.get("frame_edge_snap_thresh", 4.0))     # px: only correct deviations OBVIOUSLY off the curve
+    soft = float(p.get("frame_edge_snap_soft", 3.0))         # px over which the gate ramps 0→1
+    maxsh = float(p.get("frame_edge_snap_max_shift", 18.0))
+    deg = int(p.get("frame_edge_snap_deg", 3))
+    med_lat = int(p.get("frame_edge_snap_lat_med", 9))
+    conf_frac = float(p.get("frame_edge_snap_conf_frac", 0.20))
+    S = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lat, frames)
+    L, F = S.shape; depth = int(volume.shape[1])
+    if nb <= 0 or F < 2 * nb + 8:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    x = np.arange(F)
+    eidx = np.r_[np.arange(0, nb), np.arange(F - nb, F)]
+    wf = np.zeros(F)                                          # raised-cosine distance feather: 1 at edge → 0 at nb
+    for f in range(nb):
+        wf[f] = 0.5 * (1.0 + np.cos(np.pi * f / nb))
+    for f in range(F - nb, F):
+        wf[f] = 0.5 * (1.0 + np.cos(np.pi * (F - 1 - f) / nb))
+    dev = np.zeros((L, F)); valid = np.zeros((L, F), dtype=bool)
+    for i in range(L):
+        s = S[i].astype(np.float64); m = (s > 1.0) & np.isfinite(s)
+        if int(m.sum()) < deg + 4:
+            continue
+        c = np.polyfit(x[m], s[m], deg)
+        for _ in range(4):                                   # robust: drop the deviating (outlier) frames, refit
+            r = s - np.polyval(c, x); sd = np.std(r[m]) + 1e-6
+            k = m & (np.abs(r) < 2.0 * sd)
+            if int(k.sum()) < deg + 4 or int(k.sum()) == int(m.sum()):
+                break
+            c = np.polyfit(x[k], s[k], deg)
+        C = np.polyval(c, x)
+        for f in eidx:
+            if m[f]:
+                dev[i, f] = s[f] - C[f]; valid[i, f] = True
+    dsm = dev.copy()                                         # light lateral median → kill isolated spikes, keep per-slice
+    dsm[:, eidx] = ndimage.median_filter(dev[:, eidx], size=(max(1, med_lat), 1), mode="nearest")
+    w = np.clip((np.abs(dsm) - thresh) / max(1e-3, soft), 0.0, 1.0)
+    shift = np.clip(-dsm * w * wf[None, :], -maxsh, maxsh)
+    shift[~valid] = 0.0
+    # do-no-harm tissue gate: skip columns where there is no real boundary contrast (scan ran off the cornea)
+    for f in eidx:
+        col = shift[:, f]
+        act = np.nonzero(col != 0.0)[0]
+        if act.size == 0:
+            continue
+        r = np.clip(np.round(S[act, f]).astype(int), 6, depth - 7)
+        bscan = volume[f]                                     # (depth, lateral)
+        below = np.mean([bscan[np.clip(r + j, 0, depth - 1), act] for j in range(1, 7)], axis=0)
+        above = np.mean([bscan[np.clip(r - j, 0, depth - 1), act] for j in range(1, 7)], axis=0)
+        ref = max(float(np.percentile(below - above, 60)), 1e-3)
+        gate = np.clip((below - above) / (conf_frac * ref), 0.0, 1.0)
+        shift[act, f] = col[act] * gate
+    out = volume.copy(); nadj = 0
+    for f in eidx:
+        if np.any(shift[:, f] != 0.0):
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), shift[:, f], subpixel=True)
+            nadj += 1
+    return out, {"applied": bool(nadj), "frames_adjusted": int(nadj)}
+
+
 def surface_refine_2d(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """FINAL robust 2-D surface refinement (# FIX column-level edge errors). The anterior surface, detected as
     S(lateral, frame), is a SMOOTH 2-D dome. Bad edge detection leaves LOCAL PATCHES where the surface locks a
@@ -3791,13 +3895,19 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("frame_boundary_smooth", True):
         corrected, fbs = frame_boundary_lat_smooth(corrected, params, workers=workers)
         info["frame_boundary_smooth"] = fbs
-    # FIX the "very steep curvature near the ends": POST-HOC frame-direction over-descent cap. The flatten quad
-    # over-extrapolates the dome at the acquisition edge and plunges the last/first frames deeper than the real
-    # tissue; lift them back toward the pre-flatten reference boundary's own descent + margin. Local to the edge
-    # frames (no interior cascade) and one-sided → strict no-op on scans with no over-descent, never a hook.
-    if p_all.get("frame_edge_rawcap", True):
+    # FIX the "very steep curvature near the ends": POST-HOC frame-direction over-descent cap. RETIRED default
+    # OFF (v0.0.156) — it flattened the real smooth descent + injected a boundary kink; superseded by the
+    # conditional curve-snap below. Kept behind frame_edge_rawcap (default False) for reference only.
+    if p_all.get("frame_edge_rawcap", False):
         corrected, foc = frame_edge_overdescent_cap(corrected, _rawcap_ref, params, workers=workers)
         info["frame_edge_overdescent_cap"] = foc
+    # CONDITIONAL edge→overall-corneal-curve snap (v0.0.157): only where the acquisition-edge border OBVIOUSLY
+    # deviates from the smooth corneal arc (stair-steps / physically-implausible gradient-direction reversals),
+    # pull it onto the arc. Deviation-gated + distance-feathered → a strict no-op on on-curve (approved) edges,
+    # and structurally cannot create a boundary kink. Local to the edge frames (interior untouched).
+    if p_all.get("frame_edge_curve_snap", True):
+        corrected, fcs = frame_edge_curve_snap(corrected, params, workers=workers)
+        info["frame_edge_curve_snap"] = fcs
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")
