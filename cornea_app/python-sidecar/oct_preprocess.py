@@ -1498,10 +1498,14 @@ def _parabola_edge_constrain(edges: np.ndarray, p: dict) -> np.ndarray:
     L, F = e.shape
     nb = int(p.get("parabola_edge_nb", 4))
     deg = int(p.get("parabola_edge_deg", 2))
+    margin = int(p.get("parabola_edge_margin", 14))        # how far in from each end the motion artifact can reach
+    snap_dev = float(p.get("parabola_edge_snap_dev", 5.0)) # a near-edge frame deviating > this from the parabola
+    #   is a motion artifact → snap it too (the artifact often extends inward past the very edge frames, else the
+    #   un-snapped inner artifact frames leave a DISCONTINUITY/step where the snapped edge rejoins them)
     if nb <= 0 or F < 2 * nb + 8 or L < 4:
         return edges
-    fint = np.arange(nb, F - nb)
-    edge_frames = list(range(nb)) + list(range(F - nb, F))
+    # fit the parabola to the RELIABLE interior only (exclude both edge margins so the artifact can't bias it)
+    fint = np.arange(margin, F - margin) if F - 2 * margin >= deg + 8 else np.arange(nb, F - nb)
     out = e.copy()
     changed = False
     for l in range(L):
@@ -1523,9 +1527,12 @@ def _parabola_edge_constrain(edges: np.ndarray, p: dict) -> np.ndarray:
                 co = np.polyfit(xx, yy, deg)
         except Exception:
             continue
-        for f in edge_frames:
-            if vld[f]:
-                out[l, f] = np.polyval(co, f)
+        for f in list(range(margin)) + list(range(F - margin, F)):
+            if not vld[f]:
+                continue
+            para = np.polyval(co, f)
+            if f < nb or f >= F - nb or abs(a[f] - para) > snap_dev:   # very edge, OR a near-edge artifact
+                out[l, f] = para
                 changed = True
     return out.astype(edges.dtype) if changed else edges
 
