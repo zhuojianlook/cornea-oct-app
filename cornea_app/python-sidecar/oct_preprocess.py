@@ -309,9 +309,9 @@ DEFAULT_PARAMS: dict = {
                                   #   lateral arc → cleaner en-face edge. Verified: edge-frame lateral roughness DROPS
                                   #   (rep1 0.75→0.64, rep3 1.16→0.70) — improves BOTH marked and approved scans; local
                                   #   to the edge frames (interior untouched). Earlier default-off was too conservative.
-    "fbls_nb": 4,                 # number of frames at EACH end to lateral-smooth (feathered toward the interior)
-    "fbls_med": 31,               # lateral median window (px) — wide enough to erase the low-signal jag
-    "fbls_gauss": 12.0,           # lateral gaussian on the smooth target (clean curve)
+    "fbls_nb": 8,                 # number of frames at EACH end to lateral-smooth (feathered toward the interior)
+    "fbls_med": 41,               # lateral median window (px) — wide enough to erase the low-signal jag
+    "fbls_gauss": 16.0,           # lateral gaussian on the smooth target (clean curve)
     "fbls_max_shift": 16.0,       # cap the per-column correction (px)
     "fbls_min_coverage": 0.4,     # skip an edge frame with less cornea than this fraction (off-eye guard)
     "axcons_med_win": 15,         # lateral median-filter width (px) for the smooth target (kills spikes, keeps dome)
