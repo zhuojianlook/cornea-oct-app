@@ -180,6 +180,13 @@ DEFAULT_PARAMS: dict = {
     "robust_dome_pocket_frac": 0.72,  # below-surface brightness < frac × frame-median stroma ⇒ pocket
     "robust_dome_below_lo": 4,    # depth px below the surface where the sub-surface sampling band starts
     "robust_dome_below_hi": 30,   # depth px below the surface where it ends
+    # ── EDGE PARABOLA CONSTRAINT ── the first/last acquisition-edge frames carry a MOTION ARTIFACT that
+    # steepens the surface off the cornea's overall shape (user directive). Snap those edge frames to a robust
+    # per-slice PARABOLA fit of the reliable interior (corneal cross-section is parabolic, interior fit residual
+    # ~1px) so the corrected cornea never has steep edges deviating from the overall parabola. False disables.
+    "parabola_edge": True,
+    "parabola_edge_nb": 4,        # frames at EACH end snapped to the interior parabola
+    "parabola_edge_deg": 2,       # 2 = parabola (the corneal cross-section model)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -1471,7 +1478,56 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
         out = _robust_dome_smooth(out, p, vol=sag)          # sag=(lat,depth,frames) → pocket-darkness gate
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
+    if bool(p.get("parabola_edge", True)):
+        out = _parabola_edge_constrain(out, p)
     return out
+
+
+def _parabola_edge_constrain(edges: np.ndarray, p: dict) -> np.ndarray:
+    """EDGE MOTION-ARTIFACT correction (user directive): the first/last few acquisition-edge frames carry a
+    MOTION ARTIFACT that steepens the detected surface so it no longer matches the cornea's overall shape.
+    Snap those edge frames to a ROBUST per-slice PARABOLA fit of the RELIABLE interior — so the corrected
+    cornea never has steep edges that deviate from the overall parabola. The corneal cross-section (depth vs
+    frame) is parabolic (measured interior fit residual ~1px), so this is a well-posed, gentle correction that
+    only touches the `parabola_edge_nb` edge frames at each end; the interior is untouched. Iterative outlier
+    rejection keeps the fit itself immune to the very motion artifacts it is correcting. parabola_edge=False
+    disables. edges=(n_lateral, n_frames)."""
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2:
+        return edges
+    L, F = e.shape
+    nb = int(p.get("parabola_edge_nb", 4))
+    deg = int(p.get("parabola_edge_deg", 2))
+    if nb <= 0 or F < 2 * nb + 8 or L < 4:
+        return edges
+    fint = np.arange(nb, F - nb)
+    edge_frames = list(range(nb)) + list(range(F - nb, F))
+    out = e.copy()
+    changed = False
+    for l in range(L):
+        a = e[l]
+        vld = a > 1.0
+        ff = fint[vld[fint]]
+        if ff.size < deg + 6:
+            continue
+        xx = ff.astype(np.float64); yy = a[ff].astype(np.float64)
+        try:
+            co = np.polyfit(xx, yy, deg)
+            for _ in range(3):                             # robust: drop motion outliers, refit
+                r = yy - np.polyval(co, xx)
+                sd = np.std(r) + 1e-6
+                keep = np.abs(r) < 2.5 * sd
+                if keep.sum() < deg + 6 or keep.all():
+                    break
+                xx, yy = xx[keep], yy[keep]
+                co = np.polyfit(xx, yy, deg)
+        except Exception:
+            continue
+        for f in edge_frames:
+            if vld[f]:
+                out[l, f] = np.polyval(co, f)
+                changed = True
+    return out.astype(edges.dtype) if changed else edges
 
 
 def _robust_dome_smooth(edges: np.ndarray, p: dict, vol: np.ndarray | None = None) -> np.ndarray:
@@ -2324,6 +2380,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # filled/warped later pass the surface is already flat (high confidence) → near-no-op there too.
         if not use_provided and bool(p.get("lat_conf_smooth", True)):
             edges = _lateral_smooth_by_confidence(edges, det, p)
+        # EDGE MOTION-ARTIFACT correction (user directive): snap the first/last few acquisition-edge frames to
+        # a robust per-slice PARABOLA of the reliable interior, so the corrected cornea has no steep edges that
+        # deviate from the overall parabola. Runs on the WARP surface; interior untouched.
+        if not use_provided and bool(p.get("parabola_edge", True)):
+            edges = _parabola_edge_constrain(edges, p)
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
