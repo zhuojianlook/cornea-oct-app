@@ -180,11 +180,17 @@ DEFAULT_PARAMS: dict = {
     "robust_dome_pocket_frac": 0.72,  # below-surface brightness < frac × frame-median stroma ⇒ pocket
     "robust_dome_below_lo": 4,    # depth px below the surface where the sub-surface sampling band starts
     "robust_dome_below_hi": 30,   # depth px below the surface where it ends
-    # ── EDGE PARABOLA CONSTRAINT ── the first/last acquisition-edge frames carry a MOTION ARTIFACT that
-    # steepens the surface off the cornea's overall shape (user directive). Snap those edge frames to a robust
-    # per-slice PARABOLA fit of the reliable interior (corneal cross-section is parabolic, interior fit residual
-    # ~1px) so the corrected cornea never has steep edges deviating from the overall parabola. False disables.
-    "parabola_edge": True,
+    # ── EDGE PARABOLA CONSTRAINT (DISABLED by default — v148) ── the INTENT was to snap the first/last
+    # acquisition-edge frames to a robust per-slice PARABOLA of the reliable interior, so a motion artifact at
+    # the acquisition edge could not leave a steep edge off the overall shape (user directive). In practice this
+    # BACKFIRED: the cornea FLATTENS toward the limbus and is NOT a true parabola out there, so the interior-fit
+    # parabola OVER-descends at the periphery. Hard-snapping the outer frames to that over-descending parabola
+    # (while the frames just inside the margin stayed on the true, flatter surface) INJECTED a ~10px downward
+    # STEP/V-notch right at the margin boundary (~frame 87) — the exact "steep edge" it was meant to remove
+    # (measured CS003 OD1: right-flank step 9.5px ON → 2.2px OFF; visually a clean smooth descent OFF). The raw
+    # detection already tracks the limbus flattening smoothly, so the correct behaviour is to leave it alone.
+    # Kept as an opt-in param (default False) — no approved scan uses it (added v145, CS002 OS approved at v132).
+    "parabola_edge": False,
     "parabola_edge_nb": 4,        # frames at EACH end snapped to the interior parabola
     "parabola_edge_deg": 2,       # 2 = parabola (the corneal cross-section model)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
@@ -2392,10 +2398,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # filled/warped later pass the surface is already flat (high confidence) → near-no-op there too.
         if not use_provided and bool(p.get("lat_conf_smooth", True)):
             edges = _lateral_smooth_by_confidence(edges, det, p)
-        # EDGE MOTION-ARTIFACT correction (user directive): snap the first/last few acquisition-edge frames to
-        # a robust per-slice PARABOLA of the reliable interior, so the corrected cornea has no steep edges that
-        # deviate from the overall parabola. Runs on the WARP surface; interior untouched.
-        if not use_provided and bool(p.get("parabola_edge", True)):
+        # EDGE PARABOLA CONSTRAINT — DISABLED by default (v148): the interior-fit parabola over-descends at the
+        # limbus (cornea flattens there, not a true parabola), so hard-snapping the outer frames INJECTED a ~10px
+        # downward step/V-notch at the margin boundary (~frame 87) — the exact steep edge it meant to remove. The
+        # raw detection already tracks the limbus flattening smoothly. Opt-in only (default False). See DEFAULT_PARAMS.
+        if not use_provided and bool(p.get("parabola_edge", False)):
             edges = _parabola_edge_constrain(edges, p)
 
     res = float(p["residual_threshold"])
