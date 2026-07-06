@@ -1478,8 +1478,13 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
         out = _robust_dome_smooth(out, p, vol=sag)          # sag=(lat,depth,frames) → pocket-darkness gate
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
-    if bool(p.get("parabola_edge", True)):
-        out = _parabola_edge_constrain(out, p)
+    # NOTE: _parabola_edge_constrain is DELIBERATELY NOT applied here. detect_surface_all is the detection
+    # baseline used by the NOISE-CROP (detect_noise_frames), the surface-crop, the confidence scores and the
+    # fix-columns re-detect — all of which need the TRUE tissue-following surface. Snapping the edge frames to
+    # the parabola moves the surface off the faint edge tissue → its confidence collapses → the noise-crop
+    # wrongly zeroes valid cornea at the edges (CS003 OD: 25 real frames cropped). The parabola-edge motion-
+    # artifact correction is applied ONLY to the final WARP surface (smooth_volume), so the OUTPUT edges follow
+    # the parabola while the detectors still see the real tissue.
     return out
 
 
