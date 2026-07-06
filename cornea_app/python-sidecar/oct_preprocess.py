@@ -205,10 +205,12 @@ DEFAULT_PARAMS: dict = {
     "frame_edge_reach": 16,       # length of the robust deg-1 interior fit window (frames)
     "frame_edge_dev": 3.0,        # px deadband: only lift an edge deeper than the extrapolated trend by MORE than this
     "frame_edge_soft": 5.0,       # px over which the blend weight ramps 0→1 (soft gate, no hard threshold)
-    "frame_edge_lat_smooth": 12.0,   # gaussian sigma ACROSS slices on the lift field → smooth en-face/axial edge (no fuzz)
-    "frame_edge_frame_smooth": 1.2,  # gaussian sigma ALONG frames on the lift field → no wavy sagittal edge
-    "frame_edge_conf_frac": 0.5,     # do-no-harm gate: keep the lift only where surface tissue-contrast ≥ frac× the
-                                     #   frame's typical contrast → the cap never invents an edge in a no-signal region
+    "frame_edge_lat_med": 9,         # lateral MEDIAN window on the edge boundary → rejects narrow warp spikes before smoothing
+    "frame_edge_lat_smooth": 25.0,   # gaussian sigma ACROSS slices on the lift field → smooth en-face/axial edge (no fuzz)
+    "frame_edge_frame_smooth": 2.0,  # gaussian sigma ALONG frames on the lift field → no wavy sagittal edge
+    "frame_edge_conf_frac": 0.15,    # do-no-harm gate: only DISABLE the de-bump where tissue-contrast < frac× the
+                                     #   frame's typical contrast (truly no tissue) → keeps smoothing the dim-but-real
+                                     #   edge frames (a higher frac wrongly skipped them → boundary stayed jagged)
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -2343,20 +2345,30 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
         else:
             idx = np.arange(F - fe_nb, F)
             base = np.arange(F - fe_nb - gap - reach, F - fe_nb - gap)
-        EXP = CUR[:, idx].copy()                     # default expected = cur → no change where a slice can't fit
-        W = np.zeros((n, idx.size), dtype=np.float64)
+        EXP = CUR[:, idx].copy()                     # per-lateral expected = interior linear extrapolation
+        fit_ok = np.zeros(n, dtype=bool)
         for i in range(n):
             a = A[i]
             valid = (a[base] > 1.0) & np.isfinite(a[base])
             if valid.sum() < max(4, reach // 2):
                 continue
             co = _fit(base[valid].astype(np.float64), a[base][valid].astype(np.float64))
-            ex = np.polyval(co, idx.astype(np.float64))
-            EXP[i] = ex
-            over = CUR[i, idx] - ex
-            w = np.clip((over - dev) / max(soft, 1e-3), 0.0, 1.0)
-            w[(a[idx] <= 1.0) | exempt[i, idx]] = 0.0
-            W[i] = w
+            EXP[i] = np.polyval(co, idx.astype(np.float64))
+            fit_ok[i] = True
+        # TWO-SIDED DISTANCE FEATHER (v151): the low-signal acquisition-edge frames carry a jittery surface
+        # in BOTH directions (up spikes + down over-descent + a frame-direction wave). A one-sided lift only
+        # removes the DOWN over-descent, leaving the up-spikes/wave → the en-face (axial) border stays spiky
+        # and the sagittal top edge stays wavy (user-reported). Instead blend the surface TOWARD the smooth
+        # interior-dome extrapolation with a raised-cosine weight = 1 at the extreme edge tapering to 0 at the
+        # nb boundary — two-sided, so up-spikes are pulled DOWN and over-descent pulled UP onto one smooth arc.
+        # `expected` is the interior extrapolation (never over-descends), and both it and the weight are
+        # gaussian-smoothed across the slice (lateral) axis below → the resulting edge is a clean arc in the
+        # axial view AND smooth along frames. Feather+gate keep it a strict no-op on the reliable interior.
+        _dist = (idx if lead else (F - 1 - idx)).astype(np.float64)
+        wf = 0.5 * (1.0 + np.cos(np.pi * np.clip(_dist / float(fe_nb), 0.0, 1.0)))   # 1 at edge → 0 at nb
+        W = np.tile(wf, (n, 1))
+        W[~fit_ok] = 0.0
+        W[(A[:, idx] <= 1.0) | exempt[:, idx]] = 0.0
         # DO-NO-HARM CONFIDENCE GATE (v150): at the extreme edge frames the surface signal is often
         # near-absent (the scan ran off the cornea into noise), so `active` floats in air there; lifting
         # THAT toward the interior trend manufactures a spike hanging in the dark (seen on approved OD1/
@@ -2378,11 +2390,21 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
             frac = float(p.get("frame_edge_conf_frac", 0.5))
             gate = np.clip(conf / (frac * ref), 0.0, 1.0)               # →0 where no tissue under the surface
             W = W * gate
-        # SMOOTH the weight + target as 2-D fields so the lift is coherent (no en-face fuzz / sagittal wave)
-        EXP = ndimage.gaussian_filter(EXP, sigma=(sig_lat, sig_frame), mode="nearest")
+        # DE-BUMP THE ANTERIOR BOUNDARY (v152 — the real fix): the warp flattens each lateral slice
+        # INDEPENDENTLY, so at the low-signal acquisition-edge frames the per-lateral shifts are jittery and
+        # the anterior boundary comes out JAGGED across lateral even though the RAW boundary is a clean smooth
+        # arc — i.e. the preprocessing DEGRADES a boundary that was smoother before (user-reported, verified
+        # raw-vs-processed). Fix: smooth the ACTUAL output boundary ACROSS LATERAL so the processed arc matches
+        # the raw's smoothness, while staying ON the tissue. `base` = the boundary after a one-sided
+        # over-descent correction (min(cur, interior-extrap+dev), per lateral); `target` = base gaussian-
+        # smoothed across the slice axis (strong) + lightly along frames → a clean smooth arc that still hugs
+        # the tissue (NOT a frame-extrapolation that could float off it). Feathered 1→0 from the extreme edge
+        # to the nb boundary and gated only where there is genuinely NO tissue, so the interior is untouched.
+        med_lat = int(p.get("frame_edge_lat_med", 9))
+        base = ndimage.median_filter(CUR[:, idx], size=(max(1, med_lat), 1), mode="nearest")  # kill narrow spikes
+        target = ndimage.gaussian_filter(base, sigma=(sig_lat, sig_frame), mode="nearest")     # then smooth the arc
         W = ndimage.gaussian_filter(W, sigma=(sig_lat, sig_frame), mode="nearest")
-        newsurf = (1.0 - W) * CUR[:, idx] + W * EXP
-        newsurf = np.minimum(newsurf, CUR[:, idx])   # strictly one-sided (lift only, never push deeper)
+        newsurf = (1.0 - W) * CUR[:, idx] + W * target
         for k, f in enumerate(idx):
             col = ~exempt[:, f]
             out[col, f] = newsurf[col, k] - A[col, f]
