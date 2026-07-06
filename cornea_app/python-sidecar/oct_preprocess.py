@@ -208,9 +208,11 @@ DEFAULT_PARAMS: dict = {
     "frame_edge_lat_med": 9,         # lateral MEDIAN window on the edge boundary → rejects narrow warp spikes before smoothing
     "frame_edge_lat_smooth": 25.0,   # gaussian sigma ACROSS slices on the lift field → smooth en-face/axial edge (no fuzz)
     "frame_edge_frame_smooth": 2.0,  # gaussian sigma ALONG frames on the lift field → no wavy sagittal edge
-    "frame_edge_conf_frac": 0.15,    # do-no-harm gate: only DISABLE the de-bump where tissue-contrast < frac× the
-                                     #   frame's typical contrast (truly no tissue) → keeps smoothing the dim-but-real
-                                     #   edge frames (a higher frac wrongly skipped them → boundary stayed jagged)
+    "frame_edge_conf_frac": 0.06,    # do-no-harm gate: ramp the de-bump to 0 where tissue-contrast < frac× the frame's
+                                     #   typical contrast. LOW now (0.06) so dim-but-real edge tissue is still smoothed;
+                                     #   the frame_edge_max_shift clamp is the real safety net against no-signal columns
+    "frame_edge_max_shift": 15.0,    # px: hard cap on the per-column de-bump shift → a floating no-tissue column can
+                                     #   never shove the tissue out of frame (black bands); lets the gate stay relaxed
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -2404,7 +2406,14 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
         base = ndimage.median_filter(CUR[:, idx], size=(max(1, med_lat), 1), mode="nearest")  # kill narrow spikes
         target = ndimage.gaussian_filter(base, sigma=(sig_lat, sig_frame), mode="nearest")     # then smooth the arc
         W = ndimage.gaussian_filter(W, sigma=(sig_lat, sig_frame), mode="nearest")
-        newsurf = (1.0 - W) * CUR[:, idx] + W * target
+        # BOUNDED de-bump: the smooth target can sit far from `cur` where the surface floats in noise (off the
+        # cornea); warping the tissue there by that full delta shoves it out of frame (BLACK BANDS — seen with
+        # the gate off). Clamp the per-column de-bump shift to ±frame_edge_max_shift so a no-signal column can
+        # never cause a catastrophic shift; this backstop lets the confidence gate be RELAXED enough to still
+        # smooth the DIM-but-real edge tissue (a too-strong gate left a residual bump on the faint side).
+        maxsh = float(p.get("frame_edge_max_shift", 15.0))
+        delta = np.clip(W * (target - CUR[:, idx]), -maxsh, maxsh)
+        newsurf = CUR[:, idx] + delta
         for k, f in enumerate(idx):
             col = ~exempt[:, f]
             out[col, f] = newsurf[col, k] - A[col, f]
