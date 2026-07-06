@@ -205,8 +205,8 @@ DEFAULT_PARAMS: dict = {
     "frame_edge_reach": 16,       # length of the robust deg-1 interior fit window (frames)
     "frame_edge_dev": 3.0,        # px deadband: only lift an edge deeper than the extrapolated trend by MORE than this
     "frame_edge_soft": 5.0,       # px over which the blend weight ramps 0→1 (soft gate, no hard threshold)
-    "frame_edge_lat_med": 9,         # lateral MEDIAN window on the edge boundary → rejects narrow warp spikes before smoothing
-    "frame_edge_lat_smooth": 25.0,   # gaussian sigma ACROSS slices on the lift field → smooth en-face/axial edge (no fuzz)
+    "frame_edge_lat_med": 15,         # lateral MEDIAN window on the edge boundary → rejects narrow warp spikes before smoothing
+    "frame_edge_lat_smooth": 40.0,   # gaussian sigma ACROSS slices on the lift field → smooth en-face/axial edge (no fuzz)
     "frame_edge_frame_smooth": 2.0,  # gaussian sigma ALONG frames on the lift field → no wavy sagittal edge
     "frame_edge_conf_frac": 0.06,    # do-no-harm gate: ramp the de-bump to 0 where tissue-contrast < frac× the frame's
                                      #   typical contrast. LOW now (0.06) so dim-but-real edge tissue is still smoothed;
