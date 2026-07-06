@@ -211,8 +211,20 @@ DEFAULT_PARAMS: dict = {
     "frame_edge_conf_frac": 0.06,    # do-no-harm gate: ramp the de-bump to 0 where tissue-contrast < frac× the frame's
                                      #   typical contrast. LOW now (0.06) so dim-but-real edge tissue is still smoothed;
                                      #   the frame_edge_max_shift clamp is the real safety net against no-signal columns
-    "frame_edge_max_shift": 15.0,    # px: hard cap on the per-column de-bump shift → a floating no-tissue column can
-                                     #   never shove the tissue out of frame (black bands); lets the gate stay relaxed
+    "frame_edge_max_shift": 15.0,    # px: hard cap on the per-column surface shift (de-bump + rawcap) → a floating
+                                     #   no-tissue column can never shove tissue out of frame (black bands); gate stays relaxed
+    "frame_edge_rawcap": True,       # POST-HOC cap of the frame-edge over-descent to the pre-flatten REFERENCE boundary
+                                     #   shape + margin (fixes the "very steep curvature near the ends": the flatten quad
+                                     #   extrapolates the dome past the real limbus plateau → output plunges deeper than the
+                                     #   tissue). Runs ONCE on the final volume (frame_edge_overdescent_cap), NOT per-iteration
+                                     #   (that leaks into the interior). One-sided DOWN→UP so it never manufactures a hook
+    "frame_edge_rawcap_nb": 16,      # first/last N frames the over-descent cap covers (spans the limbus plateau zone)
+    "frame_edge_rawcap_gap": 4,      # frames skipped past the edge band before the clean-interior anchor window
+    "frame_edge_rawcap_margin": 3.0, # px: how far above the reference the lifted edge lands (small residual deadband)
+    "frame_edge_rawcap_fire": 10.0,  # px over-descent to START acting → a gentle legit edge (small excess) is a no-op;
+                                     #   only a steep od2-type over-plunge (large excess vs the pre-flatten reference) fires
+    "frame_edge_rawcap_ramp": 6.0,   # px over which the fire gate ramps 0→1 (soft, so no lateral on/off jag)
+    "frame_edge_rawcap_max_shift": 14.0,  # px: hard cap on the per-column lift → tissue can never be shoved out of frame
     "dp_smooth_weight": 0.0,      # DP step-magnitude penalty λ (cost += λ·|step|; score∈[0,1]). 0 = hard-cap only
                                   #   (legacy). Small λ (~0.02–0.06) removes the apex/flank V-notch by discouraging
                                   #   maxj-sized hops onto deeper layers, while a real steep descent still pays off.
@@ -2379,6 +2391,7 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
         # unreliable → the cap never invents an edge in a no-signal region (it leaves the pre-existing fuzz
         # rather than adding a new artifact). Reference is the per-edge-frame high-contrast level across
         # laterals, so a frame that is mostly real tissue gates out only its floating outliers.
+        gate = np.ones((n, idx.size), dtype=np.float64)
         if vol is not None and idx.size:
             D = vol.shape[1]
             conf = np.zeros((n, idx.size), dtype=np.float64)
@@ -2414,9 +2427,16 @@ def _cap_edge_descent(disp_field: np.ndarray, active: np.ndarray,
         maxsh = float(p.get("frame_edge_max_shift", 15.0))
         delta = np.clip(W * (target - CUR[:, idx]), -maxsh, maxsh)
         newsurf = CUR[:, idx] + delta
+        # bound the per-column de-bump shift so no column is ever moved more than frame_edge_max_shift — a
+        # floating no-signal column can never be shoved out of frame in either direction (black bands).
+        newsurf = np.clip(newsurf, CUR[:, idx] - maxsh, CUR[:, idx] + maxsh)
         for k, f in enumerate(idx):
             col = ~exempt[:, f]
             out[col, f] = newsurf[col, k] - A[col, f]
+    # NOTE: the frame-direction OVER-DESCENT cap ("very steep curvature near the ends") is NOT applied here —
+    # this runs inside the iterative flatten, so a displacement edit feeds the next iteration's global quad fit
+    # and LEAKS into the interior (measured 3.5px mean / 30px max on approved CS002 OS3). It is a POST-HOC pass
+    # instead (frame_edge_overdescent_cap, called once on the final volume) → strictly local, no cascade.
     for i in range(n):                               # re-assert tissue-preservation clamps
         cc = clip_cols_list[i]; zc = zero_cols_list[i]
         if cc.size: out[i][cc] = np.maximum(disp_field[i][cc], 0.0)
@@ -3104,6 +3124,81 @@ def frame_boundary_lat_smooth(volume: np.ndarray, params: dict | None = None, wo
     return out, {"applied": bool(nadj), "frames_adjusted": nadj}
 
 
+def frame_edge_overdescent_cap(volume: np.ndarray, ref_surface: np.ndarray | None,
+                               params: dict | None = None, workers: int | None = None):
+    """POST-HOC frame-direction OVER-DESCENT cap — the "very steep curvature near the ends" (user-reported).
+
+    The per-slice flatten target is a RANSAC QUADRATIC across frames; it extrapolates the corneal dome PAST
+    the point where the real surface flattens at the acquisition edge (the limbus plateau, or the slow scan
+    running off the cornea) and pushes the last/first ~15 frames 10-20px DEEPER than the tissue actually goes
+    → a sagittal anterior boundary that plunges into a steep hook the raw does NOT have (verified lat256
+    CS003 OD: raw turns flat ~frame88 at depth ~235 while the warped output dives to ~260).
+
+    Runs ONCE on the FINAL volume — NOT inside the iterative flatten (a displacement edit there feeds the next
+    iteration's GLOBAL quad fit and leaks into the interior: measured 3.5px mean / 30px max on approved CS002
+    OS3). Here only the edge frames are warped, so the interior is untouched by construction — no cascade.
+
+    Per lateral, cap the edge frames' output depth so it never descends more than the REFERENCE (pre-flatten)
+    boundary's OWN frame-direction descent + margin, anchored on a clean interior band past the over-descent
+    onset: out ≤ S_anchor + (ref_shape − ref_anchor) + margin. Referencing the real tissue's descent
+    (ref_surface, detected before the flatten) — not a linear interior extrapolation (the retired v149 EXP,
+    which under-predicted a genuinely steep limbus and lifted it into the OD1 upward hook) — keeps a real steep
+    periphery and removes only the quad's manufactured extra plunge. Strictly one-sided (lifts DOWN→UP only),
+    gated to where BOTH surfaces exist, and bounded by max_shift → it can never invent a hook or shove tissue
+    out of frame, and is a strict no-op on a scan with no over-descent. Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("frame_edge_rawcap", True)) or ref_surface is None:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    if workers is None:
+        workers = auto_workers()
+    nb = int(p.get("frame_edge_rawcap_nb", 16) or 0)
+    if nb <= 0:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    gap = int(p.get("frame_edge_rawcap_gap", 4)); margin = float(p.get("frame_edge_rawcap_margin", 3.0))
+    maxsh = float(p.get("frame_edge_rawcap_max_shift", 14.0)); med = int(p.get("frame_edge_lat_med", 15))
+    sig_lat = float(p.get("frame_edge_lat_smooth", 40.0))
+    fire = float(p.get("frame_edge_rawcap_fire", 10.0)); ramp = float(p.get("frame_edge_rawcap_ramp", 6.0))
+    S = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lat, frames)
+    R = np.asarray(ref_surface, dtype=np.float64)
+    L, F = S.shape; depth = int(volume.shape[1])
+    if R.shape != S.shape or F < 2 * (nb + gap + 8):
+        return volume, {"applied": False, "frames_adjusted": 0}
+
+    def smooth_lat(M):     # strong lateral smoothing (match the de-bump) + light frame smoothing of the ref shape
+        return ndimage.gaussian_filter(ndimage.median_filter(M, size=(max(1, med), 1), mode="nearest"),
+                                       sigma=(sig_lat, 1.5), mode="nearest")
+
+    shifts = np.zeros((F, L), dtype=np.float64)
+    for lead in (True, False):
+        idx = np.arange(0, nb) if lead else np.arange(F - nb, F)
+        aw = np.arange(nb + gap, nb + gap + 8) if lead else np.arange(F - nb - gap - 8, F - nb - gap)
+        Rs = smooth_lat(R[:, idx])
+        with np.errstate(all="ignore"):
+            Ranch = np.nanmedian(np.where(R[:, aw] > 1.0, R[:, aw], np.nan), axis=1)
+            Sanch = np.nanmedian(np.where(S[:, aw] > 1.0, S[:, aw], np.nan), axis=1)
+        Ranch = ndimage.gaussian_filter(np.nan_to_num(Ranch), sigma=sig_lat, mode="nearest")
+        Sanch = ndimage.gaussian_filter(np.nan_to_num(Sanch), sigma=sig_lat, mode="nearest")
+        base_ref = Sanch[:, None] + (Rs - Ranch[:, None])               # reference-anchored expected depth
+        excess = S[:, idx] - base_ref                                   # over-descent beyond the reference (px)
+        # FIRE GATE: only act on a genuine steep over-plunge, NOT a gentle edge whose flatten shift is legitimate
+        # (an approved scan's soft dome edge sits a few px below the pre-flatten reference by design). A soft
+        # ramp on the over-descent magnitude → gentle edges (small excess) are a strict no-op; the steep od2-type
+        # plunge (large excess) is lifted. Smoothed across lateral so the on/off boundary can't add a lateral jag.
+        wfire = np.clip((excess - fire) / max(1e-3, ramp), 0.0, 1.0)
+        wfire = ndimage.gaussian_filter(wfire, sigma=(sig_lat, 1.0), mode="nearest")
+        target = base_ref + margin
+        vld = (S[:, idx] > 1.0) & (S[:, idx] < depth - 1) & (R[:, idx] > 1.0) & np.isfinite(base_ref)
+        sh = np.where(vld, np.clip(wfire * (target - S[:, idx]), -maxsh, 0.0), 0.0)  # lift only, gated
+        for k, f in enumerate(idx):
+            shifts[f] = sh[:, k]
+    out = volume.copy(); nadj = 0
+    for f in range(F):
+        if np.any(shifts[f] != 0.0):
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), shifts[f], subpixel=True)
+            nadj += 1
+    return out, {"applied": bool(nadj), "frames_adjusted": nadj}
+
+
 def surface_refine_2d(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """FINAL robust 2-D surface refinement (# FIX column-level edge errors). The anterior surface, detected as
     S(lateral, frame), is a SMOOTH 2-D dome. Bad edge detection leaves LOCAL PATCHES where the surface locks a
@@ -3639,6 +3734,15 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     elif _cached_dp:
         auto_tune_info = {"cached": True}             # reuse persisted dp_* (deterministic tune → identical)
     clip_report: dict = {}
+    # PRE-FLATTEN reference surface (the real tissue's frame-direction shape) — captured here, on the
+    # de-tilted/cropped volume the flatten is about to operate on, so the post-hoc over-descent cap can tell a
+    # genuinely steep-but-real limbus (keep) from the flatten quad's manufactured over-plunge (remove).
+    _rawcap_ref = None
+    if provided_edges is None and bool(_pcr.get("frame_edge_rawcap", True)):
+        try:
+            _rawcap_ref = detect_surface_all(reformat_to_sagittal(vol), params, workers=workers)
+        except Exception:  # noqa: BLE001 — reference is best-effort; cap simply no-ops without it
+            _rawcap_ref = None
     if max_iterations and int(max_iterations) > 1:
         chain, best_idx, info = iterate_smooth_volume(
             vol, params, max_iter=int(max_iterations),
@@ -3685,6 +3789,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("frame_boundary_smooth", True):
         corrected, fbs = frame_boundary_lat_smooth(corrected, params, workers=workers)
         info["frame_boundary_smooth"] = fbs
+    # FIX the "very steep curvature near the ends": POST-HOC frame-direction over-descent cap. The flatten quad
+    # over-extrapolates the dome at the acquisition edge and plunges the last/first frames deeper than the real
+    # tissue; lift them back toward the pre-flatten reference boundary's own descent + margin. Local to the edge
+    # frames (no interior cascade) and one-sided → strict no-op on scans with no over-descent, never a hook.
+    if p_all.get("frame_edge_rawcap", True):
+        corrected, foc = frame_edge_overdescent_cap(corrected, _rawcap_ref, params, workers=workers)
+        info["frame_edge_overdescent_cap"] = foc
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")
