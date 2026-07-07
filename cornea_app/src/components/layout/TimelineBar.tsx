@@ -70,7 +70,6 @@ export function TimelineBar() {
   const [corpusEligible, setCorpusEligible] = useState(true);
   const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
-  const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
   const caseBusy = useCaseStore((s) => s.busy);
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const resetStep = useCaseStore((s) => s.resetStep);
@@ -437,11 +436,9 @@ export function TimelineBar() {
             {busyAction === "apply" && caseBusy ? "Applying…" : "⟳ Apply corrections"}
           </Button>
         )}
-        <Button size="small" variant="outlined" color="primary" disabled={busy} onClick={() => rerunPreprocess()}
-          startIcon={caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title="Re-run the full auto preprocessing on the raw .OCT again (fresh surface detect + warp). Keeps this scan's params/classification; drops the current correction's segmentation.">
-          {caseBusy ? "Re-running…" : "↻ Re-run preprocessing"}
-        </Button>
+        {/* "↻ Re-run preprocessing" (full auto re-run) removed from the correction workflow: it DISCARDS the
+            user's fix-column border corrections (the auto re-run pops border_anchors), so it was a footgun
+            here. Re-run via Fix-columns → Run (which keeps corrections), or "Use original (raw)" below. */}
         <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => { setBusyAction("useraw"); approveRaw(); }}
           startIcon={busyAction === "useraw" ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Use the ORIGINAL (raw) scan as the working volume instead of the correction. Drops any segmentation; also marks it vetted.">
