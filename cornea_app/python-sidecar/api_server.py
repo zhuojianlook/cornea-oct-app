@@ -3319,14 +3319,20 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         anc = (m.get("oct_params") or {}).get("border_anchors") or {}
         surf = _redetect_surface_cached(case_id, m, anc) if (pass_n <= 1 and anc) else None
         use_surf = surf is not None and surf.shape[0] == n and surf.shape[1] == n_frames
-        base_surf = None
-        if not use_surf and pass_n <= 1:
+        # AUTO baseline (pure auto detection, IGNORING anchors) — computed on pass 1 as a PERSISTENT REFERENCE
+        # the editor overlays as a faint ghost, so the user can SEE where the auto detector puts the surface and
+        # catch an anchor dragged onto a sub-surface reflection (a "decoy" below a faint true surface). Cheap:
+        # baseline.npz is cached. When there is no confirmed re-detection it is ALSO the edge source (so the
+        # scrub preview == the Confirm baseline).
+        auto_surf = None
+        if pass_n <= 1:
             try:
-                base_surf = _baseline_surface(case_id, arr, p)         # cached robust = Confirm's baseline
-                if base_surf is None or base_surf.shape[0] != n or base_surf.shape[1] != n_frames:
-                    base_surf = None
+                auto_surf = _baseline_surface(case_id, arr, p)         # cached robust = Confirm's baseline
+                if auto_surf is None or auto_surf.shape[0] != n or auto_surf.shape[1] != n_frames:
+                    auto_surf = None
             except Exception:  # noqa: BLE001 — fall back to the fast detector if the baseline can't be built
-                base_surf = None
+                auto_surf = None
+        base_surf = None if use_surf else auto_surf
         # #9 crop_region: make the previewed edge/curve reflect the TRUNCATED volume — for slices INSIDE the
         # cropped lateral range, exclude the cropped frame-columns from the quadratic fit and interpolate the
         # edge across them (matches the re-detected corrected volume; without this the overlay never changes).
@@ -3356,8 +3362,11 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
                 f = e
             edges.append([round(float(v), 1) for v in e])
             fits.append([round(float(v), 1) for v in f])
+        # auto_edges = the pure auto baseline for EVERY slice (ghost reference); None when unavailable (pass>1).
+        auto_edges = ([[round(float(v), 1) for v in np.asarray(auto_surf[i], dtype=np.float64)] for i in range(n)]
+                      if auto_surf is not None else None)
         return {"slices": n, "n_frames": n_frames, "depth_vox": depth_vox, "pass": pass_n,
-                "edges": edges, "fits": fits}
+                "edges": edges, "fits": fits, "auto_edges": auto_edges}
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
