@@ -154,7 +154,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // on in fix-columns; no column selection. x=frame/n_frames, y=depth/depth_vox (depth 0 = top).
   // ALL per-slice border curves (FAST detector), fetched ONCE per pass → scrubbing is an instant client-side
   // lookup instead of a ~258ms per-slice round-trip (the user's "can't wait for the red line" complaint).
-  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][]; autoEdges: number[][] | null } | null>(null);
+  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][] } | null>(null);
   // The slice the user SETTLES on is refined to the slower, more ACCURATE (robust) detector + cached here,
   // so the border you actually inspect/drag is the precise one while scrubbing stays smooth.
   const [accurate, setAccurate] = useState<Map<number, { edge: number[]; fit: number[] }>>(new Map());
@@ -544,9 +544,9 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     if (!fixCols || !caseId) { setAllCurves(null); setAccurate(new Map()); return; }
     let cancelled = false;
     setBorderBusy(true); setAllCurves(null); setAccurate(new Map());
-    api.json<{ edges: number[][]; fits: number[][]; auto_edges: number[][] | null }>(
+    api.json<{ edges: number[][]; fits: number[][] }>(
       `/api/case/${caseId}/oct-border-curves-all`, "POST", JSON.stringify({ border_pass: borderPass }))
-      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [], autoEdges: r.auto_edges || null }); })
+      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [] }); })
       .catch(() => !cancelled && setAllCurves(null))
       .finally(() => !cancelled && setBorderBusy(false));
     return () => { cancelled = true; };
@@ -588,9 +588,6 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // The border for the CURRENT slice: the accurate (settled) curve if we have it, else the instant fast one.
   const curEdge = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.edge ?? allCurves?.edges[borderSliceIdx]) : null) ?? null;
   const curFit = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.fit ?? allCurves?.fits[borderSliceIdx]) : null) ?? null;
-  // The PURE auto-detected surface for this slice (ignores anchors) — a persistent GHOST reference. Lets the
-  // user see where auto thinks the surface is and catch an anchor dragged onto a sub-surface reflection.
-  const curAuto = (borderSliceIdx != null ? allCurves?.autoEdges?.[borderSliceIdx] : null) ?? null;
 
   // Drag the detected border (red) onto where the TRUE surface is → an ABSOLUTE depth ANCHOR for that
   // (slice, frame). Red follows the cursor (WYSIWYG); anchored frames turn PINK. Anchors accumulate across
@@ -1227,26 +1224,6 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     return curEdge ? curEdge[f] : 0;                                    // detected / band-re-detected
   };
   const anchoredFrames = useMemo(() => new Set(curAnchors ? curAnchors.keys() : []), [curAnchors]);
-  // GUARD: anchors dragged well BELOW the auto-detected surface usually mean the user tracked a bright
-  // sub-surface reflection (a "decoy") instead of the faint true surface — the auto edge is normally correct
-  // there. Flag them (orange ticks on this slice + a scan-wide count) so the trap is visible, not silent.
-  const AUTO_BELOW_WARN = 8; // px deeper than the auto edge to count as "below"
-  const belowAutoHere = useMemo(() => {
-    const s = new Set<number>();
-    if (!curAuto || !curAnchors) return s;
-    curAnchors.forEach((d, f) => { const a = curAuto[f]; if (a != null && d > a + AUTO_BELOW_WARN) s.add(f); });
-    return s;
-  }, [curAuto, curAnchors]);
-  const belowAutoTotal = useMemo(() => {
-    const auto = allCurves?.autoEdges;
-    if (!auto) return 0;
-    let n = 0;
-    borderAnchors.forEach((fm, s) => {
-      const ae = auto[s]; if (!ae) return;
-      fm.forEach((d, f) => { if (ae[f] != null && d > ae[f] + AUTO_BELOW_WARN) n++; });
-    });
-    return n;
-  }, [allCurves, borderAnchors]);
   // Parabola mode: the live editable quadratic = fit through the detected edge with the user's points overriding.
   const curParaPts = borderSliceIdx != null ? paraAnchors.get(borderSliceIdx) : undefined;
   const curPara = (borderMode === "parabola" && curEdge) ? fitQuadratic(curEdge, curParaPts) : null;
@@ -1295,11 +1272,6 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
             line you're manipulating is the visible one (WYSIWYG), and demote the cyan to a reference. */}
         {/* In SURFACE-CROP mode the top-edge detection + its quadratic are meaningless where the apex is
             cropped (they fail / pin at the top), so suppress them and show the bottom-edge-based preview below. */}
-        {/* GHOST: the pure auto-detected surface (amber dashed) — a persistent reference of where the auto
-            detector places the edge, so a stroke dragged onto a sub-surface reflection is visibly OFF it. */}
-        {!cropMode && curAuto && <polyline fill="none" stroke="#f5c451" strokeDasharray="2.5 2.5"
-          vectorEffect="non-scaling-stroke" strokeWidth={0.8} opacity={0.55}
-          points={spanPts((f) => curAuto[f] ?? edgeY(f))} />}
         {!cropMode && <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
           strokeWidth={anchorsDirty ? 1.3 : 0.7} opacity={anchorsDirty ? 0.9 : 0.3}
           points={spanPts(edgeY)} />}
@@ -1327,12 +1299,6 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
               stroke="#ff5db0" strokeWidth={1.1} vectorEffect="non-scaling-stroke" opacity={0.8} />
           : <polyline key={`pk${i}`} fill="none" stroke="#ff5db0" strokeWidth={1.0} vectorEffect="non-scaling-stroke" opacity={0.7}
               points={Array.from({ length: b - a + 1 }, (_x, k) => `${a + k + 0.5},${edgeY(a + k)}`).join(" ")} />)}
-        {/* GUARD: anchors sitting well below the auto edge → prominent ORANGE ticks (over the pink) so the
-            likely-mistaken ones stand out from correct corrections. */}
-        {!cropMode && borderMode === "edge" && [...belowAutoHere].map((f) => (
-          <line key={`wl${f}`} x1={f + 0.5} y1={edgeY(f) - depthVox / 40} x2={f + 0.5} y2={edgeY(f) + depthVox / 40}
-            stroke="#ff8c1a" strokeWidth={1.7} vectorEffect="non-scaling-stroke" opacity={0.95} />
-        ))}
         {/* parabola mode: the live editable quadratic (green) + the points the user dragged it through.
             Suppressed in crop mode (its green clashes with the crop preview's reconstructed surface). */}
         {!cropMode && curPara && (
@@ -1804,15 +1770,6 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                 style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
                 {borderPanel ?? (
                   <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{borderBusy ? "Detecting border…" : "No border for this slice."}</span>
-                )}
-                {borderPanel && belowAutoTotal > 0 && (
-                  <div style={{ position: "absolute", top: 6, left: 6, zIndex: 5, maxWidth: "60%",
-                                background: "rgba(150,74,10,0.94)", border: "1px solid #ff8c1a", borderRadius: 6, padding: "2px 8px" }}>
-                    <span style={{ color: "#fff", fontSize: 11, lineHeight: 1.3 }}>
-                      ⚠ {belowAutoTotal} anchor{belowAutoTotal > 1 ? "s" : ""} below the auto surface (amber line). Likely a bright
-                      sub-surface reflection — auto is usually correct there; consider removing them.
-                    </span>
-                  </div>
                 )}
                 {borderPanel && (
                   <div style={{ position: "absolute", top: 6, right: 6, display: "flex", alignItems: "center", gap: 2, zIndex: 5,
