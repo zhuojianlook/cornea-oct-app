@@ -1787,11 +1787,23 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                 )}
               </div>
             </div>
-            {showRaw && correctedPanel && (
+            {showRaw && cur && (
               <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
                 <span className="text-[11px]" style={{ color: "var(--c-green)" }}>corrected (result)</span>
-                <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  {correctedPanel}
+                <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
+                  {/* Display-only mirror of the CORRECTED slice, matching the LEFT editor panel EXACTLY: same
+                      physical-aspect pixel box (bDispW×bDispH), same scaleX(-1) frame flip, and same zoom/pan —
+                      so before (left) and after (right) render same-size + same-orientation for a fair
+                      comparison. Previously the right panel reused the un-flipped, maxWidth-sized interactive
+                      correctedPanel, so it looked LR-mirrored AND a different size than the editor. */}
+                  <div style={{ position: "relative",
+                                ...(bSized ? { width: bDispW, height: bDispH } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
+                                transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom}) scaleX(-1)`, transformOrigin: "center center" }}>
+                    <img src={imgSrc(cur)} alt="corrected" draggable={false}
+                      style={bSized
+                        ? { display: "block", width: "100%", height: "100%", objectFit: "fill", imageRendering: "pixelated", filter: effectiveGroup === "context" ? enhanceFilter : undefined }
+                        : { display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: effectiveGroup === "context" ? enhanceFilter : undefined }} />
+                  </div>
                 </div>
               </div>
             )}
