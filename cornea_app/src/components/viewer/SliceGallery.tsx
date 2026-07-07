@@ -460,6 +460,26 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const safeIdx = Math.min(idx, Math.max(0, orientImgs.length - 1));
   const cur = orientImgs[safeIdx];
 
+  // "Skip by propagation range": a fix-columns border correction re-detects ±redetect_slice_band neighbouring
+  // SLICES (oct_preprocess.py DEFAULT_PARAMS redetect_slice_band = 20), so drawing on one slice fills a band.
+  // These ⏮/⏭ buttons jump the slice cursor by exactly that band (mapped to the nearest available preview
+  // slice by slice_index, so it's correct even if previews are sub-sampled) → the next slice you draw on sits
+  // at the edge of the current correction's reach, giving contiguous coverage with no gaps. Guaranteed to
+  // advance ≥1 slice in the requested direction even if the nearest-by-index lands back on the current slice.
+  const PROP_SLICE_BAND = 20;
+  const skipBand = (dir: 1 | -1) => {
+    if (!orientImgs.length || cur?.slice_index == null) return;
+    const target = Number(cur.slice_index) + dir * PROP_SLICE_BAND;
+    let best = safeIdx;
+    let bestD = Infinity;
+    orientImgs.forEach((im, i) => {
+      const d = Math.abs(Number(im.slice_index ?? 0) - target);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    if (best === safeIdx) best = Math.min(orientImgs.length - 1, Math.max(0, safeIdx + dir));
+    setIdx(best);
+  };
+
   // Before/after is only meaningful on the working "context" slices, once the pre-correction
   // ("before") snapshot exists. The current slice (cur) is the corrected "after"; match the
   // raw "before" to it by slice index (raw + corrected share the same geometry).
@@ -1784,13 +1804,34 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
           <span className="text-xs whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
             {orient} slice {cur?.slice_index ?? "—"} ({safeIdx + 1}/{orientImgs.length})
           </span>
+          <button
+            type="button"
+            onClick={() => skipBand(-1)}
+            disabled={safeIdx <= 0}
+            title={`Skip back ${PROP_SLICE_BAND} slices — one border-correction propagation band, so the next slice sits at the edge of the current correction's reach (no gap)`}
+            className="text-xs px-1.5 py-0.5 rounded border whitespace-nowrap disabled:opacity-40"
+            style={{ borderColor: "var(--c-border)", color: "var(--c-text-dim)" }}
+          >
+            ⏮{PROP_SLICE_BAND}
+          </button>
           <Slider
             size="small"
             min={0}
             max={Math.max(0, orientImgs.length - 1)}
             value={safeIdx}
             onChange={(_, v) => setIdx(v as number)}
+            sx={{ flex: 1, minWidth: 80 }}
           />
+          <button
+            type="button"
+            onClick={() => skipBand(1)}
+            disabled={safeIdx >= orientImgs.length - 1}
+            title={`Skip forward ${PROP_SLICE_BAND} slices — one border-correction propagation band, so the next slice sits at the edge of the current correction's reach (no gap)`}
+            className="text-xs px-1.5 py-0.5 rounded border whitespace-nowrap disabled:opacity-40"
+            style={{ borderColor: "var(--c-border)", color: "var(--c-text-dim)" }}
+          >
+            {PROP_SLICE_BAND}⏭
+          </button>
         </div>
       )}
 
