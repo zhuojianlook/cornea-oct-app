@@ -2622,6 +2622,10 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
              # training-schedule flags → the per-scan timeline drops back to "Preprocessed [Auto]" (red)
              # and the user re-approves. scar_classification is kept (it's scan content, not geometry).
              "preproc_vetted": False, "training_scheduled": False,
+             # GT confirmation follows preproc_vetted: a fresh output must be re-approved before its (sticky)
+             # corrected border re-enters the GT corpus. The anchor points persist in oct_params; re-approval
+             # re-confirms them (with the current anchors signature).
+             "border_gt": None,
              # CYBERNETIC-LOOP step-3 RESET: the just-produced volume is a NEW algorithm's output, so the user's
              # defect_marks (which point at the OLD output's wrong columns) are stale → clear them; the user
              # re-inspects the fresh output and re-marks anything still wrong (step 4b). difficult_scan is NOT
@@ -2774,13 +2778,48 @@ def set_case_classification(case_id: str, req: ClassificationRequest) -> dict:
             "scar_range": m.get("scar_range")}
 
 
+def _border_anchor_stats(m: dict) -> tuple[int, int, str]:
+    """(n_slices, n_points, signature) of the manual border anchors persisted in this case's oct_params.
+    The signature is a stable hash of the {slice:{frame:depth}} anchor set, so the GT confirmation can be
+    detected as STALE the moment the user re-corrects (new anchors → new sig → needs re-approval)."""
+    anc = ((m.get("oct_params") or {}).get("border_anchors")) or {}
+    ns = 0; npts = 0; parts: list[str] = []
+    for sl in sorted(anc.keys(), key=lambda k: str(k)):
+        fr = anc.get(sl)
+        if isinstance(fr, dict) and fr:
+            ns += 1; npts += len(fr)
+            inner = ",".join(f"{f}:{round(float(fr[f]), 1)}" for f in sorted(fr.keys(), key=lambda k: str(k)))
+            parts.append(f"{sl}={inner}")
+    import hashlib
+    sig = hashlib.sha1(";".join(parts).encode()).hexdigest()[:16] if parts else ""
+    return ns, npts, sig
+
+
+class VetRequest(BaseModel):
+    corpus_eligible: bool = True   # include this scan's corrected borders in the GT corpus that tunes the detector
+
+
 @app.post("/api/case/{case_id}/vet-preprocessing")
-def vet_preprocessing(case_id: str) -> dict:
+def vet_preprocessing(case_id: str, req: VetRequest | None = None) -> dict:
     """Timeline step 3: mark the preprocessing as MANUALLY VETTED (the user reviewed before/after +
     Fix-columns and approves it). Manifest metadata only — turns the scan entry orange and is the gate
-    before scar/control classification. A later auto/Fix-columns re-run clears this (see oct-preprocess)."""
-    m = orch.write_manifest_value(_require_case(case_id), {"preproc_vetted": True})
-    return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted"))}
+    before scar/control classification. A later auto/Fix-columns re-run clears this (see oct-preprocess).
+
+    GT CAPTURE: if the user manually corrected the border (oct_params.border_anchors present), approving also
+    records those anchor points as CONFIRMED GROUND TRUTH (manifest.border_gt), so they (a) keep being applied
+    and (b) feed the GT-vs-auto corpus that measures + improves the auto-detector (see /api/gt-corpus). The
+    anchor points ARE the user's true depths — pure ground truth, independent of the auto-detector. Pass
+    corpus_eligible=False to keep a scan's correction applied but EXCLUDE an idealised case (e.g. a
+    motion-corrupted scan whose hand-drawn border is not real geometry) from the global-tuning corpus."""
+    cid = _require_case(case_id)
+    corpus_eligible = bool(req.corpus_eligible) if req is not None else True
+    ns, npts, sig = _border_anchor_stats(orch.read_manifest(cid))
+    updates: dict = {"preproc_vetted": True}
+    updates["border_gt"] = ({"confirmed": True, "corpus_eligible": corpus_eligible,
+                             "n_slices": ns, "n_points": npts, "anchors_sig": sig,
+                             "ts": round(time.time(), 1)} if npts > 0 else None)
+    m = orch.write_manifest_value(cid, updates)
+    return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted")), "border_gt": m.get("border_gt")}
 
 
 class ReviewFlagRequest(BaseModel):
@@ -2856,6 +2895,125 @@ def set_case_subgroup(case_id: str, req: SubgroupRequest) -> dict:
     sub = (req.subgroup or "1").strip() or "1"
     m = orch.write_manifest_value(_require_case(case_id), {"scar_subgroup": sub})
     return {"ok": True, "scar_subgroup": m.get("scar_subgroup")}
+
+
+# ── GROUND-TRUTH CORPUS (v0.0.159) ── the user's manually-corrected borders, once Approved, become a growing
+# ground-truth corpus. /api/gt-corpus lists it (cheap); /api/gt-corpus/evaluate runs the AUTO detector against
+# every corrected point to show WHERE the detector systematically fails, score any proposed change, and track
+# convergence (how many past corrections the algorithm now gets right on its own).
+def _gt_corpus_cases() -> list[tuple[str, dict]]:
+    """(case_id, manifest) for every case whose corrected border is CONFIRMED + corpus-eligible AND whose
+    anchors still match the confirmation signature (a later re-correction without re-approval → stale → skip)."""
+    out: list[tuple[str, dict]] = []
+    root = settings.CASES_ROOT
+    if not root.exists():
+        return out
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        try:
+            m = orch.read_manifest(child.name)
+        except Exception:  # noqa: BLE001
+            continue
+        gt = m.get("border_gt") if isinstance(m, dict) else None
+        if not (isinstance(gt, dict) and gt.get("confirmed") and gt.get("corpus_eligible")):
+            continue
+        _ns, npts, sig = _border_anchor_stats(m)
+        if npts <= 0 or sig != gt.get("anchors_sig"):
+            continue
+        out.append((child.name, m))
+    return out
+
+
+@app.get("/api/gt-corpus")
+def gt_corpus() -> dict:
+    """Cheap summary of the confirmed, corpus-eligible corrected-border cases (the ground-truth corpus) — no
+    detector run. Used by the UI badge + the assistant to see how much GT has accumulated."""
+    cases = _gt_corpus_cases()
+    total = sum(_border_anchor_stats(m)[1] for _, m in cases)
+    return {"ok": True, "n_cases": len(cases), "n_points": total,
+            "cases": [{"case_id": cid,
+                       "n_slices": (m.get("border_gt") or {}).get("n_slices"),
+                       "n_points": (m.get("border_gt") or {}).get("n_points")} for cid, m in cases]}
+
+
+class GtCorpusEvalRequest(BaseModel):
+    params: dict | None = None    # detector param overrides → test a PROPOSED algorithm change against the corpus
+    limit: int | None = None
+    tol: float = 2.0              # px: an anchor point counts as "already correct" if the auto detector is within tol
+
+
+@app.post("/api/gt-corpus/evaluate")
+def evaluate_gt_corpus(req: GtCorpusEvalRequest | None = None) -> dict:
+    """GT-vs-AUTO harness. For every confirmed, corpus-eligible corrected case, run the AUTO anterior detector on
+    the RAW volume (fix-columns anchors are in raw / border_pass=1 coordinates) and measure its error at the
+    user's true-depth anchor points. Returns: WHERE the detector fails (edge vs interior + a per-frame
+    histogram of corrections), a single auto-vs-GT score, and a CONVERGENCE metric (fraction of past corrections
+    the detector now gets right on its own, within tol). Pass `params` to score a proposed detector change
+    against the whole corpus in one call. May be slow (~detector time per case); use `limit` to sample."""
+    import numpy as _np
+    req = req or GtCorpusEvalRequest()
+    tol = float(req.tol)
+    cases = _gt_corpus_cases()
+    if req.limit:
+        cases = cases[: int(req.limit)]
+    all_err: list[float] = []; edge_err: list[float] = []; inter_err: list[float] = []
+    frame_hist: dict[int, int] = {}; per_case: list[dict] = []; F_EDGE = 10
+    for cid, m in cases:
+        src = m.get("oct_source"); vi = int(m.get("oct_volume_index", 0) or 0)
+        anc = ((m.get("oct_params") or {}).get("border_anchors")) or {}
+        if not src or not anc:
+            continue
+        try:
+            params = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+            if req.params:
+                params.update(req.params)
+            sag = oct_mod.reformat_to_sagittal(oct_mod.read_oct_zstack(src, vi))
+            surf = oct_mod.detect_surface_all(sag.astype("float32"), params, workers=4)  # (lateral, frames)
+        except Exception as e:  # noqa: BLE001
+            per_case.append({"case_id": cid, "error": str(e)[:140]}); continue
+        L, Fn = surf.shape; cerr: list[float] = []
+        for sl, fr_map in anc.items():
+            try:
+                lat = int(sl)
+            except Exception:  # noqa: BLE001
+                continue
+            if not (0 <= lat < L) or not isinstance(fr_map, dict):
+                continue
+            for fk, depth in fr_map.items():
+                try:
+                    fr = int(fk); gt = float(depth)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not (0 <= fr < Fn):
+                    continue
+                a = float(surf[lat, fr])
+                if a <= 1:
+                    continue
+                e = abs(a - gt)
+                all_err.append(e); cerr.append(e)
+                (edge_err if (fr < F_EDGE or fr >= Fn - F_EDGE) else inter_err).append(e)
+                frame_hist[fr] = frame_hist.get(fr, 0) + 1
+        if cerr:
+            ca = _np.array(cerr)
+            per_case.append({"case_id": cid, "n_points": len(cerr), "mean_err": round(float(ca.mean()), 2),
+                             "p90_err": round(float(_np.percentile(ca, 90)), 2),
+                             "already_correct_frac": round(float((ca <= tol).mean()), 2)})
+
+    def _stats(arr: list[float]) -> dict:
+        if not arr:
+            return {"n": 0}
+        a = _np.array(arr)
+        return {"n": len(arr), "mean": round(float(a.mean()), 2), "median": round(float(_np.median(a)), 2),
+                "p90": round(float(_np.percentile(a, 90)), 2),
+                "already_correct_frac": round(float((a <= tol).mean()), 2)}
+
+    return {"ok": True, "n_cases": len([p for p in per_case if "n_points" in p]), "tol_px": tol,
+            "overall": _stats(all_err), "edge_frames": _stats(edge_err), "interior_frames": _stats(inter_err),
+            "corrections_by_frame": {int(k): int(v) for k, v in sorted(frame_hist.items())},
+            "per_case": per_case,
+            "note": ("auto detector run on RAW (anchors are border_pass=1); error = |auto − user true depth| at "
+                     "each corrected point; already_correct_frac = convergence (detector now matches GT unaided).")}
 
 
 class TrainingScheduleRequest(BaseModel):

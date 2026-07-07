@@ -53,13 +53,16 @@ interface CaseState {
   // without re-running the correction; null = undecided.
   setClassification: (cls: "scar" | "control" | null) => Promise<void>;
   // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
-  vetPreprocessing: () => Promise<void>;
+  vetPreprocessing: (corpusEligible?: boolean) => Promise<void>;
   // Approve the preprocessing AS-IS: mark it vetted WITHOUT applying any auto-detected proposals (the user is
   // accepting the current output and declining the de-tilt/crop/surface-crop). Non-destructive — identical to
   // vetPreprocessing(); kept as a distinct name so the button intent is explicit. (Applying corrections is the
   // SEPARATE applyCorrections() action, so an unwanted/false proposal never blocks a plain approve — e.g. a
   // spurious de-tilt on an off-centre dome.)
-  approvePreprocessing: () => Promise<void>;
+  // corpusEligible (default true): when this scan carries a manual border correction, Approve records it as
+  // CONFIRMED ground truth for the algorithm-training corpus; pass false to keep the correction applied but
+  // EXCLUDE an idealised case (e.g. a motion-corrupted scan whose hand-drawn border is not real geometry).
+  approvePreprocessing: (corpusEligible?: boolean) => Promise<void>;
   // Apply the auto-detected proposals (manifest.oct_proposals: de-tilt / crop / surface-crop): re-preprocess
   // with apply_proposals:true to BAKE the corrections into a fresh warped output. Does NOT auto-vet — the new
   // output resets to "Preprocessed [Auto]" (red) so the user re-inspects it, then approves as-is. Separate from
@@ -152,12 +155,14 @@ export const useCaseStore = create<CaseState>()(
       }
     },
 
-    vetPreprocessing: async () => {
+    vetPreprocessing: async (corpusEligible = true) => {
       const id = get().caseId;
       if (!id) return;
       set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).preproc_vetted = true; });
       try {
-        await api.json(`/api/case/${id}/vet-preprocessing`, "POST", "{}");
+        // corpus_eligible: if the scan has a manual border correction, approving confirms it as GROUND TRUTH
+        // for the training corpus (unless excluded here, e.g. an idealised motion scan).
+        await api.json(`/api/case/${id}/vet-preprocessing`, "POST", JSON.stringify({ corpus_eligible: corpusEligible }));
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }
@@ -165,8 +170,8 @@ export const useCaseStore = create<CaseState>()(
 
     // Approve AS-IS: vet the current output WITHOUT applying any proposals (declining the auto de-tilt/crop/
     // surface-crop). Non-destructive; keeps any segmentation. Applying corrections is the separate action below.
-    approvePreprocessing: async () => {
-      await get().vetPreprocessing();
+    approvePreprocessing: async (corpusEligible = true) => {
+      await get().vetPreprocessing(corpusEligible);
     },
 
     // Apply the auto-detected corrections (bake in de-tilt/crop/surface-crop) as a fresh warp. Does NOT auto-vet

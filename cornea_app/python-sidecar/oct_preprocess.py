@@ -69,6 +69,29 @@ DEFAULT_PARAMS: dict = {
     # the per-column displacement FIELD across the slice (lateral) axis with this Gaussian sigma (px,
     # 0 = off) makes neighbours shift consistently → a smoother axial boundary, while the per-slice
     # quadratic still carries the real lateral curvature. Small sigma stays close to the per-slice fit.
+    "axial_motion_correct": False,  # RETIRED default OFF (tested, not shipped): a per-frame RIGID axial de-motion is
+                                  #   REDUNDANT with the flatten — the per-slice flatten ALREADY removes the dominant
+                                  #   per-frame rigid inter-frame motion (CS004 OD rep1 raw 5.56px rigid → output 1.08px),
+                                  #   so applying it up-front smooths the RAW but not the OUTPUT, and it injects B-scan
+                                  #   tears. rep1's RESIDUAL non-smoothness is NON-RIGID INTRA-frame distortion (eye moving
+                                  #   DURING a B-scan at saccades) which a rigid shift can't fix. Code kept for reference.
+    "amc_dome_deg": 5,            # degree of the robust 2-D dome fit used as the motion-free reference
+    "amc_smooth": 1.0,            # gaussian sigma (frames) on the estimated motion → kills 1-frame detection noise
+    "amc_max_shift": 30.0,        # px cap on the per-frame rigid depth shift
+    "amc_min_motion": 1.0,        # px: if the per-frame motion std is below this, the scan is motion-free → no-op
+    "intra_frame_dewarp": False,  # RETIRED default OFF (tested, not shipped): correcting the raw B-scans before the
+                                  #   flatten gets re-processed/washed by the flatten, and correcting post-flatten hits
+                                  #   detector re-lock revert; the residual high-freq frame-direction motion steps resist
+                                  #   both and the warp adds B-scan tears. A proper fix needs joint motion-estimation +
+                                  #   volume re-slicing (major re-architecture) — not worth it when clean replicates exist.
+                                  #   (The intra_frame_dewarp function re-warps only saccade-distorted B-scans onto the
+                                  #   smooth dome using the RAW band edge, gated per-frame; kept for reference, default off.)
+    "ifd_frame_med": 7,           # frame-window median for the motion-free per-lateral reference (rejects saccade frames)
+    "ifd_frame_gauss": 2.0,       # gaussian (frames) on the reference
+    "ifd_frame_thresh": 2.0,      # px: per-frame lateral-distortion level above which a frame is treated as saccade-warped
+    "ifd_frame_soft": 1.0,        # px ramp for the per-frame gate
+    "ifd_lat_smooth": 8.0,        # gaussian (lateral) on the correction shift → coherent B-scan re-warp (no en-face jag)
+    "ifd_max_shift": 20.0,        # px cap on the per-column intra-frame correction
     "interslice_smooth": 3.0,     # (raised 1→3 with subpixel_warp) smooth the per-slice displacement across slices
                                   #   more, reducing slice-to-slice apex ripple; validated to also SMOOTH approved scans
     "subpixel_warp": True,        # flatten warp shifts columns by the FRACTIONAL displacement (linear interp in
@@ -3102,6 +3125,143 @@ def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, wor
                  "n_frames": n_frames, "cols_adjusted": int(n_moved_cols)}
 
 
+def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """Correct slow-scan (frame-axis) inter-frame AXIAL EYE MOTION (v0.0.159).
+
+    During the slow scan across frames the eye drifts/saccades AXIALLY, so each B-scan (frame) is acquired at
+    a slightly different depth. The anterior surface then shows per-frame STEPS/WAVES across frames — a
+    sagittal surface that is "obviously not smooth" — even though each individual B-scan is internally fine
+    (measured CS004 OD rep1: motion 5.8px std, 89% of it a PER-FRAME RIGID displacement uniform across
+    lateral, ±15px, with a physical drift+saccade trajectory; sibling replicates rep2/rep3 were motion-free).
+
+    Model + fix: fit a robust smooth 3-D corneal dome T(lat,frame) (deg-`amc_dome_deg` 2-D poly, iterative
+    2σ reject so the ±15px motion does not bias the fit); the per-frame RIGID motion is M(frame) = median
+    over lateral of (S−T); rigidly shift each B-scan in depth by −M so its surface lands on the smooth dome.
+    Because the shift is per-frame UNIFORM across lateral it corrects the sagittal steps WITHOUT roughening
+    the en-face view (the failure mode of per-column smoothing). M is zero-centred (minimal canvas
+    truncation) and a STRICT NO-OP when the motion is small (std < amc_min_motion) — motion-free scans
+    (rep2/rep3, all approved) are byte-unchanged. Runs EARLY (before de-tilt/flatten) so the flatten sees
+    de-motioned data. `volume` is (frames, depth, lateral). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("axial_motion_correct", True)):
+        return volume, {"applied": False}
+    if workers is None:
+        workers = auto_workers()
+    F, depth = int(volume.shape[0]), int(volume.shape[1])
+    try:
+        S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False}
+    L = int(S.shape[0])
+    valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
+    if int(valid.sum()) < (L * F) // 4 or F < 12:
+        return volume, {"applied": False}
+    yy, xx = np.mgrid[0:L, 0:F].astype(np.float64)
+    yn = yy / (L - 1) * 2 - 1; xn = xx / (F - 1) * 2 - 1
+    deg = int(p.get("amc_dome_deg", 5))
+    terms = [(a, b) for a in range(deg + 1) for b in range(deg + 1) if a + b <= deg]
+    A = np.stack([(yn ** a) * (xn ** b) for a, b in terms], axis=-1)
+    m = valid.copy()
+    try:
+        coef = np.linalg.lstsq(A[m], S[m], rcond=None)[0]
+        for _ in range(4):
+            r = S - A @ coef; sd = np.std(r[m]) + 1e-6
+            mm = valid & (np.abs(r) < 2.0 * sd)
+            if int(mm.sum()) < len(terms) + 5 or int(mm.sum()) == int(m.sum()):
+                break
+            m = mm; coef = np.linalg.lstsq(A[m], S[m], rcond=None)[0]
+        T = A @ coef
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False}
+    dev = np.where(valid, S - T, np.nan)
+    with np.errstate(all="ignore"):
+        M = np.nanmedian(dev, axis=0)                       # per-frame rigid motion (frames,)
+    M = np.where(np.isfinite(M), M, 0.0)
+    M = ndimage.gaussian_filter1d(M, float(p.get("amc_smooth", 1.0)), mode="nearest")  # kill 1-frame noise
+    M = M - np.median(M)                                     # zero-centre → minimal canvas truncation
+    M = np.clip(M, -float(p.get("amc_max_shift", 30.0)), float(p.get("amc_max_shift", 30.0)))
+    if float(np.std(M)) < float(p.get("amc_min_motion", 1.0)):   # motion-free → strict no-op
+        return volume, {"applied": False, "motion_std": round(float(np.std(M)), 2)}
+    out = volume.copy(); nadj = 0
+    for f in range(F):
+        if abs(M[f]) > 0.05:
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -M[f]), subpixel=True)
+            nadj += 1
+    return out, {"applied": bool(nadj), "frames_adjusted": int(nadj),
+                 "motion_std": round(float(np.std(M)), 2), "max_shift": round(float(np.max(np.abs(M))), 1)}
+
+
+def intra_frame_dewarp(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """Correct INTRA-frame (within-B-scan) saccade distortion (v0.0.159) — the hard residual after the flatten.
+
+    The per-slice flatten removes the per-frame RIGID axial motion, but it cannot touch distortion that
+    happens DURING a single B-scan: at a saccade the eye moves mid-lateral-sweep, so that ONE B-scan's
+    anterior surface is warped in the LATERAL direction (a ramp/step across lateral) away from the true smooth
+    corneal shape (measured CS004 OD rep1: within-frame lateral spread spikes 1px→4-5px only at the saccade
+    frames 20/42/58/78). This shows as a "not smooth" sagittal surface even though the neighbouring B-scans
+    are clean. Fix: re-warp each column onto the smooth 3-D corneal surface, but derived so it aligns the ACTUAL
+    tissue and only the genuinely-distorted frames move.
+
+    Method (the crux — use the RAW band edge, not the post-processed surface): detect the anterior surface with
+    the shape post-processors OFF (robust_dome / dip2d / lat_conf / despike / parabola off) so it tracks the
+    true bright-band edge the warp will move. Build the motion-free reference T(lat,frame) = each lateral's
+    surface robustly smoothed ALONG frames (median+gaussian, so a saccade-distorted frame is an outlier the
+    smoother rejects → T at that frame is interpolated from the clean neighbours). Deviation dev = S − T is the
+    intra-frame distortion; per-frame distortion level Dframe = robust lateral spread of dev. GATE by Dframe so
+    only the saccade frames (Dframe > thresh) are corrected — a clean scan has no such frame → strict NO-OP
+    (rep2/rep3, approved scans unchanged). The shift is smoothed across lateral (coherent B-scan re-warp, no
+    en-face jag) and bounded. Runs EARLY (before de-tilt/flatten) so the flatten sees de-distorted B-scans.
+    `volume` is (frames, depth, lateral). Returns (volume, info). intra_frame_dewarp=False disables."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("intra_frame_dewarp", True)):
+        return volume, {"applied": False}
+    if workers is None:
+        workers = auto_workers()
+    F, depth = int(volume.shape[0]), int(volume.shape[1])
+    praw = {**p, "despike_lateral": False, "dip2d_suppress": False, "robust_dome": False,
+            "lat_conf_smooth": False, "parabola_edge": False, "boundary_extrap_nb": 0, "frame_edge_cap": False}
+    try:
+        S = detect_surface_all(reformat_to_sagittal(volume), praw, workers=workers)  # RAW band edge (lat, frames)
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False}
+    L = int(S.shape[0])
+    valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
+    if int(valid.sum()) < (L * F) // 4 or F < 12:
+        return volume, {"applied": False}
+    Sf = S.astype(np.float64)
+    for f in range(F):                                   # fill invalid laterals per frame (interp) so smoothing is clean
+        mm = valid[:, f]
+        if int(mm.sum()) >= 8:
+            Sf[~mm, f] = np.interp(np.where(~mm)[0], np.where(mm)[0], Sf[mm, f])
+    fwin = int(p.get("ifd_frame_med", 7));  fwin += (fwin % 2 == 0)
+    fg = float(p.get("ifd_frame_gauss", 2.0))
+    # motion-free reference: each lateral's frame-trace robustly smoothed (rejects the distorted-frame outliers)
+    T = ndimage.median_filter(Sf, size=(1, fwin), mode="nearest")
+    if fg > 0:
+        T = ndimage.gaussian_filter(T, sigma=(0.0, fg), mode="nearest")
+    dev = np.where(valid, Sf - T, 0.0)
+    # per-frame distortion level = robust lateral spread of the deviation (a tilted/warped B-scan reads high)
+    with np.errstate(all="ignore"):
+        Dframe = np.array([np.nanstd(np.where(valid[:, f], dev[:, f], np.nan)) for f in range(F)])
+    Dframe = np.where(np.isfinite(Dframe), Dframe, 0.0)
+    thr = float(p.get("ifd_frame_thresh", 2.0)); soft = float(p.get("ifd_frame_soft", 1.0))
+    gate = np.clip((Dframe - thr) / max(1e-3, soft), 0.0, 1.0)     # 0 on clean frames → no-op
+    if float(np.max(gate)) <= 0.0:
+        return volume, {"applied": False, "max_frame_distortion": round(float(np.max(Dframe)), 2)}
+    sig_lat = float(p.get("ifd_lat_smooth", 8.0)); cap = float(p.get("ifd_max_shift", 20.0))
+    shift = -dev * gate[None, :]
+    shift[:, gate > 0] = ndimage.gaussian_filter1d(shift[:, gate > 0], sigma=sig_lat, axis=0, mode="nearest")
+    shift = np.clip(shift, -cap, cap); shift[~valid] = 0.0
+    out = volume.copy(); nadj = 0
+    for f in range(F):
+        if np.any(shift[:, f] != 0.0):
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), shift[:, f], subpixel=True)
+            nadj += 1
+    return out, {"applied": bool(nadj), "frames_adjusted": int(nadj),
+                 "max_frame_distortion": round(float(np.max(Dframe)), 2),
+                 "saccade_frames": int(np.sum(gate > 0.3))}
+
+
 def frame_boundary_lat_smooth(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """FIX the jagged border on the first/last B-scans (acquisition-edge frames). Those frames are LOW-SIGNAL, so
     the per-slice anterior detection wiggles laterally → the axial (B-scan) border looks jagged (the marked
@@ -3594,6 +3754,17 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # cornea) and zero them via the same #9 crop path before surface detection + SAM2. A normal full-cornea scan
     # detects none (no-op). Manual crop_region/crop_lateral overrides; the marched re-detect path is left alone.
     _pcr = {**DEFAULT_PARAMS, **(params or {})}
+    # ── AXIAL MOTION CORRECTION (v0.0.159): remove slow-scan inter-frame eye motion UP-FRONT (auto path only) by
+    # rigidly re-aligning each B-scan in depth to a smooth 3-D dome, so de-tilt/flatten see de-motioned data and
+    # the sagittal surface comes out smooth. Strict NO-OP on a motion-free scan (approved scans unchanged).
+    _amc_info = None
+    if provided_edges is None and bool(_pcr.get("axial_motion_correct", False)):
+        vol, _amc_info = axial_motion_correct(vol, params, workers=workers)
+    # INTRA-frame saccade de-distortion (v0.0.159): re-warp only the genuinely saccade-distorted B-scans onto
+    # the smooth 3-D dome before the flatten. Strict no-op on a clean scan.
+    _ifd_info = None
+    if provided_edges is None and bool(_pcr.get("intra_frame_dewarp", True)):
+        vol, _ifd_info = intra_frame_dewarp(vol, params, workers=workers)
     _auto_cr = None                                                # auto crop-region box → surfaced in info → persisted
     # PERF: the noise-crop check and the surface-crop check BOTH run the ~12s anterior detector on the SAME raw
     # volume with the SAME (pre-auto-tune) detector params. The detector output is independent of crop_region /
@@ -3926,6 +4097,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     info["proposals"] = _proposals
     if _crop_guard_removed:
         info["crop_guard_removed_frames"] = list(_crop_guard_removed)
+    if _amc_info:
+        info["axial_motion_correct"] = _amc_info
+    if _ifd_info:
+        info["intra_frame_dewarp"] = _ifd_info
     return info
 
 

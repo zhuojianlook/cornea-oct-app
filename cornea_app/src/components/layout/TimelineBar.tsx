@@ -60,8 +60,14 @@ export function TimelineBar() {
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
   const setDifficult = useCaseStore((s) => s.setDifficult);
-  const markDefectMode = useWorkflowStore((s) => s.markDefectMode);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
+  // Ground-truth capture: this scan carries a manual border correction (Fix-columns anchors) → Approving records
+  // it as CONFIRMED ground truth for the auto-detector training corpus. The toggle lets the user EXCLUDE an
+  // idealised case (e.g. a motion-corrupted scan whose hand-drawn border is not real geometry) from the corpus.
+  const octParams = (manifest?.oct_params ?? null) as Record<string, unknown> | null;
+  const anchorObj = (octParams?.border_anchors ?? null) as Record<string, unknown> | null;
+  const hasBorderCorrection = Boolean(anchorObj && Object.keys(anchorObj).length);
+  const [corpusEligible, setCorpusEligible] = useState(true);
   const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
@@ -357,27 +363,19 @@ export function TimelineBar() {
   // filled without a rollback (which would clear SAM2). Null once vetted, so it never shows for the normal flow.
   const ApprovePreproc = !manifest?.preproc_vetted ? (
     <Button size="small" variant="outlined" color="warning" disabled={busy}
-      onClick={() => { setBusyAction("approve"); approvePreprocessing(); }}
+      onClick={() => { setBusyAction("approve"); approvePreprocessing(corpusEligible); }}
       startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
       title="Mark the preprocessing as manually vetted (fills the Vetted step). Non-destructive — keeps the SAM2 segmentation. Does NOT apply any auto-detected corrections. Shown because this scan was segmented without an explicit preprocessing approval.">
       {busyAction === "approve" && caseBusy ? "Approving…" : "✓ Approve preprocessing"}
     </Button>
   ) : null;
 
-  // DEFECT-MARKING (replaces the old #A/#B/#C issue flags): a "⚑ Mark defect" TOGGLE that puts the main
-  // viewer into column-marking mode (drag over a sagittal/axial slice to mark the WRONG columns → persisted to
-  // manifest.defect_marks so the assistant reads exactly which frames/columns are wrong), plus a "⚠ Difficult"
-  // TOGGLE bound to manifest.difficult_scan (this scan needs manual help). Shown at the cornea-review steps (4/5).
-  const defectMarks: unknown[] = Array.isArray(manifest?.defect_marks) ? (manifest!.defect_marks as unknown[]) : [];
-  const markCount = defectMarks.length;
+  // Marking is now CONSOLIDATED into Fix-columns: the user corrects the border there (the correction IS the
+  // "mark", and on Approve it becomes ground truth), so the separate ⚑ Mark-defect toggle is retired. Only the
+  // "⚠ Difficult" flag (this scan needs manual help / can't be fixed) remains.
   const difficult = Boolean(manifest?.difficult_scan);
   const FlagButtons = (
     <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}>
-      <Button size="small" variant={markDefectMode ? "contained" : "outlined"} color="warning" disabled={busy}
-        onClick={() => set("markDefectMode", !markDefectMode)}
-        title="Mark WRONG columns: toggle on, then drag over the current sagittal/axial slice in the main viewer to mark the bad columns. Marks accumulate across slices and are saved to manifest.defect_marks (the assistant reads them).">
-        ⚑ Mark defect{markCount > 0 ? ` (${markCount})` : ""}
-      </Button>
       <Button size="small" variant={difficult ? "contained" : "outlined"} color="error" disabled={busy}
         onClick={() => void setDifficult(!difficult)}
         title="Mark this scan as a DIFFICULT SCAN needing manual help — persisted to manifest.difficult_scan so the assistant knows to hand-correct it.">
@@ -385,6 +383,14 @@ export function TimelineBar() {
       </Button>
     </span>
   );
+  // GT toggle shown next to Approve when the scan has a manual border correction (Fix-columns anchors).
+  const CorpusToggle = hasBorderCorrection ? (
+    <label className="flex items-center gap-1 text-[11px]" style={{ color: "var(--c-text-dim)", cursor: "pointer" }}
+      title="This scan has a manual border correction. Approving records it as GROUND TRUTH that trains/validates the auto-detector. Uncheck to keep the correction applied but EXCLUDE an idealised case (e.g. a motion-corrupted scan whose hand-drawn border is not real geometry) from the training corpus.">
+      <input type="checkbox" checked={corpusEligible} onChange={(e) => setCorpusEligible(e.target.checked)} disabled={busy} />
+      🎯 use correction as training ground truth
+    </label>
+  ) : null;
 
   // ── actions ──
   let actions: React.ReactNode = null;
@@ -414,10 +420,11 @@ export function TimelineBar() {
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>
           {proposals.hasProposal
             ? "An auto-correction was detected (shown in pink). Approve the output as-is, or apply the correction first:"
-            : "Review the preprocessing (Before/after · Fix-columns), then:"}
+            : "Review + correct in Fix-columns (the correction becomes ground truth on Approve), then:"}
         </span>
+        {CorpusToggle}
         <Button size="small" variant="contained" color="warning" disabled={busy}
-          onClick={() => { setBusyAction("approve"); approvePreprocessing(); }}
+          onClick={() => { setBusyAction("approve"); approvePreprocessing(corpusEligible); }}
           startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification. Accepts the CURRENT output as-is; does NOT apply any auto-detected correction.">
           {busyAction === "approve" && caseBusy ? "Approving…" : "✓ Approve preprocessing"}
