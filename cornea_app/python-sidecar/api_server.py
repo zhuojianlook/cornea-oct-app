@@ -3833,6 +3833,61 @@ def oct_border_generalize_discard(case_id: str) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/case/{case_id}/oct-smooth-corrected")
+def oct_smooth_corrected_case(case_id: str, req: OctPreprocessRequest) -> dict:
+    """SMOOTH the already manually-corrected volume. The fix-columns Run warps to the corrected surface via
+    provided_edges with inter-slice smoothing DISABLED (oct_preprocess.py:2934) so the exact drag is honoured —
+    which leaves residual slice-to-slice jitter. This applies the guarded post-hoc smoothing passes to the
+    CORRECTED output (axial_consistency → [surface_refine_2d if enabled] → frame_boundary_lat_smooth), in the
+    same order the auto pipeline uses, MINUS axial_refine (which re-flattens whole frames to a fresh auto
+    quadratic → would undo the manual correction). The included passes are HARD-GATED local nudges: each
+    re-detects the CURRENT surface, builds a locally-smoothed target of it, and moves only columns whose
+    deviation exceeds a small threshold, capped small — a strict no-op on already-smooth regions, so the manual
+    corrections are preserved within those caps. Runs on the already-written corrected nifti ONLY (never
+    re-reads the raw .OCT). Drops segmentation (geometry shifted); keeps the anchors + vetting + GT."""
+    import numpy as _np
+    import shutil as _sh2
+    m = orch.read_manifest(case_id)
+    src = m.get("oct_source")
+    if not m.get("oct_preprocessed") or not src or not Path(src).exists():
+        raise HTTPException(400, "Smoothing needs a preprocessed scan.")
+    if not ((m.get("oct_params") or {}).get("border_anchors")):
+        raise HTTPException(400, "Smoothing applies to a manually-corrected volume — Confirm border corrections first.")
+    try:
+        work = _oct_working_path(case_id, src)
+        params = dict(m.get("oct_params") or {})
+        sag = _np.asarray(_load_border_vol(work))              # (lateral, depth, frames) = sagittal
+        corrected = oct_mod.revert_sagittal(sag)               # → (frames, depth, lateral) for the passes
+        corrected, _axc = oct_mod.axial_consistency_volume(corrected, params, workers=None)
+        if params.get("surface_refine_2d", False):
+            corrected, _srf = oct_mod.surface_refine_2d(corrected, params, workers=None)
+        corrected, _fbs = oct_mod.frame_boundary_lat_smooth(corrected, params, workers=None)
+        # re-assert manual overrides LAST (mirror the auto chain) so they stay final, never smoothed away
+        ms = params.get("manual_shifts")
+        if ms:
+            corrected, _ = oct_mod.apply_manual_shifts(corrected, ms)
+        corrected, _ = oct_mod._apply_crop(corrected, params)
+        sp = oct_mod._resolve_spacing(params, m.get("companion_txt"), n_frames=int(corrected.shape[0]))
+        oct_mod.write_volume_nifti(corrected, work, sp)        # atomic; same NIFTI_DIRECTION/spacing/origin
+        # geometry shifted → drop segmentation (user re-runs SAM2); KEEP anchors + preproc_vetted + border_gt
+        seg_dir = orch.segmentation_preview_dir(case_id)
+        if seg_dir.exists():
+            _sh2.rmtree(seg_dir, ignore_errors=True)
+        for grp in ("context_seg", "context_cons"):
+            _sh2.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
+        labels.corrected_path(case_id).unlink(missing_ok=True)
+        orch.case_qa_json(case_id).unlink(missing_ok=True)
+        extra = {"oct_volume_index": int(m.get("oct_volume_index", 0)), "oct_params": params, "scar_metrics": None,
+                 "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
+                 "cornea_vetted": None, "subgroup_confirmed": None,
+                 "qa_json": None, "segmentation_preview_dir": None}
+        return _oct_render_volume(case_id, work, preprocessed=True, extra=extra)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT smooth-corrected failed: {exc}")
+
+
 class OctLoadDirRequest(BaseModel):
     directory: str
 
