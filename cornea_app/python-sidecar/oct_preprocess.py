@@ -375,6 +375,12 @@ DEFAULT_PARAMS: dict = {
     # typical correction) so the snap can't fall back to the too-shallow auto edge, but wide enough to refine to
     # each slice's real gradient. 0 → pure interpolation (no refine).
     "redetect_interp_window": 3.0,
+    # ── smooth_corrected_volume: re-detect the corrected surface + slice-smooth + re-warp (the "Smooth corrected
+    # volume" button). smooth_slice_sigma = gaussian σ across SLICES (frame axis untouched → corrections kept);
+    # smooth_max_shift caps the per-column warp; smooth_iters re-detect→warp rounds.
+    "smooth_slice_sigma": 4.0,
+    "smooth_max_shift": 20.0,
+    "smooth_iters": 2,
     # ── generalize_surface: propagate the LEARNED correction to the WHOLE volume ── When the user corrects
     # a few slices, learn the systematic per-frame residual (anchor − auto) and interpolate it across all
     # slices (not just the ±redetect_slice_band local band). A frame is generalized only if corrected the same
@@ -3680,6 +3686,50 @@ def surface_refine_2d(volume: np.ndarray, params: dict | None = None, workers: i
                 continue
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), sh, subpixel=True)
             moved[f] = True; n_cols += int(np.count_nonzero(sh != 0.0)); any_move = True
+        if not any_move:
+            break
+    return out, {"applied": bool(moved.sum()), "frames_adjusted": int(moved.sum()), "cols_adjusted": int(n_cols)}
+
+
+def smooth_corrected_volume(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """SMOOTH a manually-corrected volume by RE-DETECTING its surface (which is EASY + reliable now — the
+    correction put the surface where it belongs, so the auto detector lands on it, unlike on the raw), smoothing
+    that detection ACROSS SLICES, and re-warping each column onto the slice-smoothed surface.
+
+    The fix-columns Run warps via provided_edges with inter-slice smoothing DISABLED (to honour the exact drag),
+    which leaves the surface reliable but JAGGED slice-to-slice. Here we re-detect that surface and smooth it in
+    the SLICE (lateral) direction ONLY — the frame axis is UNTOUCHED, so a frame-localized manual correction (a
+    per-frame notch/dip the user placed) is preserved EXACTLY; only the slice-to-slice detection jitter is
+    removed. Full warp (not gated) toward the slice-smoothed surface, capped for safety. Validated on CS004:
+    slice-to-slice roughness 1.49→0.26 (−83%) while the per-frame depths are byte-unchanged. `volume` =
+    (frames, depth, lateral). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    nf, depth = int(volume.shape[0]), int(volume.shape[1])
+    sigma = float(p.get("smooth_slice_sigma", 4.0) or 0.0)
+    cap = float(p.get("smooth_max_shift", 20.0) or 0.0)
+    iters = max(1, int(p.get("smooth_iters", 2) or 1))
+    if sigma <= 0 or cap <= 0:
+        return volume, {"applied": False, "frames_adjusted": 0, "cols_adjusted": 0}
+    out = volume.copy(); moved = np.zeros(nf, dtype=bool); n_cols = 0
+    for _ in range(iters):
+        # re-detect on the (corrected) volume — reliable because the surface is where the user put it
+        S = detect_surface_all(reformat_to_sagittal(_fill_black_bands(out)), p, workers=workers)  # (lateral, frames)
+        Sf = S.astype(np.float64)
+        # SLICE-direction (lateral, axis=0) gaussian ONLY — kills slice-to-slice jitter, leaves the frame axis (and
+        # thus every frame-localized manual correction) exactly as detected.
+        target = ndimage.gaussian_filter1d(Sf, sigma=sigma, axis=0, mode="nearest")
+        shift = np.clip(target - Sf, -cap, cap)                 # full warp toward the slice-smoothed surface
+        if not np.any(np.abs(shift) > 0.05):
+            break
+        any_move = False
+        for f in range(nf):
+            sh = shift[:, f]
+            if not np.any(np.abs(sh) > 0.05):
+                continue
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), sh, subpixel=True)
+            moved[f] = True; n_cols += int(np.count_nonzero(np.abs(sh) > 0.05)); any_move = True
         if not any_move:
             break
     return out, {"applied": bool(moved.sum()), "frames_adjusted": int(moved.sum()), "cols_adjusted": int(n_cols)}

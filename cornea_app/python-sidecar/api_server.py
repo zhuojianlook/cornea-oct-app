@@ -3858,9 +3858,10 @@ def oct_smooth_corrected_case(case_id: str, req: OctPreprocessRequest) -> dict:
         params = dict(m.get("oct_params") or {})
         sag = _np.asarray(_load_border_vol(work))              # (lateral, depth, frames) = sagittal
         corrected = oct_mod.revert_sagittal(sag)               # → (frames, depth, lateral) for the passes
-        corrected, _axc = oct_mod.axial_consistency_volume(corrected, params, workers=None)
-        if params.get("surface_refine_2d", False):
-            corrected, _srf = oct_mod.surface_refine_2d(corrected, params, workers=None)
+        # PRIMARY: re-detect the (reliable) corrected surface + smooth ACROSS SLICES + re-warp — removes the
+        # slice-to-slice jitter the provided_edges warp left, preserving frame-localized corrections exactly.
+        corrected, _sm = oct_mod.smooth_corrected_volume(corrected, params, workers=None)
+        # extra cleanup of the low-signal first/last acquisition-edge frames (gated; interior untouched)
         corrected, _fbs = oct_mod.frame_boundary_lat_smooth(corrected, params, workers=None)
         # re-assert manual overrides LAST (mirror the auto chain) so they stay final, never smoothed away
         ms = params.get("manual_shifts")
