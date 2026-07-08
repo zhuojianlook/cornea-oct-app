@@ -51,6 +51,12 @@ function _createNv(canvas: HTMLCanvasElement): Niivue | null {
       show3Dcrosshair: true,
       isColorbar: false,
       dragAndDropEnabled: false,
+      // CRISP voxels (no linear blur). OCT is extremely anisotropic (lateral 0.0078 / depth 0.0031 /
+      // frame 0.040 mm → up to 13:1), so niivue's default LINEAR texture sampling smears the bright
+      // corneal surface across voxels in the coarse directions — making the axial/coronal border look
+      // "fuzzy" even when the tissue is aligned to sub-pixel. Nearest-neighbour shows the true surface
+      // so the user can judge (and correct) real smoothness. Matches GtCompareViewer's setting.
+      isNearestInterpolation: true,
     });
     nv.attachToCanvas(canvas);
     nv.setSliceType(SLICE.multi);
