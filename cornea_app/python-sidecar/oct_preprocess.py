@@ -104,6 +104,14 @@ DEFAULT_PARAMS: dict = {
     "provided_edge_lat_gate": 2.0,     # px: replace a column with the trend only where it deviates by more than this
     "provided_edge_protect_lat": 2,    # ± laterals around each drag point kept untouched (correction guard)
     "provided_edge_protect_frame": 1,  # ± frames around each drag point kept untouched
+    # ── fix-columns provided_edges INTER-SLICE (lateral) displacement smoothing ── The dominant cause of the
+    # "jagged/spiky" axial edge: the provided_edges warp flattens each lateral INDEPENDENTLY (its own per-frame
+    # quadratic), so ~1px per-lateral warp jitter turns the surface into a sawtooth in the en-face/axial view
+    # (crisp rendering makes every tooth visible). This smooths the WARP DISPLACEMENT across laterals (same
+    # mechanism as interslice_smooth on the auto path, sigma matched to it) so neighbouring slices shift
+    # coherently → the axial edge drops from ~1.3px teeth to the raw's ~0.25px. Validated on CS004: central
+    # teeth 1.4→0.22px (= raw), dragged sagittal slices visually unchanged. 0 = off (legacy per-slice warp).
+    "provided_edge_ism": 3.0,
     "subpixel_warp": True,        # flatten warp shifts columns by the FRACTIONAL displacement (linear interp in
                                   #   depth) instead of int-truncate → removes the 1-px lateral STAIRCASE ripple in
                                   #   the anterior boundary. Interp is confined to the <1px depth shift (lateral/
@@ -3004,7 +3012,7 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     # 3b) axial consistency (#3): smooth the displacement FIELD across the slice (lateral) axis so
     #     neighbouring sagittal slices shift consistently → a smoother en-face/axial boundary. The
     #     depth/frame axis is untouched (the per-slice quadratic governs it); sigma=0 → per-slice field.
-    ism = 0.0 if use_provided else float(p.get("interslice_smooth", 0.0) or 0.0)
+    ism = float(p.get("provided_edge_ism", 0.0) or 0.0) if use_provided else float(p.get("interslice_smooth", 0.0) or 0.0)
     if ism > 0 and n > 2:
         disp_field = ndimage.gaussian_filter1d(disp_field.astype(np.float64), sigma=ism, axis=0)
         # The inter-slice Gaussian re-mixes neighbouring slices, which can pull a clipped/cut column's shift
