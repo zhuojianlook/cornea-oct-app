@@ -62,7 +62,9 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
     if (!canvas) return;
     if (!canvas.getContext("webgl2")) { setError("Needs a WebGL2 context — open in Chrome/Firefox."); setLoading(false); return; }
     let cancelled = false;
-    const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false });
+    // isNearestInterpolation: crisp voxels on anisotropic OCT (same reason as the main viewer, nvController)
+    // — loads DISCRETE region maps (0/1/2), so linear sampling would produce fractional labels / haloed borders.
+    const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false, isNearestInterpolation: true });
     try {
       nv.attachToCanvas(canvas);
       try { nv.addColormap("rgA", RG_A); nv.addColormap("rgB", RG_B); nv.addColormap("rgBoth", RG_BOTH); } catch { /* older niivue */ }

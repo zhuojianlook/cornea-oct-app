@@ -94,6 +94,16 @@ DEFAULT_PARAMS: dict = {
     "ifd_max_shift": 20.0,        # px cap on the per-column intra-frame correction
     "interslice_smooth": 3.0,     # (raised 1→3 with subpixel_warp) smooth the per-slice displacement across slices
                                   #   more, reducing slice-to-slice apex ripple; validated to also SMOOTH approved scans
+    # ── fix-columns provided_edges LATERAL de-streak (see smooth_volume use_provided branch) ── The provided_edges
+    # warp disables all lateral smoothing to honour the exact drag, but that also lets UN-dragged peripheral
+    # re-detection jitter through → the warp shears the clean band into vertical spikes ("fuzzy" axial border).
+    # Replace only single-lateral spikes (> gate off the robust lateral trend) with the trend, protecting a small
+    # band around every drag point + pinning the exact drags. Off = median<=1 or gate<=0.
+    "provided_edge_lat_median": 7,     # lateral median window for the robust trend; <=1 = de-streak OFF (legacy exact)
+    "provided_edge_lat_smooth": 2.0,   # gaussian sigma (lateral) smoothing that trend; 0 = median-only trend
+    "provided_edge_lat_gate": 2.0,     # px: replace a column with the trend only where it deviates by more than this
+    "provided_edge_protect_lat": 2,    # ± laterals around each drag point kept untouched (correction guard)
+    "provided_edge_protect_frame": 1,  # ± frames around each drag point kept untouched
     "subpixel_warp": True,        # flatten warp shifts columns by the FRACTIONAL displacement (linear interp in
                                   #   depth) instead of int-truncate → removes the 1-px lateral STAIRCASE ripple in
                                   #   the anterior boundary. Interp is confined to the <1px depth shift (lateral/
@@ -2745,6 +2755,61 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         edges = np.asarray(provided_edges, dtype=np.float32)
         if edges.shape != (n, sag.shape[2]):
             raise ValueError(f"provided_edges shape {edges.shape} != expected {(n, sag.shape[2])}")
+        # LATERAL DE-STREAK (fix-columns axial fuzz) — the provided (re-detected) surface jitters column-to-
+        # column across LATERALS at low-SNR laterals the user did NOT drag; warping to it shears the clean band
+        # into vertical spikes = a "fuzzy" axial/en-face border (the raw is clean there). Replace only the
+        # single-lateral SPIKES (> _gate px off a robust lateral median→gaussian trend) with the trend, but:
+        #   (1) never touch a column within ±_protect_lat laterals / ±_protect_frame frames of one of the user's
+        #       DRAG points (their corrections + the immediate propagation zone are protected), and
+        #   (2) PIN every exact drag point to its depth.
+        # So only the re-detector's OWN un-dragged guesses are regularised (opted into); the actual drags are
+        # honoured to the pixel. Smooths across LATERALS ONLY (axis 0) — the frame axis (the per-slice drag) is
+        # never touched. Off via provided_edge_lat_median<=1 or provided_edge_lat_gate<=0. Validated on CS004:
+        # peripheral streaks reduced, drag points 0px, central frames unchanged.
+        _lem = int(p.get("provided_edge_lat_median", 7) or 0)
+        _les = float(p.get("provided_edge_lat_smooth", 2.0) or 0.0)
+        _gate = float(p.get("provided_edge_lat_gate", 2.0) or 0.0)
+        _bl = int(p.get("provided_edge_protect_lat", 2) or 0)
+        _bf = int(p.get("provided_edge_protect_frame", 1) or 0)
+        if _lem > 1 and _gate > 0:
+            _nl, _nf = edges.shape
+            _trend = ndimage.median_filter(edges, size=(_lem, 1), mode="nearest")
+            if _les > 0:
+                _trend = ndimage.gaussian_filter1d(_trend.astype(np.float64), sigma=_les, axis=0,
+                                                   mode="nearest").astype(np.float32)
+            _spike = np.abs(edges - _trend) > _gate
+            _prot = np.zeros((_nl, _nf), dtype=bool)
+            _anc = p.get("border_anchors") or {}
+            for _slat, _fm in _anc.items():
+                try:
+                    _li = int(_slat)
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= _li < _nl) or not isinstance(_fm, dict):
+                    continue
+                _l0, _l1 = max(0, _li - _bl), min(_nl, _li + _bl + 1)
+                for _sf in _fm:
+                    try:
+                        _fi = int(_sf)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= _fi < _nf:
+                        _prot[_l0:_l1, max(0, _fi - _bf):min(_nf, _fi + _bf + 1)] = True
+            _E = np.where(_spike & ~_prot, _trend, edges).astype(np.float32)
+            for _slat, _fm in _anc.items():
+                try:
+                    _li = int(_slat)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= _li < _nl and isinstance(_fm, dict):
+                    for _sf, _dep in _fm.items():
+                        try:
+                            _fi = int(_sf)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= _fi < _nf:
+                            _E[_li, _fi] = float(_dep)
+            edges = _E
         if progress:
             progress(0.5)
     else:

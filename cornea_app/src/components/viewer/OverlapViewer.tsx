@@ -79,7 +79,9 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
       return;
     }
     let cancelled = false;
-    const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false });
+    // isNearestInterpolation: crisp voxels on anisotropic OCT (same reason as the main viewer, nvController)
+    // — and this loads a DISCRETE agreement map, so linear sampling would halo between its tiers.
+    const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false, isNearestInterpolation: true });
     try {
       nv.attachToCanvas(canvas);
       try { nv.addColormap("overlap3", OVERLAP_CMAP); } catch { /* older niivue → fall back to "warm" */ }
