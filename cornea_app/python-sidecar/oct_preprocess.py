@@ -370,6 +370,11 @@ DEFAULT_PARAMS: dict = {
     # ±redetect_seed_window depth px of the drag (1-2 px), instead of a generous search that could wander off
     # the line. The march to neighbouring slices then tracks the surface within ±detect_window.
     "redetect_seed_window": 2.0,
+    # After interpolating the correction across the gap between anchored slices, re-detect the best edge within
+    # ±redetect_interp_window px of that interpolated border on the un-anchored in-between slices. NARROW (< the
+    # typical correction) so the snap can't fall back to the too-shallow auto edge, but wide enough to refine to
+    # each slice's real gradient. 0 → pure interpolation (no refine).
+    "redetect_interp_window": 3.0,
     # ── generalize_surface: propagate the LEARNED correction to the WHOLE volume ── When the user corrects
     # a few slices, learn the systematic per-frame residual (anchor − auto) and interpolate it across all
     # slices (not just the ±redetect_slice_band local band). A frame is generalized only if corrected the same
@@ -2257,27 +2262,80 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
         redet[rmask] = np.clip(redet[rmask], prior[rmask] - seed_win, prior[rmask] + seed_win)
         redet_region[s] = redet; region_wf[s] = wf_s; _splice(s, redet, wf_s)
 
-    # 2) march each anchored slice's region outward to the band slices ONLY (slice_band>0). A band slice inherits
-    #    the region (frame weight) of the anchored slice it marches from, so the correction stays confined to the
-    #    same frames. With slice_band=0, band_mask is just the anchored slices → nothing marches (strictly local).
-    band_slices = [s for s in range(n) if band_mask[s]]
-    progressing = True
-    while progressing:
-        progressing = False
-        for s in band_slices:
-            if s in redet_region:
+    # 2) INTERPOLATE the correction across slices — fills the gaps BETWEEN anchored slices, and tapers to auto
+    #    beyond ±slice_band of the outermost anchors. This REPLACES the previous re-detect march, which
+    #    re-detected each un-anchored in-between slice and so snapped it back to the (too-shallow) auto edge — the
+    #    correction never reached the slices between the ones the user fixed. Per frame, the anchored slices whose
+    #    correction touches that frame are the interpolation KNOTS; the applied correction ((redet−base) already
+    #    frame-weighted by region_wf, == what _splice adds at slice-weight 1) is linearly interpolated across
+    #    slices between those knots and tapered beyond. A frame corrected on only ONE slice keeps the old ±band
+    #    triangular taper (nothing to interpolate). Anchored slices are UNCHANGED — interp passes through their
+    #    knot value, which equals the step-1 splice (base + corr at slice-weight 1).
+    if slice_band > 0 and anchored:
+        sidx = np.arange(n)
+        # 2a) ACCURATE PRIOR — interpolate the RAW correction (anchor−base) across slices AND across frames, so the
+        #     gaps between the slices the user fixed are filled with the true interpolated correction (not the auto
+        #     edge). resid = per-frame residual interpolated over the anchored slices that touched that frame,
+        #     tapered ±slice_band beyond the span; cov = the corrected region (frame weight) interpolated the same
+        #     way. Then fill frame gaps (interp residual across frames within cov) + light smooth → no seams.
+        resid = np.zeros((n, W), dtype=np.float32)
+        cov = np.zeros((n, W), dtype=np.float32)
+        def _spread(knots, vals):
+            if len(knots) == 1:
+                s0 = knots[0]
+                return vals[0] * np.clip(1.0 - np.abs(sidx - s0) / (slice_band + 1), 0.0, 1.0).astype(np.float32)
+            v = np.interp(sidx, knots, vals).astype(np.float32)
+            lo, hi = knots[0], knots[-1]
+            tap = np.where(sidx < lo, np.clip(1.0 - (lo - sidx) / (slice_band + 1), 0.0, 1.0),
+                  np.where(sidx > hi, np.clip(1.0 - (sidx - hi) / (slice_band + 1), 0.0, 1.0), 1.0)).astype(np.float32)
+            return v * tap
+        for f in range(W):
+            kr = [s for s in anchored if f in anc[s]]                    # slices that directly anchored frame f (raw drag)
+            kc = [s for s in anchored if region_wf[s][f] > 1e-6]         # slices whose corrected region reaches f
+            if kr:
+                resid[:, f] = _spread(kr, np.array([anc[s][f] - base[s, f] for s in kr], dtype=np.float32))
+            if kc:
+                cov[:, f] = _spread(kc, np.array([region_wf[s][f] for s in kc], dtype=np.float32))
+        cov = np.clip(cov, 0.0, 1.0)
+        # fill residual across FRAMES within the corrected span of each slice (so margin frames between runs don't
+        # sit at auto), then a light 2-D smooth of the correction field (no vertical seam / lateral step).
+        for s in range(n):
+            fcov = np.where(cov[s] > 1e-3)[0]
+            if fcov.size >= 2:
+                resid[s] = np.interp(np.arange(W), fcov, resid[s, fcov]).astype(np.float32)
+                resid[s, :fcov[0]] = 0.0; resid[s, fcov[-1] + 1:] = 0.0
+        resid = ndimage.gaussian_filter(resid, (2.0, 1.0))
+        prior_surf = np.clip(base + resid, 0, depth - 1).astype(np.float32)
+        # 2b) SMART re-detect: snap to the strongest RISING gradient NEAR the interpolated border — proximity-
+        #     weighted so it refines to a nearby real edge but is NOT pulled back to the too-shallow auto edge
+        #     (which, being a strong gradient, would win a plain argmax). window = ±redetect_interp_window;
+        #     prox_sigma keeps it close to the interpolated prior; where no clear edge, the prior is kept.
+        interp_win = float(p.get("redetect_interp_window", 3.0))
+        prox_sigma = max(0.5, interp_win / 2.0)
+        depthf = float(depth)
+        for s in range(n):
+            if s in anc:                                    # anchored slice → keep the user's exact drag (seeded)
                 continue
-            nb = (s - 1) if (s - 1) in redet_region else ((s + 1) if (s + 1) in redet_region else None)
-            if nb is None:
+            w = cov[s]
+            if not (w > 1e-3).any():
                 continue
-            wf_s = region_wf[nb]                             # inherit the source anchored slice's per-frame region
-            rmask = wf_s > 0
-            sl = np.ascontiguousarray(sag[s]).astype(np.float32)
-            prior = base[s].astype(np.float32).copy(); prior[rmask] = redet_region[nb][rmask]
-            redet = _redetect_one_slice(sl, prior, march_win, p).astype(np.float32)
-            redet_region[s] = redet; region_wf[s] = wf_s; _splice(s, redet, wf_s); progressing = True
-        if progress:
-            progress(min(1.0, len(redet_region) / max(1, len(band_slices))))
+            if interp_win > 0:
+                sm = ndimage.gaussian_filter1d(sag[s].astype(np.float32), sigma=float(p["sigma"]), axis=0)
+                grad = np.gradient(sm, axis=0)              # (depth, frames); rising edge = positive
+                rows = np.arange(depth)[:, None]
+                dist = rows - prior_surf[s][None, :]        # depth offset from the interpolated border
+                inwin = np.abs(dist) <= interp_win
+                prox = np.exp(-(dist ** 2) / (2.0 * prox_sigma ** 2))
+                score = np.where(inwin, np.maximum(grad, 0.0) * prox, -1.0)
+                redet = np.argmax(score, axis=0).astype(np.float32)
+                # keep the interpolated prior where the window holds no real rising edge (score ~ 0)
+                noedge = score.max(axis=0) <= 1e-6
+                redet[noedge] = prior_surf[s][noedge]
+            else:
+                redet = prior_surf[s]
+            surface[s] = base[s] * (1.0 - w) + redet * w    # blend into auto by the interpolated coverage weight
+    if progress:
+        progress(1.0)
     return surface
 
 

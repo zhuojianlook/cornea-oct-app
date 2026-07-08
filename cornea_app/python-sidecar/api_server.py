@@ -3563,7 +3563,7 @@ def _border_anchors_sig(anchors: dict) -> str:
 _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColor", "sigmaSpace",
                       "side_window", "side_threshold_factor", "residual_threshold", "active_threshold",
                       "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band",
-                      "redetect_seed_window",
+                      "redetect_seed_window", "redetect_interp_window",
                       # native DP detector selection + tuning — a change must invalidate the surface caches
                       "detector", "dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump",
                       # DP scar-guard (cross-checks DP vs legacy, pulls DP off a bright internal scar) — its
@@ -3578,7 +3578,7 @@ _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColo
 # invalidates surfaces written by the old algorithm. "per-slice-v2" = the per-slice frame-region fix (a
 # redetect.npz from the prior global-union code would otherwise be served unchanged after an update — the
 # detection params are identical — silently keeping the old buggy surface on already-confirmed cases).
-_REDETECT_ALGO_VERSION = "dp-detector-v4-scarguard"   # DP + legacy-vicinity scar-guard (pulls DP off bright scars)
+_REDETECT_ALGO_VERSION = "dp-v4-scarguard-interp1"   # DP + legacy-vicinity scar-guard (pulls DP off bright scars)
 
 
 def _detect_params_sig(p: dict) -> str:
