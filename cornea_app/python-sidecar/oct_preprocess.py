@@ -370,6 +370,19 @@ DEFAULT_PARAMS: dict = {
     # ±redetect_seed_window depth px of the drag (1-2 px), instead of a generous search that could wander off
     # the line. The march to neighbouring slices then tracks the surface within ±detect_window.
     "redetect_seed_window": 2.0,
+    # ── generalize_surface: propagate the LEARNED correction to the WHOLE volume ── When the user corrects
+    # a few slices, learn the systematic per-frame residual (anchor − auto) and interpolate it across all
+    # slices (not just the ±redetect_slice_band local band). A frame is generalized only if corrected the same
+    # direction on >= gen_min_slices slices with robust median residual > gen_min_resid px (so one-off edits
+    # aren't globalized). gen_resid_cap clamps a wild mis-click; taper/sigma smooth the correction field.
+    "gen_min_slices": 2,
+    "gen_min_resid": 3.0,
+    "gen_sign_frac": 0.7,
+    "gen_resid_cap": 45.0,
+    "gen_taper_slices": 20,
+    "gen_frame_margin": 6,
+    "gen_slice_sigma": 8.0,
+    "gen_frame_sigma": 2.0,
     # ── clipped-apex handling ── In some scans the cornea sits so high in the acquisition window that the
     # dome APEX rises ABOVE depth 0 across the central frames. Those columns have tissue filling from row 0
     # with NO dark air gap and NO air→epithelium edge, so the detector pins the edge at the top (~5px) and
@@ -2266,6 +2279,100 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
         if progress:
             progress(min(1.0, len(redet_region) / max(1, len(band_slices))))
     return surface
+
+
+def generalize_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
+                       baseline: np.ndarray | None = None, progress=None) -> np.ndarray:
+    """GENERALIZE the user's fix-columns corrections to the WHOLE volume (all slices), so correcting a few
+    representative slices propagates the CORRECTION PATTERN everywhere — not just the ±redetect_slice_band local
+    march.
+
+    Unlike redetect_surface (which keeps auto everywhere except a local band around each anchor), this LEARNS
+    the systematic per-frame correction the user makes and interpolates it across ALL slices:
+      1. For each frame, look at the anchored slices; if the user corrected it the SAME direction on
+         >= gen_min_slices slices with a robust median |correction| > gen_min_resid, it's a "correction frame".
+      2. The correction is the RESIDUAL (anchor − auto), NOT the absolute depth — so auto's own cross-slice
+         curvature (dome/limbus) is preserved and only the learned correction is added on top. A slice the user
+         anchored NEAR AUTO contributes a ~0 residual and stays near auto (no flat offset is ever imposed).
+      3. Interpolate that residual across slices (edge-hold + taper to 0 beyond the anchored span) and across
+         frames (fill gaps between correction frames, taper to 0 beyond the corrected range), then smooth.
+      4. surface = auto + smoothed residual field.
+    Validated on real data (CS004): reproduces held-out anchored slices to ~1.3px median (vs ~4-5px auto),
+    smoothly. This is preview-first at the API layer (a separate generalize.npz, user-accepted). `sag` =
+    (lateral/slice, depth, frames); `anchors` = {slice:{frame:depth}}; `baseline` = auto surface (n, W)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    n, depth, W = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
+    base = (np.asarray(baseline, dtype=np.float64).copy()
+            if baseline is not None and np.asarray(baseline).shape == (n, W)
+            else detect_surface_all(sag, p, progress=progress).astype(np.float64))
+    # normalize anchors → {int slice: {int frame: float depth}} within bounds (same as redetect_surface)
+    anc: dict[int, dict[int, float]] = {}
+    for s_key, frames in (anchors or {}).items():
+        try:
+            s = int(s_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= s < n) or not isinstance(frames, dict):
+            continue
+        fm: dict[int, float] = {}
+        for f_key, d in frames.items():
+            try:
+                f = int(f_key); dv = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < W and np.isfinite(dv):
+                fm[f] = float(np.clip(dv, 0, depth - 1))
+        if fm:
+            anc[s] = fm
+    if not anc:
+        return base.astype(np.float32)
+    A = sorted(anc.keys())
+    min_slices = max(1, int(p.get("gen_min_slices", 2)))
+    min_resid = float(p.get("gen_min_resid", 3.0))
+    sign_frac = float(p.get("gen_sign_frac", 0.7))
+    resid_cap = float(p.get("gen_resid_cap", 45.0))     # clamp a wild mis-clicked anchor so it can't blow up
+    taper_sl = max(1, int(p.get("gen_taper_slices", 20)))
+    fmargin = max(1, int(p.get("gen_frame_margin", 6)))
+    slice_sigma = float(p.get("gen_slice_sigma", 8.0))
+    frame_sigma = float(p.get("gen_frame_sigma", 2.0))
+
+    # STEP 1  learn the "correction frames" (CF) + per-slice residuals (median-robust, direction-consistent)
+    CF: list[int] = []
+    R: dict[int, dict[int, float]] = {}
+    for f in range(W):
+        sl = [s for s in A if f in anc[s]]
+        if len(sl) < min_slices:
+            continue
+        res = np.array([float(np.clip(anc[s][f] - base[s, f], -resid_cap, resid_cap)) for s in sl])
+        if np.median(res) > min_resid and float(np.mean(res > 0)) >= sign_frac:
+            CF.append(f)
+            R[f] = {s: float(np.clip(anc[s][f] - base[s, f], -resid_cap, resid_cap)) for s in sl}
+    if not CF:
+        return base.astype(np.float32)   # no systematic correction learned → auto unchanged
+
+    # STEP 2  per-correction-frame residual, interpolated ACROSS SLICES (edge-hold, tapered beyond anchored span)
+    RES = np.zeros((n, W), dtype=np.float64)
+    sidx = np.arange(n)
+    for f in CF:
+        sf = sorted(R[f]); rv = np.array([R[f][s] for s in sf], dtype=np.float64)
+        Rhat = np.interp(sidx, sf, rv)
+        lo, hi = sf[0], sf[-1]
+        Rhat = np.where(sidx < lo, Rhat[lo] * np.clip(1 - (lo - sidx) / taper_sl, 0, 1),
+               np.where(sidx > hi, Rhat[hi] * np.clip(1 - (sidx - hi) / taper_sl, 0, 1), Rhat))
+        RES[:, f] = Rhat
+
+    # STEP 3  per slice, interpolate the residual ACROSS FRAMES (fill gaps between CF frames; taper beyond range)
+    CFa = np.array(sorted(CF)); fx = np.arange(W)
+    for s in range(n):
+        row = np.interp(fx, CFa, RES[s, CFa])
+        row = np.where(fx < CFa[0], RES[s, CFa[0]] * np.clip(1 - (CFa[0] - fx) / fmargin, 0, 1),
+              np.where(fx > CFa[-1], RES[s, CFa[-1]] * np.clip(1 - (fx - CFa[-1]) / fmargin, 0, 1), row))
+        RES[s] = row
+
+    # STEP 4  smooth the correction field (slices × frames) and add to auto
+    RES = ndimage.gaussian_filter(RES, (slice_sigma, frame_sigma))
+    surface = np.clip(base + RES, 0, depth - 1)
+    return surface.astype(np.float32)
 
 
 def _interp_bad_displacement(disp: np.ndarray, bad_cols, good_cols) -> np.ndarray:

@@ -2539,6 +2539,7 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         # a NORMAL auto preprocess SUPERSEDES any prior manual re-detection: drop the persisted anchors +
         # the cached surface so a later fix-columns scrub/Run can't show/apply a stale re-detected border.
         eff_params.pop("border_anchors", None)
+        eff_params.pop("border_generalize", None)   # whole-volume-generalize flag (its cache is in border_cache)
         eff_params.pop("detect_lo", None); eff_params.pop("detect_hi", None)   # legacy band keys, if any
         import shutil as _sh0
         _sh0.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)
@@ -3567,7 +3568,11 @@ _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColo
                       "detector", "dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump",
                       # DP scar-guard (cross-checks DP vs legacy, pulls DP off a bright internal scar) — its
                       # params change the detected surface, so they must invalidate the surface caches too
-                      "dp_scar_guard", "dp_scar_tol", "dp_scar_window", "dp_scar_min_run", "dp_scar_darker_margin")
+                      "dp_scar_guard", "dp_scar_tol", "dp_scar_window", "dp_scar_min_run", "dp_scar_darker_margin",
+                      # generalize_surface (propagate learned correction to the whole volume) — its params change
+                      # the generalized surface, so they must invalidate the generalize.npz cache
+                      "gen_min_slices", "gen_min_resid", "gen_sign_frac", "gen_resid_cap", "gen_taper_slices",
+                      "gen_frame_margin", "gen_slice_sigma", "gen_frame_sigma")
 
 # Bumped whenever redetect_surface()'s region/march LOGIC changes (not just its params), so an APP UPDATE
 # invalidates surfaces written by the old algorithm. "per-slice-v2" = the per-slice frame-region fix (a
@@ -3666,13 +3671,84 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     return surface
 
 
+# ── GENERALIZE (propagate the learned correction to the WHOLE volume) — a sibling cache of redetect.npz.
+#    generalize.npz holds the surface from oct_mod.generalize_surface (the interpolated residual field). It is
+#    keyed like redetect.npz (anchors_sig + raw_mtime + params_sig, which now includes the gen_* keys). When the
+#    manifest flag oct_params['border_generalize'] is set, _redetect_surface_cached returns THIS surface instead
+#    of the local-band redetect — so BOTH the scrub preview and the Run/warp use the generalized surface with no
+#    change at those call sites. A "generalize" endpoint sets the flag + computes the cache; "discard" clears it.
+def _generalize_cache_path(case_id: str) -> Path:
+    return orch.case_root(case_id) / "border_cache" / "generalize.npz"
+
+
+def _generalize_surface_fresh(case_id: str, anchors: dict):
+    import os
+    import numpy as np
+    cp = _generalize_cache_path(case_id)
+    if not cp.exists():
+        return None
+    try:
+        raw = _ensure_raw_border_nifti(case_id)
+        z = np.load(cp, allow_pickle=False)
+        if str(z["anchors_sig"]) != _border_anchors_sig(anchors):
+            return None
+        if abs(float(z["raw_mtime"]) - float(os.path.getmtime(raw))) > 1e-6:
+            return None
+        p = {**oct_mod.DEFAULT_PARAMS, **(orch.read_manifest(case_id).get("oct_params") or {})}
+        if str(z["params_sig"]) != _detect_params_sig(p):
+            return None
+        return np.asarray(z["surface"], dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _compute_generalize_cache(case_id: str, m: dict, anchors: dict):
+    """Compute the whole-volume generalized surface (interpolated residual field) from `anchors` and cache it."""
+    import os
+    import numpy as np
+    raw = _ensure_raw_border_nifti(case_id)
+    arr = _load_border_vol(raw)                              # (lateral, depth, frames)
+    p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+    baseline = _baseline_surface(case_id, arr, p)           # cached auto surface
+    surface = oct_mod.generalize_surface(arr, anchors, p, baseline=baseline)
+    cp = _generalize_cache_path(case_id)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cp.with_name("generalize.tmp.npz")
+    np.savez_compressed(tmp, surface=surface.astype(np.float32),
+                        anchors_sig=_border_anchors_sig(anchors),
+                        raw_mtime=float(os.path.getmtime(raw)),
+                        params_sig=_detect_params_sig(p))
+    os.replace(tmp, cp)
+    return surface
+
+
+def _generalize_surface_cached(case_id: str, m: dict, anchors: dict):
+    if not anchors:
+        return None
+    surf = _generalize_surface_fresh(case_id, anchors)
+    if surf is None:
+        try:
+            surf = _compute_generalize_cache(case_id, m, anchors)
+        except Exception:  # noqa: BLE001
+            return None
+    return surf
+
+
 def _redetect_surface_cached(case_id: str, m: dict, anchors: dict):
     """The re-detected surface for `anchors`: the fresh cache if valid, else recompute+cache. This makes an
     ALGORITHM upgrade (or a param change) transparently refresh the surface for BOTH the scrub display and the
     warp — so a case the user confirmed under the OLD algorithm shows/uses the NEW corrected surface without a
-    manual re-Confirm. Returns None when there are no anchors (→ caller shows the plain auto baseline)."""
+    manual re-Confirm. Returns None when there are no anchors (→ caller shows the plain auto baseline).
+
+    If oct_params['border_generalize'] is set, returns the WHOLE-VOLUME generalized surface (generalize.npz)
+    instead of the local-band redetect — rerouting scrub + Run to the generalization in one place."""
     if not anchors:
         return None
+    if (m.get("oct_params") or {}).get("border_generalize"):
+        gs = _generalize_surface_cached(case_id, m, anchors)
+        if gs is not None:
+            return gs
+        # generalize failed → fall through to the local redetect rather than showing bare auto
     surf = _redetect_surface_fresh(case_id, anchors)
     if surf is None:
         try:
@@ -3699,6 +3775,7 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
     try:
         op = dict(m.get("oct_params") or {})
         op.pop("detect_lo", None); op.pop("detect_hi", None)   # legacy global band — removed
+        op.pop("border_generalize", None)   # a fresh local Confirm exits whole-volume-generalize mode
         op["border_anchors"] = anchors
         # Parabola mode: the anchors are a DENSE fitted quadratic → use it EXACTLY (seed window 0). Edge mode:
         # the default tight window. Persisted so the cache write/read/run all derive the SAME seed window (and
@@ -3716,6 +3793,44 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT border re-detect failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-border-generalize")
+def oct_border_generalize(case_id: str, req: OctPreprocessRequest) -> dict:
+    """GENERALIZE the confirmed fix-columns corrections to the WHOLE volume: learn the systematic per-frame
+    correction (residual vs auto) from the anchored slices and interpolate it across ALL slices
+    (oct_mod.generalize_surface). Sets oct_params['border_generalize'] + computes generalize.npz, so BOTH the
+    scrub preview (oct-border-curves-all) AND a subsequent fix-columns Run/Approve use the generalized surface.
+    Reversible via oct-border-generalize/discard. Requires anchors already Confirmed."""
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
+    if not anchors:
+        raise HTTPException(400, "No confirmed border corrections to generalize — Confirm some anchors first.")
+    try:
+        op = dict(m.get("oct_params") or {})
+        op["border_generalize"] = True
+        orch.write_manifest_value(case_id, {"oct_params": op})
+        surf = _compute_generalize_cache(case_id, {**m, "oct_params": op}, anchors)
+        n_anchors = sum(len(v) for v in anchors.values() if isinstance(v, dict))
+        return {"ok": True, "n_anchors": int(n_anchors), "n_slices": int(getattr(surf, "shape", [0])[0])}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT generalize failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-border-generalize/discard")
+def oct_border_generalize_discard(case_id: str) -> dict:
+    """Revert the whole-volume generalization: clear the border_generalize flag + delete generalize.npz, so
+    scrub + Run go back to the local-band redetect (the user's per-slice anchors are untouched)."""
+    m = orch.read_manifest(case_id)
+    op = dict(m.get("oct_params") or {})
+    op.pop("border_generalize", None)
+    orch.write_manifest_value(case_id, {"oct_params": op})
+    _generalize_cache_path(case_id).unlink(missing_ok=True)
+    return {"ok": True}
 
 
 class OctLoadDirRequest(BaseModel):

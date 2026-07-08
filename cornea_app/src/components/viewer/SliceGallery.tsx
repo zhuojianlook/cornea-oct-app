@@ -84,6 +84,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     } catch { /* none */ }
     return m;
   }, [persistedAnchorsSig]);
+  // Whole-volume GENERALIZE mode: when set, the backend serves/warps the generalized surface (the learned
+  // correction interpolated across ALL slices) instead of the local-band redetect. Read from the manifest so
+  // it persists across reopen and the button state reflects it.
+  const genActive = Boolean(((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)?.border_generalize);
   // Re-fetch when the segmentation changes (SAM2/correct/scar re-render previews).
   const segSig = useWorkflowStore((s) => s.segVersion);
   const hintMode = useWorkflowStore((s) => s.hintMode);
@@ -211,6 +215,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // Editable anchor set (seeded from persisted; drag adds; Confirm persists). sliceIdx → frame → depth.
   const [borderAnchors, setBorderAnchors] = useState<Map<number, Map<number, number>>>(new Map());
   const [redetectBusy, setRedetectBusy] = useState(false);
+  const [genBusy, setGenBusy] = useState(false);
   const cloneAnchors = (m: Map<number, Map<number, number>>) => { const o = new Map<number, Map<number, number>>(); m.forEach((fm, s) => o.set(s, new Map(fm))); return o; };
   const anchorsToApi = (m: Map<number, Map<number, number>>) => {
     const o: Record<string, Record<string, number>> = {};
@@ -852,6 +857,35 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
       /* surfaced via the spinner stopping; the volume is unchanged on failure */
     } finally {
       setRedetectBusy(false);
+    }
+  };
+  // GENERALIZE: learn the systematic correction from the confirmed anchors and interpolate it across ALL
+  // slices (backend generalize_surface). Sets border_generalize so scrub + a subsequent Run use the whole-
+  // volume surface; reversible via discard. Scrub to review, then Run to apply (or Discard to revert).
+  const confirmGeneralize = async () => {
+    if (!caseId) return;
+    setGenBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-border-generalize`, "POST", JSON.stringify({ border_pass: borderPass }));
+      await openCase();                       // refresh oct_params (border_generalize flag → button state)
+      wfSet("segVersion", segSig + 1);        // re-pull the border curves (now the generalized surface)
+    } catch {
+      /* spinner stops; nothing warped on failure */
+    } finally {
+      setGenBusy(false);
+    }
+  };
+  const discardGeneralize = async () => {
+    if (!caseId) return;
+    setGenBusy(true);
+    try {
+      await api.json(`/api/case/${caseId}/oct-border-generalize/discard`, "POST", JSON.stringify({}));
+      await openCase();
+      wfSet("segVersion", segSig + 1);
+    } catch {
+      /* spinner stops */
+    } finally {
+      setGenBusy(false);
     }
   };
   // Request 1: re-run the DEFAULT preprocessing with the clipped surfaces cut off (sent in params.surface_cut).
@@ -1605,6 +1639,23 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                     </button>
                   );
                 })()}
+                {/* GENERALIZE to the whole volume: learn the systematic correction from the confirmed anchors
+                    and apply it to ALL slices. Gated like Run (needs confirmed anchors, no pending drags).
+                    When active, scrub shows the generalized surface and a Discard reverts to the local band. */}
+                {!genActive ? (
+                  <button onClick={confirmGeneralize}
+                    disabled={genBusy || rerunBusy || redetectBusy || anchorsDirty || paraCount > 0 || persistedAnchors.size === 0 || readOnly}
+                    title="Apply your corrections to the WHOLE volume: learn the systematic border correction from the slices you've fixed and interpolate it across every slice, so you don't have to correct each one. Scrub to review, then Run to apply — or Discard to revert. Anchor a few slices spanning the correction range first."
+                    style={{ background: "none", border: "1px solid var(--c-accent)", borderRadius: 4, color: "var(--c-accent)", cursor: (genBusy || anchorsDirty || persistedAnchors.size === 0) ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (genBusy || rerunBusy || redetectBusy || anchorsDirty || paraCount > 0 || persistedAnchors.size === 0 || readOnly) ? 0.5 : 1 }}>
+                    {genBusy ? "Generalizing…" : "⤢ Generalize to whole volume"}
+                  </button>
+                ) : (
+                  <button onClick={discardGeneralize} disabled={genBusy || rerunBusy || redetectBusy || readOnly}
+                    title="Whole-volume generalization is ACTIVE (scrub to review; Run applies it). Discard to revert to your per-slice local corrections."
+                    style={{ background: "var(--c-accent)", border: "none", borderRadius: 4, color: "#fff", cursor: genBusy ? "default" : "pointer", fontSize: 11, padding: "3px 8px", opacity: (genBusy || rerunBusy || redetectBusy || readOnly) ? 0.6 : 1 }}>
+                    {genBusy ? "Reverting…" : "✓ Generalized · Discard"}
+                  </button>
+                )}
               </>
               )
             ) : (
