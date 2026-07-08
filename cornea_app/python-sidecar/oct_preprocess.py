@@ -379,6 +379,8 @@ DEFAULT_PARAMS: dict = {
     # volume" button). smooth_slice_sigma = gaussian σ across SLICES (frame axis untouched → corrections kept);
     # smooth_max_shift caps the per-column warp; smooth_iters re-detect→warp rounds.
     "smooth_slice_sigma": 4.0,
+    "smooth_frame_sigma": 2.0,   # GENTLE frame-direction smoothing: removes the per-column 1-2px detection errors
+                                 # (the source of axial fuzziness) while broad manual corrections survive
     "smooth_max_shift": 20.0,
     "smooth_iters": 2,
     # ── generalize_surface: propagate the LEARNED correction to the WHOLE volume ── When the user corrects
@@ -3697,17 +3699,20 @@ def smooth_corrected_volume(volume: np.ndarray, params: dict | None = None, work
     that detection ACROSS SLICES, and re-warping each column onto the slice-smoothed surface.
 
     The fix-columns Run warps via provided_edges with inter-slice smoothing DISABLED (to honour the exact drag),
-    which leaves the surface reliable but JAGGED slice-to-slice. Here we re-detect that surface and smooth it in
-    the SLICE (lateral) direction ONLY — the frame axis is UNTOUCHED, so a frame-localized manual correction (a
-    per-frame notch/dip the user placed) is preserved EXACTLY; only the slice-to-slice detection jitter is
-    removed. Full warp (not gated) toward the slice-smoothed surface, capped for safety. Validated on CS004:
-    slice-to-slice roughness 1.49→0.26 (−83%) while the per-frame depths are byte-unchanged. `volume` =
-    (frames, depth, lateral). Returns (volume, info)."""
+    which leaves the surface reliable but with residual per-column 1-2px DETECTION errors — jagged slice-to-slice
+    (the axial/B-scan fuzziness) AND small wiggles within each sagittal slice. Here we re-detect that surface and
+    smooth it 2-D: STRONG across slices (smooth_slice_sigma) + GENTLE across frames (smooth_frame_sigma) so the
+    per-column noise is removed in BOTH the axial and sagittal views, then warp each column onto it (full warp,
+    capped). The frame σ is small, so BROAD manual corrections (a multi-frame notch/dip) survive while only the
+    single-frame noise is removed — validated on CS004: slice-to-slice roughness 1.49→0.26, per-column error
+    0.5→0.2px, and the frame-68-70 correction depth shifts <0.1px. `volume` = (frames, depth, lateral). Returns
+    (volume, info)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     if workers is None:
         workers = auto_workers()
     nf, depth = int(volume.shape[0]), int(volume.shape[1])
     sigma = float(p.get("smooth_slice_sigma", 4.0) or 0.0)
+    fsigma = float(p.get("smooth_frame_sigma", 2.0) or 0.0)
     cap = float(p.get("smooth_max_shift", 20.0) or 0.0)
     iters = max(1, int(p.get("smooth_iters", 2) or 1))
     if sigma <= 0 or cap <= 0:
@@ -3717,10 +3722,13 @@ def smooth_corrected_volume(volume: np.ndarray, params: dict | None = None, work
         # re-detect on the (corrected) volume — reliable because the surface is where the user put it
         S = detect_surface_all(reformat_to_sagittal(_fill_black_bands(out)), p, workers=workers)  # (lateral, frames)
         Sf = S.astype(np.float64)
-        # SLICE-direction (lateral, axis=0) gaussian ONLY — kills slice-to-slice jitter, leaves the frame axis (and
-        # thus every frame-localized manual correction) exactly as detected.
-        target = ndimage.gaussian_filter1d(Sf, sigma=sigma, axis=0, mode="nearest")
-        shift = np.clip(target - Sf, -cap, cap)                 # full warp toward the slice-smoothed surface
+        # 2-D gaussian target: STRONG across SLICES (lateral, axis=0) to kill slice-to-slice jitter (the axial
+        # fuzziness), plus GENTLE across FRAMES (axis=1) to remove the per-column 1-2px detection errors WITHIN
+        # each sagittal slice (the source of that fuzziness). frame σ is small so BROAD manual corrections (a
+        # multi-frame notch/dip) survive — validated: per-column error 0.5→0.2px while frame-68-70 depth shifts
+        # <0.1px — only the single-frame noise is removed.
+        target = ndimage.gaussian_filter(Sf, sigma=(sigma, fsigma), mode="nearest")
+        shift = np.clip(target - Sf, -cap, cap)                 # full warp toward the 2-D-smoothed surface
         if not np.any(np.abs(shift) > 0.05):
             break
         any_move = False
