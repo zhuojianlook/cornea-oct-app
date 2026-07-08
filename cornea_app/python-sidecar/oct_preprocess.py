@@ -158,6 +158,19 @@ DEFAULT_PARAMS: dict = {
                                   #   specular apex → removes the apex V-notch (CS001 OS3). Verified to CORRECT the
                                   #   same deep-lock notch on the vetted scans (improvement, not degrade). False = legacy.
     "dp_max_jump": 10,            # DP: max surface depth change between adjacent frames (smoothness constraint)
+    # ── GATED FAINT→ONSET SNAP (faint_snap_frac) ── The DP can settle on a faint pre-epithelial reflection ABOVE
+    # the true anterior surface (auto sits on intensity ~760, the true epithelium on ~1840 — learned from CS004
+    # GT). TARGETED post-detection correction: ONLY where the detected point is DIM (< faint_snap_frac × col-max)
+    # do we look just below for the ONSET of the sustained bright band and snap to it. Fires only on faint points
+    # → a surface already on bright tissue is left byte-untouched (no overshoot on clean scans, verified on the
+    # approved CS001-CS003); snaps to the FIRST sustained-bright depth → never dives into the stroma. See
+    # _detect_surface_dp. Validated on CS004: 10%→50% of the user's corrections now matched within 2px, median
+    # error 4.05→2.0px, with the approved scans' median shift 0px. 0 = off (byte-identical legacy detector).
+    "faint_snap_frac": 0.45,      # a detected point is "faint" (snap candidate) if its intensity < this × col-max
+    "faint_snap_onset": 0.55,     # band ONSET = intensity rises past this × col-max ...
+    "faint_snap_sustain": 0.42,   #   ... AND the next faint_snap_sustain_px stay above this × col-max
+    "faint_snap_range": 14,       # search at most this many px below the faint point for the onset
+    "faint_snap_sustain_px": 6,   # window (px) over which the band brightness must be sustained
     # ── BOUNDARY EXTRAPOLATION (RETIRED, default OFF) ── replaced the first/last few frames' surface with a
     # frame-direction quadratic extrapolation from the interior. The user marked this as introducing a WRONG
     # EDGE ANGLE vs the general corneal curvature (CS002 OS(2)/(3) "sagital right edge corrected to a wrong
@@ -1269,6 +1282,36 @@ def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None 
         # fall back to the prior there instead of collapsing the frame to the top.
         out = np.asarray(out, dtype=np.float32).copy()
         out[no_signal] = np.asarray(prior, dtype=np.float32)[no_signal]
+    # GATED FAINT→ONSET SNAP (faint_snap_frac): the DP can settle on a faint pre-epithelial reflection ABOVE the
+    # true surface — a dim point with the bright cornea only further below (measured on CS004: auto sits on
+    # intensity ~760, the user's true surface on ~1840). This is a TARGETED, GATED correction: for each frame,
+    # ONLY where the detected point is DIM (< faint_snap_frac × column-max) do we look just below for the ONSET of
+    # the sustained bright band and snap to it. Because it fires only on faint points, a surface already on bright
+    # tissue is left byte-untouched (no overshoot on clean scans); because it snaps to the FIRST sustained-bright
+    # depth (not the brightest), it lands on the epithelial onset, never diving into the stroma / a deeper layer.
+    # Global auto only (prior is None → not the fix-columns windowed re-detect). 0 = off (legacy).
+    _fsf = float(p.get("faint_snap_frac", 0.0) or 0.0)
+    if _fsf > 0 and prior is None:
+        # check against a LIGHTLY-smoothed RAW slice (not the heavy despeckle `img`, whose Gaussian blends the
+        # faint point with the nearby band and hides the faintness); the sustained-window mean rejects speckle.
+        chk = ndimage.gaussian_filter1d(slice_img.astype(np.float32), 1.0, axis=0)
+        cmax = chk.max(axis=0) + 1e-6
+        onf = float(p.get("faint_snap_onset", 0.55)); suf = float(p.get("faint_snap_sustain", 0.42))
+        rng = int(p.get("faint_snap_range", 14)); sus = max(2, int(p.get("faint_snap_sustain_px", 6)))
+        fc = np.arange(F)
+        s0 = np.clip(np.round(np.asarray(out)).astype(int), 0, D - 1)
+        faint = chk[s0, fc] < _fsf * cmax                          # only DIM detections are candidates for the snap
+        if np.any(faint):
+            hi = onf * cmax; lo = suf * cmax
+            csum = np.concatenate([np.zeros((1, F), np.float32), np.cumsum(chk, axis=0)], axis=0)  # (D+1,F)
+            out = np.asarray(out, dtype=np.float32).copy()
+            found = np.zeros(F, bool)
+            for k in range(1, rng + 1):                            # vectorised: first sustained-bright onset below
+                dk = np.clip(s0 + k, 0, D - 1)
+                d2 = np.clip(dk + sus, 0, D)
+                roll = (csum[d2, fc] - csum[dk, fc]) / np.maximum(d2 - dk, 1)
+                hit = faint & ~found & (chk[dk, fc] > hi) & (roll > lo)
+                out[hit] = dk[hit].astype(np.float32); found |= hit
     return out
 
 
