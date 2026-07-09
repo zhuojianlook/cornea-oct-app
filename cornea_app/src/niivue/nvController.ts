@@ -666,6 +666,23 @@ export function setSegmentationOpacity(opacity: number): void {
   nv.setOpacity(nv.volumes.length - 1, opacity);
 }
 
+// CRISP ⇄ SMOOTH display toggle (isNearest true = crisp voxels, false = linear/smooth). Purely a texture-sampling
+// choice — it does NOT change the data. Crisp shows the TRUE voxels (identical to the 2-D fix-cols/before-after
+// previews and the training volume), but the nearest DISPLAY quantises the smooth sub-pixel corneal surface to
+// integer screen rows → a voxel "staircase" at steep edges. Smooth (linear) anti-aliases that away but blurs the
+// coarse frame axis (sagittal/coronal) and no longer matches the crisp previews. The user picks per-need; writing
+// opts.isNearestInterpolation means every subsequent volume load inherits the choice too. Sets the DRAW grayscale
+// (layer 0) only — a segmentation label overlay, if present, must stay nearest (fractional labels otherwise).
+export function setInterpolationMode(isNearest: boolean): void {
+  if (!nv) return;
+  nv.opts.isNearestInterpolation = isNearest;            // so future loadVolume() inherit it
+  try {
+    if (nv.volumes.length) (nv as unknown as { updateInterpolation: (l: number, forceLinear?: boolean) => void })
+      .updateInterpolation(0, !isNearest);               // layer 0 = raw grayscale; overlays stay nearest
+    nv.drawScene();
+  } catch { /* older niivue → fall back to the global setter */ try { nv.setInterpolation(isNearest); } catch { /* */ } }
+}
+
 // CROP-SHADE red highlight: overlay the crop-mask (1 over the cropped/blink region) in RED so the cropped area
 // is highlighted over its dim tissue. Loaded in the PREPROCESSING view (no segmentation yet); loadSegmentation
 // clears it at the SAM2 stage (both are "volumes past the base"), so they never coexist.

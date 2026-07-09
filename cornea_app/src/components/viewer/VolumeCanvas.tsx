@@ -5,7 +5,7 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, loadCropMask, setView, setSegmentationOpacity, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, loadCropMask, setView, setSegmentationOpacity, setInterpolationMode, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, type ViewName } from "../../niivue/nvController";
 
 /** True if this scan had a region cropped out (blink / off-cornea) — used to overlay the crop-mask in red. */
 function hasCrop(m: Record<string, unknown> | null): boolean {
@@ -100,6 +100,10 @@ export function VolumeCanvas() {
   const [contrast, setContrast] = useState(100);   // %
   const [brightness, setBrightness] = useState(100); // %
   const [blur, setBlur] = useState(0);              // px
+  // CRISP ⇄ SMOOTH display toggle. Default CRISP (true voxels, matches the fix-cols/before-after previews AND the
+  // training volume). Smooth (linear) anti-aliases the nearest-display voxel STAIRCASE at steep corneal edges but
+  // blurs the coarse frame axis — a genuine tradeoff, so the user chooses. Data is identical either way.
+  const [crisp, setCrisp] = useState(true);
   const viewerFilter = `contrast(${contrast}%) brightness(${brightness}%)` + (blur > 0 && !fixColsView ? ` blur(${blur}px)` : "");
   // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
   // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
@@ -182,6 +186,7 @@ export function VolumeCanvas() {
       .then(() => {
         if (cancelled) return;
         setView(view);
+        setInterpolationMode(crisp);   // apply the crisp/smooth choice to the freshly-loaded volume
         // Re-show an existing segmentation when reopening a finished case — but ONLY if the manifest says
         // one exists. Calling it for an unsegmented (step-2) case fetches segmentation-display.nii.gz that
         // isn't there yet and logs a 404 on every open; the overlay correctly stays hidden either way.
@@ -460,6 +465,14 @@ export function VolumeCanvas() {
           title="Reset display adjustments"
           style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "1px 6px" }}>
           reset
+        </button>
+        <button onClick={() => { const c = !crisp; setCrisp(c); setInterpolationMode(c); }}
+          title={crisp
+            ? "CRISP display: true voxels — matches the fix-columns/before-after previews and the training volume. Steep corneal edges show the voxel staircase. Click for Smooth."
+            : "SMOOTH display: linear — anti-aliases the edge staircase but blurs the frame axis (sagittal/coronal) and differs from the crisp previews. Click for Crisp. (Data is identical either way.)"}
+          style={{ background: crisp ? "none" : "rgba(56,189,248,0.15)", border: "1px solid var(--c-border)", borderRadius: 4,
+            color: crisp ? "var(--c-text-dim)" : "#38bdf8", cursor: "pointer", fontSize: 11, padding: "1px 7px", whiteSpace: "nowrap" }}>
+          {crisp ? "◾ Crisp" : "◇ Smooth"}
         </button>
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         {hasRaw && preprocStep && (
