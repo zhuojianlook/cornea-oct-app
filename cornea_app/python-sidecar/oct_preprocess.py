@@ -181,6 +181,17 @@ DEFAULT_PARAMS: dict = {
     "edge_regularize": True,      # smooth faint edge laterals' border across frames (depth-preserving)
     "edge_reg_frame_sigma": 20.0, # base gaussian sigma (frames) at zero confidence; scales down with confidence
     "edge_reg_conf_thr": 0.8,     # laterals with band-brightness confidence >= this are untouched (interior)
+    "edge_reg_outer_band": 15,    # the outermost N laterals per edge get a FLOOR sigma even when bright/confident
+    "edge_reg_outer_floor": 4.0,  # floor frame-sigma on that outer band → de-jitters the tissue-bearing FOV edge
+    # ── EDGE DOME CONSTRAINT (downward-hook removal) ── see _edge_dome_constrain. At the FOV-boundary laterals the
+    # detector can DIVE a few px DEEPER than the smooth corneal dome (following a faint deeper structure at low SNR)
+    # → the border 'does not follow the general curve' (CS001 OD__4/__5, user-marked laterals 0-13). Per frame, fit
+    # a robust quadratic TREND past the edge and pull ONLY the laterals sitting >gate px BELOW it up onto the trend.
+    # DOWNWARD-only by construction → never pushes a shallower real LIMBUS flattening down (the _parabola_edge trap).
+    "edge_dome_constrain": True,  # remove downward hooks at the extreme lateral edges (auto path only)
+    "edge_dome_ew": 18,           # number of outer laterals per edge that may be pulled onto the trend
+    "edge_dome_band": 100,        # laterals just past the edge used to fit the robust quadratic dome trend
+    "edge_dome_gate": 1.2,        # only laterals detected > this many px DEEPER than the trend are snapped up
     # ── BOUNDARY EXTRAPOLATION (RETIRED, default OFF) ── replaced the first/last few frames' surface with a
     # frame-direction quadratic extrapolation from the interior. The user marked this as introducing a WRONG
     # EDGE ANGLE vs the general corneal curvature (CS002 OS(2)/(3) "sagital right edge corrected to a wrong
@@ -1393,11 +1404,59 @@ def _edge_regularize_surface(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.n
         s = np.clip(np.round(surf[li]).astype(int), 0, D - 9)
         band[li] = np.mean([vol[li][np.clip(s + k, 0, D - 1), fc] for k in range(2, 9)], axis=0)
     conf = np.clip(band / (np.percentile(band, 75) + 1e-6), 0.0, 1.0).mean(axis=1)   # per-lateral confidence
+    # OUTER-BAND FLOOR: the confidence taper is a NO-OP on high-confidence laterals — but the very outermost
+    # laterals near the FOV boundary can be BRIGHT (high confidence) yet still carry frame-to-frame detection
+    # JITTER at the low-SNR margin (CS001 OD__4/__5 marked edge: conf ~0.95 → escapes the taper → jitter ~3px,
+    # rougher than the interior). So on the outermost `outer` laterals of EACH edge, apply a small FLOOR sigma
+    # regardless of confidence: it de-jitters the tissue-bearing edge while a gentle sigma preserves the slowly
+    # varying corneal dome (real anatomy changes over ~20+ frames; the floor only removes 1-few-frame jitter).
+    outer = int(p.get("edge_reg_outer_band", 15)); floor = float(p.get("edge_reg_outer_floor", 4.0) or 0.0)
     out = surf.astype(np.float64).copy()
     for li in range(L):
         sig = base * max(0.0, (thr - conf[li]) / thr)        # 0 above thr (confident interior); grows as conf→0
+        if floor > 0 and min(li, L - 1 - li) < outer:
+            sig = max(sig, floor)                            # de-jitter the bright FOV-boundary laterals too
         if sig > 0.3:
             out[li] = ndimage.gaussian_filter1d(surf[li].astype(np.float64), sig, mode="nearest")
+    return out.astype(surf.dtype)
+
+
+def _edge_dome_constrain(surf: np.ndarray, p: dict) -> np.ndarray:
+    """EDGE DOME CONSTRAINT — pull DOWNWARD hooks at the FOV-boundary laterals back onto the general corneal
+    curve. At the extreme lateral edges the detector can DIVE a few px DEEPER than the smooth dome (following a
+    faint deeper structure at low SNR) → the sagittal/axial border 'doesn't follow the general curve' (CS001 OD
+    scans 4/5, user-marked laterals 0-13). Per FRAME, fit a robust quadratic TREND to the confident band just
+    PAST each edge (skipping the hook itself), then snap ONLY the edge laterals that sit MORE THAN edge_dome_gate
+    px BELOW that trend up onto it. DOWNWARD-only by construction → it can never push a shallower real LIMBUS
+    flattening DOWN (the trap that retired _parabola_edge_constrain), never over-descends, and touches only the
+    outer edge_dome_ew laterals (interior byte-untouched). Validated: CS001 OD__4/__5 dives removed, 0 downward
+    moves on any scan, interior 0px. edge_dome_constrain=False → off. surf=(L,F)."""
+    if not bool(p.get("edge_dome_constrain", True)) or surf.ndim != 2:
+        return surf
+    ew = int(p.get("edge_dome_ew", 18)); band = int(p.get("edge_dome_band", 100))
+    gate = float(p.get("edge_dome_gate", 1.2) or 0.0)
+    L, F = surf.shape
+    if gate <= 0 or L < 2 * (ew + 30):
+        return surf
+    out = surf.astype(np.float64).copy()
+    for fr in range(F):
+        y = surf[:, fr].astype(np.float64)
+        for lo, edge in ((0, np.arange(0, ew)), (L - ew, np.arange(L - ew, L))):
+            b0 = ew if lo == 0 else lo - band
+            m = np.arange(max(0, b0), min(L, b0 + band))
+            if m.size < 25:
+                continue
+            co = np.polyfit(m, y[m], 2)
+            for _ in range(2):                               # robust: drop outliers, refit the trend
+                r = y[m] - np.polyval(co, m); sd = np.std(r) + 1e-6
+                m = m[np.abs(r) < 2.5 * sd]
+                if m.size < 20:
+                    break
+                co = np.polyfit(m, y[m], 2)
+            fit = np.polyval(co, edge)
+            hit = (y[edge] - fit) > gate                     # DOWNWARD dive only → pull up to the trend
+            if np.any(hit):
+                out[edge[hit], fr] = fit[hit]
     return out.astype(surf.dtype)
 
 
@@ -1737,8 +1796,14 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # only (this function never receives a prior → it IS the auto path). See _faint_snap_coherent.
     if float(p.get("faint_snap_frac", 0.0) or 0.0) > 0 and bool(p.get("faint_snap_coherent", True)):
         out = _faint_snap_coherent(out, sag, p)
+    # EDGE DOME CONSTRAINT (BEFORE edge-regularize): pull per-frame DOWNWARD hooks at the FOV-boundary laterals
+    # back onto the general corneal curve (CS001 OD__4/__5). DOWNWARD-only → never over-descends a real limbus.
+    # Runs FIRST so the subsequent frame-direction edge-regularize has the final say on edge smoothness (else it
+    # would re-roughen the floor-smoothed outer laterals). See _edge_dome_constrain.
+    out = _edge_dome_constrain(out, p)
     # EDGE REGULARIZATION: smooth the faint FOV-boundary laterals' jagged border across frames (depth-preserving),
-    # a strict no-op on the confident interior. Handles the sagittal edge-slice jitter (CS001 OD__4 lateral 0/1).
+    # a strict no-op on the confident interior. Handles the sagittal edge-slice jitter (CS001 OD__4 lateral 0/1)
+    # AND, via the outer-band floor sigma, the BRIGHT tissue-bearing FOV edge (CS001 OD__4 visual-left / array-right).
     out = _edge_regularize_surface(out, sag, p)
     # NOTE: _parabola_edge_constrain is DELIBERATELY NOT applied here. detect_surface_all is the detection
     # baseline used by the NOISE-CROP (detect_noise_frames), the surface-crop, the confidence scores and the
@@ -3020,8 +3085,14 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # snap). Auto path only; the fix-columns provided_edges path carries the user's own surface and is skipped.
         if float(p.get("faint_snap_frac", 0.0) or 0.0) > 0 and bool(p.get("faint_snap_coherent", True)):
             edges = _faint_snap_coherent(edges, det, p)
+        # EDGE DOME CONSTRAINT on the WARP edges (BEFORE edge-regularize) — pull per-frame DOWNWARD hooks at the
+        # FOV-boundary laterals onto the general dome curve (CS001 OD__4/__5). DOWNWARD-only; auto path only (the
+        # provided fix-columns edges are the user's GROUND-TRUTH surface → NEVER touched). See _edge_dome_constrain.
+        if not use_provided:
+            edges = _edge_dome_constrain(edges, p)
         # EDGE REGULARIZATION on the WARP edges — smooth the faint FOV-boundary laterals across frames so the
-        # flattened OUTPUT sagittal border is smooth there too (depth preserved). Auto path only.
+        # flattened OUTPUT sagittal border is smooth there too (depth preserved), incl. the outer-band floor that
+        # de-jitters the BRIGHT tissue-bearing FOV edge. Runs LAST so it has the final say. Auto path only.
         edges = _edge_regularize_surface(edges, det, p)
 
     res = float(p["residual_threshold"])
