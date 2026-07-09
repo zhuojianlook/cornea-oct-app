@@ -171,6 +171,9 @@ DEFAULT_PARAMS: dict = {
     "faint_snap_sustain": 0.42,   #   ... AND the next faint_snap_sustain_px stay above this × col-max
     "faint_snap_range": 14,       # search at most this many px below the faint point for the onset
     "faint_snap_sustain_px": 6,   # window (px) over which the band brightness must be sustained
+    "faint_snap_coherent": True,  # apply the snap on the ASSEMBLED surface + smooth the correction across laterals
+                                  #   (robust: no per-column jitter). False = the per-slice snap (jittery at edges)
+    "faint_snap_lat_smooth": 2.0, # gaussian sigma (lateral) on the snap CORRECTION → laterally-coherent surface
     # ── BOUNDARY EXTRAPOLATION (RETIRED, default OFF) ── replaced the first/last few frames' surface with a
     # frame-direction quadratic extrapolation from the interior. The user marked this as introducing a WRONG
     # EDGE ANGLE vs the general corneal curvature (CS002 OS(2)/(3) "sagital right edge corrected to a wrong
@@ -1290,8 +1293,12 @@ def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None 
     # tissue is left byte-untouched (no overshoot on clean scans); because it snaps to the FIRST sustained-bright
     # depth (not the brightest), it lands on the epithelial onset, never diving into the stroma / a deeper layer.
     # Global auto only (prior is None → not the fix-columns windowed re-detect). 0 = off (legacy).
+    # NOTE: the DEFAULT is the laterally-COHERENT snap (_faint_snap_coherent), applied on the ASSEMBLED surface by
+    # detect_surface_all + smooth_volume — it smooths the snap CORRECTION across laterals so it can't inject the
+    # per-column jitter this per-slice version does at faint acquisition-edge frames (CS001 OD slice 1). This
+    # per-slice path stays as a fallback (faint_snap_coherent=False).
     _fsf = float(p.get("faint_snap_frac", 0.0) or 0.0)
-    if _fsf > 0 and prior is None:
+    if _fsf > 0 and prior is None and not bool(p.get("faint_snap_coherent", True)):
         # check against a LIGHTLY-smoothed RAW slice (not the heavy despeckle `img`, whose Gaussian blends the
         # faint point with the nearby band and hides the faintness); the sustained-window mean rejects speckle.
         chk = ndimage.gaussian_filter1d(slice_img.astype(np.float32), 1.0, axis=0)
@@ -1313,6 +1320,47 @@ def _detect_surface_dp(slice_img: np.ndarray, p: dict, prior: np.ndarray | None 
                 hit = faint & ~found & (chk[dk, fc] > hi) & (roll > lo)
                 out[hit] = dk[hit].astype(np.float32); found |= hit
     return out
+
+
+def _faint_snap_coherent(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.ndarray:
+    """Laterally-COHERENT faint→onset snap — the ROBUST version of the per-slice snap in _detect_surface_dp.
+    Same gated correction (where a detected point is DIM, snap DOWN to the ONSET of the sustained bright band
+    below — fixes the auto detector's ~4px shallow bias), but computed on the ASSEMBLED (lateral, frame) surface
+    and then the CORRECTION (delta) is SMOOTHED across laterals. The per-slice snap fires independently per
+    column, so at faint acquisition-edge frames adjacent slices snap to slightly different onsets → per-lateral
+    jitter = an axial/en-face "fuzzy" border (CS001 OD slice 1: surface roughness 0.18→1.02). Smoothing the delta
+    (not the whole surface — un-snapped columns stay exact) removes that jitter while keeping the deeper on-
+    epithelium position: the snap can no longer inject sagittal slice-to-slice misalignment anywhere.
+    surf=(L,F) detected surface; vol=(L,D,F) volume it was detected on. faint_snap_frac<=0 → no-op."""
+    fsf = float(p.get("faint_snap_frac", 0.0) or 0.0)
+    if fsf <= 0 or surf.ndim != 2:
+        return surf
+    L, D, F = vol.shape
+    onf = float(p.get("faint_snap_onset", 0.55)); suf = float(p.get("faint_snap_sustain", 0.42))
+    rng = int(p.get("faint_snap_range", 14)); sus = max(2, int(p.get("faint_snap_sustain_px", 6)))
+    latsig = float(p.get("faint_snap_lat_smooth", 2.0) or 0.0)
+    surf = np.asarray(surf, dtype=np.float32)
+    snapped = surf.copy()
+    fc = np.arange(F)
+    for li in range(L):
+        chk = ndimage.gaussian_filter1d(vol[li].astype(np.float32), 1.0, axis=0)   # lightly-smoothed raw (D,F)
+        cmax = chk.max(axis=0) + 1e-6
+        s0 = np.clip(np.round(surf[li]).astype(int), 0, D - 1)
+        faint = chk[s0, fc] < fsf * cmax                                           # DIM detections only
+        if not np.any(faint):
+            continue
+        hi = onf * cmax; lo = suf * cmax
+        csum = np.concatenate([np.zeros((1, F), np.float32), np.cumsum(chk, axis=0)], axis=0)
+        found = np.zeros(F, bool)
+        for k in range(1, rng + 1):                                                # first sustained-bright onset below
+            dk = np.clip(s0 + k, 0, D - 1); d2 = np.clip(dk + sus, 0, D)
+            roll = (csum[d2, fc] - csum[dk, fc]) / np.maximum(d2 - dk, 1)
+            hit = faint & ~found & (chk[dk, fc] > hi) & (roll > lo)
+            snapped[li, hit] = dk[hit].astype(np.float32); found |= hit
+    delta = snapped - surf
+    if latsig > 0:
+        delta = ndimage.gaussian_filter1d(delta.astype(np.float64), latsig, axis=0, mode="nearest")
+    return (surf + delta).astype(np.float32)
 
 
 def _legacy_surface(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
@@ -1645,6 +1693,12 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
         out = _robust_dome_smooth(out, p, vol=sag)          # sag=(lat,depth,frames) → pocket-darkness gate
     if bool(p.get("lat_conf_smooth", True)):
         out = _lateral_smooth_by_confidence(out, sag, p)
+    # FAINT→ONSET SNAP (laterally COHERENT): fix the auto detector's ~4px shallow bias — it locks onto a faint
+    # pre-epithelial reflection ABOVE the true surface; snap DIM detections down to the sustained bright-band
+    # onset, with the correction smoothed across laterals so it never injects per-column jitter. Auto baseline
+    # only (this function never receives a prior → it IS the auto path). See _faint_snap_coherent.
+    if float(p.get("faint_snap_frac", 0.0) or 0.0) > 0 and bool(p.get("faint_snap_coherent", True)):
+        out = _faint_snap_coherent(out, sag, p)
     # NOTE: _parabola_edge_constrain is DELIBERATELY NOT applied here. detect_surface_all is the detection
     # baseline used by the NOISE-CROP (detect_noise_frames), the surface-crop, the confidence scores and the
     # fix-columns re-detect — all of which need the TRUE tissue-following surface. Snapping the edge frames to
@@ -2920,6 +2974,11 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # raw detection already tracks the limbus flattening smoothly. Opt-in only (default False). See DEFAULT_PARAMS.
         if not use_provided and bool(p.get("parabola_edge", False)):
             edges = _parabola_edge_constrain(edges, p)
+        # FAINT→ONSET SNAP (laterally coherent) on the WARP edges — same correction as detect_surface_all, so the
+        # flattened OUTPUT surface lands on the epithelium AND stays laterally smooth (no axial fuzziness from the
+        # snap). Auto path only; the fix-columns provided_edges path carries the user's own surface and is skipped.
+        if float(p.get("faint_snap_frac", 0.0) or 0.0) > 0 and bool(p.get("faint_snap_coherent", True)):
+            edges = _faint_snap_coherent(edges, det, p)
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
