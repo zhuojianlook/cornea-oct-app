@@ -87,6 +87,11 @@ export function VolumeCanvas() {
   // detection is a MODE within this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a separate
   // top-level button — so all border-fixing tools live in the one Fix-columns menu.
   const [fixColsView, setFixColsView] = useState(false);
+  // The niivue view active BEFORE entering an overlay (before/after or fix-columns). Those modes force
+  // SAGITTAL on entry (their 2-D panels are sagittal); we restore this on exit so the user lands back on the
+  // view they were inspecting (e.g. axial) instead of being stranded on sagittal — the "the view changed and
+  // persisted after exiting fix-columns" report. Saved on the normal→overlay transition, restored on overlay→normal.
+  const preOverlayViewRef = useRef<ViewName | null>(null);
   // Preprocessing-steps filmstrip (per-stage diagnostic) — also otherwise unreachable on the 3D path.
   const [stepsView, setStepsView] = useState(false);
   // Display-only contrast / brightness / gaussian-blur (CSS filter on the viewer — covers BOTH the niivue
@@ -466,8 +471,13 @@ export function VolumeCanvas() {
               // Before/after is COMBINABLE with Fix-columns (it doesn't clear it): turning it on while
               // fix-columns is active makes the fix-columns panel show raw beside the markable corrected.
               const on = !compareView;
+              if (on && !compareView && !fixColsView) preOverlayViewRef.current = view; // entering from normal → remember view
               setCompareView(on); setStepsView(false);
               if (on && (view === "multi" || view === "render")) onView(null, "sagittal");
+              else if (!on && !fixColsView) { // back to normal → restore the pre-overlay view
+                const prev = preOverlayViewRef.current; preOverlayViewRef.current = null;
+                if (prev && prev !== view) onView(null, prev);
+              }
             }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title="Show the original (raw) scan beside the preprocessed result (combines with Fix columns)"
@@ -486,9 +496,16 @@ export function VolumeCanvas() {
               // Fix-columns is COMBINABLE with Before/after (it doesn't clear it). Surface-crop is now a
               // mode WITHIN this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a sibling button.
               const on = !fixColsView;
+              if (on && !compareView && !fixColsView) preOverlayViewRef.current = view; // entering from normal → remember view
               setFixColsView(on); setStepsView(false);
               if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
-              else if (!on) void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
+              else if (!on) {
+                void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
+                if (!compareView) { // back to normal → restore the pre-overlay view
+                  const prev = preOverlayViewRef.current; preOverlayViewRef.current = null;
+                  if (prev && prev !== view) onView(null, prev);
+                }
+              }
             }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title={proposals.hasProposal
