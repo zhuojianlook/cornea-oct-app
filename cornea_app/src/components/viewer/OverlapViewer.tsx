@@ -79,8 +79,8 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
       return;
     }
     let cancelled = false;
-    // isNearestInterpolation: KEEP nearest here (unlike the main grayscale viewer, which is now linear/smooth) —
-    // this loads a DISCRETE agreement map, so linear sampling would halo/blend between its tiers into false values.
+    // isNearestInterpolation: crisp voxels — matches the main grayscale viewer (nvController), and this loads a
+    // DISCRETE agreement map so linear sampling would halo/blend between its tiers into false values anyway.
     const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false, isNearestInterpolation: true });
     try {
       nv.attachToCanvas(canvas);

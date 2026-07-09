@@ -62,8 +62,8 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
     if (!canvas) return;
     if (!canvas.getContext("webgl2")) { setError("Needs a WebGL2 context — open in Chrome/Firefox."); setLoading(false); return; }
     let cancelled = false;
-    // isNearestInterpolation: KEEP nearest here (unlike the main grayscale viewer, which is now linear/smooth) —
-    // loads DISCRETE region maps (0/1/2), so linear sampling would produce fractional labels / haloed borders.
+    // isNearestInterpolation: crisp voxels — matches the main grayscale viewer (nvController); also loads DISCRETE
+    // region maps (0/1/2), so linear sampling would produce fractional labels / haloed borders anyway.
     const nv = new Niivue({ backColor: [0.11, 0.11, 0.12, 1], show3Dcrosshair: true, isColorbar: false, dragAndDropEnabled: false, isNearestInterpolation: true });
     try {
       nv.attachToCanvas(canvas);

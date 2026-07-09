@@ -51,13 +51,16 @@ function _createNv(canvas: HTMLCanvasElement): Niivue | null {
       show3Dcrosshair: true,
       isColorbar: false,
       dragAndDropEnabled: false,
-      // SMOOTH (LINEAR) texture sampling. Nearest-neighbour (tried v0.0.170 for "crisp voxels") renders the
-      // STEEP corneal surface — especially the low-SNR edge frames where the cornea dives out of the FOV — as a
-      // hard voxel STAIRCASE, which reads as a "jagged/stepped border" even though the surface data is smooth
-      // (verified: identical voxels render jagged under nearest, clean under linear; the surface-depth map has no
-      // real high/low spots to move — the depth-map spots are detector measurement noise, not tissue deviations).
-      // The user chose smooth rendering everywhere. Linear anti-aliases the diagonal surface → clean border.
-      isNearestInterpolation: false,
+      // CRISP (NEAREST) texture sampling — the TRUE voxels, CONSISTENT across every view. Linear (tried v0.0.178)
+      // anti-aliases the steep corneal surface into a clean line, BUT the frame axis is coarse (~101 samples) so
+      // linear BLURS the frame-spanning sagittal/coronal views heavily — and that blurred main view then DISAGREES
+      // with (a) the 2-D fix-columns/before-after preview PNGs, which are rendered crisp (marking a border needs
+      // the true pixels), and (b) the corrected volume actually sent for training (the raw voxels). The user needs
+      // what they see to MATCH what is trained and what they mark on, so nearest everywhere wins over a smoother
+      // look. The "jagged/stepped border" under nearest is the honest voxel representation of a steep surface
+      // (verified: the surface DATA is smooth — 0.36 vox/lateral — it's just voxelised), now shown identically in
+      // the viewer, the fix-cols/before-after previews, and the training data. Matches OverlapViewer/GtCompareViewer.
+      isNearestInterpolation: true,
     });
     nv.attachToCanvas(canvas);
     nv.setSliceType(SLICE.multi);
