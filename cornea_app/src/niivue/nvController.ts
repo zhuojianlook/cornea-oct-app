@@ -51,12 +51,13 @@ function _createNv(canvas: HTMLCanvasElement): Niivue | null {
       show3Dcrosshair: true,
       isColorbar: false,
       dragAndDropEnabled: false,
-      // CRISP voxels (no linear blur). OCT is extremely anisotropic (lateral 0.0078 / depth 0.0031 /
-      // frame 0.040 mm → up to 13:1), so niivue's default LINEAR texture sampling smears the bright
-      // corneal surface across voxels in the coarse directions — making the axial/coronal border look
-      // "fuzzy" even when the tissue is aligned to sub-pixel. Nearest-neighbour shows the true surface
-      // so the user can judge (and correct) real smoothness. Matches GtCompareViewer's setting.
-      isNearestInterpolation: true,
+      // SMOOTH (LINEAR) texture sampling. Nearest-neighbour (tried v0.0.170 for "crisp voxels") renders the
+      // STEEP corneal surface — especially the low-SNR edge frames where the cornea dives out of the FOV — as a
+      // hard voxel STAIRCASE, which reads as a "jagged/stepped border" even though the surface data is smooth
+      // (verified: identical voxels render jagged under nearest, clean under linear; the surface-depth map has no
+      // real high/low spots to move — the depth-map spots are detector measurement noise, not tissue deviations).
+      // The user chose smooth rendering everywhere. Linear anti-aliases the diagonal surface → clean border.
+      isNearestInterpolation: false,
     });
     nv.attachToCanvas(canvas);
     nv.setSliceType(SLICE.multi);
