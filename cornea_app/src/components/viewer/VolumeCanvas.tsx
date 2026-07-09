@@ -510,6 +510,26 @@ export function VolumeCanvas() {
             ⚙ Steps
           </ToggleButton>
         )}
+        {hasRaw && preprocStep && (
+          <ToggleButton
+            size="small"
+            value="mark"
+            selected={markDefectMode}
+            onChange={() => {
+              // Reinstated defect-marking: drag over the WRONG columns of an axial/sagittal slice, tag the type,
+              // and commit (this frame or a slice range) → manifest.defect_marks, so the assistant sees exactly
+              // where the border is off instead of a described slice number. Needs a single axial/sagittal plane
+              // (defectOrient), so force sagittal if we're in multi/3D/coronal when turning it on.
+              const on = !markDefectMode;
+              setWf("markDefectMode", on);
+              if (on && view !== "axial" && view !== "sagittal") onView(null, "sagittal");
+            }}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Mark the WRONG columns of the current axial/sagittal slice — drag over the bad region, pick a defect type, then commit to this frame or a slice range. Saved to the scan so I can see exactly which columns/frames are off. Right-click a band to remove it."
+          >
+            ⚑ Mark columns
+          </ToggleButton>
+        )}
         <div className="flex-1" />
         {loading && <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Loading volume…</span>}
         {error && <span className="text-xs" style={{ color: "var(--c-red)" }}>{error}</span>}
