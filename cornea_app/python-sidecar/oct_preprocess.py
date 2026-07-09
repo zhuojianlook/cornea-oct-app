@@ -174,6 +174,13 @@ DEFAULT_PARAMS: dict = {
     "faint_snap_coherent": True,  # apply the snap on the ASSEMBLED surface + smooth the correction across laterals
                                   #   (robust: no per-column jitter). False = the per-slice snap (jittery at edges)
     "faint_snap_lat_smooth": 2.0, # gaussian sigma (lateral) on the snap CORRECTION → laterally-coherent surface
+    # ── EDGE REGULARIZATION (low-SNR FOV-boundary laterals) ── see _edge_regularize_surface. At the extreme
+    # lateral edges the cornea exits the FOV → weak signal → jagged sagittal border (CS001 OD__4 lat 0/1). Smooth
+    # the surface ACROSS FRAMES (depth-preserving) with a sigma tapered by each lateral's confidence: strong on
+    # faint edge laterals, a strict no-op on the confident interior. Off via edge_regularize=False.
+    "edge_regularize": True,      # smooth faint edge laterals' border across frames (depth-preserving)
+    "edge_reg_frame_sigma": 20.0, # base gaussian sigma (frames) at zero confidence; scales down with confidence
+    "edge_reg_conf_thr": 0.8,     # laterals with band-brightness confidence >= this are untouched (interior)
     # ── BOUNDARY EXTRAPOLATION (RETIRED, default OFF) ── replaced the first/last few frames' surface with a
     # frame-direction quadratic extrapolation from the interior. The user marked this as introducing a WRONG
     # EDGE ANGLE vs the general corneal curvature (CS002 OS(2)/(3) "sagital right edge corrected to a wrong
@@ -1363,6 +1370,37 @@ def _faint_snap_coherent(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.ndarr
     return (surf + delta).astype(np.float32)
 
 
+def _edge_regularize_surface(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.ndarray:
+    """EDGE REGULARIZATION for low-SNR FOV-boundary laterals. At the extreme lateral edges the cornea is exiting
+    the field of view — the OCT signal is weak, so the per-slice surface jitters across frames (a jagged sagittal
+    border, e.g. CS001 OD__4 lateral 0/1). Fix: smooth the surface ACROSS FRAMES (axis 1) with a sigma tapered by
+    each LATERAL's detection confidence — strong on the faint edge laterals, a strict NO-OP on the confident
+    interior. Crucially this is the FRAME direction, so it removes the jitter WITHOUT changing the lateral's depth
+    (no over-shallowing of the descending dome) and without pulling toward the interior. Confidence = mean
+    brightness of the band just below the surface, normalised by the scan's p75 (low where the cornea is faint).
+    surf=(L,F); vol=(L,D,F) the volume surf was detected on. edge_regularize=False or edge_reg_frame_sigma<=0 →
+    no-op. Complements _lateral_smooth_by_confidence (which handles low-confidence FRAMES across laterals)."""
+    if not bool(p.get("edge_regularize", True)) or surf.ndim != 2:
+        return surf
+    base = float(p.get("edge_reg_frame_sigma", 20.0) or 0.0)
+    thr = float(p.get("edge_reg_conf_thr", 0.8) or 0.0)
+    if base <= 0 or thr <= 0:
+        return surf
+    L, D, F = vol.shape
+    fc = np.arange(F)
+    band = np.empty((L, F), np.float32)
+    for li in range(L):
+        s = np.clip(np.round(surf[li]).astype(int), 0, D - 9)
+        band[li] = np.mean([vol[li][np.clip(s + k, 0, D - 1), fc] for k in range(2, 9)], axis=0)
+    conf = np.clip(band / (np.percentile(band, 75) + 1e-6), 0.0, 1.0).mean(axis=1)   # per-lateral confidence
+    out = surf.astype(np.float64).copy()
+    for li in range(L):
+        sig = base * max(0.0, (thr - conf[li]) / thr)        # 0 above thr (confident interior); grows as conf→0
+        if sig > 0.3:
+            out[li] = ndimage.gaussian_filter1d(surf[li].astype(np.float64), sig, mode="nearest")
+    return out.astype(surf.dtype)
+
+
 def _legacy_surface(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
     """The ORIGINAL ('old method') per-slice anterior surface: {hist-eq, raw} gradient-argmax, the better
     RANSAC-quadratic of the two, then a side-correction bias. RANSAC fits a smooth corneal dome and rejects a
@@ -1699,6 +1737,9 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # only (this function never receives a prior → it IS the auto path). See _faint_snap_coherent.
     if float(p.get("faint_snap_frac", 0.0) or 0.0) > 0 and bool(p.get("faint_snap_coherent", True)):
         out = _faint_snap_coherent(out, sag, p)
+    # EDGE REGULARIZATION: smooth the faint FOV-boundary laterals' jagged border across frames (depth-preserving),
+    # a strict no-op on the confident interior. Handles the sagittal edge-slice jitter (CS001 OD__4 lateral 0/1).
+    out = _edge_regularize_surface(out, sag, p)
     # NOTE: _parabola_edge_constrain is DELIBERATELY NOT applied here. detect_surface_all is the detection
     # baseline used by the NOISE-CROP (detect_noise_frames), the surface-crop, the confidence scores and the
     # fix-columns re-detect — all of which need the TRUE tissue-following surface. Snapping the edge frames to
@@ -2979,6 +3020,9 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # snap). Auto path only; the fix-columns provided_edges path carries the user's own surface and is skipped.
         if float(p.get("faint_snap_frac", 0.0) or 0.0) > 0 and bool(p.get("faint_snap_coherent", True)):
             edges = _faint_snap_coherent(edges, det, p)
+        # EDGE REGULARIZATION on the WARP edges — smooth the faint FOV-boundary laterals across frames so the
+        # flattened OUTPUT sagittal border is smooth there too (depth preserved). Auto path only.
+        edges = _edge_regularize_surface(edges, det, p)
 
     res = float(p["residual_threshold"])
     W = int(sag.shape[2])
