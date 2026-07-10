@@ -84,3 +84,10 @@ input[type="number"]::-webkit-outer-spin-button {
   animation: crop-proposal-glow 1.4s ease-in-out infinite;
   border-color: #ff5db0 !important;
 }
+
+/* SMOOTH display mode (Crisp/Smooth toggle, default Smooth): the 2-D preview slice PNGs (before/after,
+   fix-columns) are inline-styled image-rendering:pixelated (crisp voxels). When the viewer is in Smooth
+   mode its overlay container gets .oct-smooth-imgs, which overrides those to bilinear so the smooth
+   sub-pixel corneal surface isn't shown as a voxel staircase — matching the smooth niivue main view.
+   (Crisp mode omits the class → previews stay pixelated for pixel-precise marking.) */
+.oct-smooth-imgs img { image-rendering: auto !important; }

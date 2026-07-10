@@ -100,10 +100,11 @@ export function VolumeCanvas() {
   const [contrast, setContrast] = useState(100);   // %
   const [brightness, setBrightness] = useState(100); // %
   const [blur, setBlur] = useState(0);              // px
-  // CRISP ⇄ SMOOTH display toggle. Default CRISP (true voxels, matches the fix-cols/before-after previews AND the
-  // training volume). Smooth (linear) anti-aliases the nearest-display voxel STAIRCASE at steep corneal edges but
-  // blurs the coarse frame axis — a genuine tradeoff, so the user chooses. Data is identical either way.
-  const [crisp, setCrisp] = useState(true);
+  // CRISP ⇄ SMOOTH display toggle. Default SMOOTH: the corneal surface is smooth (the warp is sub-pixel), so the
+  // smooth/linear render is the FAITHFUL one — the nearest/crisp render ADDS voxel-quantization "steps" that are
+  // not in the anatomy (steps are always wrong on a smooth cornea). Crisp stays available (opt-in) for pixel-
+  // precise border marking. Display-only — the data (and what's trained) is identical in both modes.
+  const [crisp, setCrisp] = useState(false);
   const viewerFilter = `contrast(${contrast}%) brightness(${brightness}%)` + (blur > 0 && !fixColsView ? ` blur(${blur}px)` : "");
   // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
   // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
@@ -683,12 +684,12 @@ export function VolumeCanvas() {
             marking panel, which shows raw beside the corrected when before/after is also on (showRaw). When
             BOTH are on only ONE overlay mounts (the fix-cols panel) so they never stack. */}
         {compareView && !fixColsView && volumeUrl && (
-          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+          <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
             <BeforeAfterViewer orient={orient2d} filter={viewerFilter} />
           </div>
         )}
         {fixColsView && volumeUrl && (
-          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
+          <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
             <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting} />
           </div>
         )}

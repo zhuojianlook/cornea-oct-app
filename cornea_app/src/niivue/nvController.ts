@@ -674,13 +674,15 @@ export function setSegmentationOpacity(opacity: number): void {
 // opts.isNearestInterpolation means every subsequent volume load inherits the choice too. Sets the DRAW grayscale
 // (layer 0) only — a segmentation label overlay, if present, must stay nearest (fractional labels otherwise).
 export function setInterpolationMode(isNearest: boolean): void {
-  if (!nv) return;
-  nv.opts.isNearestInterpolation = isNearest;            // so future loadVolume() inherit it
+  if (!nv || !nv.volumes.length) return;
+  // Layer 0 (the raw grayscale) ONLY — do NOT touch nv.opts.isNearestInterpolation: that is the default for
+  // FUTURE volume loads incl. a segmentation label overlay, which must stay NEAREST (linear → fractional labels
+  // / haloed tiers). The overlay keeps the _createNv default (nearest); the grayscale is (re)set here on every
+  // load. forceLinear = !isNearest → Smooth = linear grayscale, Crisp = nearest grayscale.
   try {
-    if (nv.volumes.length) (nv as unknown as { updateInterpolation: (l: number, forceLinear?: boolean) => void })
-      .updateInterpolation(0, !isNearest);               // layer 0 = raw grayscale; overlays stay nearest
+    (nv as unknown as { updateInterpolation: (l: number, forceLinear?: boolean) => void }).updateInterpolation(0, !isNearest);
     nv.drawScene();
-  } catch { /* older niivue → fall back to the global setter */ try { nv.setInterpolation(isNearest); } catch { /* */ } }
+  } catch { /* older niivue without per-layer updateInterpolation → no-op (stays at construction default) */ }
 }
 
 // CROP-SHADE red highlight: overlay the crop-mask (1 over the cropped/blink region) in RED so the cropped area
