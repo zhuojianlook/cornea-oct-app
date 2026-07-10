@@ -390,7 +390,9 @@ DEFAULT_PARAMS: dict = {
     "fbls_max_shift": 16.0,       # cap the per-column correction (px)
     "fbls_min_coverage": 0.4,     # skip an edge frame with less cornea than this fraction (off-eye guard)
     "axcons_med_win": 15,         # lateral median-filter width (px) for the smooth target (kills spikes, keeps dome)
-    "axcons_two_sided": False,    # correct only DOWNWARD notches (detector locked too deep); True also lifts up-spikes
+    "axcons_two_sided": True,     # correct BOTH directions — a narrow up-spike is as much an axial discontinuity as a
+                                  #   down-notch on a smooth cornea; the smooth median+gaussian target follows the broad
+                                  #   dome so a genuine apex reads dev≈0 (untouched), only narrow jitter spikes deviate
     "axcons_gate": 3.0,           # px: correct only lateral columns deviating from the smooth target by more than this
     "axcons_max_shift": 10.0,     # px: hard clamp on the per-column depth nudge (bounded, never a re-flatten)
     "axcons_strength": 1.0,       # fraction of the gated deviation removed per column
@@ -3523,9 +3525,13 @@ def _axcons_shift_from_edge(edge: np.ndarray, depth: int, p: dict) -> np.ndarray
     # pushing a column deeper) avoids fighting a genuine shallow dome apex. axcons_two_sided=True corrects both.
     if not bool(p.get("axcons_two_sided", False)):
         dev = np.maximum(dev, 0.0)
-    # GATE = SOFT-THRESHOLD: leave a gate-width dead-band untouched (a small wobble ≤ gate is genuine dome
-    # micro-texture, NOT jitter → strict no-op), but apply the FULL excess beyond it so a real notch/spike
-    # is pulled all the way onto the smooth target. corr = sign(dev)·max(|dev|−gate, 0).
+    # GATE = SOFT-THRESHOLD: corr = sign(dev)·max(|dev|−gate, 0). Leave a gate-width dead-band (a wobble ≤ gate is
+    # genuine dome micro-texture → no-op) and remove the excess beyond it. CRITICAL that this stays SOFT, not a
+    # hard "|dev|>gate → pull fully to the dome": a continuity pass must be CONTINUOUS in dev, else two adjacent
+    # columns straddling the gate (e.g. 3.1 vs 2.9) would be corrected by 3.1 vs 0 and the pass would CREATE a
+    # ~gate step where there was none. Soft caps every residual at ≤ gate and can never introduce a gate-boundary
+    # step. A real notch (|dev| ≫ gate) is still pulled to within gate of the dome; combined with the sub-pixel
+    # apply + two-sided detection this smoothly flattens both up-spikes and down-notches.
     mag = np.abs(dev)
     excess = np.maximum(mag - gate, 0.0)
     corr = np.sign(dev) * excess
@@ -3545,7 +3551,9 @@ def _axcons_shift_from_edge(edge: np.ndarray, depth: int, p: dict) -> np.ndarray
     # a too-deep column (dev>0) UP we need a NEGATIVE depth shift, so shift = -strength·corr, clamped small.
     shift = -strength * corr
     shift = np.clip(shift, -max_shift, max_shift)
-    shift = np.round(shift)                                   # the warp truncates to int; round so a sub-px notch still moves
+    # SUB-PIXEL: keep the FRACTIONAL shift (no np.round) — the apply site warps with subpixel=True, so a notch is
+    # pulled smoothly onto the dome instead of snapping to the nearest integer row (which would re-quantise the
+    # very axial staircase this pass exists to remove). Matches the sub-pixel main warp.
     return shift.astype(np.float64)
 
 
@@ -3577,7 +3585,9 @@ def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, wor
                 continue
             # warp the B-scan (depth × lateral) by the per-lateral-column depth shift — SAME primitive as the
             # sagittal warp (_warp_by_displacement warps rows=depth by a per-column shift), applied laterally.
-            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), sh)
+            # SUB-PIXEL (matches the main warp): a fractional notch correction lands the column smoothly on the
+            # dome instead of int-truncating it into a fresh 1-px staircase.
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), sh, subpixel=True)
             moved[f] = True
             n_moved_cols += int(np.count_nonzero(sh != 0.0))
             any_move = True
