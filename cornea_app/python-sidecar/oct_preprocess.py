@@ -1416,8 +1416,16 @@ def _edge_regularize_surface(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.n
     out = surf.astype(np.float64).copy()
     for li in range(L):
         sig = base * max(0.0, (thr - conf[li]) / thr)        # 0 above thr (confident interior); grows as conf→0
-        if floor > 0 and min(li, L - 1 - li) < outer:
-            sig = max(sig, floor)                            # de-jitter the bright FOV-boundary laterals too
+        ed = min(li, L - 1 - li)
+        if floor > 0 and ed < outer:
+            # TAPERED floor: FULL at the FOV boundary (ed=0), fading LINEARLY to 0 at the band seam (ed=outer).
+            # A HARD floor on 0..outer-1 (and none at `outer`) frame-smooths one side of the seam but not the
+            # other → the smoothing pulls the low-SNR EDGE-FRAME value toward its neighbours on the inner side,
+            # leaving a ~floor-px STEP in the anterior surface exactly at lateral `outer` on the acquisition-edge
+            # frames (CS001 OD, "step near the ends of axial slice 1/101 & 101/101"). Tapering makes the smoothing
+            # continuous across the seam → the step becomes a gentle ramp → no visible discontinuity, while the
+            # extreme edge (where jitter is worst) still gets the full floor.
+            sig = max(sig, floor * (outer - ed) / outer)
         if sig > 0.3:
             out[li] = ndimage.gaussian_filter1d(surf[li].astype(np.float64), sig, mode="nearest")
     return out.astype(surf.dtype)
