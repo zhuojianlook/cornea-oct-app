@@ -192,6 +192,24 @@ DEFAULT_PARAMS: dict = {
     "edge_dome_ew": 18,           # number of outer laterals per edge that may be pulled onto the trend
     "edge_dome_band": 100,        # laterals just past the edge used to fit the robust quadratic dome trend
     "edge_dome_gate": 1.2,        # only laterals detected > this many px DEEPER than the trend are snapped up
+    # ── FAINT-EDGE DOME FOLLOW (too-shallow correction) ── see _edge_dome_follow. The OPPOSITE defect to the dome
+    # CONSTRAINT: at the faint FOV edge the DP locks onto a dim PRE-epithelial reflection ABOVE the true epithelium,
+    # so the border FLATTENS off the corneal curve (CS001 OD, user: "doesn't follow the overall corneal curvature").
+    # A-scans confirm the true epithelium is BRIGHTER (~1100-1300 vs ~400-900) and a few px DEEPER, at the dome. Per
+    # (lateral,frame) in the edge band, if a dome-bounded window below the surface holds a SUSTAINED band ≥ratio× the
+    # surface brightness, snap DOWN onto it; the whole edge patch is then 2-D (lateral×frame) smoothed so it follows
+    # the curve without jitter, interior byte-untouched. DESCEND-only, dome-bounded → never dives into stroma.
+    "edge_dome_follow": True,     # snap the too-shallow faint edge down onto the true epithelium (auto path only)
+    "edge_follow_band": 28,       # outer laterals per edge examined for the too-shallow → snap-down correction
+    "edge_follow_fit": 90,        # reliable interior laterals (just past the band) fitted for the dome window bound
+    "edge_follow_ratio": 1.4,     # snap only where the sustained band below is >= this * the surface brightness
+    "edge_follow_search": 20,     # max px below the surface to search for that brighter epithelium band
+    "edge_follow_pad": 6,         # allow the search to reach dome+this many px (dome-bounded, no stroma dive)
+    "edge_follow_sustain": 5,     # px window a band must stay bright over to count (rejects single-px specular)
+    "edge_follow_med": 5,         # lateral median width on the snapped patch (kills per-lateral argmax jitter)
+    "edge_follow_med_frame": 3,   # frame-direction median width on the snapped patch (kills per-frame jitter)
+    "edge_follow_smooth": 1.6,    # lateral gaussian sigma on the snapped patch
+    "edge_follow_smooth_frame": 1.6,  # frame-direction gaussian sigma on the snapped patch
     # ── BOUNDARY EXTRAPOLATION (RETIRED, default OFF) ── replaced the first/last few frames' surface with a
     # frame-direction quadratic extrapolation from the interior. The user marked this as introducing a WRONG
     # EDGE ANGLE vs the general corneal curvature (CS002 OS(2)/(3) "sagital right edge corrected to a wrong
@@ -1470,6 +1488,97 @@ def _edge_dome_constrain(surf: np.ndarray, p: dict) -> np.ndarray:
     return out.astype(surf.dtype)
 
 
+def _edge_dome_follow(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.ndarray:
+    """FAINT-EDGE DOME FOLLOW — where the cornea is EXITING the FOV (extreme lateral edges, weak signal) the DP
+    detector locks onto a faint PRE-epithelial reflection ABOVE the true surface and the boundary FLATTENS off the
+    corneal curve (CS001 OD, user: "the edge doesn't follow the overall corneal curvature"). Verified on the
+    A-scans: the edge surface sits on DIM signal (~400-900) while the TRUE epithelium is BRIGHTER (~1100-1300) and
+    a few px DEEPER, right where the dome predicts. TRIGGER = the faint-snap signature: within the edge band, a
+    laterally-guided window below the surface holds a SUSTAINED band markedly BRIGHTER than the surface itself
+    (peak ≥ `edge_follow_ratio`× the surface intensity). When it fires, SNAP the surface DOWN to that band
+    (descend-only), bounded above by the robust dome fit of the reliable interior laterals + `edge_follow_pad` so
+    it can never dive past the epithelium into stroma. The trigger self-limits: it stops at the first lateral whose
+    surface already sits on the bright band (nothing brighter below → no change), so the snapped edge joins the
+    correct interior with NO seam and follows the curve WITHOUT the over-descent V-notch that retired
+    _parabola_edge_constrain. Auto path only. edge_dome_follow=False → off. surf=(L,F); vol=(L,D,F)."""
+    if not bool(p.get("edge_dome_follow", True)) or surf.ndim != 2:
+        return surf
+    ew = int(p.get("edge_follow_band", 28)); fitb = int(p.get("edge_follow_fit", 90))
+    pad = int(p.get("edge_follow_pad", 6)); sustain = int(p.get("edge_follow_sustain", 5))
+    search = int(p.get("edge_follow_search", 20)); ratio = float(p.get("edge_follow_ratio", 1.4))
+    L, F = surf.shape; D = vol.shape[1]
+    if L < 2 * (ew + fitb) or ratio <= 1.0:
+        return surf
+    ker = np.ones(max(1, sustain)) / max(1, sustain)
+    mwl = int(p.get("edge_follow_med", 5)); mwf = int(p.get("edge_follow_med_frame", 3))
+    sgl = float(p.get("edge_follow_smooth", 1.6)); sgf = float(p.get("edge_follow_smooth_frame", 1.6))
+    anchor = 8
+    out = surf.astype(np.float64).copy()
+
+    # ── pass 1: per (lateral, frame) in each edge band, snap the RAW target down to the bright band ──
+    snap = surf.astype(np.float64).copy()                   # raw snap field (= surf where the trigger doesn't fire)
+    fired_any = False
+    for fr in range(F):
+        y = surf[:, fr].astype(np.float64)
+        for edge, fitrng in ((np.arange(0, ew), np.arange(ew, ew + fitb)),
+                             (np.arange(L - ew, L), np.arange(L - ew - fitb, L - ew))):
+            m = np.array(fitrng)                            # robust quadratic dome of the reliable interior band
+            if m.size < 20:
+                continue
+            co = np.polyfit(m, y[m], 2)
+            for _ in range(2):                              # drop outliers, refit
+                r = y[m] - np.polyval(co, m); sd = np.std(r) + 1e-6; m = m[np.abs(r) < 2.5 * sd]
+                if m.size < 15:
+                    break
+                co = np.polyfit(m, y[m], 2)
+            dome = np.polyval(co, edge)
+            for k, li in enumerate(edge):
+                s = int(round(y[li]))
+                surf_int = float(np.mean(vol[li, s:min(D, s + 2), fr]))          # brightness AT the surface
+                s_lo = s + 2
+                s_hi = int(min(D - 1, min(round(dome[k]) + pad, s + search)))    # dome-bounded search below
+                if s_hi <= s_lo + sustain:
+                    continue
+                seg = vol[li, s_lo:s_hi + 1, fr].astype(np.float64)
+                run = np.convolve(seg, ker, mode="valid")   # sustained brightness (epithelium ≫ pre-reflection)
+                pk = int(np.argmax(run))
+                if run[pk] < ratio * (surf_int + 1e-6):     # nothing markedly brighter below → surface is right
+                    continue
+                snap[li, fr] = float(min(s_lo + pk + (sustain - 1) // 2, s_hi))  # snap DOWN to the bright band
+                fired_any = True
+    if not fired_any:
+        return surf
+
+    def _med(a: np.ndarray, w: int, ax: int) -> np.ndarray:
+        if w <= 1:
+            return a
+        r = w // 2; b = np.pad(a, [(r, r) if i == ax else (0, 0) for i in range(a.ndim)], mode="edge")
+        sl = [slice(None)] * a.ndim
+        stack = []
+        for j in range(w):
+            sl[ax] = slice(j, j + a.shape[ax]); stack.append(b[tuple(sl)])
+        return np.median(np.stack(stack, 0), axis=0)
+
+    def _gauss(a: np.ndarray, sg: float, ax: int) -> np.ndarray:
+        if sg <= 0:
+            return a
+        rad = max(1, int(3 * sg)); x = np.arange(-rad, rad + 1)
+        k = np.exp(-x * x / (2 * sg * sg)); k /= k.sum()
+        b = np.pad(a, [(rad, rad) if i == ax else (0, 0) for i in range(a.ndim)], mode="edge")
+        return np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), ax, b)
+
+    # ── pass 2: 2-D smooth each edge patch (lat×frame) with the untouched interior as a lateral anchor ──
+    for edge, inner in ((np.arange(0, ew), np.arange(ew, ew + anchor)),
+                        (np.arange(L - ew, L), np.arange(L - ew - anchor, L - ew))):
+        left = edge[0] == 0
+        idx = np.concatenate([edge, inner]) if left else np.concatenate([inner, edge])
+        patch = snap[idx, :].copy()                         # (ew+anchor, F) raw snap + interior anchor rows
+        patch = _med(patch, mwl, 0); patch = _med(patch, mwf, 1)
+        patch = _gauss(patch, sgl, 0); patch = _gauss(patch, sgf, 1)
+        out[edge, :] = patch[:ew, :] if left else patch[anchor:, :]
+    return out.astype(surf.dtype)
+
+
 def _legacy_surface(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
     """The ORIGINAL ('old method') per-slice anterior surface: {hist-eq, raw} gradient-argmax, the better
     RANSAC-quadratic of the two, then a side-correction bias. RANSAC fits a smooth corneal dome and rejects a
@@ -1811,6 +1920,12 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # Runs FIRST so the subsequent frame-direction edge-regularize has the final say on edge smoothness (else it
     # would re-roughen the floor-smoothed outer laterals). See _edge_dome_constrain.
     out = _edge_dome_constrain(out, p)
+    # FAINT-EDGE DOME FOLLOW (AFTER the downward-hook constraint, BEFORE the frame-smoothing): where the edge
+    # surface floats on a faint PRE-epithelial reflection ABOVE the true (brighter) epithelium, snap it DOWN onto
+    # that sustained band so the border FOLLOWS the corneal curve instead of flattening off it (CS001 OD, user:
+    # "the edge doesn't follow the overall corneal curvature"). 2-D smoothed; interior byte-untouched. Complements
+    # _edge_dome_constrain (which fixes the opposite, too-DEEP, defect). See _edge_dome_follow.
+    out = _edge_dome_follow(out, sag, p)
     # EDGE REGULARIZATION: smooth the faint FOV-boundary laterals' jagged border across frames (depth-preserving),
     # a strict no-op on the confident interior. Handles the sagittal edge-slice jitter (CS001 OD__4 lateral 0/1)
     # AND, via the outer-band floor sigma, the BRIGHT tissue-bearing FOV edge (CS001 OD__4 visual-left / array-right).
@@ -3100,6 +3215,10 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # provided fix-columns edges are the user's GROUND-TRUTH surface → NEVER touched). See _edge_dome_constrain.
         if not use_provided:
             edges = _edge_dome_constrain(edges, p)
+        # FAINT-EDGE DOME FOLLOW on the WARP edges (see detect_surface_all) — snap the too-shallow faint edge DOWN
+        # onto the brighter epithelium band so the flattened OUTPUT border follows the corneal curve. Auto path only.
+        if not use_provided:
+            edges = _edge_dome_follow(edges, det, p)
         # EDGE REGULARIZATION on the WARP edges — smooth the faint FOV-boundary laterals across frames so the
         # flattened OUTPUT sagittal border is smooth there too (depth preserved), incl. the outer-band floor that
         # de-jitters the BRIGHT tissue-bearing FOV edge. Runs LAST so it has the final say. Auto path only.
