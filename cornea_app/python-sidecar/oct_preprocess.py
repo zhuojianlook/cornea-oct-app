@@ -89,6 +89,13 @@ DEFAULT_PARAMS: dict = {
                                   #   (a manual fix-columns provided_edges warp still honours the user's exact drawn border).
     "rigid_frame_smooth": 1.5,    # gaussian sigma (frames) on the per-frame rigid shift → kills frame-to-frame detection
                                   #   jitter (adjacent B-scans ~40ms apart, so real motion is smooth); 0 = raw per-frame median
+    "rigid_height_refine": True,  # DEFAULT ON (v0.0.191): final RIGID per-frame height cleanup for a smoother sagittal —
+                                  #   iteratively re-estimate the leftover per-frame depth JITTER vs a robust smooth dome,
+                                  #   keep only its HIGH-FREQ part (dome trajectory preserved, NOT flattened) and rigidly
+                                  #   shift each B-scan by it. Self-gated: kept only if surface roughness drops. Rigid only.
+    "rhr_iters": 4,               # iterations of the dome-fit → median-residual → subtract loop
+    "rhr_smooth": 3.0,            # gaussian sigma (frames) splitting removable jitter (HF) from the real dome trajectory (LF)
+    "rhr_max": 8.0,               # px cap on the per-frame height correction
     "intra_frame_dewarp": False,  # RETIRED default OFF (tested, not shipped): correcting the raw B-scans before the
                                   #   flatten gets re-processed/washed by the flatten, and correcting post-flatten hits
                                   #   detector re-lock revert; the residual high-freq frame-direction motion steps resist
@@ -3844,6 +3851,83 @@ def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers
                  "motion_std": round(float(np.std(M)), 2), "max_shift": round(float(np.max(np.abs(M))), 1)}
 
 
+def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """RIGID per-frame HEIGHT refinement for a smoother sagittal (v0.0.191).
+
+    After the rigid flatten each B-scan sits at ONE depth (a single per-frame height). Any residual ESTIMATION
+    JITTER in those heights (AMC + rigid_frame_warp leave a small ±few-px error) leaves the sagittal anterior
+    surface slightly WAVY — the user's "the rearranging of the axial 2-D image heights is not perfect". Because
+    the B-scan must not deform, the ONLY lever is a better per-frame height. Estimate the leftover per-frame
+    error by ITERATIVELY aligning the detected surface to a robust smooth 3-D dome (deg-`amc_dome_deg` 2-D poly,
+    re-fit each iteration so the ±jitter doesn't bias it), then keep ONLY the HIGH-FREQUENCY component of the
+    accumulated correction (subtract a gaussian-`rhr_smooth` low-pass) so the TRUE smooth dome trajectory is
+    preserved — we remove jitter, we do NOT flatten the dome — and apply it as a per-frame RIGID depth shift
+    (uniform across lateral → zero B-scan deformation). SELF-GATED: re-detect after the shift and KEEP the
+    result only if the per-frame surface roughness actually DROPS, else a strict no-op (never worse). Most of
+    the residual sagittal roughness is PER-LATERAL (detection noise / real astigmatism) and is irreducible by
+    any rigid shift; this pass only recovers the removable COMMON-motion part. `volume`=(frames,depth,lateral)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    F, depth = int(volume.shape[0]), int(volume.shape[1])
+    if F < 12:
+        return volume, {"applied": False}
+    try:
+        S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False}
+    L = int(S.shape[0])
+    valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
+    if int(valid.sum()) < (L * F) // 4:
+        return volume, {"applied": False}
+
+    def _rough(surf):
+        sm = np.where((surf > 1) & (surf < depth - 1) & np.isfinite(surf), surf, np.nan)
+        with np.errstate(all="ignore"):
+            return float(np.nanmean([np.nanmean(np.abs(np.diff(sm[l, :], 2))) for l in range(10, L - 10, 4)]))
+
+    yy, xx = np.mgrid[0:L, 0:F].astype(np.float64)
+    yn = yy / (L - 1) * 2 - 1; xn = xx / (F - 1) * 2 - 1
+    deg = int(p.get("amc_dome_deg", 5))
+    terms = [(a, b) for a in range(deg + 1) for b in range(deg + 1) if a + b <= deg]
+    A = np.stack([(yn ** a) * (xn ** b) for a, b in terms], axis=-1)
+    Sc = np.where(valid, S, np.nan).astype(np.float64)
+    Mcum = np.zeros(F)
+    for _ in range(int(p.get("rhr_iters", 4))):
+        v = np.isfinite(Sc) & (Sc > 1) & (Sc < depth - 1)
+        if int(v.sum()) < len(terms) + 5:
+            break
+        try:
+            coef = np.linalg.lstsq(A[v], Sc[v], rcond=None)[0]
+        except Exception:  # noqa: BLE001
+            break
+        T = A @ coef
+        with np.errstate(all="ignore"):
+            step = np.nanmedian(np.where(v, Sc - T, np.nan), axis=0)
+        step = np.where(np.isfinite(step), step, 0.0)
+        Sc = Sc - step[None, :]; Mcum += step
+    sig = float(p.get("rhr_smooth", 3.0) or 0.0)
+    jitter = (Mcum - ndimage.gaussian_filter1d(Mcum, sig, mode="nearest")) if sig > 0 else Mcum
+    jitter = np.clip(jitter, -float(p.get("rhr_max", 8.0)), float(p.get("rhr_max", 8.0)))
+    if float(np.max(np.abs(jitter))) < 0.15:       # no meaningful jitter → strict no-op
+        return volume, {"applied": False, "max_jitter": round(float(np.max(np.abs(jitter))), 2)}
+    r0 = _rough(S)
+    out = volume.copy(); nadj = 0
+    for f in range(F):
+        if abs(jitter[f]) > 0.02:
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -jitter[f]), subpixel=True)
+            nadj += 1
+    try:                                            # SELF-GATE: keep only if the surface got smoother
+        S2 = detect_surface_all(reformat_to_sagittal(out), p, workers=workers)
+        r1 = _rough(S2)
+    except Exception:  # noqa: BLE001
+        r1 = r0 + 1.0
+    if not (r1 < r0):                               # no improvement → revert (never worse)
+        return volume, {"applied": False, "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+    return out, {"applied": bool(nadj), "frames_adjusted": int(nadj), "max_jitter": round(float(np.max(np.abs(jitter))), 2),
+                 "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+
+
 def intra_frame_dewarp(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """Correct INTRA-frame (within-B-scan) saccade distortion (v0.0.159) — the hard residual after the flatten.
 
@@ -4860,6 +4944,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("frame_edge_curve_snap", True) and not _rigid:
         corrected, fcs = frame_edge_curve_snap(corrected, params, workers=workers)
         info["frame_edge_curve_snap"] = fcs
+    # RIGID-mode sagittal cleanup: with the per-column post-passes gated off, the only remaining lever for a smooth
+    # sagittal is a better PER-FRAME HEIGHT. Re-estimate + remove the residual per-frame jitter as a rigid depth shift
+    # (self-gated, never worse; keeps the dome, no B-scan deformation). Runs ONLY under rigid (the deforming path
+    # already smooths the sagittal by warping). Before the user-GT anchors so those still win.
+    if _rigid and p_all.get("rigid_height_refine", True):
+        corrected, rhr = rigid_height_refine(corrected, params, workers=workers)
+        info["rigid_height_refine"] = rhr
     # AXIAL fix-tool GT: apply the annotator's axial-plane surface corrections (drawn on an axial B-scan across
     # laterals) as a post-hoc additive per-frame warp onto the corrected result — reaches the apex/limbus defects
     # the sagittal fix-columns tool can't. Sticky + idempotent (re-diffs the drawn target vs the re-detected surface).
