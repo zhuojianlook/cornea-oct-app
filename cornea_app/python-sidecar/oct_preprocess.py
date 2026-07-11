@@ -69,16 +69,26 @@ DEFAULT_PARAMS: dict = {
     # the per-column displacement FIELD across the slice (lateral) axis with this Gaussian sigma (px,
     # 0 = off) makes neighbours shift consistently → a smoother axial boundary, while the per-slice
     # quadratic still carries the real lateral curvature. Small sigma stays close to the per-slice fit.
-    "axial_motion_correct": False,  # RETIRED default OFF (tested, not shipped): a per-frame RIGID axial de-motion is
-                                  #   REDUNDANT with the flatten — the per-slice flatten ALREADY removes the dominant
-                                  #   per-frame rigid inter-frame motion (CS004 OD rep1 raw 5.56px rigid → output 1.08px),
-                                  #   so applying it up-front smooths the RAW but not the OUTPUT, and it injects B-scan
-                                  #   tears. rep1's RESIDUAL non-smoothness is NON-RIGID INTRA-frame distortion (eye moving
-                                  #   DURING a B-scan at saccades) which a rigid shift can't fix. Code kept for reference.
+    "axial_motion_correct": True,  # DEFAULT ON (v0.0.190): PROPER rigid inter-frame motion registration. A B-scan is
+                                  #   acquired near-instantaneously so its internal geometry is truth and must NOT be
+                                  #   deformed (user constraint); only the SLOW-scan inter-frame eye drift/saccade shifts
+                                  #   each B-scan in depth. Estimate that per-frame RIGID depth offset by aligning each
+                                  #   B-scan's surface to a robust smooth 3-D dome (deg-`amc_dome_deg` 2-D poly, iterative
+                                  #   2σ reject → saccade-robust) and shift each frame uniformly → the sagittal flattens
+                                  #   WITHOUT per-column deformation. Was retired when the per-column flatten removed the
+                                  #   motion BY DEFORMING; with rigid_frame_warp that deformation is gone, so AMC becomes
+                                  #   the primary motion corrector. Strict no-op on motion-free scans (byte-unchanged).
     "amc_dome_deg": 5,            # degree of the robust 2-D dome fit used as the motion-free reference
     "amc_smooth": 1.0,            # gaussian sigma (frames) on the estimated motion → kills 1-frame detection noise
     "amc_max_shift": 30.0,        # px cap on the per-frame rigid depth shift
     "amc_min_motion": 1.0,        # px: if the per-frame motion std is below this, the scan is motion-free → no-op
+    "rigid_frame_warp": True,     # DEFAULT ON (v0.0.190): enforce the instantaneous-B-scan constraint IN the flatten —
+                                  #   replace each frame's per-lateral displacement with ONE robust rigid depth shift
+                                  #   (median over reliable laterals) so the flatten can never per-column-deform a B-scan.
+                                  #   Composes with axial_motion_correct (both are rigid per-frame shifts). Auto path only
+                                  #   (a manual fix-columns provided_edges warp still honours the user's exact drawn border).
+    "rigid_frame_smooth": 1.5,    # gaussian sigma (frames) on the per-frame rigid shift → kills frame-to-frame detection
+                                  #   jitter (adjacent B-scans ~40ms apart, so real motion is smooth); 0 = raw per-frame median
     "intra_frame_dewarp": False,  # RETIRED default OFF (tested, not shipped): correcting the raw B-scans before the
                                   #   flatten gets re-processed/washed by the flatten, and correcting post-flatten hits
                                   #   detector re-lock revert; the residual high-freq frame-direction motion steps resist
@@ -3418,6 +3428,49 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     #     retired parabola_edge margin shelf), gated + feathered (a slice already on-trend is a strict no-op).
     if not use_provided:
         disp_field = _cap_edge_descent(disp_field, active, clip_cols_list, zero_cols_list, p, vol=det)
+    # 3d) RIGID-B-SCAN constraint (#rigidframe): an AXIAL B-scan (frame) is captured near-instantaneously, so its
+    #     internal geometry is REAL — the correction of the sagittal (time-domain) inter-frame motion must only
+    #     shift the WHOLE B-scan in depth, NEVER deform it per-column. The per-sagittal-slice flatten is already
+    #     ~rigid on high-SNR interior frames (per-lateral disp spread ≈ detection noise), but on faint boundary
+    #     frames the columns disagree and it bends the real geometry (the apex/limbus notch, per-frame disp spread
+    #     3-6px ≫ the ~0 rigid part). Replace each frame's per-lateral displacement with ONE robust rigid shift
+    #     (median over the reliable laterals, excluding clipped/user-cut columns whose disp is a clamp not a motion
+    #     sample), then re-assert the tissue-preservation clamps. Interior barely changes (≤ noise); the boundary
+    #     deformation is removed at the source. Auto path only. rigid_frame_warp=False → off (legacy per-column).
+    if not use_provided and bool(p.get("rigid_frame_warp", False)):
+        clamped = np.zeros(disp_field.shape, dtype=bool)          # (lateral, frame) clip/user-cut columns
+        for i in range(n):
+            cc = clip_cols_list[i]; zc = zero_cols_list[i]
+            if len(cc):
+                clamped[i, np.clip(np.asarray(cc, dtype=int), 0, disp_field.shape[1] - 1)] = True
+            if len(zc):
+                clamped[i, np.clip(np.asarray(zc, dtype=int), 0, disp_field.shape[1] - 1)] = True
+        df = disp_field.astype(np.float64)
+        deltas = np.full(df.shape[1], np.nan)
+        for f in range(df.shape[1]):
+            good = np.isfinite(df[:, f]) & (~clamped[:, f])
+            if int(good.sum()) >= 8:
+                deltas[f] = float(np.median(df[good, f]))         # ONE rigid depth shift for the whole B-scan
+        val = np.isfinite(deltas)
+        if int(val.sum()) >= 4:
+            # the inter-frame motion is SMOOTH (adjacent B-scans are ~40ms apart), so a per-frame median that
+            # jitters frame-to-frame is DETECTION NOISE, not motion → smoothing the per-frame shift across frames
+            # removes that jitter (the frames stay rigidly aligned, no B-scan deformation) and recovers a smooth
+            # sagittal border. rigid_frame_smooth=0 → raw per-frame median (jittery).
+            xs = np.arange(df.shape[1], dtype=np.float64)
+            deltas = np.interp(xs, xs[val], deltas[val])
+            sig = float(p.get("rigid_frame_smooth", 1.5) or 0.0)
+            if sig > 0:
+                deltas = ndimage.gaussian_filter1d(deltas, sigma=sig, mode="nearest")
+            df[:] = deltas[None, :]
+        disp_field = df
+        for i in range(n):                                        # re-assert clip (disp>=0) + user-cut (disp==0)
+            cc = clip_cols_list[i]
+            if len(cc):
+                disp_field[i][cc] = np.maximum(disp_field[i][cc], 0.0)
+            zc = zero_cols_list[i]
+            if len(zc):
+                disp_field[i][zc] = 0.0
     # 4) warp each slice by its guarded+smoothed displacement, then revert. sub-pixel (subpixel_warp) removes the
     #    int-truncate lateral staircase in the flattened anterior boundary (the "ripples" seen at zoom).
     _subpx = bool(p.get("subpixel_warp", False))
@@ -4768,25 +4821,30 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # it makes the en-face boundary smoother (and only if the whole 3-D surface improves). Confirmed on
     # real scans to give the smoothest 3-D corneal surface; never worse than sagittal-only.
     p_all = {**DEFAULT_PARAMS, **(params or {})}
-    if p_all.get("axial_refine", True):
+    # RIGID-B-SCAN mode disables the per-column axial post-passes: axial_refine / axial_consistency / fbls /
+    # surface_refine_2d / frame_edge_curve_snap all NUDGE individual lateral columns to smooth the detected B-scan
+    # surface — they exist only to repair the DEFORMATION the per-column main warp injected. A rigid main warp
+    # preserves the real instantaneous B-scan geometry, so those repairs would now BEND the true geometry. Off.
+    _rigid = bool(p_all.get("rigid_frame_warp", False))
+    if p_all.get("axial_refine", True) and not _rigid:
         corrected, ref = axial_refine_volume(corrected, params, workers=workers)
         info["axial_refine"] = ref
     # FIX axialcons: final AXIAL-consistency pass — the sagittal flatten corrects the 513 lateral columns
     # independently, so their shifts are inconsistent → lateral WAVINESS/spikes/notches visible only in the
     # AXIAL (B-scan) view. Per B-scan, apply a SMALL GATED per-column depth nudge onto a laterally-smoothed
     # surface. Strict no-op on an already-smooth scan (gate), so it can't regress good scans.
-    if p_all.get("axial_consistency", True):
+    if p_all.get("axial_consistency", True) and not _rigid:
         corrected, axc = axial_consistency_volume(corrected, params, workers=workers)
         info["axial_consistency"] = axc
     # FIX column-level edge errors: a final robust 2-D surface-refine pass (both lateral AND frame directions)
     # that pulls LOCAL patches where the edge detector locked a few px off (invisible to the lateral-only
     # axial_consistency) onto the smooth 2-D dome. Hard-gated on deviation → strict no-op on a smooth scan.
-    if p_all.get("surface_refine_2d", True):
+    if p_all.get("surface_refine_2d", True) and not _rigid:
         corrected, srf = surface_refine_2d(corrected, params, workers=workers)
         info["surface_refine_2d"] = srf
     # FIX jagged edge B-scans: lateral-smooth ONLY the first/last few (low-signal acquisition-edge) frames, whose
     # jagged border axial_consistency's gate leaves untouched. Gated to the boundary frames → no-op on the interior.
-    if p_all.get("frame_boundary_smooth", True):
+    if p_all.get("frame_boundary_smooth", True) and not _rigid:
         corrected, fbs = frame_boundary_lat_smooth(corrected, params, workers=workers)
         info["frame_boundary_smooth"] = fbs
     # FIX the "very steep curvature near the ends": POST-HOC frame-direction over-descent cap. RETIRED default
@@ -4799,7 +4857,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # deviates from the smooth corneal arc (stair-steps / physically-implausible gradient-direction reversals),
     # pull it onto the arc. Deviation-gated + distance-feathered → a strict no-op on on-curve (approved) edges,
     # and structurally cannot create a boundary kink. Local to the edge frames (interior untouched).
-    if p_all.get("frame_edge_curve_snap", True):
+    if p_all.get("frame_edge_curve_snap", True) and not _rigid:
         corrected, fcs = frame_edge_curve_snap(corrected, params, workers=workers)
         info["frame_edge_curve_snap"] = fcs
     # AXIAL fix-tool GT: apply the annotator's axial-plane surface corrections (drawn on an axial B-scan across
