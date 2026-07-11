@@ -96,6 +96,11 @@ DEFAULT_PARAMS: dict = {
     "rhr_iters": 4,               # iterations of the dome-fit → median-residual → subtract loop
     "rhr_smooth": 3.0,            # gaussian sigma (frames) splitting removable jitter (HF) from the real dome trajectory (LF)
     "rhr_max": 8.0,               # px cap on the per-frame height correction
+    "rigid_frame_derotate": True, # DEFAULT ON (v0.0.192): SECONDARY per-frame rigid ROTATION (inter-frame eye torsion)
+                                  #   after the axial (depth) alignment — flattens the per-frame surface TILT jitter that a
+                                  #   depth-shift can't reach, by rotating the whole B-scan (rigid, no deformation). Rigid only.
+    "rfd_smooth": 3.0,            # gaussian sigma (frames) splitting removable tilt jitter (HF) from real peripheral tilt (LF)
+    "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°
     "intra_frame_dewarp": False,  # RETIRED default OFF (tested, not shipped): correcting the raw B-scans before the
                                   #   flatten gets re-processed/washed by the flatten, and correcting post-flatten hits
                                   #   detector re-lock revert; the residual high-freq frame-direction motion steps resist
@@ -3928,6 +3933,105 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
                  "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
 
 
+def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """Per-frame rigid ROTATION correction — the SECONDARY inter-frame motion component (v0.0.192).
+
+    Between two axial B-scans (~40 ms) the eye's motion is not purely IN/OUT (depth) — there is also a small
+    TORSION / in-plane ROTATION. In the B-scan (lateral×depth) plane that rotation appears as a TILT of the
+    anterior surface across the lateral axis; in the sagittal view it is a residual that varies LINEARLY across
+    lateral (which a single per-frame depth shift — rigid_height_refine — cannot remove, and which a per-COLUMN
+    correction must NOT touch because that would deform the instantaneous B-scan). A true rigid ROTATION of the
+    whole B-scan removes it WITHOUT deforming it (rotation preserves every internal distance/angle). Biggest in
+    the first/last few frames (the eye settling/drifting at scan start/end), matching where the residual lives.
+
+    Estimate per frame the surface-tilt residual vs a robust smooth 3-D dome (deg-`amc_dome_deg`), keep only the
+    HIGH-FREQUENCY (frame-to-frame jitter) part — `rfd_smooth` low-pass — so the cornea's real peripheral tilt is
+    preserved, then rotate each B-scan by the angle that flattens that jitter tilt (rotate the (lateral,depth)
+    image, mode='nearest'). SELF-GATED: re-detect and keep only if per-frame surface roughness drops. Δx (lateral
+    translation) is NOT estimated — it is collinear with the tilt on the dome flanks and destabilises the fit
+    (tested: makes it worse). Runs AFTER rigid_height_refine (the "initial axial alignment"). volume=(frames,depth,lateral)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    F, depth = int(volume.shape[0]), int(volume.shape[1])
+    if F < 12:
+        return volume, {"applied": False}
+    try:
+        S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False}
+    L = int(S.shape[0])
+    valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
+    if int(valid.sum()) < (L * F) // 4:
+        return volume, {"applied": False}
+
+    def _rough(surf):
+        sm = np.where((surf > 1) & (surf < depth - 1) & np.isfinite(surf), surf, np.nan)
+        with np.errstate(all="ignore"):
+            return float(np.nanmean([np.nanmean(np.abs(np.diff(sm[l, :], 2))) for l in range(10, L - 10, 4)]))
+
+    # robust smooth dome (re-fit with 2σ reject so the tilt jitter doesn't bias it)
+    yy, xx = np.mgrid[0:L, 0:F].astype(np.float64)
+    yn = yy / (L - 1) * 2 - 1; xn2 = xx / (F - 1) * 2 - 1
+    deg = int(p.get("amc_dome_deg", 5))
+    terms = [(a, b) for a in range(deg + 1) for b in range(deg + 1) if a + b <= deg]
+    A = np.stack([(yn ** a) * (xn2 ** b) for a, b in terms], axis=-1)
+    m = valid.copy()
+    try:
+        for _ in range(3):
+            coef = np.linalg.lstsq(A[m], S[m], rcond=None)[0]
+            r = S - A @ coef; sd = np.std(r[m]) + 1e-6
+            mm = valid & (np.abs(r) < 2.0 * sd)
+            if int(mm.sum()) < len(terms) + 5:
+                break
+            m = mm
+        Dome = A @ coef
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False}
+    R = np.where(valid, S - Dome, np.nan)
+    xc = (L - 1) / 2.0
+    xnl = (np.arange(L) - xc) / (L / 2.0)                # normalised lateral, [-1,1]
+    tilt = np.zeros(F)
+    for f in range(F):
+        col = R[:, f]; mk = np.isfinite(col)
+        if int(mk.sum()) < 40:
+            continue
+        try:                                            # 2σ-trimmed slope fit (robust to a few detector glitches)
+            b1, b0 = np.polyfit(xnl[mk], col[mk], 1)
+            res = col[mk] - (b1 * xnl[mk] + b0); sd = np.std(res) + 1e-6
+            keep = np.abs(res) < 2.0 * sd
+            if int(keep.sum()) > 30:
+                idx = np.where(mk)[0][keep]
+                b1 = np.polyfit(xnl[idx], col[idx], 1)[0]
+            tilt[f] = b1
+        except Exception:  # noqa: BLE001
+            continue
+    sig = float(p.get("rfd_smooth", 3.0) or 0.0)
+    tilt_jit = (tilt - ndimage.gaussian_filter1d(tilt, sig, mode="nearest")) if sig > 0 else tilt
+    alpha = -2.0 * tilt_jit / L                          # radians: rotation whose z-shift α·(x-xc) cancels the tilt
+    amax = np.radians(float(p.get("rfd_max_deg", 3.0)))
+    alpha = np.clip(alpha, -amax, amax)
+    if float(np.degrees(np.max(np.abs(alpha)))) < 0.03:  # no meaningful tilt → strict no-op
+        return volume, {"applied": False, "max_deg": round(float(np.degrees(np.max(np.abs(alpha)))), 2)}
+    r0 = _rough(S)
+    out = volume.copy(); nrot = 0
+    for f in range(F):
+        if abs(alpha[f]) > 1e-4:
+            fr_ld = np.ascontiguousarray(out[f].T)       # (lateral, depth) — matches the validated prototype
+            rot = ndimage.rotate(fr_ld, np.degrees(alpha[f]), reshape=False, order=1, mode="nearest")
+            out[f] = np.ascontiguousarray(rot.T)
+            nrot += 1
+    try:                                                # SELF-GATE: keep only if the surface got smoother
+        S2 = detect_surface_all(reformat_to_sagittal(out), p, workers=workers)
+        r1 = _rough(S2)
+    except Exception:  # noqa: BLE001
+        r1 = r0 + 1.0
+    if not (r1 < r0):
+        return volume, {"applied": False, "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+    return out, {"applied": bool(nrot), "frames_rotated": int(nrot), "max_deg": round(float(np.degrees(np.max(np.abs(alpha)))), 2),
+                 "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+
+
 def intra_frame_dewarp(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """Correct INTRA-frame (within-B-scan) saccade distortion (v0.0.159) — the hard residual after the flatten.
 
@@ -4951,6 +5055,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if _rigid and p_all.get("rigid_height_refine", True):
         corrected, rhr = rigid_height_refine(corrected, params, workers=workers)
         info["rigid_height_refine"] = rhr
+    # SECONDARY rigid alignment: per-frame ROTATION (inter-frame eye torsion) — flattens the residual surface TILT
+    # jitter that the depth-only rigid_height_refine leaves (a rigid rotation, so still zero B-scan deformation).
+    # Runs after the axial alignment, self-gated. Rigid only; before user-GT anchors.
+    if _rigid and p_all.get("rigid_frame_derotate", True):
+        corrected, rfd = rigid_frame_derotate(corrected, params, workers=workers)
+        info["rigid_frame_derotate"] = rfd
     # AXIAL fix-tool GT: apply the annotator's axial-plane surface corrections (drawn on an axial B-scan across
     # laterals) as a post-hoc additive per-frame warp onto the corrected result — reaches the apex/limbus defects
     # the sagittal fix-columns tool can't. Sticky + idempotent (re-diffs the drawn target vs the re-detected surface).
