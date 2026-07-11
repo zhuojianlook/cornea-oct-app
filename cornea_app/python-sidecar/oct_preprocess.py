@@ -4209,6 +4209,71 @@ def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
     return out, n
 
 
+def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | None = None,
+                           workers: int | None = None) -> tuple[np.ndarray, dict]:
+    """AXIAL fix-tool GT (v0.0.186). The annotator opened an AXIAL B-scan (fixed FRAME, lateral×depth) and dragged
+    the anterior corneal surface across LATERALS onto the true band where the auto-detector got it wrong — a notch
+    at the apex/limbus of the first/last low-SNR frames that the SAGITTAL fix-columns tool (which corrects along the
+    FRAME axis) structurally cannot reach. This applies that correction as a POST-HOC ADDITIVE per-frame warp on the
+    FINISHED corrected volume: the frame_boundary_lat_smooth / apply_manual_shifts template, but the target is the
+    user's ABSOLUTE drawn curve instead of a smoothed one. It never re-runs the sagittal flatten (no provided_edges,
+    no re-detect) → no double-warp, no interior cascade. It is IDEMPOTENT + STICKY: it stores the TARGET depth (not a
+    fixed shift) and each run RE-DETECTS the current surface with the SAME detector the annotator drew against and
+    re-diffs, so re-runs land on the target every time. The correction is LOCAL: it spans only the drawn lateral
+    range, raised-cosine feathered back to the detected surface over `axial_gt_feather` laterals on each side, so
+    undrawn laterals are WYSIWYG-unchanged and no step forms. axial_anchors = {str(frame): {str(lateral): depth}} in
+    the corrected-volume depth space (0 = TOP). volume = (frames, depth, lateral). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not isinstance(axial_anchors, dict) or not axial_anchors:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    if workers is None:
+        workers = auto_workers()
+    nF, depth, L = volume.shape
+    fm = int(p.get("axial_gt_feather", 14) or 0)
+    try:
+        surf = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lat, frames)
+    except Exception:  # noqa: BLE001 — best effort; without a current surface we cannot diff → no-op
+        return volume, {"applied": False, "frames_adjusted": 0}
+    out = volume.copy(); nadj = 0; xs = np.arange(L, dtype=np.float64)
+    for f_key, lat_map in axial_anchors.items():
+        try:
+            f = int(f_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= f < nF) or not isinstance(lat_map, dict) or not lat_map:
+            continue
+        dl, dv = [], []                                          # drawn (lateral, depth) anchors for this frame
+        for l_key, d in lat_map.items():
+            try:
+                li, dd = int(l_key), float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= li < L and math.isfinite(dd):
+                dl.append(li); dv.append(dd)
+        if len(dl) < 3:                                          # too few anchors → don't inject a garbage warp
+            continue
+        order = np.argsort(dl); dl = np.asarray(dl)[order].astype(np.float64); dv = np.asarray(dv)[order]
+        lo_l, hi_l = int(dl[0]), int(dl[-1])
+        cur = surf[:, f].astype(np.float64)
+        t_dense = np.interp(xs, dl, dv)                          # drawn target spread across laterals (flat outside)
+        w = np.zeros(L, dtype=np.float64)                        # correction weight: 1 inside the drawn span
+        w[lo_l:hi_l + 1] = 1.0
+        for k in range(1, fm + 1):                               # raised-cosine feather back to the detected surface
+            ww = 0.5 * (1.0 + math.cos(math.pi * k / max(1, fm)))
+            if lo_l - k >= 0:
+                w[lo_l - k] = max(w[lo_l - k], ww)
+            if hi_l + k < L:
+                w[hi_l + k] = max(w[hi_l + k], ww)
+        good = np.isfinite(cur) & (cur > 1.0) & (cur < depth - 1)   # never move an off-cornea / padding column
+        shift = np.where(good, w * (t_dense - cur), 0.0)           # + = deeper; local, feathered, WYSIWYG elsewhere
+        shift[~np.isfinite(shift)] = 0.0
+        shift = np.clip(shift, -(depth - 2), depth - 2)
+        if np.any(np.abs(shift) > 1e-6):
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), shift, subpixel=True)
+            nadj += 1
+    return out, {"applied": nadj > 0, "frames_adjusted": int(nadj)}
+
+
 # ── NIfTI output (correct Avanti geometry, matching the app's existing volumes) ──
 def write_volume_nifti(vol_zyx: np.ndarray, out_path: str | Path,
                        spacing_xyz=NIFTI_SPACING, direction=NIFTI_DIRECTION,
@@ -4595,6 +4660,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if _crop_tune:
                 info["auto_tune"] = _crop_tune
             p_all = {**DEFAULT_PARAMS, **(params or {})}
+            _axa = p_all.get("axial_anchors")   # AXIAL fix-tool GT (see main path) — applies on the surface-crop path too
+            if _axa:
+                corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
+                info["axial_anchors"] = _axinfo
             ms = p_all.get("manual_shifts")
             if ms:
                 corrected, n_ms = apply_manual_shifts(corrected, ms)
@@ -4622,6 +4691,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "redetect",
                 "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0}}
         p_all = {**DEFAULT_PARAMS, **(params or {})}
+        _axa = p_all.get("axial_anchors")   # AXIAL fix-tool GT (see main path) — applies on the fix-columns path too
+        if _axa:
+            corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
+            info["axial_anchors"] = _axinfo
         ms = p_all.get("manual_shifts")
         if ms:
             corrected, n_ms = apply_manual_shifts(corrected, ms)
@@ -4729,6 +4802,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if p_all.get("frame_edge_curve_snap", True):
         corrected, fcs = frame_edge_curve_snap(corrected, params, workers=workers)
         info["frame_edge_curve_snap"] = fcs
+    # AXIAL fix-tool GT: apply the annotator's axial-plane surface corrections (drawn on an axial B-scan across
+    # laterals) as a post-hoc additive per-frame warp onto the corrected result — reaches the apex/limbus defects
+    # the sagittal fix-columns tool can't. Sticky + idempotent (re-diffs the drawn target vs the re-detected surface).
+    _axa = p_all.get("axial_anchors")
+    if _axa:
+        corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
+        info["axial_anchors"] = _axinfo
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")

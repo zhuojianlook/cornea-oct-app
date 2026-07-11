@@ -2109,6 +2109,10 @@ class OctPreprocessRequest(BaseModel):
     border_anchors: dict | None = None        # fix-columns "Confirm": {str(slice_index): {str(frame): true_depth}}
                                               # corrected ABSOLUTE surface depths (depth 0 = TOP). The server MARCHES
                                               # a tilt-aware re-detection of the whole RAW volume seeded by these.
+    axial_anchors: dict | None = None         # AXIAL fix-tool "Confirm": {str(frame): {str(lateral): true_depth}}
+                                              # anterior-surface depths (CORRECTED-output depth space, 0 = TOP) drawn on
+                                              # an axial B-scan across laterals. STICKY like manual_shifts: applied as a
+                                              # post-hoc additive per-frame warp (apply_axial_surface_gt); {} clears.
     use_redetect: bool | None = None          # oct-preprocess: flatten to the confirmed re-detected surface
                                               # (provided_edges) instead of auto-detecting — the fix-columns "Run".
     parabola: bool | None = None              # fix-columns "Confirm" parabola mode: the anchors are a DENSE fitted
@@ -2506,6 +2510,11 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # ground truth stays applied on every later re-run. Flows to the worker inside eff_params (--params).
     if req.manual_shifts is not None:
         eff_params["manual_shifts"] = req.manual_shifts
+    # AXIAL fix-tool GT (sticky, like manual_shifts): a request set REPLACES; omitted carries the persisted set
+    # through (merged from oct_params above) so the axial correction re-applies on every re-run. Never popped by the
+    # normal-auto supersede / use_redetect blocks below → it composes with (survives) a sagittal fix-columns Run.
+    if req.axial_anchors is not None:
+        eff_params["axial_anchors"] = req.axial_anchors
     # Sanitize the EFFECTIVE set (request-provided OR carried-through from persisted oct_params): drop any
     # zero / NaN / Infinity / malformed entry so the manifest never accumulates no-op garbage and always
     # matches the frontend's zero-free view (a zero shift is a no-op the frontend already removes).
@@ -3793,6 +3802,126 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT border re-detect failed: {exc}")
+
+
+# ── AXIAL fix-tool: correct the anterior surface in the AXIAL (B-scan) plane (fixed FRAME, drag across laterals),
+#    which the sagittal fix-columns tool structurally cannot reach. Serves the CORRECTED preprocessed-output volume
+#    (what the user sees) + its detected surface; Confirm persists sticky axial_anchors; Run re-applies them via the
+#    post-hoc apply_axial_surface_gt warp. See oct_preprocess.apply_axial_surface_gt. ─────────────────────────────
+def _oct_corrected_vol_path(case_id: str, m: dict) -> Path:
+    """The corrected (preprocessed-output) working NIfTI — the volume the axial fix-tool draws on + warps."""
+    src = m.get("oct_source")
+    if not src:
+        raise HTTPException(400, f"Case {case_id} has no .OCT source.")
+    return _oct_working_path(case_id, src)
+
+
+_AXIAL_SURF_CACHE: dict = {}   # case_id -> (work_mtime, params_sig, surf(lateral,frames), (L, D, nF))
+
+
+def _axial_surface_cached(case_id: str, work: Path, p: dict):
+    """detect_surface_all on the CORRECTED volume (lateral,depth,frame) → (lateral, frames), cached per case by the
+    output file mtime + a detection-params signature so scrubbing frames is instant (first call detects the whole
+    volume, ~seconds). This is the SAME detector apply_axial_surface_gt diffs against, so the drawn line the user
+    corrects is the one the warp re-diffs (preview ≈ result)."""
+    import numpy as np
+    import nibabel as nib
+    mt = work.stat().st_mtime
+    sig = ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS if k in p)
+    c = _AXIAL_SURF_CACHE.get(case_id)
+    if c and c[0] == mt and c[1] == sig:
+        return c[2], c[3]
+    vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)   # (lateral, depth, frame) = sagittal layout
+    surf = oct_mod.detect_surface_all(vol, p)                          # (lateral, frames)
+    shape = (int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2]))
+    _AXIAL_SURF_CACHE[case_id] = (mt, sig, surf, shape)
+    return surf, shape
+
+
+@app.get("/api/case/{case_id}/oct-axial-slice")
+def oct_axial_slice_png(case_id: str, frame: int = 0) -> Response:
+    """The Fix-axial editor's B-scan (a FIXED FRAME) at NATIVE voxel resolution (depth rows × lateral cols,
+    depth 0 = TOP) as a grayscale PNG, from the CORRECTED preprocessed-output volume (what the user is fixing).
+    Mirrors oct-border-slice's 1-99 percentile stretch + no-store. array lateral 0 = column 0; the frontend
+    scaleX(-1)-flips it so lateral 0 renders on the VISUAL RIGHT (matches niivue's L/R flip)."""
+    import io
+    import numpy as np
+    import nibabel as nib
+    from PIL import Image
+    m = orch.read_manifest(case_id)
+    work = _oct_corrected_vol_path(case_id, m)
+    if not work.exists():
+        raise HTTPException(400, f"Case {case_id} is not preprocessed yet.")
+    try:
+        vol = np.asarray(nib.load(str(work)).dataobj)            # (lateral, depth, frame)
+        nF = int(vol.shape[2])
+        f = max(0, min(nF - 1, int(frame)))
+        sl = np.ascontiguousarray(vol[:, :, f].T).astype(np.float32)   # (depth, lateral), depth 0 = TOP
+        finite = sl[np.isfinite(sl)]
+        if finite.size:
+            lo = float(np.percentile(finite, 1)); hi = float(np.percentile(finite, 99))
+            if hi <= lo:
+                hi = lo + 1.0
+            gray = (np.clip((sl - lo) / (hi - lo), 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            gray = np.zeros(sl.shape, dtype=np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(gray, mode="L").save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT axial slice failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-axial-curve")
+def oct_axial_curve(case_id: str, req: OctPreprocessRequest) -> dict:
+    """The detected anterior corneal surface across LATERALS for ONE frame of the CORRECTED volume (+ a robust
+    quadratic fit) so the Fix-axial UI draws + drags the border. req.slice_index = the FRAME index (central if
+    None). Coordinates: edge[lateral] = depth (0 = TOP), aligning with oct-axial-slice's (depth, lateral) image."""
+    import nibabel as nib  # noqa: F401 — used by _axial_surface_cached
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    work = _oct_corrected_vol_path(case_id, m)
+    if not work.exists():
+        raise HTTPException(400, f"Case {case_id} is not preprocessed yet.")
+    try:
+        p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        surf, (L, D, nF) = _axial_surface_cached(case_id, work, p)   # (lateral, frames)
+        f = nF // 2 if req.slice_index is None else max(0, min(nF - 1, int(req.slice_index)))
+        edge = np.asarray(surf[:, f], dtype=np.float32)
+        fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
+        return {"n_lateral": int(L), "depth_vox": int(D), "n_frames": int(nF), "frame": int(f),
+                "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT axial curve failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-axial-redetect")
+def oct_axial_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Fix-axial "Confirm": persist the user's axial-surface anchors as STICKY GT (oct_params.axial_anchors) so a
+    later Run re-applies them (and the correction is recorded for detector-learning). NO warp + NO cache here — the
+    warp is the post-hoc apply_axial_surface_gt pass inside preprocess_oct_to_nifti. Empty anchors clear it (revert
+    to auto). {str(frame): {str(lateral): true_depth}} in corrected-output depth space."""
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    anchors = req.axial_anchors if isinstance(req.axial_anchors, dict) else {}
+    try:
+        op = dict(m.get("oct_params") or {})
+        if anchors:
+            op["axial_anchors"] = anchors
+        else:
+            op.pop("axial_anchors", None)
+        orch.write_manifest_value(case_id, {"oct_params": op})
+        n_anchors = sum(len(v) for v in anchors.values() if isinstance(v, dict))
+        return {"ok": True, "n_anchors": int(n_anchors)}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT axial re-detect failed: {exc}")
 
 
 @app.post("/api/case/{case_id}/oct-border-generalize")

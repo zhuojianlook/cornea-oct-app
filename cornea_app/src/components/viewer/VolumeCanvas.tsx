@@ -19,6 +19,7 @@ import type { DefectMark } from "../../store/caseStore";
 import { scanStep, hasSegmentation, octProposals } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
+import { AxialGallery } from "./AxialGallery";
 import { SubgroupGrid } from "./SubgroupGrid";
 import { GtCompareViewer } from "./GtCompareViewer";
 import { BeforeAfterViewer } from "./BeforeAfterViewer";
@@ -87,6 +88,10 @@ export function VolumeCanvas() {
   // detection is a MODE within this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a separate
   // top-level button — so all border-fixing tools live in the one Fix-columns menu.
   const [fixColsView, setFixColsView] = useState(false);
+  // AXIAL fix-tool: correct the anterior surface in the AXIAL (B-scan) plane — drag the surface across laterals
+  // on a FIXED FRAME — reaching apex/limbus notches on the low-signal first/last frames that the SAGITTAL
+  // Fix-columns tool (which corrects along the frame axis) structurally cannot. Its own 2-D overlay (AxialGallery).
+  const [fixAxialView, setFixAxialView] = useState(false);
   // The niivue view active BEFORE entering an overlay (before/after or fix-columns). Those modes force
   // SAGITTAL on entry (their 2-D panels are sagittal); we restore this on exit so the user lands back on the
   // view they were inspecting (e.g. axial) instead of being stranded on sagittal — the "the view changed and
@@ -108,7 +113,7 @@ export function VolumeCanvas() {
   const viewerFilter = `contrast(${contrast}%) brightness(${brightness}%)` + (blur > 0 && !fixColsView ? ` blur(${blur}px)` : "");
   // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
   // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
-  const overlay2d = compareView || fixColsView;
+  const overlay2d = compareView || fixColsView || fixAxialView;
   // #9 — Fix-columns "Crop region" mode is SAGITTAL-ONLY (the crop is defined in sagittal terms: frame
   // columns over a lateral-slice range), so force sagittal + disable the coronal option while it's active.
   const cropRegionMode = useWorkflowStore((s) => s.cropRegionMode);
@@ -116,6 +121,8 @@ export function VolumeCanvas() {
   // sagittal terms), so it's removed from the toolbar and the orientation is forced to sagittal in fix-columns.
   const orient2d: "axial" | "coronal" | "sagittal" = fixColsView
     ? "sagittal"
+    : fixAxialView
+    ? "axial"
     : (view === "axial" || view === "coronal" || view === "sagittal") ? view : "sagittal";
   // Slices | Segmentation overlay toggle (Segmentation greyed until SAM2 has run). On the niivue path it
   // simply shows/hides the cornea/scar overlay by opacity; the 2-D gallery reads the same flag.
@@ -223,14 +230,14 @@ export function VolumeCanvas() {
   // the user inspects Cornea+), close the preprocessing overlays so the niivue Slices/Segmentation
   // view shows. (Fixes "after SAM2 the user is still in Fix-columns and can't see the segmentation".)
   useEffect(() => {
-    if (!preprocStep) { setCompareView(false); setFixColsView(false); setStepsView(false); }
+    if (!preprocStep) { setCompareView(false); setFixColsView(false); setFixAxialView(false); setStepsView(false); }
   }, [preprocStep]);
 
   // Leave the comparison / fix-columns / steps overlays when switching to a different case. The Slices|
   // Segmentation toggle DEFAULTS to Segmentation for a scan that already HAS a segmentation (#16 — opening a
   // segmented scan should land on its segmentation, not raw Slices); otherwise Slices (greyed until SAM2).
   useEffect(() => {
-    setCompareView(false); setFixColsView(false); setStepsView(false);
+    setCompareView(false); setFixColsView(false); setFixAxialView(false); setStepsView(false);
     wfSet("showSegmentation", hasSegmentation(manifest));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseInfo?.case_id]);
@@ -486,7 +493,7 @@ export function VolumeCanvas() {
               // fix-columns is active makes the fix-columns panel show raw beside the markable corrected.
               const on = !compareView;
               if (on && !compareView && !fixColsView) preOverlayViewRef.current = view; // entering from normal → remember view
-              setCompareView(on); setStepsView(false);
+              setCompareView(on); setStepsView(false); setFixAxialView(false);
               if (on && (view === "multi" || view === "render")) onView(null, "sagittal");
               else if (!on && !fixColsView) { // back to normal → restore the pre-overlay view
                 const prev = preOverlayViewRef.current; preOverlayViewRef.current = null;
@@ -511,7 +518,7 @@ export function VolumeCanvas() {
               // mode WITHIN this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a sibling button.
               const on = !fixColsView;
               if (on && !compareView && !fixColsView) preOverlayViewRef.current = view; // entering from normal → remember view
-              setFixColsView(on); setStepsView(false);
+              setFixColsView(on); setStepsView(false); setFixAxialView(false);
               if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
               else if (!on) {
                 void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
@@ -532,9 +539,33 @@ export function VolumeCanvas() {
         {hasRaw && preprocStep && (
           <ToggleButton
             size="small"
+            value="fixaxial"
+            selected={fixAxialView}
+            onChange={() => {
+              // Fix-axial is a full 2-D overlay (mutually exclusive with the sagittal panels): drag the anterior
+              // surface across laterals on a fixed FRAME. Force the AXIAL view on entry; restore on exit.
+              const on = !fixAxialView;
+              if (on && !compareView && !fixColsView && !fixAxialView) preOverlayViewRef.current = view;
+              setFixAxialView(on); setStepsView(false); setFixColsView(false); setCompareView(false);
+              if (on && view !== "axial") onView(null, "axial");
+              else if (!on) {
+                void openCase(); // leaving: reload the 3D volume in case a Run changed it
+                const prev = preOverlayViewRef.current; preOverlayViewRef.current = null;
+                if (prev && prev !== view) onView(null, prev);
+              }
+            }}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            title="Correct the corneal surface in the AXIAL (B-scan) plane — drag it across laterals onto the true band where the auto-detector notched at the apex/limbus of the first/last frames (reaches what Fix columns can't)"
+          >
+            ▤ Fix axial
+          </ToggleButton>
+        )}
+        {hasRaw && preprocStep && (
+          <ToggleButton
+            size="small"
             value="steps"
             selected={stepsView}
-            onChange={() => { setStepsView((v) => !v); setCompareView(false); setFixColsView(false); }}
+            onChange={() => { setStepsView((v) => !v); setCompareView(false); setFixColsView(false); setFixAxialView(false); }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
             title="Preview every preprocessing step (hist-eq → edge → quadratic fit → 3D active → warp) for the central slice"
           >
@@ -691,6 +722,14 @@ export function VolumeCanvas() {
         {fixColsView && volumeUrl && (
           <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
             <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting} />
+          </div>
+        )}
+        {/* AXIAL fix-tool — a 2-D overlay over the (still-mounted) niivue canvas. Mutually exclusive with the
+            other 2-D panels (its toolbar onChange clears them). Do NOT early-return: the niivue singleton must
+            stay mounted (see the note above the return). */}
+        {fixAxialView && volumeUrl && (
+          <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
+            <AxialGallery filterCss={viewerFilter} readOnly={inspecting} />
           </div>
         )}
         {stepsView && volumeUrl && (
