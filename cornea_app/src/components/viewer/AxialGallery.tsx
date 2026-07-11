@@ -159,7 +159,23 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
   };
   const clearFrame = () => setAnchors((prev) => { const o = cloneMap(prev); o.delete(arrayFrame); return o; });
 
+  // Concrete pixel box for the B-scan (aspect-ratio alone collapses to 0 without a base dimension) — measure the
+  // editor host and fit the physical aspect inside it (mirrors SliceGallery's bDispW/bDispH).
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [host, setHost] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = hostRef.current; if (!el) return;
+    const upd = () => setHost({ w: Math.max(0, el.clientWidth - 16), h: Math.max(0, el.clientHeight - 16) });
+    const ro = new ResizeObserver(upd); ro.observe(el); upd();
+    return () => ro.disconnect();
+  }, []);
+
   const aspect = nLateral > 0 && depthVox > 0 ? (nLateral * LAT_SP) / (depthVox * DEP_SP) : 2;
+  let dispW = 0, dispH = 0;
+  if (host.w > 1 && host.h > 1 && aspect > 0) {
+    dispW = host.w; dispH = dispW / aspect;
+    if (dispH > host.h) { dispH = host.h; dispW = dispH * aspect; }
+  }
   const btn = (extra?: React.CSSProperties): React.CSSProperties => ({
     padding: "3px 10px", borderRadius: 6, fontSize: 12, lineHeight: 1.4, cursor: "pointer",
     border: "1px solid var(--c-border)", background: "var(--c-surface)", color: "var(--c-text)", ...extra });
@@ -189,11 +205,11 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
       </div>
       {msg && <div style={{ fontSize: 11, padding: "2px 10px", opacity: 0.8, flex: "none" }}>{msg}</div>}
       {/* editor */}
-      <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", padding: 8, overflow: "hidden" }}>
+      <div ref={hostRef} style={{ flex: 1, minHeight: 0, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", padding: 8, overflow: "hidden" }}>
         {!edge || nLateral < 2 ? (
           <div style={{ opacity: 0.6, fontSize: 13 }}>{busy ? "Loading…" : "No axial surface — preprocess this scan first."}</div>
-        ) : (
-          <div style={{ position: "relative", aspectRatio: String(aspect), maxWidth: "100%", maxHeight: "100%" }}>
+        ) : dispW > 1 && dispH > 1 ? (
+          <div style={{ position: "relative", width: dispW, height: dispH }}>
             <div style={{ position: "absolute", inset: 0, transform: "scaleX(-1)" }}>
               {imgSrc && <img src={imgSrc} alt="axial B-scan" draggable={false}
                 style={{ display: "block", width: "100%", height: "100%", objectFit: "fill",
@@ -213,7 +229,7 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
               </svg>
             </div>
           </div>
-        )}
+        ) : <div style={{ opacity: 0.6, fontSize: 13 }}>Sizing…</div>}
       </div>
       <div style={{ fontSize: 11, padding: "3px 10px", opacity: 0.6, flex: "none", borderTop: "1px solid var(--c-border)" }}>
         Drag the red surface line onto the true corneal band where the auto-detector is off, then Confirm → Run. Corrections are saved per scan and re-applied on every re-run.
