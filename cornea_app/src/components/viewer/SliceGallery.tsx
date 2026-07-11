@@ -459,7 +459,11 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     () =>
       images
         .filter((i) => i.orientation === orient)
-        .sort((a, b) => Number(a.slice_index ?? 0) - Number(b.slice_index ?? 0)),
+        // DESCENDING by slice_index so scrubbing matches the normal niivue view's direction: niivue slice s ↔
+        // array slice (n-1-s) (RAS-canonical flip of the all-negative OCT affine), so ascending array order ran
+        // OPPOSITE to niivue ("slice N" showed a different B-scan). Descending → panel position p == niivue slice
+        // p. Data is keyed by cur.slice_index (true array index), unchanged.
+        .sort((a, b) => Number(b.slice_index ?? 0) - Number(a.slice_index ?? 0)),
     [images, orient],
   );
   const safeIdx = Math.min(idx, Math.max(0, orientImgs.length - 1));
@@ -474,7 +478,9 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const PROP_SLICE_BAND = 20;
   const skipBand = (dir: 1 | -1) => {
     if (!orientImgs.length || cur?.slice_index == null) return;
-    const target = Number(cur.slice_index) + dir * PROP_SLICE_BAND;
+    // orientImgs is now DESCENDING (matches the niivue view), so ⏭ (dir=+1, "next") must go to a LOWER array
+    // slice_index → subtract. The position-based fallback (safeIdx + dir) below stays correct as-is.
+    const target = Number(cur.slice_index) - dir * PROP_SLICE_BAND;
     let best = safeIdx;
     let bestD = Infinity;
     orientImgs.forEach((im, i) => {
@@ -1845,7 +1851,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
       {orientImgs.length > 0 && (
         <div className="flex items-center gap-3 px-4 py-2 border-t" style={{ borderColor: "var(--c-border)" }}>
           <span className="text-xs whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
-            {orient} slice {cur?.slice_index ?? "—"} ({safeIdx + 1}/{orientImgs.length})
+            {orient} slice {safeIdx + 1} / {orientImgs.length}
           </span>
           <button
             type="button"

@@ -105,7 +105,12 @@ export function BeforeAfterViewer({ orient, filter }: {
     () =>
       after
         .filter((i) => i.orientation === orient)
-        .sort((a, b) => Number(a.slice_index ?? 0) - Number(b.slice_index ?? 0)),
+        // DESCENDING by slice_index so the scrubber navigates in the SAME direction as the normal niivue view:
+        // niivue reorients to RAS-canonical and the OCT affine has all three voxel axes NEGATIVE, so niivue slice
+        // s ↔ array slice (n-1-s). The 2-D previews are array-indexed, so scrubbing them ascending ran OPPOSITE to
+        // the niivue view (its "slice N" showed a different B-scan). Descending makes panel position p == niivue
+        // slice p == the normal view's slice N. Data pairs by slice_index, so the true array index is unchanged.
+        .sort((a, b) => Number(b.slice_index ?? 0) - Number(a.slice_index ?? 0)),
     [after, orient],
   );
   const safeIdx = Math.min(idx, Math.max(0, afterImgs.length - 1));
