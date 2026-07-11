@@ -96,10 +96,12 @@ DEFAULT_PARAMS: dict = {
     "rhr_iters": 4,               # iterations of the dome-fit → median-residual → subtract loop
     "rhr_smooth": 3.0,            # gaussian sigma (frames) splitting removable jitter (HF) from the real dome trajectory (LF)
     "rhr_max": 8.0,               # px cap on the per-frame height correction
-    "rigid_frame_derotate": True, # DEFAULT ON (v0.0.192): SECONDARY per-frame rigid ROTATION (inter-frame eye torsion)
-                                  #   after the axial (depth) alignment — flattens the per-frame surface TILT jitter that a
-                                  #   depth-shift can't reach, by rotating the whole B-scan (rigid, no deformation). Rigid only.
-    "rfd_smooth": 3.0,            # gaussian sigma (frames) splitting removable tilt jitter (HF) from real peripheral tilt (LF)
+    "rigid_frame_derotate": True, # DEFAULT ON (v0.0.192, drift-aware v0.0.193): SECONDARY per-frame rigid ROTATION
+                                  #   (inter-frame eye torsion) after the axial (depth) alignment — flattens the per-frame
+                                  #   surface TILT that a depth-shift can't reach, by rotating the whole B-scan (rigid, no
+                                  #   deformation). v0.0.193: removes the full frame-VARIATION of the tilt incl. a slow
+                                  #   PROGRESSIVE-ROTATION drift (per-scan motion; keeps the constant real decentration DC).
+    "rfd_smooth": 1.5,            # gaussian sigma (frames) — light denoise of the per-frame tilt (the drift is kept intact)
     "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°
     "intra_frame_dewarp": False,  # RETIRED default OFF (tested, not shipped): correcting the raw B-scans before the
                                   #   flatten gets re-processed/washed by the flatten, and correcting post-flatten hits
@@ -3970,45 +3972,37 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
         with np.errstate(all="ignore"):
             return float(np.nanmean([np.nanmean(np.abs(np.diff(sm[l, :], 2))) for l in range(10, L - 10, 4)]))
 
-    # robust smooth dome (re-fit with 2σ reject so the tilt jitter doesn't bias it)
-    yy, xx = np.mgrid[0:L, 0:F].astype(np.float64)
-    yn = yy / (L - 1) * 2 - 1; xn2 = xx / (F - 1) * 2 - 1
-    deg = int(p.get("amc_dome_deg", 5))
-    terms = [(a, b) for a in range(deg + 1) for b in range(deg + 1) if a + b <= deg]
-    A = np.stack([(yn ** a) * (xn2 ** b) for a, b in terms], axis=-1)
-    m = valid.copy()
-    try:
-        for _ in range(3):
-            coef = np.linalg.lstsq(A[m], S[m], rcond=None)[0]
-            r = S - A @ coef; sd = np.std(r[m]) + 1e-6
-            mm = valid & (np.abs(r) < 2.0 * sd)
-            if int(mm.sum()) < len(terms) + 5:
-                break
-            m = mm
-        Dome = A @ coef
-    except Exception:  # noqa: BLE001
-        return volume, {"applied": False}
-    R = np.where(valid, S - Dome, np.nan)
+    # PER-FRAME lateral tilt from a per-frame quadratic fit a·xn²+b·xn+c → b = tilt (independent of the dome
+    # curvature a). Measuring per-frame (NOT as a residual vs a frame-smooth 2-D dome) is what lets us SEE a slow
+    # PROGRESSIVE-ROTATION drift — a frame-smooth dome fit would ABSORB that drift into the reference and hide it.
     xc = (L - 1) / 2.0
     xnl = (np.arange(L) - xc) / (L / 2.0)                # normalised lateral, [-1,1]
-    tilt = np.zeros(F)
+    tilt = np.full(F, np.nan)
     for f in range(F):
-        col = R[:, f]; mk = np.isfinite(col)
-        if int(mk.sum()) < 40:
+        col = S[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
+        if int(mk.sum()) < 60:
             continue
-        try:                                            # 2σ-trimmed slope fit (robust to a few detector glitches)
-            b1, b0 = np.polyfit(xnl[mk], col[mk], 1)
-            res = col[mk] - (b1 * xnl[mk] + b0); sd = np.std(res) + 1e-6
+        try:                                            # 2σ-trimmed quadratic (robust to a few detector glitches)
+            c2 = np.polyfit(xnl[mk], col[mk], 2)
+            res = col[mk] - np.polyval(c2, xnl[mk]); sd = np.std(res) + 1e-6
             keep = np.abs(res) < 2.0 * sd
-            if int(keep.sum()) > 30:
-                idx = np.where(mk)[0][keep]
-                b1 = np.polyfit(xnl[idx], col[idx], 1)[0]
-            tilt[f] = b1
+            if int(keep.sum()) > 40:
+                idx = np.where(mk)[0][keep]; c2 = np.polyfit(xnl[idx], col[idx], 2)
+            tilt[f] = c2[1]
         except Exception:  # noqa: BLE001
             continue
-    sig = float(p.get("rfd_smooth", 3.0) or 0.0)
-    tilt_jit = (tilt - ndimage.gaussian_filter1d(tilt, sig, mode="nearest")) if sig > 0 else tilt
-    alpha = -2.0 * tilt_jit / L                          # radians: rotation whose z-shift α·(x-xc) cancels the tilt
+    good = np.isfinite(tilt)
+    if int(good.sum()) < max(8, F // 4):
+        return volume, {"applied": False}
+    # Remove the FRAME-VARIATION of the tilt (jitter + hump + progressive drift = per-scan MOTION, confirmed
+    # inconsistent across replicates of the same eye) but KEEP the constant DC = the real, reproducible corneal
+    # decentration/astigmatism (consistent across replicates). Light denoise leaves the drift intact.
+    DC = float(np.median(tilt[good]))
+    corr = np.where(good, tilt - DC, 0.0)
+    sig = float(p.get("rfd_smooth", 1.5) or 0.0)
+    if sig > 0:
+        corr = ndimage.gaussian_filter1d(corr, sig, mode="nearest")
+    alpha = -2.0 * corr / L                              # radians: rotation whose z-shift α·(x-xc) cancels the tilt
     amax = np.radians(float(p.get("rfd_max_deg", 3.0)))
     alpha = np.clip(alpha, -amax, amax)
     if float(np.degrees(np.max(np.abs(alpha)))) < 0.03:  # no meaningful tilt → strict no-op
