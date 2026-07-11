@@ -6,14 +6,19 @@ import { useWorkflowStore } from "../../store/workflowStore";
 import type { CaseInfo } from "../../api/types";
 
 // AXIAL fix-tool: correct the anterior corneal surface in the AXIAL (B-scan) plane — a FIXED FRAME shown as
-// lateral×depth, the surface dragged ACROSS LATERALS. This reaches apex/limbus notches on the low-signal first/
-// last frames that the SAGITTAL fix-columns tool (which corrects along the FRAME axis) structurally cannot.
-// The niivue viewer mirrors left/right (array lateral 0 = VISUAL RIGHT); we flip the panel with scaleX(-1) and
-// invert the drag's screen-x (1 - fx) so a drag lands on the lateral the user sees. Backend contract:
-//   GET  oct-axial-slice?frame=   → the corrected-output B-scan PNG (depth rows × lateral cols, depth 0 = TOP)
-//   POST oct-axial-curve {slice_index:frame} → {edge[lateral], fit, n_lateral, depth_vox, n_frames}
-//   POST oct-axial-redetect {axial_anchors} → persist sticky GT (Confirm); Run = oct-preprocess (applies the warp)
-type AxMap = Map<number, Map<number, number>>;   // frame -> lateral -> depth (corrected-output depth space, 0 = TOP)
+// lateral×depth, the surface dragged ACROSS LATERALS onto the true band. This reaches apex/limbus notches on the
+// low-signal first/last frames that the SAGITTAL fix-columns tool (which corrects along the FRAME axis) cannot.
+//
+// COORDINATES. The niivue viewer is what the user scrubs; we OPEN on (and number by) the niivue AXIAL slice they
+// selected. niivue mirrors both axes vs the array (verified via manifest.defect_marks): niivue axial slice s ↔
+// array frame (n-1-s); niivue column c ↔ array lateral (n-1-c). So: navigate + label in niivue-slice space
+// (matches the niivue toolbar's "axial slice N/M"); convert to the ARRAY frame `f = nFrames-1-niiSlice` for the
+// endpoints + anchors; and scaleX(-1)-flip the panel + invert the drag's screen-x so array lateral 0 is on the
+// VISUAL RIGHT. Backend contract (all in ARRAY indices):
+//   GET  oct-axial-slice?frame=f   → corrected-output B-scan PNG (depth rows × lateral cols, depth 0 = TOP)
+//   POST oct-axial-curve {slice_index:f} → {edge[lateral], fit, n_lateral, depth_vox, n_frames}
+//   POST oct-axial-redetect {axial_anchors:{f:{lateral:depth}}} → persist sticky GT (Confirm); Run = oct-preprocess
+type AxMap = Map<number, Map<number, number>>;   // ARRAY frame -> lateral -> depth (corrected-output depth space, 0 = TOP)
 
 const LAT_SP = 0.0078, DEP_SP = 0.0031;          // Avanti physical spacing (mm) → correct B-scan aspect
 
@@ -27,14 +32,15 @@ function ocParams(ci: CaseInfo | null): Record<string, unknown> {
   return ((ci?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined) ?? {};
 }
 
-export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: string; readOnly?: boolean }) {
+export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sliceTotal = 0 }:
+  { filterCss?: string; readOnly?: boolean; initialSlice?: number; sliceTotal?: number }) {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const openCase = useCaseStore((s) => s.openCase);
   const segVersion = useWorkflowStore((s) => s.segVersion);
   const wfSet = useWorkflowStore((s) => s.set);
 
-  // persisted axial anchors → seed the editable set (survive reopen; re-seed after Confirm re-fetches the case)
+  // persisted axial anchors (keyed by ARRAY frame) → seed the editable set
   const persistedSig = JSON.stringify(ocParams(caseInfo).axial_anchors ?? {});
   const persisted = useMemo(() => {
     const o: AxMap = new Map();
@@ -48,8 +54,9 @@ export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: stri
     return o;
   }, [persistedSig]);
 
-  const [frameIdx, setFrameIdx] = useState(0);
-  const [nFrames, setNFrames] = useState(0);
+  // navigate in NIIVUE-slice space (matches the viewer); nFrames from the curve response (hint = niivue slice count).
+  const [niiSlice, setNiiSlice] = useState(initialSlice);
+  const [nFrames, setNFrames] = useState(sliceTotal > 1 ? sliceTotal : 0);
   const [nLateral, setNLateral] = useState(0);
   const [depthVox, setDepthVox] = useState(0);
   const [edge, setEdge] = useState<number[] | null>(null);
@@ -57,23 +64,28 @@ export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: stri
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
+  const nTot = nFrames > 1 ? nFrames : (sliceTotal > 1 ? sliceTotal : 0);
+  const arrayFrame = nTot > 1 ? Math.max(0, Math.min(nTot - 1, (nTot - 1) - niiSlice)) : 0;   // niivue slice → array frame
+
   useEffect(() => { setAnchors(cloneMap(persisted)); }, [persistedSig]);   // re-seed on case load / after Confirm
 
-  // detected surface for the current frame (edge over laterals). Re-fetches after a Run (segVersion).
+  // detected surface for the current ARRAY frame (edge over laterals). Re-fetches after a Run (segVersion).
   useEffect(() => {
     if (!caseId) { setEdge(null); return; }
     let cancel = false;
     api.json<{ n_lateral: number; depth_vox: number; n_frames: number; frame: number; edge: number[]; fit: number[] }>(
-      `/api/case/${caseId}/oct-axial-curve`, "POST", JSON.stringify({ slice_index: frameIdx }))
+      `/api/case/${caseId}/oct-axial-curve`, "POST", JSON.stringify({ slice_index: arrayFrame }))
       .then((r) => { if (cancel) return; setEdge(r.edge); setNLateral(r.n_lateral); setDepthVox(r.depth_vox); setNFrames(r.n_frames); })
       .catch(() => { if (!cancel) { setEdge(null); setMsg("Preprocess this scan first."); } });
     return () => { cancel = true; };
-  }, [caseId, frameIdx, segVersion]);
+  }, [caseId, arrayFrame, segVersion]);
 
-  const imgSrc = caseId ? resourceUrl(`/api/case/${caseId}/oct-axial-slice?frame=${frameIdx}&t=${segVersion}`) : null;
-  const curAnchors = anchors.get(frameIdx) ?? null;
+  const imgSrc = caseId && nTot > 1 ? resourceUrl(`/api/case/${caseId}/oct-axial-slice?frame=${arrayFrame}&t=${segVersion}`) : null;
+  const curAnchors = anchors.get(arrayFrame) ?? null;
   const anchorCount = useMemo(() => { let n = 0; anchors.forEach((m) => { n += m.size; }); return n; }, [anchors]);
-  const framesTouched = useMemo(() => [...anchors.keys()].filter((f) => (anchors.get(f)?.size ?? 0) > 0).sort((a, b) => a - b), [anchors]);
+  // edited frames, shown as niivue-slice numbers (1-based) so they match what the user scrubs
+  const editedSlices = useMemo(() => [...anchors.keys()].filter((f) => (anchors.get(f)?.size ?? 0) > 0)
+    .map((f) => (nTot > 1 ? (nTot - 1 - f) : f) + 1).sort((a, b) => a - b), [anchors, nTot]);
   const dirty = sig(anchors) !== sig(persisted);
 
   const edgeY = (l: number): number => {
@@ -91,7 +103,7 @@ export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: stri
 
   // drag: screen → (lateral, depth). The panel is scaleX(-1)-flipped so lateral 0 is on the VISUAL RIGHT;
   // invert the screen-x fraction (1 - fx) to recover the array lateral. A drag within 1px of the detected
-  // edge clears that anchor (snap-back), so you can undo by dragging back.
+  // edge clears that anchor (snap-back), so you can undo by dragging back onto the line.
   const dragRef = useRef(false);
   const applyDrag = (clientX: number, clientY: number, svg: SVGSVGElement) => {
     if (readOnly || !edge || nLateral < 2 || depthVox < 2) return;
@@ -101,10 +113,10 @@ export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: stri
     const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
     setAnchors((prev) => {
       const o = cloneMap(prev);
-      let inner = o.get(frameIdx); if (!inner) { inner = new Map(); o.set(frameIdx, inner); }
+      let inner = o.get(arrayFrame); if (!inner) { inner = new Map(); o.set(arrayFrame, inner); }
       if (Math.abs(depth - (edge[lateral] ?? depth)) <= 1) inner.delete(lateral);   // back on the detected line → clear
       else inner.set(lateral, depth);
-      if (inner.size === 0) o.delete(frameIdx);
+      if (inner.size === 0) o.delete(arrayFrame);
       return o;
     });
   };
@@ -131,46 +143,45 @@ export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: stri
     try {
       await api.json(`/api/case/${caseId}/oct-axial-redetect`, "POST", JSON.stringify({ axial_anchors: anchorsToApi(anchors) }));
       await openCase();                            // refresh oct_params (persisted anchors → enables Run)
-      setMsg(anchorCount ? `Saved ${anchorCount} point(s) on ${framesTouched.length} frame(s) — press Run to apply.` : "Cleared.");
+      setMsg(anchorCount ? `Saved ${anchorCount} point(s) on ${editedSlices.length} slice(s) — press Run to apply.` : "Cleared.");
     } catch { setMsg("Confirm failed."); } finally { setBusy(false); }
   };
   const run = async () => {
     if (!caseId || busy) return;
     setBusy(true); setMsg("Running preprocessing…");
     try {
-      // compose with a sagittal fix-columns correction if one is persisted (else a normal auto re-run applies
-      // the sticky axial GT). Axial anchors are carried from oct_params server-side.
       const hasBorder = Object.keys((ocParams(caseInfo).border_anchors as Record<string, unknown>) ?? {}).length > 0;
       await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify(hasBorder ? { use_redetect: true } : {}));
       await openCase();
       wfSet("segVersion", segVersion + 1);         // re-fetch the corrected B-scan + surface (warp applied)
-      setMsg("Done — frame(s) warped onto your curve.");
+      setMsg("Done — slice(s) warped onto your curve.");
     } catch { setMsg("Run failed."); } finally { setBusy(false); }
   };
-  const clearFrame = () => setAnchors((prev) => { const o = cloneMap(prev); o.delete(frameIdx); return o; });
+  const clearFrame = () => setAnchors((prev) => { const o = cloneMap(prev); o.delete(arrayFrame); return o; });
 
   const aspect = nLateral > 0 && depthVox > 0 ? (nLateral * LAT_SP) / (depthVox * DEP_SP) : 2;
   const btn = (extra?: React.CSSProperties): React.CSSProperties => ({
     padding: "3px 10px", borderRadius: 6, fontSize: 12, lineHeight: 1.4, cursor: "pointer",
     border: "1px solid var(--c-border)", background: "var(--c-surface)", color: "var(--c-text)", ...extra });
+  const maxSlice = Math.max(0, nTot - 1);
 
   return (
     <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column",
                   background: "var(--c-bg)", color: "var(--c-text)", zIndex: 20 }}>
-      {/* toolbar */}
+      {/* toolbar — navigate in niivue-slice space so it matches the viewer */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", flexWrap: "wrap",
                     borderBottom: "1px solid var(--c-border)", flex: "none" }}>
         <span style={{ fontSize: 12, fontWeight: 600 }}>Fix axial</span>
-        <span style={{ fontSize: 12, opacity: 0.75 }}>axial slice {frameIdx + 1} / {nFrames || "…"}</span>
-        <button style={btn()} disabled={busy} onClick={() => setFrameIdx(0)}>⏮ first</button>
-        <button style={btn()} disabled={busy || frameIdx <= 0} onClick={() => setFrameIdx((f) => Math.max(0, f - 1))}>◀</button>
-        <input type="range" min={0} max={Math.max(0, nFrames - 1)} value={frameIdx} disabled={busy || nFrames < 2}
-               onChange={(e) => setFrameIdx(Number(e.target.value))} style={{ width: 160 }} />
-        <button style={btn()} disabled={busy || frameIdx >= nFrames - 1} onClick={() => setFrameIdx((f) => Math.min(nFrames - 1, f + 1))}>▶</button>
-        <button style={btn()} disabled={busy} onClick={() => setFrameIdx(Math.max(0, nFrames - 1))}>last ⏭</button>
+        <span style={{ fontSize: 12, opacity: 0.75 }}>axial slice {niiSlice + 1} / {nTot || "…"}</span>
+        <button style={btn()} disabled={busy} onClick={() => setNiiSlice(0)}>⏮ first</button>
+        <button style={btn()} disabled={busy || niiSlice <= 0} onClick={() => setNiiSlice((s) => Math.max(0, s - 1))}>◀</button>
+        <input type="range" min={0} max={maxSlice} value={Math.min(niiSlice, maxSlice)} disabled={busy || nTot < 2}
+               onChange={(e) => setNiiSlice(Number(e.target.value))} style={{ width: 160 }} />
+        <button style={btn()} disabled={busy || niiSlice >= maxSlice} onClick={() => setNiiSlice((s) => Math.min(maxSlice, s + 1))}>▶</button>
+        <button style={btn()} disabled={busy} onClick={() => setNiiSlice(maxSlice)}>last ⏭</button>
         <span style={{ flex: 1 }} />
-        {framesTouched.length > 0 && <span style={{ fontSize: 11, opacity: 0.7 }}>edited: {framesTouched.map((f) => f + 1).join(", ")}</span>}
-        <button style={btn()} disabled={busy || readOnly || !(curAnchors?.size)} onClick={clearFrame}>Clear frame</button>
+        {editedSlices.length > 0 && <span style={{ fontSize: 11, opacity: 0.7 }}>edited: {editedSlices.join(", ")}</span>}
+        <button style={btn()} disabled={busy || readOnly || !(curAnchors?.size)} onClick={clearFrame}>Clear slice</button>
         <button style={btn({ borderColor: dirty ? "var(--c-accent)" : "var(--c-border)" })} disabled={busy || readOnly || !dirty} onClick={confirm}>Confirm</button>
         <button style={btn({ background: "var(--c-accent)", color: "#fff", borderColor: "var(--c-accent)" })}
                 disabled={busy || readOnly} onClick={run}>Run preprocessing</button>
@@ -182,8 +193,7 @@ export function AxialGallery({ filterCss, readOnly = false }: { filterCss?: stri
         {!edge || nLateral < 2 ? (
           <div style={{ opacity: 0.6, fontSize: 13 }}>{busy ? "Loading…" : "No axial surface — preprocess this scan first."}</div>
         ) : (
-          <div style={{ position: "relative", aspectRatio: String(aspect), maxWidth: "100%", maxHeight: "100%",
-                        width: aspect >= 1 ? "min(100%, calc((100% ) * 1))" : undefined }}>
+          <div style={{ position: "relative", aspectRatio: String(aspect), maxWidth: "100%", maxHeight: "100%" }}>
             <div style={{ position: "absolute", inset: 0, transform: "scaleX(-1)" }}>
               {imgSrc && <img src={imgSrc} alt="axial B-scan" draggable={false}
                 style={{ display: "block", width: "100%", height: "100%", objectFit: "fill",

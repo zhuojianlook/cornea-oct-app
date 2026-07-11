@@ -729,7 +729,8 @@ export function VolumeCanvas() {
             stay mounted (see the note above the return). */}
         {fixAxialView && volumeUrl && (
           <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
-            <AxialGallery filterCss={viewerFilter} readOnly={inspecting} />
+            <AxialGallery filterCss={viewerFilter} readOnly={inspecting}
+              initialSlice={getSliceIndex("axial")} sliceTotal={sliceCount("axial")} />
           </div>
         )}
         {stepsView && volumeUrl && (
