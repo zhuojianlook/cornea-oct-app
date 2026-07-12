@@ -103,8 +103,10 @@ DEFAULT_PARAMS: dict = {
                                   #   PROGRESSIVE-ROTATION drift (per-scan motion; keeps the constant real decentration DC).
     "rfd_smooth": 1.5,            # gaussian sigma (frames) — light denoise of the per-frame tilt (the drift is kept intact)
     "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°
-    "crop_incomplete_cornea": True,  # DEFAULT ON (v0.0.196): after the rigid rotation, trim the few EXTREME laterals whose
-                                  #   corneal band is left partially black, so every sagittal slice has a full cornea for SAM2
+    "crop_incomplete_cornea": False,  # DEFAULT OFF (v0.0.197): RETIRED. SAM2 fuses axial+coronal+sagittal by 2-of-3 majority
+                                  #   vote, so a truncated cornea in the SAGITTAL view alone is outvoted by the two intact
+                                  #   views → no crop needed. (The v0.0.196 crop was also inconsistent at the very edges.)
+                                  #   Code kept behind the flag; the volume stays full-width with honest black edges (v195).
     "crop_cornea_max_frac": 0.06, # cap: never trim more than this fraction of laterals per side (keeps a clean scan near-full)
     "crop_cornea_band": 110,      # corneal-band depth (px below the anterior surface) checked for black = incomplete cornea
     "crop_cornea_black_thr": 0.15, # a lateral is "incomplete" if >this fraction of its band is black at ANY frame
