@@ -103,6 +103,11 @@ DEFAULT_PARAMS: dict = {
                                   #   PROGRESSIVE-ROTATION drift (per-scan motion; keeps the constant real decentration DC).
     "rfd_smooth": 1.5,            # gaussian sigma (frames) — light denoise of the per-frame tilt (the drift is kept intact)
     "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°
+    "crop_incomplete_cornea": True,  # DEFAULT ON (v0.0.196): after the rigid rotation, trim the few EXTREME laterals whose
+                                  #   corneal band is left partially black, so every sagittal slice has a full cornea for SAM2
+    "crop_cornea_max_frac": 0.06, # cap: never trim more than this fraction of laterals per side (keeps a clean scan near-full)
+    "crop_cornea_band": 110,      # corneal-band depth (px below the anterior surface) checked for black = incomplete cornea
+    "crop_cornea_black_thr": 0.15, # a lateral is "incomplete" if >this fraction of its band is black at ANY frame
     "intra_frame_dewarp": False,  # RETIRED default OFF (tested, not shipped): correcting the raw B-scans before the
                                   #   flatten gets re-processed/washed by the flatten, and correcting post-flatten hits
                                   #   detector re-lock revert; the residual high-freq frame-direction motion steps resist
@@ -4638,6 +4643,58 @@ def _apply_crop(corrected: np.ndarray, params: dict | None) -> tuple[np.ndarray,
     return corrected, int(zeroed)
 
 
+def _crop_incomplete_cornea(corrected: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """Minimal LATERAL dimension-crop (v0.0.196): the rigid derotate BLACK-fills the swept-out corners, which at
+    the EXTREME laterals can leave the corneal BAND partially black — a partial cornea in a sagittal slice confuses
+    SAM2. Trim ONLY the few edge laterals whose band is incomplete, so every REMAINING sagittal slice contains the
+    FULL cornea. Interior black (deep, below the cornea) is left untouched; capped at `crop_cornea_max_frac` per
+    side so a clean/non-rotated scan barely moves. `corrected` is (frames, depth, lateral). Returns
+    (cropped, (n_left, n_right))."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if workers is None:
+        workers = auto_workers()
+    F, D, L = corrected.shape
+    cap = int(float(p.get("crop_cornea_max_frac", 0.06)) * L)
+    if cap < 1:
+        return corrected, (0, 0)
+    band = int(p.get("crop_cornea_band", 110))
+    blk = float(p.get("crop_cornea_black_thr", 0.15))
+    try:
+        S = detect_surface_all(reformat_to_sagittal(corrected), p, workers=workers)   # (lat, frames)
+    except Exception:  # noqa: BLE001
+        return corrected, (0, 0)
+
+    cc = S[L // 2]                                            # centre-lateral surface = "is there a cornea this frame?"
+    cmid = L // 2
+
+    def _incomplete(l):
+        col = S[l]
+        for f in range(F):
+            cd = cc[f]                                         # SKIP frames the whole B-scan lacks a cornea for
+            if not (np.isfinite(cd) and 1 < cd < D - 1):       # (a damaged / black TAIL frame is a frame problem,
+                continue                                       #  not a rotation edge — cropping laterals can't fix it)
+            clo = int(cd); chi = min(D, clo + band)
+            if float((corrected[f, clo:chi, cmid] < 1).mean()) > blk:
+                continue                                       # centre band itself black at this frame → skip
+            d = col[f]                                         # the frame HAS a cornea (centre is intact):
+            if not (np.isfinite(d) and 1 < d < D - 1):
+                return True                                    # ...but this lateral has no surface → incomplete
+            lo = int(d); hi = min(D, lo + band)
+            if float((corrected[f, lo:hi, l] < 1).mean()) > blk:
+                return True                                    # ...this lateral's band partly black → incomplete
+        return False
+
+    lo = 0
+    while lo < cap and _incomplete(lo):
+        lo += 1
+    hi = L
+    while (L - hi) < cap and _incomplete(hi - 1):
+        hi -= 1
+    if lo == 0 and (L - hi) == 0:
+        return corrected, (0, 0)
+    return np.ascontiguousarray(corrected[:, :, lo:hi]), (int(lo), int(L - hi))
+
+
 def estimate_global_tilt(det: np.ndarray, n_frames: int, p: dict):
     """Robustly estimate the DOMINANT LINEAR tilt (px per frame) of the anterior surface in the FRAME direction
     from the per-slice detection `det` (n_lateral, n_frames). Returns (slope, total_tilt, frame_depth) where
@@ -5094,6 +5151,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     corrected, n_crop = _apply_crop(corrected, p_all)
     if n_crop:
         info["crop"] = {"n_voxels": n_crop}
+    # MINIMAL lateral crop: drop only the extreme laterals whose corneal band the rigid rotation left partially
+    # black, so SAM2 sees a FULL cornea in every sagittal slice (rigid path only — no rotation ⇒ no edge black).
+    if _rigid and p_all.get("crop_incomplete_cornea", True):
+        corrected, _cic = _crop_incomplete_cornea(corrected, params, workers=workers)
+        if _cic[0] or _cic[1]:
+            info["crop_incomplete_cornea"] = {"left": _cic[0], "right": _cic[1], "new_lateral": int(corrected.shape[2])}
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     if _auto_cr:
