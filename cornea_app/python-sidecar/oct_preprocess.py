@@ -4008,11 +4008,28 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
     if float(np.degrees(np.max(np.abs(alpha)))) < 0.03:  # no meaningful tilt → strict no-op
         return volume, {"applied": False, "max_deg": round(float(np.degrees(np.max(np.abs(alpha)))), 2)}
     r0 = _rough(S)
+    # DYNAMIC rotation pivot: rotate each B-scan about ITS OWN corneal surface, not the array centre. A fixed
+    # array-centre pivot sits ~180-210px BELOW the surface, so a per-frame rotation by θ swings the surface
+    # sideways by ~(depth_centre − surface_depth)·sinθ — a spurious per-frame lateral shift (a smooth lateral
+    # shear from the drift angles, up to ~9px on drift scans; jitter on the rest). Pivoting on the surface
+    # (lateral centre, that frame's median surface depth) makes the correction a pure tilt-levelling with no
+    # spurious lateral translation. Small angles → pixel-space rotation matrix (shear negligible); the affine
+    # about the array centre is bit-identical to ndimage.rotate (verified), so this ONLY moves the pivot.
+    scen = np.full(F, (depth - 1) / 2.0)
+    for f in range(F):
+        col = S[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
+        if int(mk.sum()) > 40:
+            scen[f] = float(np.median(col[mk]))
+    rc = (L - 1) / 2.0
     out = volume.copy(); nrot = 0
     for f in range(F):
         if abs(alpha[f]) > 1e-4:
-            fr_ld = np.ascontiguousarray(out[f].T)       # (lateral, depth) — matches the validated prototype
-            rot = ndimage.rotate(fr_ld, np.degrees(alpha[f]), reshape=False, order=1, mode="nearest")
+            fr_ld = np.ascontiguousarray(out[f].T)       # (lateral, depth)
+            ct, st = np.cos(alpha[f]), np.sin(alpha[f])
+            Mrot = np.array([[ct, st], [-st, ct]])       # == ndimage.rotate's matrix (pixel-space)
+            piv = np.array([rc, scen[f]])                # pivot on the surface, NOT the array centre
+            offr = piv - Mrot @ piv
+            rot = ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="nearest")
             out[f] = np.ascontiguousarray(rot.T)
             nrot += 1
     try:                                                # SELF-GATE: keep only if the surface got smoother
