@@ -3949,7 +3949,9 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
     Estimate per frame the surface-tilt residual vs a robust smooth 3-D dome (deg-`amc_dome_deg`), keep only the
     HIGH-FREQUENCY (frame-to-frame jitter) part — `rfd_smooth` low-pass — so the cornea's real peripheral tilt is
     preserved, then rotate each B-scan by the angle that flattens that jitter tilt (rotate the (lateral,depth)
-    image, mode='nearest'). SELF-GATED: re-detect and keep only if per-frame surface roughness drops. Δx (lateral
+    image; swept-out regions are filled with BLACK cval=0, NOT edge-replicated — an out-of-FOV pixel has no data,
+    so honest black beats extrapolating the edge value). SELF-GATED: re-detect and keep only if per-frame surface
+    roughness drops (black corners don't fool the re-detection — the depth warp already blacks-out vacated rows). Δx (lateral
     translation) is NOT estimated — it is collinear with the tilt on the dome flanks and destabilises the fit
     (tested: makes it worse). Runs AFTER rigid_height_refine (the "initial axial alignment"). volume=(frames,depth,lateral)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
@@ -4021,19 +4023,23 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
         if int(mk.sum()) > 40:
             scen[f] = float(np.median(col[mk]))
     rc = (L - 1) / 2.0
-    out = volume.copy(); nrot = 0
+    out = volume.copy()          # BLACK-filled swept-out corners → honest OUTPUT (no invented edge data)
+    gate = volume.copy()         # NEAREST-filled → stable self-gate re-detection: extrapolated corners keep the
+                                 #   surface detector from locking onto a black↔tissue edge and spuriously failing
+                                 #   the gate (which would DROP a real drift correction, e.g. the big-angle od_v5).
+    nrot = 0
     for f in range(F):
         if abs(alpha[f]) > 1e-4:
-            fr_ld = np.ascontiguousarray(out[f].T)       # (lateral, depth)
+            fr_ld = np.ascontiguousarray(volume[f].T)    # (lateral, depth)
             ct, st = np.cos(alpha[f]), np.sin(alpha[f])
             Mrot = np.array([[ct, st], [-st, ct]])       # == ndimage.rotate's matrix (pixel-space)
             piv = np.array([rc, scen[f]])                # pivot on the surface, NOT the array centre
             offr = piv - Mrot @ piv
-            rot = ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="nearest")
-            out[f] = np.ascontiguousarray(rot.T)
+            out[f] = np.ascontiguousarray(ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="constant", cval=0.0).T)
+            gate[f] = np.ascontiguousarray(ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="nearest").T)
             nrot += 1
-    try:                                                # SELF-GATE: keep only if the surface got smoother
-        S2 = detect_surface_all(reformat_to_sagittal(out), p, workers=workers)
+    try:                                                # SELF-GATE on the nearest-filled copy (tissue is identical
+        S2 = detect_surface_all(reformat_to_sagittal(gate), p, workers=workers)   # to `out`; only the bg corners differ)
         r1 = _rough(S2)
     except Exception:  # noqa: BLE001
         r1 = r0 + 1.0
