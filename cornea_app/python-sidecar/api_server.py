@@ -3162,12 +3162,12 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
             steps.append({"label": it["label"], "data_url": f"data:image/png;base64,{b64}",
                           "kind": it.get("kind", "stage"), "branch": it.get("branch", ""),
                           "group": "per-slice", "lane": it.get("lane", "full")})
-    # ── VOLUME-LEVEL decisions (the newer steps): note nodes carrying the REAL numbers from the last
-    # preprocess. These are whole-volume decisions (keep-best iteration, axial ping-pong refine,
-    # inter-slice smoothing) that can't be faithfully shown from one slice, so they're reported as
-    # the decision + its outcome. (Images for these need an orientation check on a real scan first.)
-    # Number the volume-level nodes CONTIGUOUSLY after the per-slice steps (the DP filmstrip has 7, legacy 8),
-    # so the sequence has no gap regardless of detector.
+    # ── VOLUME-LEVEL decisions: note nodes carrying the REAL numbers from the last preprocess. These are
+    # whole-volume decisions (keep-best iteration, de-tilt, detector auto-tune, surface-crop, minimal crop)
+    # that can't be read off one slice, so they're reported as the decision + its outcome. The rigid
+    # inter-frame STAGES (motion-correct → dewarp → flatten → height-refine → derotate) are shown visually
+    # per-slice above. Number the volume-level nodes CONTIGUOUSLY after the per-slice filmstrip so there is
+    # no gap in the sequence.
     _vn = [len(steps)]
     def _vlabel(text: str) -> str:
         _vn[0] += 1
@@ -3182,19 +3182,32 @@ def oct_preprocess_steps(case_id: str, req: OctPreprocessRequest) -> dict:
         steps.append({"label": _vlabel(f"Keep-best iteration — {passes} pass(es), kept pass {best}"),
                       "kind": "decision", "group": "volume",
                       "branch": f"boundary deviation per pass: [{dev}] px · argmin kept · stop: {stopped}"})
-    ism = float((eff_params.get("interslice_smooth") or 0) or 0)
-    steps.append({"label": _vlabel("Inter-slice smoothing"),
-                  "kind": "decision", "group": "volume",
-                  "branch": (f"displacement field smoothed across slices (σ={ism:.1f})" if ism > 0
-                             else "off (interslice_smooth = 0)")})
-    axial_on = bool(eff_params.get("axial_refine", True))
-    ax = oct_iter.get("axial") or oct_iter.get("axial_refine") or {}
-    if isinstance(ax, dict) and ax:
-        ax_note = ", ".join(f"{k}={v}" for k, v in ax.items())
-    else:
-        ax_note = "ping-pong axial pass; per-frame kept only where it lowers lateral roughness (global never-worse guard)"
-    steps.append({"label": _vlabel("Axial ping-pong refine — " + ("applied" if axial_on else "off")),
-                  "kind": "decision", "group": "volume", "branch": ax_note})
+    # Volume-level decisions from the REAL last run (oct_iter) that complement the per-slice rigid filmstrip
+    # (de-tilt / auto-tune / surface-crop / minimal crop can't be read off one slice). The RIGID stages
+    # themselves (motion-correct → dewarp → flatten → height-refine → derotate) are shown per-slice above.
+    detilt = oct_iter.get("detilt") if isinstance(oct_iter.get("detilt"), dict) else None
+    prop = m.get("oct_proposals") or {}
+    if detilt:
+        steps.append({"label": _vlabel("Global de-tilt — applied"), "kind": "decision", "group": "volume",
+                      "branch": f"whole-volume tilt removed: total {detilt.get('total_tilt', '?')}px, slope {detilt.get('slope_per_frame', '?')}px/frame (the constant real decentration is kept)"})
+    elif isinstance(prop.get("detilt"), dict):
+        pdt = prop["detilt"]
+        steps.append({"label": _vlabel("Global de-tilt — PROPOSED (not applied)"), "kind": "decision", "group": "volume",
+                      "branch": f"detected total tilt {pdt.get('total_tilt', '?')}px, slope {pdt.get('slope_per_frame', '?')}px/frame — below the auto-apply gate → left for review"})
+    at_info = oct_iter.get("auto_tune") if isinstance(oct_iter.get("auto_tune"), dict) else {}
+    if at_info.get("params"):
+        prm = at_info["params"]
+        steps.append({"label": _vlabel("Detector auto-tune"), "kind": "decision", "group": "volume",
+                      "branch": "DP surface detector tuned to THIS scan → " + ", ".join(f"{k}={v}" for k, v in prm.items())
+                                + (f" · score {at_info.get('score')}" if at_info.get("score") is not None else "")})
+    scv = oct_iter.get("surface_crop") if isinstance(oct_iter.get("surface_crop"), dict) else None
+    if scv:
+        steps.append({"label": _vlabel("Surface-crop extend — clipped apex reconstructed"), "kind": "decision", "group": "volume",
+                      "branch": f"posterior parabola fit + canvas extended upward: {scv.get('n_frames', '?')} frame(s), pad {scv.get('pad', '?')}px" + (" (clamped)" if scv.get("clamped") else "")})
+    cic = oct_iter.get("crop_incomplete_cornea") if isinstance(oct_iter.get("crop_incomplete_cornea"), dict) else None
+    if cic:
+        steps.append({"label": _vlabel("Minimal lateral crop (rotation-incomplete edges)"), "kind": "decision", "group": "volume",
+                      "branch": f"trimmed left {cic.get('left', 0)} / right {cic.get('right', 0)} lateral slice(s) → {cic.get('new_lateral', '?')} wide, so SAM2 sees a full cornea in every sagittal slice"})
     steps.append({"label": _vlabel("Manual depth nudges (Fix-columns)"),
                   "kind": "decision", "group": "volume",
                   "branch": (f"{len(eff_params.get('manual_shifts') or {})} frame(s) nudged — applied LAST as ground truth"

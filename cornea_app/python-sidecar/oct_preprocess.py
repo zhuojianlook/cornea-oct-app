@@ -5302,122 +5302,229 @@ def border_curves(oct_path, params=None, volume_index=0, companion_txt=None, sli
     }
 
 
+def _plot_series(series, colors, H=170, W=440):
+    """Line plot of 1..k equal-domain series (per-frame profiles) on a dark canvas → HxWx3 uint8.
+    Used for the derotate tilt-reference detail. Auto y-range with a zero baseline when it spans 0."""
+    arrs = [np.asarray(s, float) for s in series]
+    canvas = np.full((H, W, 3), 18, np.uint8)
+    fin = [a[np.isfinite(a)] for a in arrs if np.isfinite(a).any()]
+    if not fin:
+        return canvas
+    allv = np.concatenate(fin)
+    lo, hi = float(allv.min()), float(allv.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    m = 0.12 * (hi - lo); lo -= m; hi += m
+    if lo < 0.0 < hi:                                            # zero baseline
+        yz = int((1.0 - (0.0 - lo) / (hi - lo)) * (H - 1))
+        if 0 <= yz < H:
+            canvas[yz, :] = (70, 70, 70)
+    for a, col in zip(arrs, colors):
+        Ln = len(a)
+        if Ln < 2:
+            continue
+        for xi in range(W):
+            fi = xi * (Ln - 1) / (W - 1); i0 = int(fi); i1 = min(Ln - 1, i0 + 1); t = fi - i0
+            v = a[i0] * (1 - t) + a[i1] * t
+            if not np.isfinite(v):
+                continue
+            yi = int((1.0 - (v - lo) / (hi - lo)) * (H - 1))
+            for dy in (-1, 0, 1):
+                if 0 <= yi + dy < H:
+                    canvas[yi + dy, xi] = col
+    return canvas
+
+
+def _tilt_profile_and_ref(S, depth, p):
+    """Per-frame lateral tilt b(f) + the ROBUST smooth-across-frames reference b_ref(f) — mirrors
+    rigid_frame_derotate's reference, for the steps-viewer tilt detail. S = (lateral, frames)."""
+    L, F = S.shape
+    xc = (L - 1) / 2.0; xn = (np.arange(L) - xc) / (L / 2.0)
+    b = np.full(F, np.nan)
+    for f in range(F):
+        col = S[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
+        if int(mk.sum()) >= 60:
+            try:
+                b[f] = np.polyfit(xn[mk], col[mk], 2)[1]
+            except Exception:  # noqa: BLE001
+                pass
+    g = np.isfinite(b)
+    if int(g.sum()) < max(8, F // 4):
+        return b, b
+    bi = np.interp(np.arange(F), np.where(g)[0], b[g])
+    sig = float(p.get("rfd_ref_sigma", 9.0) or 0.0)
+    ref = (ndimage.gaussian_filter1d(ndimage.median_filter(bi, size=5, mode="nearest"), sig, mode="nearest")
+           if sig > 0 else bi)
+    return b, ref
+
+
+def _derotate_pivot_overlay(v, S, p):
+    """Central axial B-scan (depth×lateral) with the detected surface (red) + the derotate rotation PIVOT
+    (magenta ✚ = lateral centre, that frame's median surface depth). v=(frames,depth,lateral), S=(lateral,frames)."""
+    try:
+        F, depth, L = v.shape
+        f = F // 2
+        fr = v[f].astype(np.float32)                            # (depth, lateral)
+        rgb = _gray_rgb(fr)
+        col = S[:, f]                                           # depth per lateral
+        for x in range(L):
+            d = col[x]
+            if np.isfinite(d) and 0 < d < depth:
+                for dy in (-1, 0, 1):
+                    if 0 <= int(d) + dy < depth:
+                        rgb[int(d) + dy, x] = _C_RED
+        mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
+        pd = int(np.median(col[mk])) if int(mk.sum()) > 40 else depth // 2
+        pc = (L - 1) // 2
+        for k in range(-8, 9):                                  # magenta cross at the pivot
+            if 0 <= pd + k < depth:
+                rgb[pd + k, pc] = _C_MAGENTA
+            if 0 <= pc + k < L:
+                rgb[pd, pc + k] = _C_MAGENTA
+        return rgb
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
                      bad_cols=None, workers=None, slice_index=None):
-    """Return (n_sagittal_slices, idx, [(label, rgb_uint8, kind, branch)]) for every per-slice
-    preprocessing step on ONE sagittal slice (the central one, or `slice_index` so the user can
-    inspect the detected border + fit on any slice). Faithful to the per-slice pipeline; the final
-    warp reflects the current bad-column selection so the filmstrip shows exactly what a re-run does.
-    `kind` is "stage" or "decision"; `branch` is the decision outcome text (for the tree)."""
+    """Faithful visual filmstrip of EVERY step the DEFAULT (rigid) preprocessing performs, on ONE sagittal
+    slice (central or `slice_index`):
+      A. Surface DETECTION — how the DP detector finds the anterior epithelium (what is being detected).
+      B. Rigid INTER-FRAME correction — the ACTUAL default stages (axial motion-correct → intra-frame dewarp
+         → rigid flatten → height-refine → derotate), each as the detected surface BEFORE→AFTER + the
+         decision (applied?/metrics/gate), plus the derotate's smooth tilt-reference + rotation-pivot detail.
+    Returns (n_slices, idx, [(label, rgb, kind, branch, lane)]). kind∈{stage,decision}; lane∈{full,dp,legacy}.
+    NOTE: this re-runs the real stage functions (not the retired per-column warp) so preview == result."""
     p = {**DEFAULT_PARAMS, **(params or {})}
-    res = float(p["residual_threshold"]); cf = float(p.get("corr_factor", 1.0)); at = float(p.get("active_threshold", 5.0))
     vol = read_oct_zstack(oct_path, volume_index)
-    sag = reformat_to_sagittal(vol)                 # (lateral, depth, frames)
-    # Mirror preprocess: auto-tune the DP detector to THIS scan so the filmstrip's detection + warp match what
-    # a real preprocess produces (preview == result), even BEFORE the first preprocess has persisted the dp_*.
-    # Deterministic (auto_tune_detector seeds from defaults), so this yields the same dp_* the warp used.
+    sag = reformat_to_sagittal(vol)                             # (lateral, depth, frames)
+    # Mirror preprocess: auto-tune the DP detector to THIS scan so the detection + correction match a real run.
     if p.get("auto_tune", True) and str(p.get("detector", "dp")).lower() != "legacy":
         try:
-            _best, _ = auto_tune_detector(sag, p)
-            p = {**p, **_best}
-        except Exception:  # noqa: BLE001 — best-effort; fall back to the fixed defaults
+            _best, _ = auto_tune_detector(sag, p); p = {**p, **_best}
+        except Exception:  # noqa: BLE001
             pass
     n = sag.shape[0]
     idx = n // 2 if slice_index is None else max(0, min(n - 1, int(slice_index)))
     sl = sag[idx].astype(np.float32)
-    steps = []
-    _si = [0]
-    # Morphologically-correct display aspect (#2): a frame column is (slice_spacing / depth_spacing)× as
-    # wide as a depth row, so the sagittal slice renders at its true ~2:1 landscape shape. Per-scan geometry
-    # from the companion .txt when available, else the Avanti constants.
     geom = companion_geometry(companion_txt, n_frames=sag.shape[2]) if companion_txt else {}
     depth_sp = float(geom.get("depth_spacing") or DEPTH_SPACING)
     frame_sp = float(geom.get("slice_spacing") or SLICE_SPACING)
     px_aspect = (frame_sp / depth_sp) if depth_sp > 0 else 1.0
+    steps = []; _si = [0]
 
-    def add(label, rgb, kind="stage", branch="", lane="full"):
-        # lane: "full" spans the tree; "dp" / "legacy" are the two parallel detector branches.
+    def add(label, rgb, kind="stage", branch="", lane="full", resize=True):
         _si[0] += 1
-        steps.append((f"{_si[0]}. {label}", _disp_resize(rgb, px_aspect), kind, branch, lane))
+        steps.append((f"{_si[0]}. {label}", _disp_resize(rgb, px_aspect) if resize else rgb, kind, branch, lane))
 
+    def surf_overlay(volnow, color=_C_RED):
+        sg = reformat_to_sagittal(volnow); j = max(0, min(sg.shape[0] - 1, idx))
+        s2 = sg[j].astype(np.float32)
+        try:
+            e = _merged_side_edge(s2, p)
+        except Exception:  # noqa: BLE001
+            e = np.full(s2.shape[1], np.nan)
+        return _draw_curve(_gray_rgb(s2), e, color)
+
+    # ── A. SURFACE DETECTION (what is being detected) ──
     add(f"Original — sagittal slice {idx}/{n}", _gray_rgb(sl))
-    # The FINAL anterior edge = the guarded DP path (what auto preprocessing uses). We now ALWAYS render
-    # BOTH detector branches (#2 "the program runs both methods") as a decision tree that converges at the
-    # DP scar-guard cross-check, regardless of the detector param.
-    merged = _merged_side_edge(sl, p)
-
-    # ── DP lane (the native detector auto preprocessing uses) ──
     img = ndimage.gaussian_filter(sl, sigma=(float(p.get("dp_sigma_depth", 3.0)), float(p.get("dp_sigma_frame", 1.2))))
-    add("DP · despeckle — anisotropic Gaussian (heavier along depth)", _gray_rgb(img), lane="dp")
+    add("Detect · despeckle — anisotropic Gaussian (heavier along depth)", _gray_rgb(img))
     gy = np.gradient(img, axis=0); np.clip(gy, 0.0, None, out=gy)
     bw = max(2, int(p.get("dp_below", 24)))
     below = ndimage.uniform_filter1d(img, size=bw, axis=0, origin=-(bw // 2))
     score = gy * np.maximum(below - float(np.median(img)), 0.0)
     score = score / (score.max(axis=0, keepdims=True) + 1e-6)
-    add("DP · surface score — dark→bright gradient × bright-tissue-below", _gray_rgb(score * 255.0),
-        kind="decision", lane="dp",
+    add("Detect · surface score — dark→bright gradient × bright-tissue-below", _gray_rgb(score * 255.0),
+        kind="decision",
         branch="locks to the anterior epithelium (a real edge AND bright cornea just below), not internal layers or top speckle")
-    dp_raw = _detect_surface_dp(sl, p)               # DP BEFORE the scar-guard (to show the guard's effect)
-    add("DP · detected surface (red) — smooth path", _draw_curve(_gray_rgb(sl), dp_raw, _C_RED),
-        kind="decision", lane="dp",
-        branch=f"dynamic-programming shortest smooth MAX-score path (per-frame depth step ≤ {int(p.get('dp_max_jump', 10))}) + 3-point sub-voxel refine")
+    dp_raw = _detect_surface_dp(sl, p)
+    add("Detect · DP surface (red) — smooth MAX-score path", _draw_curve(_gray_rgb(sl), dp_raw, _C_RED),
+        kind="decision",
+        branch=f"dynamic-programming shortest smooth path (per-frame depth step ≤ {int(p.get('dp_max_jump', 10))}) + 3-point sub-voxel refine")
+    try:
+        legacy_edge = _legacy_surface(sl, p); merged = _merged_side_edge(sl, p)
+        n_pulled = int(np.count_nonzero(np.abs(np.asarray(dp_raw) - np.asarray(merged)) > 0.5))
+        add("Detect · scar-guard cross-check — red = final, green = legacy reference",
+            _draw_curve(_draw_curve(_gray_rgb(sl), legacy_edge, _C_GREEN), merged, _C_RED),
+            kind="decision", lane="full",
+            branch=(f"where raw DP dives > {float(p.get('dp_scar_tol', 18)):.0f}px DEEPER than the legacy RANSAC surface "
+                    f"(scar-lock signature), DP is re-detected near legacy → {n_pulled} frame(s) pulled back; "
+                    "the final anterior edge = guarded DP"))
+    except Exception:  # noqa: BLE001
+        pass
 
-    # ── Legacy lane (the 'old method' — and the DP scar-guard's reference surface) ──
-    heq = _histeq(sl)
-    add("Legacy · histogram equalized", _gray_rgb(heq), lane="legacy")
-    filt = cv2.bilateralFilter(cv2.normalize(heq, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
-                               int(p["d"]), int(p["sigmaColor"]), int(p["sigmaSpace"]))
-    add("Legacy · bilateral filtered", _gray_rgb(filt), lane="legacy")
-    raw_edge = _detect_surface_gradient(filt, p["sigma"])
-    add("Legacy · gradient-argmax edge (red)", _draw_curve(_gray_rgb(heq), raw_edge, _C_RED), lane="legacy")
-    legacy_edge = _legacy_surface(sl, p)
-    add("Legacy · side-corrected RANSAC surface (green)", _draw_curve(_gray_rgb(sl), legacy_edge, _C_GREEN),
-        kind="decision", lane="legacy",
-        branch="per side: keep the hist-eq OR raw edge, whichever fits its RANSAC quadratic best (robust to a bright internal scar)")
-
-    # ── Merge: DP scar-guard cross-check — both lanes converge on the final edge ──
-    guard_ov = _draw_curve(_draw_curve(_gray_rgb(sl), legacy_edge, _C_GREEN), merged, _C_RED)
-    n_pulled = int(np.count_nonzero(np.abs(np.asarray(dp_raw) - np.asarray(merged)) > 0.5))
-    add("Scar-guard cross-check — red = final DP (guarded), green = legacy reference", guard_ov,
-        kind="decision", lane="full",
-        branch=(f"where raw DP dives > {float(p.get('dp_scar_tol', 18)):.0f}px DEEPER than legacy (scar-lock signature), "
-                f"DP is re-detected within ±{float(p.get('dp_scar_window', 12)):.0f}px of legacy → {n_pulled} frame(s) pulled "
-                "back; the final anterior edge = guarded DP"))
-
-    # clipped-apex: if the dome apex is above the frame, fit/extrapolate from the in-frame flanks so the
-    # filmstrip's fit + final warp match a real clip-aware re-run (preview == result).
-    clip_cols, clip_fit = (_resolve_clip(merged, sl, res, p) if p.get("clip_handling", True)
-                           else (np.array([], dtype=int), None))
-    quad = clip_fit if clip_fit is not None else _fit_quadratic_ransac(merged, res)
-    im6 = _draw_curve(_gray_rgb(sl), merged, _C_GREEN)
-    _clip_note = f"; apex clipped → extrapolated from in-frame flanks ({len(clip_cols)} cols)" if len(clip_cols) else ""
-    add("Quadratic warp-target fit — green = edge, blue = fit", _draw_curve(im6, quad, _C_BLUE, dashed=False),
-        kind="decision", branch=f"RANSAC quadratic (residual ≤ {res:.0f}px); degree-2 polyfit fallback if RANSAC fails{_clip_note}")
-    nb = [merged]
-    if idx > 0:
-        nb.append(_merged_side_edge(sag[idx - 1].astype(np.float32), p))
-    if idx < n - 1:
-        nb.append(_merged_side_edge(sag[idx + 1].astype(np.float32), p))
-    med = np.median(np.stack(nb), axis=0)
-    dvv = np.abs(merged - med); snap = dvv > at
-    if len(clip_cols):
-        snap[clip_cols] = False                 # don't snap a clipped column toward neighbours
-    active_e = merged.copy(); active_e[snap] = med[snap]
-    n_snapped = int(np.count_nonzero(snap))
-    quad_a = clip_fit if clip_fit is not None else _fit_quadratic_ransac(active_e, res)
-    im7 = _draw_curve(_gray_rgb(sl), active_e, _C_MAGENTA)
-    add("3D active correction — magenta = corrected, blue = fit", _draw_curve(im7, quad_a, _C_BLUE, dashed=False),
-        kind="decision", branch=f"snap cols deviating > {at:.0f}px from the 3-slice neighbour median → {n_snapped} snapped")
-    # Final warp: same logic as smooth_volume — with the over-correction guard (#2) + clipped-apex handling
-    # so the filmstrip matches a real re-run (runaway shift interpolated from good neighbours + clamped;
-    # clipped columns extrapolated + never shifted up).
-    max_disp = float(p.get("max_displacement", 0.0) or 0.0)
-    disp = _slice_displacement(active_e, res, cf, [int(c) for c in (bad_cols or [])],
-                               [int(c) for c in (p.get("good_columns") or [])], max_disp,
-                               clip_cols=clip_cols, clip_fit=clip_fit)
-    warped = _warp_by_displacement(sag[idx], disp)
-    guard = f"over-correction guard: clamp |shift| > {max_disp:.0f}px (interp from good neighbours)" if max_disp > 0 else "no over-correction guard (max_displacement=0)"
-    add("Final corrected — column warp", _gray_rgb(warped.astype(np.float32)), kind="decision", branch=guard)
+    # ── B. RIGID INTER-FRAME CORRECTION (the actual default pipeline; re-runs the real stage functions) ──
+    _rigid = bool(p.get("rigid_frame_warp", True))
+    _blank = (np.zeros((sl.shape[0], sl.shape[1], 3), np.uint8) + 26)
+    v = vol.copy()
+    add("Rigid pipeline · input surface (red) — wavy from inter-frame eye motion", surf_overlay(v),
+        kind="stage", lane="full",
+        branch=("each axial B-scan is captured near-instantaneously — its internal geometry is TRUTH; only its "
+                "RIGID pose between frames (depth + tilt) is corrected, never its shape"))
+    try:
+        v, amc = axial_motion_correct(v, p, workers=workers)
+    except Exception:  # noqa: BLE001
+        amc = {"applied": False}
+    if amc.get("applied"):
+        add("① Axial motion-correct — coarse per-frame DEPTH shift onto a robust 3-D dome", surf_overlay(v),
+            kind="decision", branch=f"APPLIED — {amc.get('frames_adjusted', '?')} frames · motion σ={amc.get('motion_std', '?')}px · max shift {amc.get('max_shift', '?')}px")
+    else:
+        add("① Axial motion-correct — no-op", _blank, kind="decision", branch="SKIPPED — the dome fit found negligible per-frame depth motion")
+    try:
+        v, ifd = intra_frame_dewarp(v, p, workers=workers)
+    except Exception:  # noqa: BLE001
+        ifd = {"applied": False}
+    if ifd.get("applied"):
+        add("② Intra-frame dewarp — undo within-B-scan saccade distortion", surf_overlay(v),
+            kind="decision", branch=f"APPLIED — saccade frames {ifd.get('saccade_frames', '?')} re-warped onto the motion-free reference")
+    else:
+        add("② Intra-frame dewarp — no-op", _blank, kind="decision", branch="SKIPPED — no frame exceeds the intra-frame saccade-distortion gate")
+    try:
+        v, mflat, _axf = smooth_volume(v, p, return_metric=True, workers=workers)
+        add("③ Flatten — RIGID per-frame depth alignment (constant across lateral → no B-scan deformation)", surf_overlay(v),
+            kind="decision", branch=f"APPLIED — per-frame shift onto the DP surface's smooth dome; boundary deviation {float(mflat):.2f}px (keep-best over passes)")
+    except Exception as _e:  # noqa: BLE001
+        add("③ Flatten — error", surf_overlay(v), kind="decision", branch=str(_e)[:70])
+    if _rigid and p.get("rigid_height_refine", True):
+        try:
+            v, rhr = rigid_height_refine(v, p, workers=workers)
+        except Exception:  # noqa: BLE001
+            rhr = {"applied": False}
+        if rhr.get("applied"):
+            add("④ Rigid height-refine — remove residual per-frame height JITTER (rigid depth shift)", surf_overlay(v),
+                kind="decision", branch=f"APPLIED — {rhr.get('frames_adjusted', '?')} frames · max jitter {rhr.get('max_jitter', '?')}px · sag roughness {rhr.get('rough_before', '?')}→{rhr.get('rough_after', '?')}")
+        else:
+            add("④ Rigid height-refine — no-op", _blank, kind="decision", branch="SKIPPED — self-gate: no roughness improvement")
+    if _rigid and p.get("rigid_frame_derotate", True):
+        b_before = b_ref = piv_png = None
+        try:
+            _Sb = detect_surface_all(reformat_to_sagittal(v), p, workers=workers)
+            b_before, b_ref = _tilt_profile_and_ref(_Sb, v.shape[1], p)
+            piv_png = _derotate_pivot_overlay(v, _Sb, p)       # pivot on the PRE-derotate frame + surface
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            v, rfd = rigid_frame_derotate(v, p, workers=workers)
+        except Exception:  # noqa: BLE001
+            rfd = {"applied": False}
+        if rfd.get("applied"):
+            add("⑤ Rigid derotate — level per-frame TILT (inter-frame torsion) by a rigid rotation", surf_overlay(v),
+                kind="decision", branch=f"APPLIED — {rfd.get('frames_rotated', '?')} frames · max {rfd.get('max_deg', '?')}° · {rfd.get('iters', '?')} closed-loop iters · sag roughness {rfd.get('rough_before', '?')}→{rfd.get('rough_after', '?')}")
+            if b_before is not None and b_ref is not None:
+                add("⑤ · tilt reference — per-frame tilt b(f) [red] vs ROBUST smooth reference [blue]",
+                    _plot_series([b_before, b_ref], [_C_RED, _C_BLUE]), kind="decision", lane="full", resize=False,
+                    branch=("the reference is a SMOOTH-across-frames baseline (median-prefilter + gaussian σ≈9), NOT a single "
+                            "global median — it keeps the slow real decentration/astigmatism and rotates away only the fast per-frame torsion (red−blue)"))
+            if piv_png is not None:
+                add("⑤ · rotation pivot (magenta ✚) on an axial B-scan — on the surface, lateral centre", piv_png,
+                    kind="decision", lane="full", resize=False,
+                    branch="the rotation axis is the surface point (not the array centre) → pure tilt-levelling, no spurious lateral shear; the angle itself is pivot-independent")
+        else:
+            add("⑤ Rigid derotate — no-op", _blank, kind="decision", branch="SKIPPED — self-gate: no roughness improvement")
+    add("Final corrected surface (red)", surf_overlay(v), kind="decision", lane="full",
+        branch="every frame's rigid pose (depth + tilt) corrected; the instantaneous B-scan geometry preserved throughout")
     return n, idx, steps
 
 
