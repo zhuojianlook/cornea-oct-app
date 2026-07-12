@@ -103,6 +103,13 @@ DEFAULT_PARAMS: dict = {
                                   #   PROGRESSIVE-ROTATION drift (per-scan motion; keeps the constant real decentration DC).
     "rfd_smooth": 1.5,            # gaussian sigma (frames) — light denoise of the per-frame tilt (the drift is kept intact)
     "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°
+    "rfd_ref_sigma": 9.0,         # v0.0.198 ROBUST rotational reference: level each frame's tilt to a SMOOTH-across-frames
+                                  #   baseline (median-prefilter + gaussian σ frames), NOT a single global DC median. σ≈9
+                                  #   keeps the real, slow decentration/astigmatism trend (>>σ) and marks the fast per-frame
+                                  #   tilt swings (torsion motion, ~a few frames) for removal. A single DC ref is not robust
+                                  #   (worked on centred scans by luck) — it can't represent a tilt that varies frame-to-frame.
+    "rfd_iters": 3,               # v0.0.198 CLOSED-LOOP: rotate → re-detect → re-measure the tilt, repeat, so each frame's
+                                  #   tilt actually REACHES the reference (the open-loop single-shot formula under-delivered).
     "crop_incomplete_cornea": False,  # DEFAULT OFF (v0.0.197): RETIRED. SAM2 fuses axial+coronal+sagittal by 2-of-3 majority
                                   #   vote, so a truncated cornea in the SAGITTAL view alone is outvoted by the two intact
                                   #   views → no crop needed. (The v0.0.196 crop was also inconsistent at the very edges.)
@@ -3953,14 +3960,19 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
     whole B-scan removes it WITHOUT deforming it (rotation preserves every internal distance/angle). Biggest in
     the first/last few frames (the eye settling/drifting at scan start/end), matching where the residual lives.
 
-    Estimate per frame the surface-tilt residual vs a robust smooth 3-D dome (deg-`amc_dome_deg`), keep only the
-    HIGH-FREQUENCY (frame-to-frame jitter) part — `rfd_smooth` low-pass — so the cornea's real peripheral tilt is
-    preserved, then rotate each B-scan by the angle that flattens that jitter tilt (rotate the (lateral,depth)
-    image; swept-out regions are filled with BLACK cval=0, NOT edge-replicated — an out-of-FOV pixel has no data,
-    so honest black beats extrapolating the edge value). SELF-GATED: re-detect and keep only if per-frame surface
-    roughness drops (black corners don't fool the re-detection — the depth warp already blacks-out vacated rows). Δx (lateral
-    translation) is NOT estimated — it is collinear with the tilt on the dome flanks and destabilises the fit
-    (tested: makes it worse). Runs AFTER rigid_height_refine (the "initial axial alignment"). volume=(frames,depth,lateral)."""
+    ROBUST REFERENCE + CLOSED LOOP (v0.0.198). Per frame measure the lateral tilt b (linear coeff of a per-frame
+    quadratic a·xn²+b·xn+c, independent of the dome curvature a) and level it to a SMOOTH-across-frames baseline
+    b_ref (median-prefilter + gaussian σ=`rfd_ref_sigma`), NOT a single global DC=median(b). The DC reference is
+    not robust — it assumes the real corneal tilt is one constant on every frame (it varies smoothly with slow-scan
+    position), so it drags legitimately-different frames to the median AND under-removes localised torsion (measured:
+    the old single-shot removed only ~¼ of the marked tilt swing). b_ref keeps the slow real decentration/astigmatism
+    trend (>>σ, consistent across replicates) and marks the fast per-frame tilt swings (torsion motion) as b−b_ref.
+    The rotation is CLOSED-LOOP: rotate → re-detect → re-measure → repeat (`rfd_iters`) so each frame's tilt actually
+    REACHES b_ref (the open-loop formula stopped ¼ of the way). The net per-frame angle is applied ONCE to the
+    original B-scan (rotate the (lateral,depth) image; swept-out regions BLACK cval=0, NOT edge-replicated — honest
+    black beats invented edge data). SELF-GATED on a nearest-filled iterate: keep only if surface roughness drops.
+    Δx (lateral translation) is NOT estimated — collinear with the tilt on the dome flanks, destabilises the fit
+    (tested: worse). Runs AFTER rigid_height_refine (the "initial axial alignment"). volume=(frames,depth,lateral)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     if workers is None:
         workers = auto_workers()
@@ -3982,77 +3994,104 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
             return float(np.nanmean([np.nanmean(np.abs(np.diff(sm[l, :], 2))) for l in range(10, L - 10, 4)]))
 
     # PER-FRAME lateral tilt from a per-frame quadratic fit a·xn²+b·xn+c → b = tilt (independent of the dome
-    # curvature a). Measuring per-frame (NOT as a residual vs a frame-smooth 2-D dome) is what lets us SEE a slow
-    # PROGRESSIVE-ROTATION drift — a frame-smooth dome fit would ABSORB that drift into the reference and hide it.
+    # curvature a). ROBUST REFERENCE (v0.0.198): level each frame's tilt to a SMOOTH-across-frames baseline b_ref
+    # (median-prefilter + gaussian σ=rfd_ref_sigma), NOT a single global DC=median(b). A single DC assumes the real
+    # corneal tilt is one constant on every frame — it isn't (it varies smoothly with the slow-scan position), so a
+    # DC reference drags legitimately-different frames to the median AND leaves localised torsion only partly
+    # removed (worked on centred scans by luck). b_ref keeps the slow, real decentration/astigmatism trend (>>σ)
+    # and marks the fast per-frame tilt swings (torsion motion) as b−b_ref for removal.
     xc = (L - 1) / 2.0
     xnl = (np.arange(L) - xc) / (L / 2.0)                # normalised lateral, [-1,1]
-    tilt = np.full(F, np.nan)
-    for f in range(F):
-        col = S[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
-        if int(mk.sum()) < 60:
-            continue
-        try:                                            # 2σ-trimmed quadratic (robust to a few detector glitches)
-            c2 = np.polyfit(xnl[mk], col[mk], 2)
-            res = col[mk] - np.polyval(c2, xnl[mk]); sd = np.std(res) + 1e-6
-            keep = np.abs(res) < 2.0 * sd
-            if int(keep.sum()) > 40:
-                idx = np.where(mk)[0][keep]; c2 = np.polyfit(xnl[idx], col[idx], 2)
-            tilt[f] = c2[1]
-        except Exception:  # noqa: BLE001
-            continue
-    good = np.isfinite(tilt)
-    if int(good.sum()) < max(8, F // 4):
-        return volume, {"applied": False}
-    # Remove the FRAME-VARIATION of the tilt (jitter + hump + progressive drift = per-scan MOTION, confirmed
-    # inconsistent across replicates of the same eye) but KEEP the constant DC = the real, reproducible corneal
-    # decentration/astigmatism (consistent across replicates). Light denoise leaves the drift intact.
-    DC = float(np.median(tilt[good]))
-    corr = np.where(good, tilt - DC, 0.0)
-    sig = float(p.get("rfd_smooth", 1.5) or 0.0)
-    if sig > 0:
-        corr = ndimage.gaussian_filter1d(corr, sig, mode="nearest")
-    alpha = -2.0 * corr / L                              # radians: rotation whose z-shift α·(x-xc) cancels the tilt
-    amax = np.radians(float(p.get("rfd_max_deg", 3.0)))
-    alpha = np.clip(alpha, -amax, amax)
-    if float(np.degrees(np.max(np.abs(alpha)))) < 0.03:  # no meaningful tilt → strict no-op
-        return volume, {"applied": False, "max_deg": round(float(np.degrees(np.max(np.abs(alpha)))), 2)}
-    r0 = _rough(S)
-    # DYNAMIC rotation pivot: rotate each B-scan about ITS OWN corneal surface, not the array centre. A fixed
-    # array-centre pivot sits ~180-210px BELOW the surface, so a per-frame rotation by θ swings the surface
-    # sideways by ~(depth_centre − surface_depth)·sinθ — a spurious per-frame lateral shift (a smooth lateral
-    # shear from the drift angles, up to ~9px on drift scans; jitter on the rest). Pivoting on the surface
-    # (lateral centre, that frame's median surface depth) makes the correction a pure tilt-levelling with no
-    # spurious lateral translation. Small angles → pixel-space rotation matrix (shear negligible); the affine
-    # about the array centre is bit-identical to ndimage.rotate (verified), so this ONLY moves the pivot.
-    scen = np.full(F, (depth - 1) / 2.0)
-    for f in range(F):
-        col = S[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
-        if int(mk.sum()) > 40:
-            scen[f] = float(np.median(col[mk]))
     rc = (L - 1) / 2.0
-    out = volume.copy()          # BLACK-filled swept-out corners → honest OUTPUT (no invented edge data)
-    gate = volume.copy()         # NEAREST-filled → stable self-gate re-detection: extrapolated corners keep the
-                                 #   surface detector from locking onto a black↔tissue edge and spuriously failing
-                                 #   the gate (which would DROP a real drift correction, e.g. the big-angle od_v5).
-    nrot = 0
-    for f in range(F):
-        if abs(alpha[f]) > 1e-4:
-            fr_ld = np.ascontiguousarray(volume[f].T)    # (lateral, depth)
+    amax = np.radians(float(p.get("rfd_max_deg", 3.0)))
+    ref_sig = float(p.get("rfd_ref_sigma", 9.0) or 0.0)
+    n_iter = max(1, int(p.get("rfd_iters", 3)))
+
+    def _tilt(surf):                                    # per-frame lateral tilt b, 2σ-trimmed quadratic
+        b = np.full(F, np.nan)
+        for f in range(F):
+            col = surf[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
+            if int(mk.sum()) < 60:
+                continue
+            try:
+                c2 = np.polyfit(xnl[mk], col[mk], 2)
+                res = col[mk] - np.polyval(c2, xnl[mk]); sd = np.std(res) + 1e-6
+                keep = np.abs(res) < 2.0 * sd
+                if int(keep.sum()) > 40:
+                    idx = np.where(mk)[0][keep]; c2 = np.polyfit(xnl[idx], col[idx], 2)
+                b[f] = c2[1]
+            except Exception:  # noqa: BLE001
+                continue
+        return b
+
+    def _ref(b):                                        # robust SMOOTH-across-frames baseline (keeps the DC + slow trend)
+        g = np.isfinite(b)
+        if int(g.sum()) < max(8, F // 4):
+            return None
+        bi = np.interp(np.arange(F), np.where(g)[0], b[g])
+        bi = ndimage.median_filter(bi, size=5, mode="nearest")       # kill single-frame detector spikes
+        return ndimage.gaussian_filter1d(bi, ref_sig, mode="nearest") if ref_sig > 0 else bi
+
+    def _pivots(surf):                                  # per-frame surface pivot depth (lateral centre)
+        sc = np.full(F, (depth - 1) / 2.0)
+        for f in range(F):
+            col = surf[:, f]; mk = (col > 1) & (col < depth - 1) & np.isfinite(col)
+            if int(mk.sum()) > 40:
+                sc[f] = float(np.median(col[mk]))
+        return sc
+
+    r0 = _rough(S)
+    # CLOSED-LOOP: rotate → re-detect → re-measure the tilt until each frame reaches b_ref. The open-loop single-shot
+    # rotation under-delivered (measured: removed only ~1/4 of the marked tilt swing). Accumulate the NET per-frame
+    # angle on a NEAREST-filled iterate (stable re-detection — black corners would confuse the surface detector),
+    # then apply the net rotation ONCE to the original B-scan with honest BLACK fill.
+    det = volume.copy()
+    Scur = S
+    total_alpha = np.zeros(F)
+    it_done = 0
+    for it_done in range(1, n_iter + 1):
+        b = _tilt(Scur)
+        bref = _ref(b)
+        if bref is None:
+            break
+        resid = np.where(np.isfinite(b), b - bref, 0.0)
+        sig = float(p.get("rfd_smooth", 1.5) or 0.0)     # light denoise of the RESIDUAL (single-frame detect noise)
+        if sig > 0:
+            resid = ndimage.gaussian_filter1d(resid, sig, mode="nearest")
+        alpha = np.clip(-2.0 * resid / L, -amax, amax)   # radians: rotation whose z-shift α·(x-xc) cancels the tilt
+        if float(np.degrees(np.max(np.abs(alpha)))) < 0.03:
+            break
+        scen = _pivots(Scur)                             # DYNAMIC surface pivot (no spurious lateral shear)
+        for f in range(F):
+            if abs(alpha[f]) <= 1e-4:
+                continue
             ct, st = np.cos(alpha[f]), np.sin(alpha[f])
-            Mrot = np.array([[ct, st], [-st, ct]])       # == ndimage.rotate's matrix (pixel-space)
-            piv = np.array([rc, scen[f]])                # pivot on the surface, NOT the array centre
-            offr = piv - Mrot @ piv
-            out[f] = np.ascontiguousarray(ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="constant", cval=0.0).T)
-            gate[f] = np.ascontiguousarray(ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="nearest").T)
-            nrot += 1
-    try:                                                # SELF-GATE on the nearest-filled copy (tissue is identical
-        S2 = detect_surface_all(reformat_to_sagittal(gate), p, workers=workers)   # to `out`; only the bg corners differ)
-        r1 = _rough(S2)
-    except Exception:  # noqa: BLE001
-        r1 = r0 + 1.0
+            Mrot = np.array([[ct, st], [-st, ct]]); piv = np.array([rc, scen[f]]); offr = piv - Mrot @ piv
+            fd = np.ascontiguousarray(det[f].T)
+            det[f] = np.ascontiguousarray(ndimage.affine_transform(fd, Mrot, offset=offr, order=1, mode="nearest").T)
+        total_alpha += alpha
+        try:
+            Scur = detect_surface_all(reformat_to_sagittal(det), p, workers=workers)
+        except Exception:  # noqa: BLE001
+            break
+    total_alpha = np.clip(total_alpha, -amax, amax)
+    max_deg = float(np.degrees(np.max(np.abs(total_alpha))))
+    if max_deg < 0.03:                                   # nothing meaningful to rotate → strict no-op
+        return volume, {"applied": False, "max_deg": round(max_deg, 2)}
+    scen0 = _pivots(S)                                   # pivot on the ORIGINAL surface for the net one-shot rotation
+    out = volume.copy(); nrot = 0
+    for f in range(F):
+        if abs(total_alpha[f]) <= 1e-4:
+            continue
+        ct, st = np.cos(total_alpha[f]), np.sin(total_alpha[f])
+        Mrot = np.array([[ct, st], [-st, ct]]); piv = np.array([rc, scen0[f]]); offr = piv - Mrot @ piv
+        fr_ld = np.ascontiguousarray(volume[f].T)        # (lateral, depth); BLACK fill (no invented edge data)
+        out[f] = np.ascontiguousarray(ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="constant", cval=0.0).T)
+        nrot += 1
+    r1 = _rough(Scur)                                    # SELF-GATE on the nearest-filled iterate (stable corners)
     if not (r1 < r0):
         return volume, {"applied": False, "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
-    return out, {"applied": bool(nrot), "frames_rotated": int(nrot), "max_deg": round(float(np.degrees(np.max(np.abs(alpha)))), 2),
+    return out, {"applied": True, "frames_rotated": int(nrot), "max_deg": round(max_deg, 2), "iters": int(it_done),
                  "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
 
 
