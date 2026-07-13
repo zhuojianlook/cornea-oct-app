@@ -659,11 +659,13 @@ export async function loadSegmentation(url: string, opacity: number): Promise<vo
   await nv.addVolumeFromUrl({ url, colormap: cmap, opacity, cal_min: 0.5, cal_max: 4.5 });
   segUrl = url;
   nv.updateGLVolume();
+  reapplyGrayscaleInterpolation();   // updateGLVolume reverted layer-0 grayscale to crisp → restore the toggle
 }
 
 export function setSegmentationOpacity(opacity: number): void {
   if (!nv || nv.volumes.length < 2) return;
   nv.setOpacity(nv.volumes.length - 1, opacity);
+  reapplyGrayscaleInterpolation();   // setOpacity rebuilds the layer stack → restore the grayscale toggle
 }
 
 // CRISP ⇄ SMOOTH display toggle (isNearest true = crisp voxels, false = linear/smooth). Purely a texture-sampling
@@ -673,14 +675,29 @@ export function setSegmentationOpacity(opacity: number): void {
 // coarse frame axis (sagittal/coronal) and no longer matches the crisp previews. The user picks per-need; writing
 // opts.isNearestInterpolation means every subsequent volume load inherits the choice too. Sets the DRAW grayscale
 // (layer 0) only — a segmentation label overlay, if present, must stay nearest (fractional labels otherwise).
+// Last grayscale (layer-0) Crisp/Smooth choice — remembered so it can be RE-ASSERTED after any overlay op.
+// nv.updateGLVolume() (called by loadCropMask / loadSegmentation / setSegmentationOpacity) rebuilds ALL layer
+// textures to the GLOBAL isNearestInterpolation default (nearest), clobbering the layer-0 override → the Smooth
+// toggle silently reverted to Crisp on cropped/segmented scans only (looked like "sometimes smoothed, sometimes
+// not" when clicking between scans). Default true = the niivue construction default (crisp) until the first set.
+let _grayNearest = true;
+
 export function setInterpolationMode(isNearest: boolean): void {
+  _grayNearest = isNearest;                          // remember even before a volume exists (applied on next load)
   if (!nv || !nv.volumes.length) return;
   // Layer 0 (the raw grayscale) ONLY — do NOT touch nv.opts.isNearestInterpolation: that is the default for
   // FUTURE volume loads incl. a segmentation label overlay, which must stay NEAREST (linear → fractional labels
   // / haloed tiers). The overlay keeps the _createNv default (nearest); the grayscale is (re)set here on every
   // load. forceLinear = !isNearest → Smooth = linear grayscale, Crisp = nearest grayscale.
+  reapplyGrayscaleInterpolation();
+}
+
+// Re-assert the layer-0 grayscale Crisp/Smooth choice after an overlay op rebuilt the textures (see above).
+// Call after any nv.updateGLVolume() / nv.setOpacity() that touches the layer stack.
+function reapplyGrayscaleInterpolation(): void {
+  if (!nv || !nv.volumes.length) return;
   try {
-    (nv as unknown as { updateInterpolation: (l: number, forceLinear?: boolean) => void }).updateInterpolation(0, !isNearest);
+    (nv as unknown as { updateInterpolation: (l: number, forceLinear?: boolean) => void }).updateInterpolation(0, !_grayNearest);
     nv.drawScene();
   } catch { /* older niivue without per-layer updateInterpolation → no-op (stays at construction default) */ }
 }
@@ -695,6 +712,7 @@ export async function loadCropMask(url: string): Promise<void> {
   await nv.addVolumeFromUrl({ url, colormap: "red", opacity: 0.45, cal_min: 0.5, cal_max: 1.0 });
   cropUrl = url;
   nv.updateGLVolume();
+  reapplyGrayscaleInterpolation();   // updateGLVolume reverted layer-0 grayscale to crisp → restore the toggle
 }
 export function removeCropMask(): void {
   if (!nv || cropUrl == null) return;
