@@ -576,6 +576,10 @@ DEFAULT_PARAMS: dict = {
     "crop_disp_smooth_slice": 40.0,  # anti-wave: gaussian on the per-column warp shift ACROSS slices. RAISED 6→40
                                   #   for the same reason — kills the lateral wave from a faint/noisy posterior.
     "crop_disp_smooth_frame": 1.5,  # across frames (lighter — real frame-direction shape is kept). 0 = disabled.
+    "crop_rigid_disp": True,      # v0.0.202 RIGID surface-crop warp: collapse the per-column shift to ONE depth
+                                  #   shift per frame (median over laterals) so an axial B-scan is repositioned
+                                  #   RIGIDLY, never per-column-DEFORMED (surface-crop scans obey the rigid rule too).
+                                  #   crop_disp_smooth_slice is then moot. False = legacy per-column warp (A/B only).
     "crop_pad_margin": 8,         # extra rows above the highest above-old-top point (breathing room)
     "crop_max_pad": 160,          # safety cap on the upward extension (rows). A required pad above this means a
                                   # SEVERE tilt / artifact, not a clean clip: AUTO skips it (→ normal pipeline);
@@ -2434,16 +2438,24 @@ def warp_surface_crop_extend(sag: np.ndarray, posterior: np.ndarray, crop_frames
     # robust per-column shift: parabola − median-smoothed posterior, clipped so an outlier can't inflate the pad
     post_rob = np.stack([ndimage.median_filter(posterior[i].astype(np.float64), size=int(p.get("crop_target_med", 11)))
                          for i in range(n)])
-    disp = np.nan_to_num(np.clip(Pb - post_rob, -md, md), nan=0.0, posinf=md, neginf=-md)  # never round a NaN shift
-    # DISP SMOOTHING (anti-streak): the per-column shift = Pb(smooth) − posterior; when the posterior edge is FAINT
-    # (a low-contrast bottom edge), its per-slice detection is noisy, so `disp` varies erratically slice-to-slice →
-    # adjacent lateral columns shift by very different amounts → a vertical COMB artifact that mangles the extended
-    # volume (even unclipped frames). A 2-D Gaussian over (slices, frames) removes that high-frequency noise while
-    # preserving the low-frequency correction (recovering the clipped apex/edge as a coherent surface). On a
-    # crisp-posterior scan `disp` is already smooth, so this is a near-no-op. Set the sigmas to 0 to disable.
-    _ss = float(p.get("crop_disp_smooth_slice", 6.0)); _sf = float(p.get("crop_disp_smooth_frame", 1.5))
-    if _ss > 0 or _sf > 0:
-        disp = ndimage.gaussian_filter(disp, sigma=(_ss, _sf))
+    disp_col = np.nan_to_num(np.clip(Pb - post_rob, -md, md), nan=0.0, posinf=md, neginf=-md)  # per-column (lateral,frame)
+    if bool(p.get("crop_rigid_disp", True)):
+        # RIGID B-SCAN CONSTRAINT (v0.0.202): disp_col[i,f] varies across lateral i WITHIN a single axial frame f, so
+        # applying it column-by-column would DEFORM the instantaneous B-scan. Surface-crop scans are NO EXCEPTION to the
+        # rigid rule (a B-scan is captured near-instantaneously → its internal geometry is TRUTH): collapse to ONE depth
+        # shift PER FRAME (robust median over the laterals) so every lateral of a frame moves TOGETHER — a pure rigid
+        # depth reposition + canvas extend, ZERO per-column warp. The posterior lands on its smooth parabola in
+        # aggregate and the reconstructed apex is repositioned coherently; the frame's real lateral shape is preserved.
+        # Smooth the per-frame shift across FRAMES only (the old 2-D lateral+frame Gaussian's lateral axis is now moot);
+        # the median already kills the faint-posterior per-slice noise the lateral smoothing existed to remove.
+        disp_f = np.array([float(np.median(disp_col[:, f])) for f in range(F)])
+        _sf = float(p.get("crop_disp_smooth_frame", 1.5))
+        if _sf > 0:
+            disp_f = ndimage.gaussian_filter1d(disp_f, sigma=_sf, mode="nearest")
+        disp = np.repeat(disp_f[None, :], n, axis=0)                            # constant across lateral → RIGID per frame
+    else:  # LEGACY per-column warp (deforms the B-scan) — kept only for A/B comparison; NOT the default.
+        _ss = float(p.get("crop_disp_smooth_slice", 6.0)); _sf = float(p.get("crop_disp_smooth_frame", 1.5))
+        disp = ndimage.gaussian_filter(disp_col, sigma=(_ss, _sf)) if (_ss > 0 or _sf > 0) else disp_col
     Pa = np.nan_to_num(Pa, nan=0.0)
     raw_pad = int(np.ceil(max(0.0, -float(np.min(Pa)), -float(np.min(disp))))) + int(p.get("crop_pad_margin", 8))
     cap = int(p.get("crop_max_pad", 120))
