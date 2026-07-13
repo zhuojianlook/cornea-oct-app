@@ -1571,13 +1571,18 @@ def _edge_dome_follow(surf: np.ndarray, vol: np.ndarray, p: dict) -> np.ndarray:
                 co = np.polyfit(m, y[m], 2)
             dome = np.polyval(co, edge)
             for k, li in enumerate(edge):
-                s = int(round(y[li]))
-                surf_int = float(np.mean(vol[li, s:min(D, s + 2), fr]))          # brightness AT the surface
-                s_lo = s + 2
+                if not np.isfinite(y[li]):                  # surface extrapolated OUT of frame (clipped apex) → no band below to follow
+                    continue
+                s = int(round(float(y[li])))
+                sc = max(0, min(D - 1, s))                  # clamp for indexing (a negative/above-FOV depth has no valid slice)
+                surf_int = float(np.mean(vol[li, sc:min(D, sc + 2), fr]))         # brightness AT the surface
+                s_lo = max(0, s + 2)
                 s_hi = int(min(D - 1, min(round(dome[k]) + pad, s + search)))    # dome-bounded search below
                 if s_hi <= s_lo + sustain:
                     continue
                 seg = vol[li, s_lo:s_hi + 1, fr].astype(np.float64)
+                if seg.size <= sustain:                     # too few depth samples for a valid sustained-run convolution
+                    continue
                 run = np.convolve(seg, ker, mode="valid")   # sustained brightness (epithelium ≫ pre-reflection)
                 pk = int(np.argmax(run))
                 if run[pk] < ratio * (surf_int + 1e-6):     # nothing markedly brighter below → surface is right
