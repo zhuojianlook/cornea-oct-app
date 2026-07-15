@@ -60,6 +60,7 @@ export function TimelineBar() {
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
   const setDifficult = useCaseStore((s) => s.setDifficult);
+  const setSurfaceCrop = useCaseStore((s) => s.setSurfaceCrop);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
   // Ground-truth capture: this scan carries a manual border correction (Fix-columns anchors) → Approving records
   // it as CONFIRMED ground truth for the auto-detector training corpus. The toggle lets the user EXCLUDE an
@@ -373,11 +374,22 @@ export function TimelineBar() {
   // "mark", and on Approve it becomes ground truth), so the separate ⚑ Mark-defect toggle is retired. Only the
   // "⚠ Difficult" flag (this scan needs manual help / can't be fixed) remains.
   const difficult = Boolean(manifest?.difficult_scan);
+  // Surface-crop (clipped cornea): AUTO = the pipeline took the surface-crop path; MANUAL = human review override
+  // (true/false). The effective state = manual if the human set it, else the auto detection.
+  const scAuto = ((manifest?.oct_iter as Record<string, unknown> | undefined)?.stopped) === "surface_crop";
+  const scManual = (manifest as Record<string, unknown> | undefined)?.surface_crop_manual;
+  const surfaceCrop = scManual != null ? Boolean(scManual) : scAuto;
+  const scReviewed = scManual != null;
   const FlagButtons = (
     <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}>
+      <Button size="small" variant={surfaceCrop ? "contained" : "outlined"} color="info" disabled={busy}
+        onClick={() => void setSurfaceCrop(!surfaceCrop)}
+        title={`Mark this scan as SURFACE-CROPPED (clipped cornea) → manifest.surface_crop_manual. ${scAuto ? "Auto-detected by the pipeline; " : ""}${scReviewed ? "you reviewed it. " : "not yet reviewed. "}Toggle to confirm, add one the detector missed, or clear a false positive.`}>
+        {surfaceCrop ? "⬚ Surface-crop✓" : "⬚ Surface-crop"}{scAuto && !scReviewed ? " (auto)" : ""}
+      </Button>
       <Button size="small" variant={difficult ? "contained" : "outlined"} color="error" disabled={busy}
         onClick={() => void setDifficult(!difficult)}
-        title="Mark this scan as a DIFFICULT SCAN needing manual help — persisted to manifest.difficult_scan so the assistant knows to hand-correct it.">
+        title="Mark this scan as a DIFFICULT SCAN needing manual help / too damaged to correct — persisted to manifest.difficult_scan. Difficult scans are EXCLUDED from nnU-Net training.">
         ⚠ Difficult
       </Button>
     </span>

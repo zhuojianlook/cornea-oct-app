@@ -132,6 +132,8 @@ def per_scan_segmented_cases() -> list[str]:
             continue                       # this IS a consensus case → skip
         if not m.get("oct_source"):
             continue                       # per-scan OCT scans only
+        if m.get("difficult_scan"):
+            continue                       # human-flagged as too damaged to correct → excluded from training
         if label_mod.corrected_path(cid).exists():
             out.append(cid)
     return out

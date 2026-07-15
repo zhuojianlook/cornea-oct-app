@@ -920,6 +920,25 @@ export function OctLoader() {
                               ⚑{(s.life!.review_flags as string[]).join("")}
                             </span>
                           )}
+                          {/* Surface-crop badge: AUTO-detected (blue ⬚) or human-confirmed (⬚✓). A manual "not
+                              surface-crop" override (surface_crop_manual === false) hides it. Lets the user find +
+                              verify every auto-detected clipped-cornea scan. */}
+                          {(() => {
+                            const life = s.life as Record<string, unknown> | undefined;
+                            const scM = life?.surface_crop_manual;
+                            // auto = the list-payload flag (other rows) OR oct_iter.stopped (the OPEN scan, whose life
+                            // is the full mirrored manifest without the derived surface_crop_auto field).
+                            const scAuto = Boolean(life?.surface_crop_auto)
+                              || ((life?.oct_iter as Record<string, unknown> | undefined)?.stopped === "surface_crop");
+                            const sc = scM != null ? Boolean(scM) : scAuto;
+                            return sc ? (
+                              <span title={`Surface-crop / clipped cornea${scM != null ? " · reviewed" : " · auto-detected (unreviewed)"}`}
+                                style={{ color: "#38bdf8", fontWeight: 700, flex: "none" }}>⬚{scM != null ? "✓" : ""}</span>
+                            ) : null;
+                          })()}
+                          {Boolean((s.life as Record<string, unknown> | undefined)?.difficult_scan) && (
+                            <span title="Marked DIFFICULT — excluded from training" style={{ color: "#ef4444", fontWeight: 700, flex: "none" }}>⚠</span>
+                          )}
                           {done && s.caseId && (
                             <button title="Download this preprocessed scan (.nii.gz) for manual segmentation"
                               onClick={(e) => { e.stopPropagation(); void downloadPreprocessed(s.caseId!, s.filename, downloadPass && downloadPass <= (s.passes ?? 1) ? downloadPass : null); }}

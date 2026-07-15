@@ -76,6 +76,8 @@ interface CaseState {
   setDefectMarks: (marks: DefectMark[]) => Promise<void>;
   // "Difficult scan" toggle → manifest.difficult_scan (needs manual help). Optimistic, mirrors setReviewFlags.
   setDifficult: (difficult: boolean) => Promise<void>;
+  // "Surface-crop" manual mark → manifest.surface_crop_manual (human review of the auto-detected clipped-cornea set).
+  setSurfaceCrop: (surfaceCrop: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
   // Before/after "Use original (raw)": discard the correction, make the raw .OCT the working volume +
   // mark it vetted (drops any segmentation; reloads the volume).
@@ -237,6 +239,17 @@ export const useCaseStore = create<CaseState>()(
       set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).difficult_scan = difficult; });
       try {
         await api.json(`/api/case/${id}/difficult`, "POST", JSON.stringify({ difficult }));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    setSurfaceCrop: async (surfaceCrop) => {
+      const id = get().caseId;
+      if (!id) return;
+      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).surface_crop_manual = surfaceCrop; });
+      try {
+        await api.json(`/api/case/${id}/surface-crop`, "POST", JSON.stringify({ surface_crop: surfaceCrop }));
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }

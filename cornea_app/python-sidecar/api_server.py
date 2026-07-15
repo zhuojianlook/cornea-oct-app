@@ -2888,9 +2888,24 @@ class DifficultRequest(BaseModel):
 @app.post("/api/case/{case_id}/difficult")
 def set_difficult_scan(case_id: str, req: DifficultRequest) -> dict:
     """Flag this scan as a DIFFICULT SCAN needing manual help (persisted to manifest.difficult_scan). Toggle
-    the user sets in the viewer; the assistant reads it to know which scans to hand-correct. Manifest-only."""
+    the user sets in the viewer; the assistant reads it to know which scans to hand-correct. Manifest-only.
+    Difficult scans are EXCLUDED from nnU-Net training candidate selection (per_scan_segmented_cases)."""
     m = orch.write_manifest_value(_require_case(case_id), {"difficult_scan": bool(req.difficult)})
     return {"ok": True, "difficult_scan": bool(m.get("difficult_scan"))}
+
+
+class SurfaceCropRequest(BaseModel):
+    surface_crop: bool | None = True   # True = confirm/mark surface-crop, False = mark NOT, None = clear the review
+
+
+@app.post("/api/case/{case_id}/surface-crop")
+def set_surface_crop_manual(case_id: str, req: SurfaceCropRequest) -> dict:
+    """MANUALLY mark this scan's surface-crop (clipped-cornea) classification — human review of the pipeline's
+    AUTO-detected set (manifest.oct_iter.stopped == "surface_crop"). True = confirm / mark it surface-cropped,
+    False = it is NOT (override a false positive), None = clear back to auto-only. Persisted to
+    manifest.surface_crop_manual. Manifest-only (does not itself re-preprocess)."""
+    m = orch.write_manifest_value(_require_case(case_id), {"surface_crop_manual": req.surface_crop})
+    return {"ok": True, "surface_crop_manual": m.get("surface_crop_manual")}
 
 
 class SubgroupRequest(BaseModel):
@@ -4180,6 +4195,11 @@ def cases_list() -> dict:
                 # both the sidebar and the assistant can see them (count only for the marks, to keep the list light).
                 "defect_marks": (len(m.get("defect_marks")) if isinstance(m.get("defect_marks"), list) else 0),
                 "difficult_scan": bool(m.get("difficult_scan")),
+                # Surface-crop (clipped cornea): AUTO = the pipeline took the surface-crop path
+                # (oct_iter.stopped == "surface_crop"); MANUAL = the human's review override (True/False/None).
+                # The loader badges both so every auto-detected clip is easy to find + verify.
+                "surface_crop_auto": ((m.get("oct_iter") or {}).get("stopped") == "surface_crop"),
+                "surface_crop_manual": m.get("surface_crop_manual"),
             },
         })
     return {"cases": out}
