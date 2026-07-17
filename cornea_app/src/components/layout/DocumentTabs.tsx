@@ -22,6 +22,8 @@ export function DocumentTabs() {
   const initTabs = useWorkflowStore((s) => s.initTabs);
   const selectTab = useWorkflowStore((s) => s.selectTab);
   const setOverlayMode = useWorkflowStore((s) => s.setOverlayMode);
+  const debugOpen = useWorkflowStore((s) => s.debugOpen);
+  const wfSet = useWorkflowStore((s) => s.set);
   const updBusy = useUpdater((s) => s.busy);
   const updMsg = useUpdater((s) => s.msg);
   const checkUpdates = useUpdater((s) => s.check);
@@ -116,8 +118,20 @@ export function DocumentTabs() {
         </>
       )}
 
-      {/* Manual update check (the app also checks silently on launch). */}
+      {/* Debug + manual update check. Both sit on the RIGHT so they can't shift the case chip /
+          consensus tabs, and both are styled as subdued outline buttons — this is a developer tool,
+          not part of the clinical workflow. Rendered outside the isConsensus ternary so it exists in
+          both modes; it toggles workflowStore.debugOpen, which is orthogonal to activeTab. */}
       <div className="flex items-center gap-2" style={{ marginLeft: "auto" }}>
+        <Tooltip title="Replicate-alignment comparison — pick two repeat scans of one eye and see the magenta/green overlap" arrow>
+          <button onClick={() => wfSet("debugOpen", !debugOpen)}
+            className="text-[11px] whitespace-nowrap"
+            style={{ background: debugOpen ? "var(--c-surface)" : "none",
+                     border: `1px solid ${debugOpen ? "var(--c-accent)" : "var(--c-border)"}`, borderRadius: 4,
+                     color: debugOpen ? "var(--c-text)" : "var(--c-text-dim)", cursor: "pointer", padding: "2px 8px" }}>
+            Debug
+          </button>
+        </Tooltip>
         {updMsg && <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{updMsg}</span>}
         <Tooltip title="Check for a newer version and install it in-app" arrow>
           <button onClick={() => checkUpdates(true)} disabled={updBusy}

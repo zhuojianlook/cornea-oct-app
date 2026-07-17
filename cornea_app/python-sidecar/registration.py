@@ -62,23 +62,39 @@ def _iso(img: sitk.Image, interp=sitk.sitkLinear, iso: float = ISO) -> sitk.Imag
 
 # ── cascade stages ──────────────────────────────────────────────────────────
 def _rigid_intensity(fi: sitk.Image, mi: sitk.Image,
-                     fixed_mask: sitk.Image | None = None) -> sitk.Transform:
+                     fixed_mask: sitk.Image | None = None,
+                     *,
+                     learning_rate: float = 0.8,
+                     smoothing_sigmas: tuple[float, ...] = (2.0, 1.0, 0.0),
+                     seed: int = 1) -> sitk.Transform:
     """Multi-resolution rigid (Euler3D = translation + rotation) via Mattes MI on raw iso
     intensities. When fixed_mask is given the metric is restricted to it (the cornea), so the
-    alignment is driven by the cornea and the dark background is ignored."""
+    alignment is driven by the cornea and the dark background is ignored.
+
+    learning_rate / smoothing_sigmas / seed are KEYWORD-ONLY and DEFAULT TO THE SHIPPED VALUES, so
+    every existing caller (align_transform, align_transform_v2, reg_bench_scar) is bit-for-bit
+    unchanged — the post-SAM2 consensus lifecycle is validated at cornea Dice 0.978 and must not move.
+    They exist so debug_align.py can run the SAME optimiser with the "2-constant fix" (sigmas in mm
+    rather than voxel-ish units, gentler lr) side-by-side against production for visual adjudication,
+    WITHOUT forking this function. Do not change the defaults without re-validating consensus.
+
+    NOTE on the sigmas' units: SetSmoothingSigmasPerLevel is in PHYSICAL units (mm) here — the grid is
+    isotropic 0.02 mm, so the shipped [2.0, 1.0, 0.0] blurs by 100/50 voxels, which erases the cornea
+    at the coarse levels and is why the optimiser so often flings the moving volume off the buffer
+    ("All samples map outside moving image buffer"). [0.04, 0.02, 0.0] mm = 2/1 voxels."""
     R = sitk.ImageRegistrationMethod()
     R.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
     R.SetMetricSamplingStrategy(R.RANDOM)
-    R.SetMetricSamplingPercentage(0.05, seed=1)
+    R.SetMetricSamplingPercentage(0.05, seed=seed)
     R.SetInterpolator(sitk.sitkLinear)
     if fixed_mask is not None:
         R.SetMetricFixedMask(fixed_mask)   # cornea-only metric → align the cornea, not the background
     R.SetOptimizerAsRegularStepGradientDescent(
-        learningRate=0.8, minStep=1e-4, numberOfIterations=80,
+        learningRate=learning_rate, minStep=1e-4, numberOfIterations=80,
         relaxationFactor=0.7, gradientMagnitudeTolerance=1e-6)
     R.SetOptimizerScalesFromPhysicalShift()
     R.SetShrinkFactorsPerLevel([4, 2, 1])
-    R.SetSmoothingSigmasPerLevel([2.0, 1.0, 0.0])
+    R.SetSmoothingSigmasPerLevel(list(smoothing_sigmas))
     init = sitk.CenteredTransformInitializer(
         fi, mi, sitk.Euler3DTransform(),
         sitk.CenteredTransformInitializerFilter.GEOMETRY)

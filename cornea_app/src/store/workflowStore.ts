@@ -137,6 +137,13 @@ interface WorkflowState {
   activeTab: string; // "consensus" or a scan caseId
   overlayMode: OverlayMode; // for a scan tab: its own scar vs the consensus
 
+  // Top-level "Debug" tab (replicate-alignment comparison). A GLOBAL developer view that covers the
+  // workspace — deliberately NOT part of activeTab, which routes the per-scan consensus tabs and is
+  // hard-reset to "consensus" by initTabs on every case change / resetForCase; folding Debug into it
+  // would kick the user out of the panel whenever any case opened. Also not cleared by resetForCase:
+  // it is not per-case state.
+  debugOpen: boolean;
+
   // Subgroup review: the consensus case to return to after focusing one of its scans
   // to correct it (survives the case switch — deliberately NOT cleared by resetForCase).
   reviewConsensusId: string | null;
@@ -259,6 +266,7 @@ export const useWorkflowStore = create<WorkflowState>()(
     previewGroup: null,
     activeTab: "consensus",
     overlayMode: "self",
+    debugOpen: false,
     reviewConsensusId: null,
 
     gtViewerActive: false,
@@ -342,6 +350,7 @@ export const useWorkflowStore = create<WorkflowState>()(
 
     selectTab: (tab) =>
       set((s) => {
+        s.debugOpen = false;   // picking a scan/consensus tab leaves the Debug view
         s.activeTab = tab;
         s.previewGroup = groupFor(tab, s.overlayMode);
         s.segVersion += 1;

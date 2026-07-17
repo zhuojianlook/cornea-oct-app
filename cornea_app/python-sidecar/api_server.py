@@ -54,6 +54,7 @@ import normal_baseline
 import oct_preprocess as oct_mod
 import oct_motion as oct_motion_mod
 import cohort as cohort_mod
+import debug_align
 
 app = FastAPI(title="Cornea OCT Segmentation Sidecar")
 
@@ -4540,6 +4541,69 @@ def train_run_delete(name: str) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": ok, "runs": nntrain.list_runs()}
+
+
+# ── Debug tab: replicate-alignment comparison ──────────────────────────────
+# Pick two repeat scans of one eye, run several alignment methods, and SEE the overlap as a
+# magenta(fixed)/green(moving) composite. Developer/adjudication tooling — it never writes to a
+# case; renders go to a temp cache dir (debug_align._RENDER_ROOT). See debug_align.py's docstring
+# for the methods, the metric's two load-bearing properties, and why TEASER++ is absent.
+class DebugAlignRequest(BaseModel):
+    fixed_case: str
+    moving_case: str
+    methods: List[str] | None = None
+
+
+@app.get("/api/debug/align/groups")
+def debug_align_groups() -> dict:
+    """Eyes with >=2 replicate scans. Handles BOTH case-naming schemes (see debug_align.parse_case:
+    scheme B `case_cs030_od_v1_2` MUST be matched before scheme A `case_cs001_os_v2`)."""
+    return {"groups": debug_align.groups()}
+
+
+@app.post("/api/debug/align/compare")
+def debug_align_compare(req: DebugAlignRequest) -> dict:
+    """Start an alignment comparison. Returns a job_id; poll /api/debug/align/job/{job_id}.
+
+    Runs in a background thread (the cohort pattern): a full run is tens of seconds — several
+    SimpleITK registrations plus a 33M-voxel FFT — and must not hold a threadpool worker that long.
+    Concurrent runs are serialised inside the worker, so a second job queues rather than thrashing
+    every core; it reports status "running" while it waits."""
+    try:
+        job_id = debug_align.start_compare(req.fixed_case, req.moving_case, req.methods)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Alignment comparison failed to start: {exc}")
+    return {"job_id": job_id}
+
+
+@app.get("/api/debug/align/job/{job_id}")
+def debug_align_job(job_id: str) -> dict:
+    """Live status/progress/results of a comparison job. `views` hold GET-able PNG URLs."""
+    view = debug_align.job_view(job_id)
+    if view is None:
+        raise HTTPException(404, "No such alignment job (it may have been pruned).")
+    return view
+
+
+@app.get("/api/debug/align/view/{job_id}/{name}")
+def debug_align_view(job_id: str, name: str) -> FileResponse:
+    """One rendered composite PNG. GET => token-exempt, so a plain <img src> loads it.
+    Path-traversal-guarded exactly like get_preview_file: a bare *.png basename only, and the
+    job_id is resolved through the same sanitiser rather than pasted into a path."""
+    safe_name = Path(name).name
+    if safe_name != name or not safe_name.lower().endswith(".png"):
+        raise HTTPException(400, "Invalid view file name.")
+    safe_job = orch.safe_case_id(job_id)
+    if safe_job != job_id:
+        raise HTTPException(400, "Invalid job id.")
+    p = debug_align.job_dir(safe_job) / safe_name
+    if not p.exists():
+        raise HTTPException(404, "View not found.")
+    return FileResponse(str(p), media_type="image/png")
 
 
 # ── Serve the built frontend (single-port mode) ────────────────────────────
