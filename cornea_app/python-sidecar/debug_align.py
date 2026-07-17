@@ -108,6 +108,19 @@ ZOOM_LAT_MM = 2.0        # zoom crop width around the apex
 # At 0.15 mm the moving surface fell outside the crop, hiding the very thing being adjudicated.
 ZOOM_UP_MM, ZOOM_DOWN_MM = 0.30, 0.55
 
+# ── 3-D replicate-agreement turntable (Debug tab "see the consensus in 3D") ────
+# A rotating MAXIMUM-INTENSITY PROJECTION turntable, rendered on the BACKEND (no second WebGL/niivue
+# instance — the Debug view covers the workspace and this desktop's GL stack is fragile). Two modes
+# per method, SAME camera/window/crop across every method and both modes (all per-job constants).
+TT_N_FRAMES = 24          # rotation frames; a full 360 turntable about the en-face vertical axis
+TT_ISO_MM = 0.035         # display grid: resample the anisotropic (~13x) crop to THIS isotropic mm
+                          # before rotating/MIP, or the MIP is geometrically wrong. Coarser than
+                          # reg.ISO (0.02) -> small cubes, fast rotate; fine enough for the cornea.
+TT_MAX_SPAN = 180         # cap the rotation-plane dimension; coarsen the iso grid if a wide FOV exceeds it
+TT_DILATE_MM = 0.30       # disagreement gate: dilate the FIXED tissue mask to SPAN the surface edge, so a
+                          # surface OFFSET (tissue in one scan, background in the other) is not masked out
+TT_HOT_PCT = 99.0         # disagreement normaliser: percentile of the IDENTITY diff, SHARED across methods
+
 METHODS: dict[str, str] = {
     "identity": "identity (no alignment)",
     "asis": "production as-is",
@@ -710,6 +723,170 @@ def _write_png(path: Path, rgb: np.ndarray) -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 3-D replicate-agreement turntable — rotating MIP, rendered on the backend
+# ═════════════════════════════════════════════════════════════════════════════
+# Two modes per method, the 3-D twin of the 2-D overlay:
+#   OVERLAP       magenta=fixed / green=aligned-moving / white=agree, MIP'd through the rotated volume.
+#   DISAGREEMENT  |fixed - aligned_moving| gated to the tissue edge, MIP'd through a HOT colormap over
+#                 dim anatomy. A residual TILT reads as a hot band along one edge; a genuine
+#                 per-replicate SCAR difference reads as a localised blob — both invisible on a single
+#                 slice, obvious in the round. THIS is the novel, high-value view.
+# Correctness that is NOT optional:
+#   * ANISOTROPY ~13x. The tissue-bbox crop is resampled to an ISOTROPIC mm grid BEFORE any rotation
+#     (a MIP through a rotated anisotropic array is geometrically wrong), anti-aliased along the
+#     downsampled axes — which also suppresses the independent per-scan speckle that would otherwise
+#     fill the disagreement view with noise instead of anatomy.
+#   * ONE window (lo,hi from the FIXED volume) for fixed and moving across every method and frame, so
+#     brightness cannot masquerade as disagreement.
+#   * The disagreement is normalised by a percentile of the IDENTITY diff, SHARED across methods, so a
+#     good aligner looks visibly COOLER than identity — that comparison is the whole point.
+# matplotlib is NOT a declared sidecar dependency, so the hot colormap is implemented in numpy.
+
+def _display_iso(spf, geom) -> float:
+    """Isotropic display spacing (mm): TT_ISO_MM, coarsened so the padded rotation cube's span stays
+    <= TT_MAX_SPAN. Depends ONLY on the per-job geom+spf, so it is identical for every method."""
+    l0, l1 = geom["lat"]
+    f0, f1 = geom["frames"]
+    ext_lat = (l1 - l0) * float(spf[0])
+    ext_fr = (f1 - f0) * float(spf[2])
+    iso = TT_ISO_MM
+    span = float(np.hypot(ext_lat / iso, ext_fr / iso))
+    if span > TT_MAX_SPAN:
+        iso *= span / TT_MAX_SPAN
+    return float(iso)
+
+
+def _iso_crop(v: np.ndarray, spf, geom: dict, iso: float, *, order: int = 1,
+              antialias: bool = True) -> np.ndarray:
+    """Crop to the FIXED tissue bbox and resample to an `iso`-mm ISOTROPIC grid. Anti-aliased along any
+    axis being downsampled (Nyquist sigma matched to the zoom) — that also suppresses the independent
+    per-scan speckle. Crop indices come from `geom` and are identical for the fixed and the moving
+    (same grid), so both land on the SAME iso lattice."""
+    l0, l1 = geom["lat"]
+    d0, d1 = geom["depth"]
+    f0, f1 = geom["frames"]
+    sub = np.asarray(v[l0:l1, d0:d1, f0:f1], np.float32)
+    fac = [float(spf[i]) / iso for i in range(3)]
+    if antialias:
+        sig = [0.5 / f if f < 1.0 else 0.0 for f in fac]   # smooth only the DOWNSAMPLED axes
+        if any(s > 0 for s in sig):
+            sub = ndi.gaussian_filter(sub, sig)
+    return ndi.zoom(sub, fac, order=order)
+
+
+def _pad_cube(v: np.ndarray) -> np.ndarray:
+    """Pad the rotation plane (axes 0 and 2) to a common square so every angle has identical canvas
+    dims — required for a scrubber and for cross-method comparability. Depth (axis 1) is untouched;
+    rotation is in the (0,2) plane, so depth-stacked sub-volumes never bleed into each other."""
+    s = int(np.ceil(np.hypot(v.shape[0], v.shape[2])))
+    out = np.zeros((s, v.shape[1], s), v.dtype)
+    a = (s - v.shape[0]) // 2
+    c = (s - v.shape[2]) // 2
+    out[a:a + v.shape[0], :, c:c + v.shape[2]] = v
+    return out
+
+
+def _hot(t: np.ndarray) -> np.ndarray:
+    """Classic MATLAB 'hot' colormap, self-contained (matplotlib is not a declared sidecar dep).
+    t in [0,1] -> (..., 3) uint8: black -> red -> yellow -> white."""
+    r = np.clip(3.0 * t, 0.0, 1.0)
+    g = np.clip(3.0 * t - 1.0, 0.0, 1.0)
+    b = np.clip(3.0 * t - 2.0, 0.0, 1.0)
+    return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+
+
+def render_turntable(vf: np.ndarray, m_res: np.ndarray, spf, geom: dict, lo: float, hi: float,
+                     tissue: np.ndarray, out_dir: Path, method: str, *,
+                     n_frames: int = TT_N_FRAMES, scale: float | None = None) -> dict:
+    """Render the OVERLAP + DISAGREEMENT rotating-MIP frames for one method. `m_res` is the moving
+    ALREADY resampled onto the fixed grid (identical shape+spacing to vf), the same array the 2-D
+    renderer and the surface residual consume. `tissue` is the FIXED volume's cleaned tissue mask.
+
+    Returns {"frames": {"overlap": [names], "disagreement": [names]}, "n_frames": N, "scale": s,
+    "disagree_mean": a}. `scale` (the identity diff percentile) is REUSED across methods when passed;
+    when None it is computed here — identity is always the first method — and returned for the rest,
+    so the hot maps are directly comparable and a good aligner reads visibly cooler."""
+    iso = _display_iso(spf, geom)
+    f_iso = _pad_cube(_iso_crop(vf, spf, geom, iso, order=1))
+    m_iso = _pad_cube(_iso_crop(m_res, spf, geom, iso, order=1))
+    t_iso = _pad_cube(_iso_crop(np.asarray(tissue, np.float32), spf, geom, iso,
+                                order=0, antialias=False)) > 0.5
+    # Coverage = where the aligned moving is IN its FOV (exactly 0 marks the out-of-FOV region a
+    # rotation evicts). Cropped nearest-neighbour from the UNSMOOTHED m_res so the boundary is crisp.
+    cov = _pad_cube(_iso_crop((np.asarray(m_res) > 0).astype(np.float32), spf, geom, iso,
+                              order=0, antialias=False)) > 0.5
+
+    # Gate the disagreement to the tissue EDGE, INSIDE the shared FOV:
+    #  * DILATE the fixed tissue mask (load-bearing): a surface offset is bright in one scan and dark
+    #    (background) in the other, so a tissue-ONLY gate would zero out the very band that IS the
+    #    disagreement — the metric spans the edge for the same reason (its dil0.2 mask).
+    #  * AND with coverage: an alignment that ROTATES tissue out of the FOV leaves missing data, not a
+    #    disagreement — painting that rim hot would penalise a good aligner (the eviction shows up as
+    #    magenta-only in the OVERLAP view instead). Without this, a MIP amplifies the evicted rim into
+    #    hot streaks and a good aligner can read HOTTER than identity — the opposite of the truth.
+    it = max(1, int(round(TT_DILATE_MM / iso)))
+    gate = ndi.binary_dilation(t_iso, ndi.generate_binary_structure(3, 1), iterations=it) & cov
+    diff = np.abs(f_iso - m_iso)
+    diff[~gate] = 0.0
+
+    # Rotate fixed, moving and diff together in ONE call: stacked along the depth axis (axis 1),
+    # which the (0,2)-plane rotation never touches, so the three sub-cubes cannot bleed into each
+    # other. MIP-of-diff (not diff-of-MIPs) is required: collapsing depth into a MIP first would hide
+    # a surface DEPTH offset, the very tilt this view exists to reveal.
+    nd = f_iso.shape[1]
+    stack = np.concatenate([f_iso, m_iso, diff], axis=1)
+    angles = np.linspace(0.0, 360.0, int(n_frames), endpoint=False)
+    ov_names: list[str] = []
+    d_mips: list[np.ndarray] = []          # cached projected disagreement per angle
+    bases: list[np.ndarray] = []           # cached windowed fixed MIP (the dim anatomy base)
+    # PASS 1: rotate + MIP once per angle. Overlap needs no scale, so write it now; cache the
+    # disagreement MIP so the hot map can be calibrated to the PROJECTED values without re-rotating.
+    for i, a in enumerate(angles):
+        sr = ndi.rotate(stack, float(a), axes=(0, 2), reshape=False, order=1,
+                        mode="constant", cval=0.0)
+        f_mip = sr[:, :nd, :].max(axis=2).T           # (depth, span): vertical = depth
+        m_mip = sr[:, nd:2 * nd, :].max(axis=2).T
+        d_mip = sr[:, 2 * nd:, :].max(axis=2).T
+
+        f8, m8 = _win(f_mip, lo, hi), _win(m_mip, lo, hi)
+        ov = out_dir / f"{method}_t3d_overlap_{i:02d}.png"
+        _write_png(ov, _aspect_resize(np.dstack([f8, m8, f8]), iso, iso))   # already iso -> true aspect
+        ov_names.append(ov.name)
+        d_mips.append(d_mip)
+        bases.append(f8)
+
+    # Calibrate the hot colormap to the DISPLAYED (projected) disagreement, not the per-voxel volume:
+    # a MIP is the max along the ray, so a per-voxel percentile would saturate even a good aligner.
+    # The scale is a high percentile of the IDENTITY MIP (identity runs first) and is SHARED across
+    # methods, so a good aligner's frames read visibly COOLER — the whole point of the view.
+    if scale is None:
+        allmip = np.concatenate([dm.ravel() for dm in d_mips])
+        pos = allmip[allmip > 0]
+        scale = float(np.percentile(pos, TT_HOT_PCT)) if pos.size else 0.0
+        if not (scale > 0):
+            scale = max(1e-6, float(hi - lo) * 0.05)
+
+    # PASS 2: map the cached MIPs through the shared scale (arithmetic only — no re-rotation).
+    dis_names: list[str] = []
+    hot_sum, hot_n = 0.0, 0
+    for i, (d_mip, f8) in enumerate(zip(d_mips, bases)):
+        tnorm = np.clip(d_mip / scale, 0.0, 1.0)
+        base = f8 // 4                                 # dim anatomy so a hotspot stays localisable
+        rgb = np.maximum(np.dstack([base, base, base]), _hot(tnorm))
+        di = out_dir / f"{method}_t3d_disagree_{i:02d}.png"
+        _write_png(di, _aspect_resize(rgb, iso, iso))
+        dis_names.append(di.name)
+        anat = f8 > 0                                  # score hotness over the projected anatomy only
+        if anat.any():
+            hot_sum += float(tnorm[anat].sum())
+            hot_n += int(anat.sum())
+    disagree_mean = float(hot_sum / hot_n) if hot_n else 0.0
+
+    return {"frames": {"overlap": ov_names, "disagreement": dis_names},
+            "n_frames": int(n_frames), "scale": float(scale), "disagree_mean": disagree_mean}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Surface residual — the GEOMETRIC truth, and the number that should be ranked on
 # ═════════════════════════════════════════════════════════════════════════════
 # WHY THIS EXISTS. 'primary' (NCC over a dilated mask) scored the 2-constant fix (0.8547) and the
@@ -943,7 +1120,8 @@ def _sweep_once() -> None:
         pass
 
 
-def start_compare(fixed_case: str, moving_case: str, methods: list[str] | None) -> str:
+def start_compare(fixed_case: str, moving_case: str, methods: list[str] | None,
+                  render_3d: bool = False) -> str:
     _sweep_once()
     fixed_case, moving_case = orch.safe_case_id(fixed_case), orch.safe_case_id(moving_case)
     for c in (fixed_case, moving_case):
@@ -962,16 +1140,19 @@ def start_compare(fixed_case: str, moving_case: str, methods: list[str] | None) 
             "status": "running", "progress": 0.0, "error": None, "results": [],
             "fixed_case": fixed_case, "moving_case": moving_case, "methods": ms,
             "running": True, "started": time.time(), "geometry": None, "note": None,
+            "render_3d": bool(render_3d),
         }
     job_dir(job_id).mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=_worker, args=(job_id, fixed_case, moving_case, ms), daemon=True).start()
+    threading.Thread(target=_worker, args=(job_id, fixed_case, moving_case, ms, bool(render_3d)),
+                     daemon=True).start()
     return job_id
 
 
-def _worker(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
+def _worker(job_id: str, fixed_case: str, moving_case: str, ms: list[str],
+            render_3d: bool = False) -> None:
     try:
         with _RUN_LOCK:
-            _run(job_id, fixed_case, moving_case, ms)
+            _run(job_id, fixed_case, moving_case, ms, render_3d)
     except Exception as exc:  # noqa: BLE001 — a job must never take the sidecar down
         _set(job_id, status="error", error=f"{type(exc).__name__}: {exc}", progress=1.0, running=False)
     finally:
@@ -985,7 +1166,8 @@ def _worker(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> No
         _prune_jobs()
 
 
-def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
+def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str],
+         render_3d: bool = False) -> None:
     out_dir = job_dir(job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -998,6 +1180,9 @@ def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
     masks = _fixed_masks(vf, spf)          # ~1.3 s, once — shared by the geometry and the residual
     geom = view_geometry(vf, spf, masks)
     ref = surface_reference(vf, spf, geom, masks)
+    # The 3-D disagreement gate needs the FIXED tissue mask; keep it (only when 3-D is on) rather
+    # than recomputing the ~1.3 s _clean_tissue per method.
+    tissue = masks["tissue"] if render_3d else None
     del masks
     lo, hi = window_from_fixed(vf)
     note = None
@@ -1018,6 +1203,9 @@ def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
 
     # Identity FIRST: every other method's delta is measured against it.
     id_primary: float | None = None
+    # The 3-D disagreement normaliser: computed from IDENTITY's diff (the first method) and reused for
+    # every method, so a good aligner's hot map is directly comparable and reads visibly cooler.
+    tt_scale: float | None = None
     step = 0.86 / max(len(ms), 1)
 
     for n, method in enumerate(ms):
@@ -1062,6 +1250,25 @@ def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
             m_res = _from_sitk(sitk.Resample(mi, fi, _tx(R, t), sitk.sitkLinear, 0.0, sitk.sitkFloat32))
             views = render_views(vf, m_res, spf, geom, lo, hi, out_dir, method)
             extra.update(surface_residual(ref, m_res))   # ~40 ms, reuses the render's resampling
+
+            # 3-D turntable (opt-in). Rendered in its OWN try/except so a 3-D failure degrades to a
+            # null turntable instead of losing this method's 2-D result. `tissue` is the FIXED mask.
+            tt = None
+            if render_3d and tissue is not None:
+                try:
+                    ttr = render_turntable(vf, m_res, spf, geom, lo, hi, tissue, out_dir, method,
+                                           n_frames=TT_N_FRAMES, scale=tt_scale)
+                    if tt_scale is None:
+                        tt_scale = float(ttr["scale"])
+                    tt = {"overlap": [f"/api/debug/align/view/{job_id}/{v}"
+                                      for v in ttr["frames"]["overlap"]],
+                          "disagreement": [f"/api/debug/align/view/{job_id}/{v}"
+                                           for v in ttr["frames"]["disagreement"]],
+                          "n_frames": int(ttr["n_frames"]), "axis": "enface"}
+                    extra["disagree_mean"] = float(ttr["disagree_mean"])
+                except Exception as exc:  # noqa: BLE001 — a 3-D failure must not lose the 2-D result
+                    tt = None
+                    extra["turntable_error"] = f"{type(exc).__name__}: {exc}"
             del m_res
 
             _append_result(job_id, {
@@ -1075,6 +1282,7 @@ def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
                 "ncc_in": float(s["ncc_in"]), "nmi": float(s["nmi"]),
                 "runtime_s": round(time.time() - t0, 2),
                 "views": {k: f"/api/debug/align/view/{job_id}/{v}" for k, v in views.items()},
+                "turntable": tt,
                 **extra,
             })
         except Exception as exc:  # noqa: BLE001 — one bad method must not kill the job
@@ -1083,6 +1291,7 @@ def _run(job_id: str, fixed_case: str, moving_case: str, ms: list[str]) -> None:
                 "error": f"{type(exc).__name__}: {exc}", "rot_deg": None, "t_mm": None,
                 "primary": None, "identity_primary": id_primary, "delta": None,
                 "frac_out": None, "runtime_s": round(time.time() - t0, 2), "views": {},
+                "turntable": None,
                 # Explicit nulls: the UI renders a residual column for every row.
                 "resid_vox": None, "resid_um": None, "tilt_vox": None, "resid_max_vox": None,
                 "resid_saturated": False,

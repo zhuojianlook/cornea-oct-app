@@ -428,6 +428,81 @@ def test_fixed_masks_reuse_matches_computing_them_inline():
     assert da.view_geometry(v, _RSP) == da.view_geometry(v, _RSP, da._fixed_masks(v, _RSP))
 
 
+# ── 3-D replicate-agreement turntable ────────────────────────────────────────
+def test_display_iso_coarsens_only_a_wide_fov():
+    sp = [0.01, 0.005, 0.04]
+    small = {"lat": [0, 20], "depth": [0, 40], "frames": [0, 20]}
+    assert da._display_iso(sp, small) == pytest.approx(da.TT_ISO_MM)
+    big = {"lat": [0, 4000], "depth": [0, 40], "frames": [0, 4000]}
+    iso = da._display_iso(sp, big)
+    assert iso > da.TT_ISO_MM
+    span = np.hypot(4000 * sp[0] / iso, 4000 * sp[2] / iso)   # capped at TT_MAX_SPAN
+    assert span == pytest.approx(da.TT_MAX_SPAN, rel=1e-6)
+
+
+def test_pad_cube_squares_the_rotation_plane_and_preserves_content():
+    v = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+    out = da._pad_cube(v)
+    assert out.shape[0] == out.shape[2]            # square rotation plane (axes 0,2)
+    assert out.shape[1] == 3                        # depth (axis 1) untouched
+    assert out.sum() == pytest.approx(v.sum())      # only zero padding was added
+
+
+def test_hot_colormap_runs_black_to_white():
+    assert (da._hot(np.array(0.0)) == 0).all()
+    assert (da._hot(np.array(1.0)) == 255).all()
+    mid = da._hot(np.array(0.34))                   # ~1/3 of the way: full red, no green yet
+    assert mid[0] > 200 and mid[1] < 60
+
+
+def _tt_inputs(v):
+    masks = da._fixed_masks(v, _RSP)
+    geom = da.view_geometry(v, _RSP, masks)
+    lo, hi = da.window_from_fixed(v)
+    return _RSP, geom, lo, hi, masks["tissue"]
+
+
+def test_render_turntable_emits_named_frames_for_both_modes(tmp_path):
+    v = _slab(60, shape=(40, 160, 24))
+    sp, geom, lo, hi, tissue = _tt_inputs(v)
+    N = 6
+    r = da.render_turntable(v, _shift_frames(v, np.full(24, 8)), sp, geom, lo, hi, tissue,
+                            tmp_path, "identity", n_frames=N, scale=None)
+    assert r["n_frames"] == N and r["scale"] > 0
+    for mode, tag in (("overlap", "overlap"), ("disagreement", "disagree")):
+        names = r["frames"][mode]
+        assert len(names) == N
+        for i, name in enumerate(names):
+            assert name == f"identity_t3d_{tag}_{i:02d}.png"
+            assert (tmp_path / name).exists()          # GET-able by the existing view endpoint
+
+
+def test_render_turntable_disagreement_is_hotter_for_a_worse_alignment(tmp_path):
+    """THE point of the disagreement view: a misaligned pair reads visibly HOTTER than an aligned
+    one AT THE SAME (identity-derived) scale — the numeric twin of 'identity hotter than fixed'."""
+    v = _slab(60, shape=(40, 160, 24))
+    sp, geom, lo, hi, tissue = _tt_inputs(v)
+    worse = da.render_turntable(v, _shift_frames(v, np.full(24, 8)), sp, geom, lo, hi, tissue,
+                                tmp_path, "identity", n_frames=4, scale=None)
+    better = da.render_turntable(v, v, sp, geom, lo, hi, tissue, tmp_path, "fixed",
+                                 n_frames=4, scale=worse["scale"])   # SHARED scale
+    assert 0.0 <= better["disagree_mean"] <= 1.0
+    assert worse["disagree_mean"] > better["disagree_mean"]
+    assert better["disagree_mean"] == pytest.approx(0.0, abs=1e-6)   # a perfect match is cool
+
+
+def test_render_turntable_frames_share_one_canvas_size(tmp_path):
+    """A scrubber and cross-method comparison require an identical canvas at every angle."""
+    from PIL import Image
+    v = _slab(60, shape=(40, 160, 24))
+    sp, geom, lo, hi, tissue = _tt_inputs(v)
+    r = da.render_turntable(v, _shift_frames(v, np.full(24, 6)), sp, geom, lo, hi, tissue,
+                            tmp_path, "identity", n_frames=4, scale=None)
+    sizes = {Image.open(tmp_path / n).size
+             for n in r["frames"]["overlap"] + r["frames"]["disagreement"]}
+    assert len(sizes) == 1
+
+
 # ── orphan render dirs ───────────────────────────────────────────────────────
 def test_sweep_removes_stale_dirs_only(tmp_path, monkeypatch):
     """_prune_jobs only knows the in-memory _JOBS, so on restart every prior job dir is orphaned and

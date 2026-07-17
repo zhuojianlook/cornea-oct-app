@@ -4552,6 +4552,9 @@ class DebugAlignRequest(BaseModel):
     fixed_case: str
     moving_case: str
     methods: List[str] | None = None
+    # Opt-in 3-D turntable render (heavier). When false/absent the 2-D path is unchanged; when true
+    # each method result also carries `turntable` (rotating overlap + hot-disagreement MIP frames).
+    render_3d: bool = False
 
 
 @app.get("/api/debug/align/groups")
@@ -4570,7 +4573,8 @@ def debug_align_compare(req: DebugAlignRequest) -> dict:
     Concurrent runs are serialised inside the worker, so a second job queues rather than thrashing
     every core; it reports status "running" while it waits."""
     try:
-        job_id = debug_align.start_compare(req.fixed_case, req.moving_case, req.methods)
+        job_id = debug_align.start_compare(req.fixed_case, req.moving_case, req.methods,
+                                           render_3d=req.render_3d)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except ValueError as exc:

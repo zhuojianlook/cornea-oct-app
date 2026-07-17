@@ -14,6 +14,8 @@ import { api, resourceUrl } from "../api/client";
 
 export type MethodId = "identity" | "asis" | "fixed" | "bruteforce";
 export type ViewId = "bscan" | "sagittal" | "zoom";
+/** The two 3-D turntable modes. Keys match the backend `turntable` dict verbatim (no mapping layer). */
+export type Mode3d = "overlap" | "disagreement";
 export type Layout = "grid" | "flip";
 
 /** The methods offered, in a FIXED display order — identity first, because it is the reference every
@@ -77,9 +79,42 @@ export const ALIGN_VIEWS: { id: ViewId; label: string; hint: string }[] = [
   { id: "zoom", label: "Zoom", hint: "Zoomed on the cornea, where a sub-voxel misalignment is actually visible." },
 ];
 
+/** The two 3-D turntable modes, offered ALONGSIDE the 2-D views. Selecting one is what makes the run
+    request the (heavier) 3-D render — see `run()`. Same magenta/green convention as the 2-D overlap for
+    OVERLAP; a hot |diff| MIP for DISAGREEMENT (the novel view). */
+export const ALIGN_MODES_3D: { id: Mode3d; label: string; hint: string }[] = [
+  {
+    id: "overlap",
+    label: "3D Overlap",
+    hint:
+      "3-D magenta/green MIP of the aligned pair, rotating about the en-face axis. White/grey where the two " +
+      "replicates agree, coloured fringes where they don't — the round-view twin of the 2-D overlay.",
+  },
+  {
+    id: "disagreement",
+    label: "3D Disagreement",
+    hint:
+      "3-D MIP of |fixed − moving| inside the tissue, hot where the replicates differ. A residual TILT reads " +
+      "as a band along one edge; a genuine per-replicate SCAR difference reads as a localized blob — both " +
+      "invisible on a single slice, obvious in the round.",
+  },
+];
+
 export interface AlignGroup {
   eye: string;
   cases: string[];
+}
+
+/** The per-method 3-D turntable payload (present only when the run was launched with render_3d=true and the
+    method did not error). Each mode is an ORDERED list of frame PNG URLs — the SAME N frames, camera, window
+    and crop across every method and both modes, so flipping methods or scrubbing the angle keeps the pose
+    locked and only the fringes/hotspots move. `overlap` = magenta(fixed)/green(moving)/white(agree) MIP;
+    `disagreement` = hot |fixed−moving| MIP over dim anatomy. URLs are GET-able by an <img> (token-exempt). */
+export interface Turntable {
+  overlap?: string[] | null;
+  disagreement?: string[] | null;
+  n_frames?: number;
+  axis?: string;
 }
 
 export interface AlignResult {
@@ -107,6 +142,10 @@ export interface AlignResult {
   resid_um?: number | null;
   resid_vox?: number | null;
   tilt_vox?: number | null;
+
+  /** 3-D turntable frames for this method (see Turntable). null when the run was 2-D-only or the method
+      errored — the 3-D card then shows a spinner (still rendering) or the method's error. */
+  turntable?: Turntable | null;
 }
 
 /** Backend job-level geometry detail (shapes/spacings of the pair + the render window). Also carries
@@ -147,6 +186,14 @@ const DEFAULT_MOVING = "case_cs001_os_v3";
 const POLL_MS = 900;
 const MAX_POLL_FAILURES = 5; // tolerate a blip; give up before spinning forever on a dead sidecar
 
+// Respect the OS "reduce motion" setting for the turntable's DEFAULT: the auto-rotate spinner is a moving
+// animation, so if the user has asked for less motion we start paused (they can still opt in). Read once at
+// module load; the component also re-checks live so a mid-session OS change is honoured.
+const prefersReducedMotion =
+  typeof window !== "undefined" &&
+  typeof window.matchMedia === "function" &&
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 interface DebugState {
   groups: AlignGroup[];
   groupsBusy: boolean;
@@ -170,6 +217,15 @@ interface DebugState {
   layout: Layout;
   focus: MethodId; // the method shown large in flip layout
 
+  /* 3-D turntable axis. `mode3d` null = a 2-D view is active; a value = a 3-D turntable is active (and the
+     next run renders 3-D). `rotIdx` is the SHARED frame index every method's turntable rotates to, so the
+     row stays in one pose. `render3d` tracks whether the CURRENT results carry 3-D turntables — it gates the
+     lazy auto-render (don't re-run if the data is already there) and resets whenever the pair changes. */
+  mode3d: Mode3d | null;
+  rotIdx: number;
+  autoRotate: boolean;
+  render3d: boolean;
+
   loadGroups: () => Promise<void>;
   selectEye: (eye: string) => void;
   setFixed: (c: string) => void;
@@ -177,6 +233,10 @@ interface DebugState {
   swapPair: () => void;
   toggleMethod: (m: MethodId) => void;
   setView: (v: ViewId) => void;
+  setMode3d: (m: Mode3d | null) => void;
+  setRotIdx: (i: number) => void;
+  stepRot: (n: number) => void;
+  setAutoRotate: (on: boolean) => void;
   setLayout: (l: Layout) => void;
   setFocus: (m: MethodId) => void;
   cycleFocus: (dir: 1 | -1) => void;
@@ -206,6 +266,11 @@ export const useDebugStore = create<DebugState>()(
     view: "bscan",
     layout: "grid",
     focus: "identity",
+
+    mode3d: null,
+    rotIdx: 0,
+    autoRotate: !prefersReducedMotion, // start paused when the OS asks for reduced motion
+    render3d: false,
 
     // Lazy by design: nothing fetches until the Debug tab mounts the panel and calls this.
     loadGroups: async () => {
@@ -254,6 +319,7 @@ export const useDebugStore = create<DebugState>()(
         s.results = []; // results belong to the old pair — never show them under a new one
         s.note = null;  // ...and so does the geometry note: showing it under a new pair would be a lie
         s.geometry = null;
+        s.render3d = false; // the new pair has no 3-D turntables yet — a 3-D mode re-renders them lazily
         s.error = null;
         s.progress = 0;
       }),
@@ -270,6 +336,7 @@ export const useDebugStore = create<DebugState>()(
         s.results = [];
         s.note = null;
         s.geometry = null;
+        s.render3d = false; // the new pair has no 3-D turntables yet — a 3-D mode re-renders them lazily
         s.error = null;
       }),
 
@@ -284,6 +351,7 @@ export const useDebugStore = create<DebugState>()(
         s.results = [];
         s.note = null;
         s.geometry = null;
+        s.render3d = false; // the new pair has no 3-D turntables yet — a 3-D mode re-renders them lazily
         s.error = null;
       }),
 
@@ -295,6 +363,7 @@ export const useDebugStore = create<DebugState>()(
         s.results = []; // magenta/green swap meaning with the pair — stale images would mislead
         s.note = null;  // the note names fixed/moving — it is wrong the moment they swap
         s.geometry = null;
+        s.render3d = false; // the new pair has no 3-D turntables yet — a 3-D mode re-renders them lazily
         s.error = null;
       }),
 
@@ -305,6 +374,14 @@ export const useDebugStore = create<DebugState>()(
       }),
 
     setView: (v) => set((s) => { s.view = v; }),
+    // Selecting a 3-D mode only flips the axis; the component's lazy effect notices `render3d` is false and
+    // fires the (heavier) 3-D render — so 2-D runs stay light and 3-D is never requested until asked for.
+    setMode3d: (m) => set((s) => { s.mode3d = m; }),
+    setRotIdx: (i) => set((s) => { s.rotIdx = i < 0 ? 0 : Math.round(i); }),
+    // Advance one frame with wraparound — driven by the auto-rotate timer. Takes n from the component so the
+    // timer callback never closes over a stale frame count.
+    stepRot: (n) => set((s) => { if (n > 0) s.rotIdx = (s.rotIdx + 1) % n; }),
+    setAutoRotate: (on) => set((s) => { s.autoRotate = on; }),
     setLayout: (l) => set((s) => { s.layout = l; }),
     setFocus: (m) => set((s) => { s.focus = m; }),
 
@@ -326,6 +403,10 @@ export const useDebugStore = create<DebugState>()(
         return;
       }
       const list = ALIGN_METHODS.filter((m) => m.locked || methods[m.id]).map((m) => m.id);
+      // 3-D is opt-in: only render the (heavier) turntable when a 3-D mode is the active axis. The flag is
+      // set NOW (not on completion) so the lazy render effect sees the render in-flight and never double-fires
+      // — and it stays set even if the run errors, so a failing sidecar can't spin the effect into a loop.
+      const wants3d = get().mode3d != null;
       const token = get().runToken + 1;
       set((s) => {
         s.runToken = token;
@@ -335,6 +416,7 @@ export const useDebugStore = create<DebugState>()(
         s.results = [];
         s.note = null;
         s.geometry = null;
+        s.render3d = wants3d;
       });
       // A newer run (or a pair change) supersedes this one — drop its writes instead of racing them.
       const current = () => get().runToken === token;
@@ -342,7 +424,7 @@ export const useDebugStore = create<DebugState>()(
         const { job_id } = await api.json<{ job_id: string }>(
           "/api/debug/align/compare",
           "POST",
-          JSON.stringify({ fixed_case: fixedCase, moving_case: movingCase, methods: list }),
+          JSON.stringify({ fixed_case: fixedCase, moving_case: movingCase, methods: list, render_3d: wants3d }),
         );
         if (!current()) return;
         if (!job_id) throw new Error("The sidecar did not return a job id.");
