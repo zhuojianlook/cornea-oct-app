@@ -4552,8 +4552,9 @@ class DebugAlignRequest(BaseModel):
     fixed_case: str
     moving_case: str
     methods: List[str] | None = None
-    # Opt-in 3-D turntable render (heavier). When false/absent the 2-D path is unchanged; when true
-    # each method result also carries `turntable` (rotating overlap + hot-disagreement MIP frames).
+    # Opt-in 3-D interactive volumes. When false/absent the 2-D path is unchanged; when true the job
+    # writes a shared `fixed_iso.nii.gz` (job-level `fixed3d`/`iso_mm`) plus per-method aligned-moving
+    # + disagreement .nii.gz (result `volumes3d`), which the Debug tab renders LIVE in niivue.
     render_3d: bool = False
 
 
@@ -4595,11 +4596,18 @@ def debug_align_job(job_id: str) -> dict:
 
 @app.get("/api/debug/align/view/{job_id}/{name}")
 def debug_align_view(job_id: str, name: str) -> FileResponse:
-    """One rendered composite PNG. GET => token-exempt, so a plain <img src> loads it.
-    Path-traversal-guarded exactly like get_preview_file: a bare *.png basename only, and the
-    job_id is resolved through the same sanitiser rather than pasted into a path."""
+    """One rendered composite PNG (2-D views) or interactive 3-D volume (.nii.gz). GET => token-exempt,
+    so a plain <img src> or niivue's own fetch loads it directly. Path-traversal-guarded exactly like
+    get_preview_file: a bare *.png / *.nii.gz basename only, and the job_id is resolved through the
+    same sanitiser rather than pasted into a path.
+
+    The .nii.gz is served with media_type application/gzip and NO Content-Encoding header: niivue picks
+    its gunzip decoder from the .nii.gz URL extension, so a Content-Encoding: gzip would make the
+    browser double-decompress and break niivue's own gunzip."""
     safe_name = Path(name).name
-    if safe_name != name or not safe_name.lower().endswith(".png"):
+    low = safe_name.lower()
+    is_png, is_nii = low.endswith(".png"), low.endswith(".nii.gz")
+    if safe_name != name or not (is_png or is_nii):
         raise HTTPException(400, "Invalid view file name.")
     safe_job = orch.safe_case_id(job_id)
     if safe_job != job_id:
@@ -4607,7 +4615,45 @@ def debug_align_view(job_id: str, name: str) -> FileResponse:
     p = debug_align.job_dir(safe_job) / safe_name
     if not p.exists():
         raise HTTPException(404, "View not found.")
-    return FileResponse(str(p), media_type="image/png")
+    return FileResponse(str(p), media_type="image/png" if is_png else "application/gzip")
+
+
+# ── Debug tab: N-replicate consensus (all replicates of one eye, in one 3-D volume) ──
+# The N-way generalisation of the pairwise magenta/green/white overlay: ALL replicates of the eye are
+# aligned to the first (reference) by ONE chosen method and composited into a single min/excess RGBA
+# volume — agreement=white, each replicate its own hue. niivue renders the RGBA .nii.gz directly in
+# 3-D (colours baked backend-side, so there is no client windowing to mis-scale). Same long-job
+# pattern as compare; the RGBA volume + 2-D composite PNGs are served by the token-exempt view route.
+class ConsensusRequest(BaseModel):
+    eye: str
+    method: str = "fixed"
+
+
+@app.post("/api/debug/consensus")
+def debug_consensus(req: ConsensusRequest) -> dict:
+    """Start an N-replicate consensus render for one eye. Returns a job_id; poll
+    /api/debug/consensus/job/{job_id}. Runs in a background thread serialised with the pairwise
+    compare job (a second click queues rather than thrashing every core)."""
+    try:
+        job_id = debug_align.start_consensus(req.eye, req.method)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Consensus render failed to start: {exc}")
+    return {"job_id": job_id}
+
+
+@app.get("/api/debug/consensus/job/{job_id}")
+def debug_consensus_job(job_id: str) -> dict:
+    """Live status/progress/result of a consensus job. `volume` is the RGBA .nii.gz URL (min/excess
+    composite of every replicate), `replicates` the per-replicate colour legend, `slices` the matching
+    2-D composite PNGs — all served via the existing token-exempt /api/debug/align/view route."""
+    view = debug_align.consensus_job_view(job_id)
+    if view is None:
+        raise HTTPException(404, "No such consensus job (it may have been pruned).")
+    return view
 
 
 # ── Serve the built frontend (single-port mode) ────────────────────────────

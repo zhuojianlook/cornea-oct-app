@@ -428,79 +428,107 @@ def test_fixed_masks_reuse_matches_computing_them_inline():
     assert da.view_geometry(v, _RSP) == da.view_geometry(v, _RSP, da._fixed_masks(v, _RSP))
 
 
-# ── 3-D replicate-agreement turntable ────────────────────────────────────────
-def test_display_iso_coarsens_only_a_wide_fov():
-    sp = [0.01, 0.005, 0.04]
-    small = {"lat": [0, 20], "depth": [0, 40], "frames": [0, 20]}
-    assert da._display_iso(sp, small) == pytest.approx(da.TT_ISO_MM)
-    big = {"lat": [0, 4000], "depth": [0, 40], "frames": [0, 4000]}
-    iso = da._display_iso(sp, big)
-    assert iso > da.TT_ISO_MM
-    span = np.hypot(4000 * sp[0] / iso, 4000 * sp[2] / iso)   # capped at TT_MAX_SPAN
-    assert span == pytest.approx(da.TT_MAX_SPAN, rel=1e-6)
+# ── 3-D interactive replicate-agreement volumes ──────────────────────────────
+def test_dbg_affine_orients_like_the_main_viewer():
+    """niivue derives the initial camera pose from the affine; it must match the app's preview volumes
+    (axcodes L,I,P: lat->X, depth->Z, frames->Y) so the cornea shows the right way up."""
+    import nibabel as nib
+    aff = da._dbg_affine(0.02)
+    assert nib.aff2axcodes(aff) == ("L", "I", "P")
+    # isotropic spacing recovered from the affine columns
+    assert np.allclose(np.linalg.norm(aff[:3, :3], axis=0), [0.02, 0.02, 0.02])
 
 
-def test_pad_cube_squares_the_rotation_plane_and_preserves_content():
-    v = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
-    out = da._pad_cube(v)
-    assert out.shape[0] == out.shape[2]            # square rotation plane (axes 0,2)
-    assert out.shape[1] == 3                        # depth (axis 1) untouched
-    assert out.sum() == pytest.approx(v.sum())      # only zero padding was added
+def test_write_nifti_round_trips_on_the_iso_grid(tmp_path):
+    """Written .nii.gz must load back with the same voxels, the iso spacing, and the debug affine —
+    exactly what niivue fetches from the token-exempt view endpoint."""
+    import nibabel as nib
+    arr = (np.arange(3 * 4 * 5, dtype=np.float32).reshape(3, 4, 5))
+    p = tmp_path / "fixed_iso.nii.gz"
+    da._write_nifti(p, arr, 0.02, np.uint16)
+    img = nib.load(str(p))
+    assert np.array_equal(np.asarray(img.dataobj), arr.astype(np.uint16))
+    assert np.allclose(img.header.get_zooms()[:3], [0.02, 0.02, 0.02])
+    assert nib.aff2axcodes(img.affine) == ("L", "I", "P")
 
 
-def test_hot_colormap_runs_black_to_white():
-    assert (da._hot(np.array(0.0)) == 0).all()
-    assert (da._hot(np.array(1.0)) == 255).all()
-    mid = da._hot(np.array(0.34))                   # ~1/3 of the way: full red, no green yet
-    assert mid[0] > 200 and mid[1] < 60
+def test_write_nifti_clips_uint16_range(tmp_path):
+    import nibabel as nib
+    arr = np.array([[[-5.0, 70000.0]]], np.float32)
+    p = tmp_path / "clip.nii.gz"
+    da._write_nifti(p, arr, 0.02, np.uint16)
+    got = np.asarray(nib.load(str(p)).dataobj)
+    assert got.min() == 0 and got.max() == 65535
 
 
-def _tt_inputs(v):
+def test_build_disagree_gates_to_the_tissue_edge_within_coverage():
+    """The gate = dilated fixed tissue AND moving coverage. Disagreement outside coverage (FOV
+    eviction) or far from tissue must be zeroed, never mistaken for a real difference."""
+    f = np.zeros((10, 10, 10), np.float32)
+    f[3:7, 3:7, 3:7] = 100.0
+    m = f.copy()
+    m[5, 5, 5] = 900.0                              # a genuine in-tissue difference
+    tissue = f > 0
+    cov = np.ones_like(tissue, bool)
+    cov[:2, :, :] = False                           # a rim the moving does NOT cover
+    diff, gate = da.build_disagree(f, m, tissue, cov, 0.02)
+    assert diff[5, 5, 5] == pytest.approx(800.0)    # the real difference survives
+    assert not diff[:2, :, :].any()                 # uncovered rim is zeroed
+    assert (diff[~gate] == 0.0).all()
+
+
+def _v3d_inputs(v):
     masks = da._fixed_masks(v, _RSP)
     geom = da.view_geometry(v, _RSP, masks)
-    lo, hi = da.window_from_fixed(v)
-    return _RSP, geom, lo, hi, masks["tissue"]
+    iso = da.DBG_ISO_MM
+    f_iso = da._iso_crop(v, _RSP, geom, iso, order=1)
+    t_iso = da._iso_crop(masks["tissue"].astype(np.float32), _RSP, geom, iso,
+                         order=0, antialias=False) > 0.5
+    return geom, iso, f_iso, t_iso
 
 
-def test_render_turntable_emits_named_frames_for_both_modes(tmp_path):
+def test_build_method_volumes_writes_gettable_nifti(tmp_path):
     v = _slab(60, shape=(40, 160, 24))
-    sp, geom, lo, hi, tissue = _tt_inputs(v)
-    N = 6
-    r = da.render_turntable(v, _shift_frames(v, np.full(24, 8)), sp, geom, lo, hi, tissue,
-                            tmp_path, "identity", n_frames=N, scale=None)
-    assert r["n_frames"] == N and r["scale"] > 0
-    for mode, tag in (("overlap", "overlap"), ("disagreement", "disagree")):
-        names = r["frames"][mode]
-        assert len(names) == N
-        for i, name in enumerate(names):
-            assert name == f"identity_t3d_{tag}_{i:02d}.png"
-            assert (tmp_path / name).exists()          # GET-able by the existing view endpoint
+    geom, iso, f_iso, t_iso = _v3d_inputs(v)
+    m_res = _shift_frames(v, np.full(24, 8))
+    out = da.build_method_volumes(f_iso, t_iso, m_res, _RSP, geom, iso,
+                                  tmp_path, "job123", "identity", scale=None)
+    v3 = out["volumes3d"]
+    assert out["scale"] > 0
+    assert v3["moving"] == "/api/debug/align/view/job123/identity_moving_iso.nii.gz"
+    assert v3["disagree"] == "/api/debug/align/view/job123/identity_disagree_iso.nii.gz"
+    assert (tmp_path / "identity_moving_iso.nii.gz").exists()   # GET-able by the view endpoint
+    assert (tmp_path / "identity_disagree_iso.nii.gz").exists()
+    assert 0.0 <= v3["disagree_mean"] <= 1.0
+    # RAW shared scale for the client's cal_max (intensity units, NOT the [0,1] mean).
+    assert v3["disagree_max"] == pytest.approx(out["scale"])
 
 
-def test_render_turntable_disagreement_is_hotter_for_a_worse_alignment(tmp_path):
-    """THE point of the disagreement view: a misaligned pair reads visibly HOTTER than an aligned
-    one AT THE SAME (identity-derived) scale — the numeric twin of 'identity hotter than fixed'."""
+def test_build_method_volumes_disagreement_is_cooler_for_a_better_alignment(tmp_path):
+    """THE point of the disagreement volume: a misaligned pair reads a HIGHER disagree_mean than an
+    aligned one AT THE SAME (identity-derived) scale — the numeric twin of 'identity hotter'."""
     v = _slab(60, shape=(40, 160, 24))
-    sp, geom, lo, hi, tissue = _tt_inputs(v)
-    worse = da.render_turntable(v, _shift_frames(v, np.full(24, 8)), sp, geom, lo, hi, tissue,
-                                tmp_path, "identity", n_frames=4, scale=None)
-    better = da.render_turntable(v, v, sp, geom, lo, hi, tissue, tmp_path, "fixed",
-                                 n_frames=4, scale=worse["scale"])   # SHARED scale
-    assert 0.0 <= better["disagree_mean"] <= 1.0
-    assert worse["disagree_mean"] > better["disagree_mean"]
-    assert better["disagree_mean"] == pytest.approx(0.0, abs=1e-6)   # a perfect match is cool
+    geom, iso, f_iso, t_iso = _v3d_inputs(v)
+    worse = da.build_method_volumes(f_iso, t_iso, _shift_frames(v, np.full(24, 8)), _RSP, geom, iso,
+                                    tmp_path, "job1", "identity", scale=None)
+    better = da.build_method_volumes(f_iso, t_iso, v, _RSP, geom, iso,
+                                     tmp_path, "job1", "fixed", scale=worse["scale"])  # SHARED scale
+    assert worse["volumes3d"]["disagree_mean"] > better["volumes3d"]["disagree_mean"]
+    assert better["volumes3d"]["disagree_mean"] == pytest.approx(0.0, abs=1e-6)   # perfect match cool
 
 
-def test_render_turntable_frames_share_one_canvas_size(tmp_path):
-    """A scrubber and cross-method comparison require an identical canvas at every angle."""
-    from PIL import Image
+def test_build_method_volumes_shares_one_iso_grid(tmp_path):
+    """fixed / moving / disagree must land on ONE lattice so niivue overlays them voxel-perfect."""
+    import nibabel as nib
     v = _slab(60, shape=(40, 160, 24))
-    sp, geom, lo, hi, tissue = _tt_inputs(v)
-    r = da.render_turntable(v, _shift_frames(v, np.full(24, 6)), sp, geom, lo, hi, tissue,
-                            tmp_path, "identity", n_frames=4, scale=None)
-    sizes = {Image.open(tmp_path / n).size
-             for n in r["frames"]["overlap"] + r["frames"]["disagreement"]}
-    assert len(sizes) == 1
+    geom, iso, f_iso, t_iso = _v3d_inputs(v)
+    da._write_nifti(tmp_path / "fixed_iso.nii.gz", f_iso, iso, np.uint16)
+    da.build_method_volumes(f_iso, t_iso, _shift_frames(v, np.full(24, 6)), _RSP, geom, iso,
+                            tmp_path, "job1", "identity", scale=None)
+    shapes = {tuple(nib.load(str(tmp_path / n)).shape) for n in
+              ("fixed_iso.nii.gz", "identity_moving_iso.nii.gz", "identity_disagree_iso.nii.gz")}
+    assert len(shapes) == 1
+    assert f_iso.shape == next(iter(shapes))
 
 
 # ── orphan render dirs ───────────────────────────────────────────────────────
@@ -548,3 +576,143 @@ def test_sweep_never_raises_into_a_job(monkeypatch):
 def test_sweep_is_a_noop_when_the_root_does_not_exist(tmp_path, monkeypatch):
     monkeypatch.setattr(da, "_RENDER_ROOT", tmp_path / "nope")
     assert da.sweep_render_root() == 0
+
+
+# ── consensus: N-replicate min/excess decomposition ──────────────────────────
+def test_consensus_decompose_agreement_is_white():
+    """Where every replicate has the SAME intensity, excess is 0 -> pure white (the consensus glow),
+    with alpha = that intensity."""
+    I = [np.full((3, 3, 2), 0.7, np.float32) for _ in range(4)]
+    cols = [np.asarray(da.CONSENSUS_PALETTE[i], np.float32) / 255.0 for i in range(4)]
+    rgb, alpha = da.consensus_decompose(I, cols)
+    assert np.allclose(rgb, 0.7, atol=1e-6)          # R==G==B==shared -> white/grey
+    assert np.allclose(alpha, 0.7, atol=1e-6)
+
+
+def test_consensus_decompose_single_replicate_sticks_out_in_its_hue():
+    """A voxel bright in ONE replicate and dark in the rest -> shared 0 -> pure replicate hue."""
+    I = [np.zeros((2, 2, 2), np.float32) for _ in range(3)]
+    I[1][0, 0, 0] = 1.0                                # only replicate 1 (index 1) sticks out
+    cols = [np.asarray(da.CONSENSUS_PALETTE[i], np.float32) / 255.0 for i in range(3)]
+    rgb, alpha = da.consensus_decompose(I, cols)
+    assert np.allclose(rgb[0, 0, 0], cols[1], atol=1e-6)   # exactly replicate 1's colour
+    assert alpha[0, 0, 0] == pytest.approx(1.0)
+    assert np.allclose(rgb[1, 1, 1], 0.0)                  # nobody there -> black/transparent
+    assert alpha[1, 1, 1] == pytest.approx(0.0)
+
+
+def test_consensus_decompose_alpha_is_the_max():
+    rng = np.random.default_rng(0)
+    I = [rng.random((4, 4, 3), np.float32) for _ in range(5)]
+    cols = [np.asarray(da.CONSENSUS_PALETTE[i], np.float32) / 255.0 for i in range(5)]
+    _rgb, alpha = da.consensus_decompose(I, cols)
+    assert np.allclose(alpha, np.max(np.stack(I, 0), axis=0))
+
+
+def test_consensus_decompose_clips_to_unit_cube():
+    """Two replicates both sticking out in bright hues can sum past 1 -> must clip, never overflow."""
+    I = [np.ones((2, 2, 2), np.float32), np.ones((2, 2, 2), np.float32)]
+    cols = [np.array([1.0, 1.0, 0.0], np.float32), np.array([0.0, 1.0, 1.0], np.float32)]
+    # shared = 1 everywhere -> excess 0 -> pure white; but test the raw-excess branch too:
+    I2 = [np.ones((2, 2, 2), np.float32), np.zeros((2, 2, 2), np.float32)]
+    rgb, _ = da.consensus_decompose(I2, cols)
+    assert rgb.max() <= 1.0 and rgb.min() >= 0.0
+    rgb2, _ = da.consensus_decompose(I, cols)
+    assert np.allclose(rgb2, 1.0)                      # full agreement -> white
+
+
+def test_consensus_colors_labels_both_schemes_and_marks_reference():
+    a = da.consensus_colors("cs001_os", ["case_cs001_os_v1", "case_cs001_os_v2", "case_cs001_os_v3"])
+    assert [r["label"] for r in a] == ["v1", "v2", "v3"]
+    assert a[0]["is_ref"] and not a[1]["is_ref"] and not a[2]["is_ref"]
+    b = da.consensus_colors("cs030_od", ["case_cs030_od_v1", "case_cs030_od_v1_2", "case_cs030_od_v1_3"])
+    assert [r["label"] for r in b] == ["v1", "v1_2", "v1_3"]
+    assert all(len(r["color"]) == 3 for r in a + b)
+
+
+def test_consensus_palette_is_distinct_and_agree_is_white():
+    """The legend must be readable: every replicate hue distinct, and none is the white agreement."""
+    assert da.AGREE_COLOR == (255, 255, 255)
+    assert len(set(da.CONSENSUS_PALETTE)) == len(da.CONSENSUS_PALETTE)   # all distinct
+    assert da.AGREE_COLOR not in da.CONSENSUS_PALETTE
+    assert len(da.CONSENSUS_PALETTE) >= 9                                # scales to the 9-rep eye
+
+
+def test_write_rgba_nifti_is_rgba32_and_round_trips(tmp_path):
+    """niivue's 3-D RGBA path keys off DT_RGBA32 (2304); the volume must load back byte-for-byte with
+    the iso spacing and the debug (L,I,P) affine."""
+    import nibabel as nib
+    rgb = np.zeros((3, 4, 5, 3), np.float32)
+    rgb[0, 0, 0] = [1.0, 0.0, 0.0]
+    alpha = np.zeros((3, 4, 5), np.float32)
+    alpha[0, 0, 0] = 1.0
+    p = tmp_path / "consensus_rgba.nii.gz"
+    da._write_rgba_nifti(p, rgb, alpha, 0.02)
+    img = nib.load(str(p))
+    assert int(img.header["datatype"]) == 2304 and int(img.header["bitpix"]) == 32
+    assert np.allclose(img.header.get_zooms()[:3], [0.02, 0.02, 0.02])
+    assert nib.aff2axcodes(img.affine) == ("L", "I", "P")
+    got = np.asarray(img.dataobj)
+    assert int(got["R"][0, 0, 0]) == 255 and int(got["A"][0, 0, 0]) == 255
+    assert int(got["G"][0, 0, 0]) == 0 and int(got["R"][1, 1, 1]) == 0
+
+
+def _mkcase_vol(root, cid, vol):
+    import nibabel as nib
+    d = root / cid / "previews"
+    d.mkdir(parents=True, exist_ok=True)
+    # affine spacing = _RSP (lat, depth, frames) so window/geometry behave like a real preview
+    aff = np.diag([_RSP[0], _RSP[1], _RSP[2], 1.0])
+    nib.save(nib.Nifti1Image(np.asarray(vol, np.float32), aff), str(d / "volume.nii.gz"))
+
+
+def test_start_consensus_rejects_unknown_method_and_single_replicate(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    _mkcase_vol(tmp_path, "case_cs001_os_v1", _slab(60, shape=(40, 160, 24)))
+    with pytest.raises(ValueError):                       # only one replicate
+        da.start_consensus("cs001_os", "fixed")
+    _mkcase_vol(tmp_path, "case_cs001_os_v2", _slab(60, shape=(40, 160, 24), seed=1))
+    with pytest.raises(ValueError):                       # unknown method
+        da.start_consensus("cs001_os", "bogus")
+
+
+def test_consensus_end_to_end_identity(tmp_path, monkeypatch):
+    """The whole path on synthetic data: 3 replicates -> a GET-able RGBA volume on the iso lattice,
+    with a mostly-agreeing region reading whitish (R~=G~=B)."""
+    import nibabel as nib
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    monkeypatch.setattr(da, "_RENDER_ROOT", tmp_path / "render")
+    base = _slab(60, shape=(40, 160, 24))
+    for i, cid in enumerate(("case_cs007_os_v1", "case_cs007_os_v2", "case_cs007_os_v3")):
+        _mkcase_vol(tmp_path, cid, _slab(60, shape=(40, 160, 24), seed=i))   # aligned surfaces
+    job_id = da.start_consensus("cs007_os", "identity")
+    for _ in range(200):
+        v = da.consensus_job_view(job_id)
+        if v["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert v["status"] == "done", v.get("error")
+    assert v["reference"] == "case_cs007_os_v1"
+    assert [r["label"] for r in v["replicates"]] == ["v1", "v2", "v3"]
+    assert v["agree_color"] == [255, 255, 255]
+    assert v["iso_mm"] == da.DBG_ISO_MM
+    # The RGBA volume the view route would serve exists at job_dir/<basename>.
+    name = v["volume"].rsplit("/", 1)[-1]
+    p = da.job_dir(job_id) / name
+    assert p.exists() and name.endswith(".nii.gz")
+    img = nib.load(str(p))
+    assert int(img.header["datatype"]) == 2304
+    assert tuple(img.shape) == tuple(v["geometry"]["iso_shape"])
+    # 2-D composites exist and are named as the view route expects.
+    for s in ("bscan", "sagittal"):
+        assert (da.job_dir(job_id) / f"consensus_{s}.png").exists()
+    # Whiteness: over voxels with real signal, aligned identical-surface slabs read grey/white
+    # (channels ~equal), i.e. the agreement colour dominates.
+    arr = np.asarray(img.dataobj)
+    R = arr["R"].astype(np.float32); Gc = arr["G"].astype(np.float32); B = arr["B"].astype(np.float32)
+    A = arr["A"].astype(np.float32)
+    m = A > 60
+    assert m.sum() > 0
+    chroma = np.stack([R, Gc, B], -1)[m]
+    whiteness = 1.0 - (chroma.max(-1) - chroma.min(-1)) / np.maximum(chroma.max(-1), 1.0)
+    assert float(whiteness.mean()) > 0.6      # mostly-agreeing -> mostly white/grey

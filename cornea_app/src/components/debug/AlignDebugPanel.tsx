@@ -20,8 +20,8 @@
    GEOMETRIC truth, and it is the number that matters: ~30 µm of boundary error lands straight in scar
    Dice when a scar label is propagated onto a replicate, which is the whole point of aligning. */
 
-import { useEffect, useRef, useState } from "react";
-import { CircularProgress, LinearProgress, MenuItem, Select, Slider, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
+import { useEffect } from "react";
+import { CircularProgress, LinearProgress, MenuItem, Select, ToggleButton, ToggleButtonGroup, Tooltip } from "@mui/material";
 import {
   ALIGN_METHODS,
   ALIGN_MODES_3D,
@@ -32,6 +32,7 @@ import {
   type MethodId,
   type Mode3d,
 } from "../../store/debugStore";
+import { Debug3DViewport } from "./Debug3DViewport";
 
 // case_cs001_os_v2 → "v2"; case_cs030_od_v1_2 → "v1_2" (scheme B replicates keep their full suffix).
 const repLabel = (cid: string, eye: string | null): string =>
@@ -82,23 +83,28 @@ const isTypingTarget = (t: EventTarget | null): boolean => {
 
 const selSx = { fontSize: 12, minWidth: 140, "& .MuiSelect-select": { py: 0.4 } };
 
-// Turntable auto-rotate speed. ~13 fps reads as a smooth rotation without hammering the paint loop; the
-// backend renders 24 frames so a full turn is ~1.8 s.
-const FPS_3D = 13;
-
 // The magenta→red→yellow→white ramp of the DISAGREEMENT ("hot") colormap, for the legend swatch only.
 const HOT_SWATCH = "linear-gradient(90deg, #400 0%, #b00 40%, #f30 65%, #fd0 85%, #fff 100%)";
 
 const OVERLAP3D_TIP =
-  "3-D magenta/green MIP of the aligned pair, projected through the rotated volume. White/grey where the two " +
-  "replicates agree, magenta/green fringes where they don't — the same convention as the 2-D overlay, but in " +
-  "the round so a misalignment that hides on one slice is visible across the whole cornea.";
+  "Interactive 3-D volume render of the aligned pair — fixed magenta, moving green. White/grey where the two " +
+  "replicates agree, magenta/green where they don't — the same convention as the 2-D overlay, but in the round " +
+  "and live on the GPU so a misalignment that hides on one slice is visible across the whole cornea. Drag to " +
+  "rotate, scroll to zoom.";
 
 const DISAGREE3D_TIP =
-  "3-D maximum-intensity projection of |fixed − moving| inside the tissue, hot where the replicates differ, " +
+  "Interactive 3-D volume render of |fixed − moving| inside the tissue, hot where the replicates differ, " +
   "transparent where they agree. THE view to read: a residual TILT shows as a hot band along one edge; a " +
   "genuine per-replicate SCAR difference shows as a localized hot blob. Expect it to be cooler (darker) for " +
-  "the rigid methods than for translation-only or identity — that contrast is the point.";
+  "the rigid methods than for translation-only or identity — that contrast is the point. Drag to rotate, " +
+  "scroll to zoom.";
+
+const CONSENSUS3D_TIP =
+  "Interactive 3-D volume render of ALL replicates of the eye at once, aligned to a common reference by one " +
+  "method. Each replicate gets its own colour; where they all agree the glow is WHITE, where one diverges it " +
+  "fringes in that replicate's colour (a misalignment, or a feature unique to that scan). Pick the alignment " +
+  "with the method radio — identity shows the raw un-aligned scatter, the rigid methods pull the whites " +
+  "together. Drag to rotate, scroll to zoom.";
 
 export function AlignDebugPanel() {
   const groups = useDebugStore((s) => s.groups);
@@ -130,34 +136,20 @@ export function AlignDebugPanel() {
   const cycleFocus = useDebugStore((s) => s.cycleFocus);
   const run = useDebugStore((s) => s.run);
   const mode3d = useDebugStore((s) => s.mode3d);
-  const rotIdx = useDebugStore((s) => s.rotIdx);
-  const autoRotate = useDebugStore((s) => s.autoRotate);
   const render3d = useDebugStore((s) => s.render3d);
   const setMode3d = useDebugStore((s) => s.setMode3d);
-  const setRotIdx = useDebugStore((s) => s.setRotIdx);
-  const stepRot = useDebugStore((s) => s.stepRot);
-  const setAutoRotate = useDebugStore((s) => s.setAutoRotate);
+  const fixed3d = useDebugStore((s) => s.fixed3d);
+  const isoMm = useDebugStore((s) => s.iso_mm);
+  const consensus = useDebugStore((s) => s.consensus);
+  const consensusMethod = useDebugStore((s) => s.consensusMethod);
+  const consensusRunning = useDebugStore((s) => s.consensusRunning);
+  const consensusProgress = useDebugStore((s) => s.consensusProgress);
+  const consensusError = useDebugStore((s) => s.consensusError);
+  const consensusRender3d = useDebugStore((s) => s.consensusRender3d);
+  const setConsensusMethod = useDebugStore((s) => s.setConsensusMethod);
+  const runConsensus = useDebugStore((s) => s.runConsensus);
 
-  // Live "reduce motion" signal — mirrors the store's load-time default but also honours a mid-session OS
-  // change, so a user who turns the preference on gets the auto-rotate animation to stop.
-  const [reducedMotion, setReducedMotion] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches,
-  );
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const on = () => setReducedMotion(mq.matches);
-    mq.addEventListener?.("change", on);
-    return () => mq.removeEventListener?.("change", on);
-  }, []);
-
-  // Drag-to-rotate bookkeeping, and a ref that keeps preloaded frame Images alive (so scrubbing/auto-rotate
-  // never waits on a network fetch mid-turn).
-  const dragRef = useRef<{ x: number; startIdx: number; w: number } | null>(null);
-  const preloadRef = useRef<HTMLImageElement[]>([]);
+  const isConsensus = mode3d === "consensus";
 
   // Lazy: the eye list is only fetched once this panel actually mounts (i.e. the Debug tab is opened).
   useEffect(() => {
@@ -169,13 +161,14 @@ export function AlignDebugPanel() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      if (isTypingTarget(e.target) || results.length === 0) return;
+      // Consensus has no per-method result list to flip through — its method is chosen by the viewport radio.
+      if (isTypingTarget(e.target) || results.length === 0 || isConsensus) return;
       e.preventDefault();
       cycleFocus(e.key === "ArrowRight" ? 1 : -1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cycleFocus, results.length]);
+  }, [cycleFocus, results.length, isConsensus]);
 
   const group = groups.find((g) => g.eye === eye);
   const canRun = !!fixedCase && !!movingCase && fixedCase !== movingCase && !running;
@@ -185,81 +178,22 @@ export function AlignDebugPanel() {
   // scale (the unaligned offset), so every other method is drawn as a fraction of "did nothing".
   const maxResid = Math.max(0, ...results.map((r) => (num(r.resid_vox) ? r.resid_vox : 0)));
 
-  /* ── 3-D turntable wiring ── */
-  // The frame count is the longest frame list across methods for the active mode — every method renders the
-  // SAME N (a per-job constant), but a failed method contributes 0, so take the max to size the scrubber.
-  const nFrames = mode3d
-    ? results.reduce((n, r) => {
-        const f = r.turntable?.[mode3d];
-        return Array.isArray(f) && f.length > n ? f.length : n;
-      }, 0)
-    : 0;
-  const frameClamped = nFrames > 0 ? Math.min(rotIdx, nFrames - 1) : 0;
-
-  // LAZY 3-D render: the heavier turntable is only requested once a 3-D mode is actually selected, and only
-  // if the current results don't already carry it (render3d). `run()` reads mode3d and sets render_3d=true.
-  // The flag flips true the instant the run dispatches, so this never double-fires — and it stays true after
-  // an error, so a failing sidecar can't spin this into a loop.
+  // LAZY 3-D render: the heavier 3-D volumes are only requested once a 3-D mode is actually selected, and
+  // only if the current results don't already carry them (render3d). `run()` reads mode3d and sets
+  // render_3d=true. The flag flips true the instant the run dispatches, so this never double-fires — and it
+  // stays true after an error, so a failing sidecar can't spin this into a loop.
   useEffect(() => {
-    if (!mode3d || running || render3d || !canRun) return;
+    if (!mode3d || isConsensus || running || render3d || !canRun) return;
     void run();
-  }, [mode3d, running, render3d, canRun, run]);
+  }, [mode3d, isConsensus, running, render3d, canRun, run]);
 
-  // Respect prefers-reduced-motion: the turntable STARTS paused when the OS asks for reduced motion (store
-  // default), and if the preference is turned on mid-session the animation is halted. The user can still
-  // opt back in explicitly with the play button — that's a deliberate action, not motion imposed on them.
+  // LAZY CONSENSUS render: eye-level, so it ignores the pair and fires when the consensus 3-D mode is active
+  // and the current eye+method isn't loaded yet. Mirrors the render3d guard (consensusRender3d flips true the
+  // instant the run dispatches and stays true after an error) so it never double-fires or loops.
   useEffect(() => {
-    if (reducedMotion) setAutoRotate(false);
-  }, [reducedMotion, setAutoRotate]);
-
-  // Auto-rotate: advance the SHARED frame index on a timer so every method's card turns to the same pose.
-  useEffect(() => {
-    if (!mode3d || !autoRotate || nFrames <= 1) return;
-    const id = window.setInterval(() => stepRot(nFrames), Math.round(1000 / FPS_3D));
-    return () => window.clearInterval(id);
-  }, [mode3d, autoRotate, nFrames, stepRot]);
-
-  // Preload every frame of the active mode across all methods, so rotation is smooth from the first turn.
-  useEffect(() => {
-    if (!mode3d) {
-      preloadRef.current = [];
-      return;
-    }
-    const imgs: HTMLImageElement[] = [];
-    for (const r of results) {
-      const frames = r.turntable?.[mode3d];
-      if (!Array.isArray(frames)) continue;
-      for (const u of frames) {
-        const im = new Image();
-        im.src = viewUrl(u);
-        imgs.push(im);
-      }
-    }
-    preloadRef.current = imgs;
-  }, [mode3d, results]);
-
-  // Drag-to-rotate over a turntable frame: horizontal drag maps the full image width to a full turn, and all
-  // cards move together (shared rotIdx). Grabbing pauses auto-rotate so the drag isn't fought by the timer.
-  const onFrameDown = (e: React.PointerEvent<HTMLImageElement>) => {
-    if (nFrames <= 1) return;
-    e.currentTarget.setPointerCapture?.(e.pointerId);
-    dragRef.current = { x: e.clientX, startIdx: frameClamped, w: e.currentTarget.clientWidth || 1 };
-    if (autoRotate) setAutoRotate(false);
-  };
-  const onFrameMove = (e: React.PointerEvent<HTMLImageElement>) => {
-    const d = dragRef.current;
-    if (!d || nFrames <= 1) return;
-    const delta = Math.round(((e.clientX - d.x) / d.w) * nFrames);
-    setRotIdx((((d.startIdx + delta) % nFrames) + nFrames) % nFrames);
-  };
-  const onFrameUp = (e: React.PointerEvent<HTMLImageElement>) => {
-    dragRef.current = null;
-    try {
-      e.currentTarget.releasePointerCapture?.(e.pointerId);
-    } catch {
-      /* pointer already released */
-    }
-  };
+    if (!isConsensus || !eye || consensusRunning || consensusRender3d) return;
+    void runConsensus();
+  }, [isConsensus, eye, consensusRunning, consensusRender3d, runConsensus]);
 
   const label = (r: AlignResult): string =>
     r.label || ALIGN_METHODS.find((m) => m.id === r.method)?.label || r.method;
@@ -272,11 +206,6 @@ export function AlignDebugPanel() {
     const src = viewUrl(r.views?.[view]);
     const isFocus = r.method === focus;
     const failed = r.raised || r.ok === false;
-    // 3-D: the current turntable frame for this method in the active mode. The shared rotIdx keeps every
-    // card in the same pose, so flipping methods leaves only the fringes/hotspots moving.
-    const frames3d = mode3d ? r.turntable?.[mode3d] ?? null : null;
-    const nf3d = Array.isArray(frames3d) ? frames3d.length : 0;
-    const frame3dUrl = nf3d > 0 ? viewUrl(frames3d![Math.min(rotIdx, nf3d - 1)]) : "";
     return (
       <div
         key={r.method}
@@ -333,42 +262,13 @@ export function AlignDebugPanel() {
         </div>
 
         <div style={{ background: "#000", display: "flex", alignItems: "center", justifyContent: "center", minHeight: big ? 0 : 150, flex: big ? 1 : undefined }}>
-          {mode3d ? (
-            nf3d > 0 ? (
-              <img
-                src={frame3dUrl}
-                alt={`${label(r)} — 3D ${mode3d} (angle ${Math.min(rotIdx, nf3d - 1) + 1}/${nf3d})`}
-                draggable={false}
-                onPointerDown={onFrameDown}
-                onPointerMove={onFrameMove}
-                onPointerUp={onFrameUp}
-                onPointerCancel={onFrameUp}
-                style={{
-                  width: "100%",
-                  height: big ? "100%" : undefined,
-                  objectFit: "contain",
-                  display: "block",
-                  imageRendering: "pixelated",
-                  touchAction: "none",
-                  cursor: nf3d > 1 ? "ew-resize" : "default",
-                }}
-              />
-            ) : failed ? (
-              <span style={{ fontSize: 11, color: "var(--c-text-dim)", padding: 24 }}>
-                {r.error ? r.error : "fell back to identity — no 3-D turntable"}
-              </span>
-            ) : (
-              <span className="flex items-center gap-2" style={{ fontSize: 11, color: "var(--c-text-dim)", padding: 24 }}>
-                <CircularProgress size={16} color="inherit" /> rendering 3-D…
-              </span>
-            )
-          ) : src ? (
+          {src ? (
             <img
               src={src}
               alt={`${label(r)} — ${view}`}
               draggable={false}
               style={{
-                width: big ? "100%" : "100%",
+                width: "100%",
                 height: big ? "100%" : undefined,
                 objectFit: "contain",
                 display: "block",
@@ -438,6 +338,16 @@ export function AlignDebugPanel() {
           ))}
         </Select>
 
+        {/* Consensus is EYE-LEVEL — it uses ALL replicates, not a chosen pair — so hide the fixed/moving
+            selectors + the pair method checkboxes + Run while it's active. The alignment method is chosen by
+            the radio inside the consensus viewport. */}
+        {isConsensus && (
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+            all {group?.cases.length ?? 0} replicates · pick the alignment method in the viewport
+          </span>
+        )}
+
+        {!isConsensus && (<>
         <span className="text-[11px]" style={{ color: "#e879f9" }}>fixed</span>
         <Select size="small" value={group && fixedCase ? fixedCase : ""} disabled={!group || running}
           onChange={(e) => setFixed(e.target.value as string)} sx={{ ...selSx, minWidth: 90 }} displayEmpty>
@@ -492,16 +402,20 @@ export function AlignDebugPanel() {
           {running && <CircularProgress size={11} color="inherit" />}
           {running ? "Running…" : "Run"}
         </button>
+        </>)}
       </div>
 
       {running && <LinearProgress variant={progress > 0 ? "determinate" : "indeterminate"} value={Math.round(progress * 100)} sx={{ height: 2 }} />}
+      {isConsensus && consensusRunning && (
+        <LinearProgress variant={consensusProgress > 0 ? "determinate" : "indeterminate"} value={Math.round(consensusProgress * 100)} sx={{ height: 2 }} />
+      )}
 
       {/* ── the backend's job-level finding about THIS PAIR ──
           Without this the expert sees a low score and ugly composites and reads METHOD FAILURE, when the
           truth can be DATA MISMATCH: cs005_od v1 vs v9 have different lateral spacing and cover different
           FOVs, so no method can make them agree everywhere. That inverts the purpose of the panel, so the
           note gets a banner — not a tooltip. It lands before the first method finishes. */}
-      {jobNote && (
+      {jobNote && !isConsensus && (
         <div
           className="px-3 py-1 flex items-start gap-2"
           style={{ background: "rgba(245,158,11,0.12)", borderBottom: "1px solid #f59e0b", fontSize: 11, color: "var(--c-text)" }}
@@ -521,9 +435,9 @@ export function AlignDebugPanel() {
         </div>
       )}
 
-      {/* ── view switcher + 3-D turntable controls + legend ── */}
+      {/* ── view switcher + 3-D mode toggle + legend ── */}
       <div className="flex items-center gap-3 px-3 py-1 border-b flex-wrap" style={{ borderColor: "var(--c-border)", background: "var(--c-surface2)" }}>
-        {/* 2-D views. Picking one clears the 3-D axis, so the two groups behave as one exclusive set. */}
+        {/* 2-D views. Picking one clears the 3-D mode, so the two groups behave as one exclusive set. */}
         <ToggleButtonGroup size="small" exclusive value={mode3d ? "" : view}
           onChange={(_, v) => { if (v) { setView(v); setMode3d(null); } }}>
           {ALIGN_VIEWS.map((v) => (
@@ -535,12 +449,18 @@ export function AlignDebugPanel() {
           ))}
         </ToggleButtonGroup>
 
-        {/* 3-D turntable modes — the round-view. Selecting one lazily kicks a render_3d run (see the effect);
-            2-D runs stay light because 3-D is never requested until asked for. */}
+        {/* Interactive 3-D modes — the round-view. Selecting one lazily kicks a render_3d run (see the effect);
+            2-D runs stay light because 3-D is never requested until asked for. Both render live on the GPU in a
+            single interactive viewport; the METHOD switcher lives in the viewport so the camera pose is kept
+            when flipping methods. */}
         <ToggleButtonGroup size="small" exclusive value={mode3d ?? ""}
           onChange={(_, v) => { if (v) setMode3d(v as Mode3d); }}>
           {ALIGN_MODES_3D.map((m) => (
-            <Tooltip key={m.id} title={m.id === "disagreement" ? DISAGREE3D_TIP : OVERLAP3D_TIP} arrow>
+            <Tooltip
+              key={m.id}
+              title={m.id === "disagreement" ? DISAGREE3D_TIP : m.id === "consensus" ? CONSENSUS3D_TIP : OVERLAP3D_TIP}
+              arrow
+            >
               <ToggleButton value={m.id} sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>
                 {m.label}
               </ToggleButton>
@@ -548,42 +468,35 @@ export function AlignDebugPanel() {
           ))}
         </ToggleButtonGroup>
 
-        {/* Turntable transport — only in a 3-D mode. One shared angle drives EVERY method's card, so they
-            compare in the same pose. */}
-        {mode3d && (
-          <span className="flex items-center gap-2">
-            <Tooltip title={autoRotate ? "Pause rotation" : reducedMotion ? "Auto-rotate (your OS asks for reduced motion, so it started paused)" : "Auto-rotate the turntable"} arrow>
-              <span>
-                <button onClick={() => setAutoRotate(!autoRotate)} disabled={nFrames <= 1}
-                  className="text-[11px]"
-                  style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: nFrames <= 1 ? "default" : "pointer", padding: "1px 7px", minWidth: 26 }}>
-                  {autoRotate ? "❚❚" : "▶"}
-                </button>
-              </span>
+        {/* Grid/flip only arranges the 2-D cards — the 3-D mode is a single interactive viewport, so hide it. */}
+        {!mode3d && (
+          <ToggleButtonGroup size="small" exclusive value={layout} onChange={(_, v) => v && setLayout(v)}>
+            <Tooltip title="All methods at once, same view — scan across for the odd one out" arrow>
+              <ToggleButton value="grid" sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>Side by side</ToggleButton>
             </Tooltip>
-            <Tooltip title="Rotate the turntable — or drag left/right on any frame. All methods turn together." arrow>
-              <Slider size="small" min={0} max={Math.max(0, nFrames - 1)} value={frameClamped}
-                onChange={(_, v) => { if (autoRotate) setAutoRotate(false); setRotIdx(v as number); }}
-                disabled={nFrames <= 1}
-                sx={{ width: 130, color: "var(--c-accent)", "& .MuiSlider-thumb": { width: 11, height: 11 } }} />
+            <Tooltip title="One method large, identity kept alongside — ←/→ flips methods in place" arrow>
+              <ToggleButton value="flip" sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>Flip</ToggleButton>
             </Tooltip>
-            <span style={{ fontSize: 10, color: "var(--c-text-dim)", minWidth: 60, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-              {nFrames > 0 ? `∠ ${frameClamped + 1}/${nFrames}` : "…"}
-            </span>
-          </span>
+          </ToggleButtonGroup>
         )}
 
-        <ToggleButtonGroup size="small" exclusive value={layout} onChange={(_, v) => v && setLayout(v)}>
-          <Tooltip title="All methods at once, same view — scan across for the odd one out" arrow>
-            <ToggleButton value="grid" sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>Side by side</ToggleButton>
-          </Tooltip>
-          <Tooltip title="One method large, identity kept alongside — ←/→ flips methods in place" arrow>
-            <ToggleButton value="flip" sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>Flip</ToggleButton>
-          </Tooltip>
-        </ToggleButtonGroup>
-
         {/* The legend is not decoration: without it the composite (or the hot MIP) is unreadable. */}
-        {mode3d === "disagreement" ? (
+        {isConsensus ? (
+          <Tooltip title={CONSENSUS3D_TIP} arrow>
+            <span className="flex items-center gap-2 text-[11px] flex-wrap" style={{ color: "var(--c-text-dim)", cursor: "help" }}>
+              {(consensus?.replicates ?? []).map((r) => (
+                <span key={r.case} className="flex items-center" style={{ gap: 3 }}>
+                  <span style={{ width: 9, height: 9, background: `rgb(${r.color[0]}, ${r.color[1]}, ${r.color[2]})`, borderRadius: 2 }} />
+                  {r.label}{r.is_ref ? " (ref)" : ""}
+                </span>
+              ))}
+              <span className="flex items-center" style={{ gap: 3 }}>
+                <span style={{ width: 9, height: 9, background: "#ffffff", borderRadius: 2, border: "1px solid var(--c-border)" }} /> agree
+              </span>
+              <span style={{ opacity: 0.8 }}>— white = all replicates agree; colour = a replicate diverging</span>
+            </span>
+          </Tooltip>
+        ) : mode3d === "disagreement" ? (
           <Tooltip title={DISAGREE3D_TIP} arrow>
             <span className="flex items-center gap-2 text-[11px]" style={{ color: "var(--c-text-dim)", cursor: "help" }}>
               <span style={{ width: 34, height: 9, background: HOT_SWATCH, borderRadius: 2 }} />
@@ -596,13 +509,13 @@ export function AlignDebugPanel() {
             <span style={{ width: 9, height: 9, background: "#e879f9", borderRadius: 2 }} /> fixed
             <span style={{ width: 9, height: 9, background: "#4ade80", borderRadius: 2 }} /> moving
             <span style={{ width: 9, height: 9, background: "#d4d4d8", borderRadius: 2 }} /> {mode3d === "overlap" ? "agree (white/grey)" : "aligned (white/grey)"}
-            <span style={{ opacity: 0.8 }}>— {mode3d === "overlap" ? "3-D MIP; colour = disagreement" : "colour fringes = disagreement"}</span>
+            <span style={{ opacity: 0.8 }}>— {mode3d === "overlap" ? "live 3-D render; colour = disagreement" : "colour fringes = disagreement"}</span>
           </span>
         )}
 
-        {results.length > 0 && (
+        {!isConsensus && results.length > 0 && (
           <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-            ←/→ flips methods{mode3d ? " · drag or scrub to rotate" : ""}
+            ←/→ flips methods{mode3d ? " · drag to rotate, scroll to zoom" : ""}
           </span>
         )}
       </div>
@@ -611,8 +524,9 @@ export function AlignDebugPanel() {
           The per-card numbers can't be compared across methods without scanning the whole grid. This strip
           puts them in one aligned column, which is the only way to SEE the finding that motivated it: the
           residual column separates methods that the primary column calls a tie. Deliberately in the same
-          fixed order as everything else — no sorting, no winner, no colour-coding of "good"/"bad". */}
-      {results.length > 0 && (
+          fixed order as everything else — no sorting, no winner, no colour-coding of "good"/"bad".
+          Pair-only — hidden in the eye-level consensus mode. */}
+      {results.length > 0 && !isConsensus && (
         <div className="px-3 py-1 border-b overflow-x-auto" style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}>
           <table style={{ fontSize: 10, borderCollapse: "collapse", minWidth: 560 }}>
             <thead>
@@ -676,23 +590,37 @@ export function AlignDebugPanel() {
       <div className="flex-1 min-h-0 overflow-auto p-3">
         {groupsError ? (
           <div className="text-center" style={{ color: "var(--c-red)", fontSize: 12 }}>Couldn't load the replicate list: {groupsError}</div>
-        ) : error ? (
+        ) : error && !isConsensus ? (
+          // The pair-run error belongs to overlap/disagreement; consensus surfaces its OWN error in the viewport.
           <div className="text-center" style={{ color: "var(--c-red)", fontSize: 12 }}>{error}</div>
         ) : !groupsLoaded && groupsBusy ? (
           <div className="text-center" style={{ color: "var(--c-text-dim)", fontSize: 13 }}>Finding eyes with repeat scans…</div>
+        ) : mode3d ? (
+          // Interactive 3-D: a single live GPU viewport + a method switcher (the viewport shows its own
+          // spinner until the backend has rendered the volumes). Pairwise (overlap/disagreement) uses the
+          // per-method results; consensus (eye-level) uses the single min/excess RGBA volume + legend.
+          <Debug3DViewport
+            mode={mode3d}
+            results={results}
+            focus={focus}
+            setFocus={setFocus}
+            fixed3d={fixed3d}
+            isoMm={isoMm}
+            window={geometry?.window}
+            running={running}
+            consensus={consensus}
+            consensusMethod={consensusMethod}
+            setConsensusMethod={setConsensusMethod}
+            consensusRunning={consensusRunning}
+            consensusError={consensusError}
+          />
         ) : results.length === 0 ? (
           <div className="text-center" style={{ color: "var(--c-text-dim)", fontSize: 13, marginTop: 24 }}>
-            {running
-              ? mode3d
-                ? "Rendering the 3-D turntable — each method appears as it finishes…"
-                : "Aligning — the first methods appear as they finish…"
-              : mode3d
-                ? "Preparing the 3-D turntable…"
-                : "Pick a pair and press Run."}
+            {running ? "Aligning — the first methods appear as they finish…" : "Pick a pair and press Run."}
             <div style={{ fontSize: 11, opacity: 0.75, marginTop: 6, maxWidth: 620, marginLeft: "auto", marginRight: "auto" }}>
-              {mode3d
-                ? "Each method's aligned pair is projected as a rotating MIP through the isotropically-resampled volume: 3D Overlap shows magenta/green agreement in the round; 3D Disagreement shows a hot |fixed − moving| where a residual tilt or a per-replicate scar difference stands out. Same camera and window across every method."
-                : "Each method's result is drawn as a magenta/green composite of the two scans. Both are windowed from the FIXED scan and resampled to a true-mm aspect, so what you see is geometry — not a brightness or aspect-ratio difference between the scans."}
+              Each method's result is drawn as a magenta/green composite of the two scans. Both are windowed
+              from the FIXED scan and resampled to a true-mm aspect, so what you see is geometry — not a
+              brightness or aspect-ratio difference between the scans.
             </div>
           </div>
         ) : layout === "grid" ? (
@@ -723,8 +651,8 @@ export function AlignDebugPanel() {
         )}
       </div>
 
-      {/* ── the caveat that keeps this honest ── */}
-      {results.length > 0 && (
+      {/* ── the caveat that keeps this honest (pair-only — hidden in consensus mode) ── */}
+      {results.length > 0 && !isConsensus && (
         <div className="px-3 py-1 border-t" style={{ borderColor: "var(--c-border)", background: "var(--c-surface)", fontSize: 10, color: "var(--c-text-dim)" }}>
           <b style={{ color: "var(--c-text)" }}>Two yardsticks, and they can disagree.</b>{" "}
           <b>Surface residual</b> is the geometric one: the mean gap between the two scans' detected anterior surfaces,
