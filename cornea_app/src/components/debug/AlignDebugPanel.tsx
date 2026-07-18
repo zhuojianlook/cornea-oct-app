@@ -422,23 +422,21 @@ export function AlignDebugPanel() {
     <div className="flex flex-1 flex-col min-h-0 min-w-0" style={{ backgroundColor: "var(--c-bg)" }}>
       {/* ── controls ── */}
       <div className="flex items-center gap-2 px-3 py-1 border-b flex-wrap" style={{ borderColor: "var(--c-border)", background: "var(--c-surface)" }}>
-        <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--c-text-dim)" }}>
-          Replicate alignment
-        </span>
-
         <Tooltip title="Eyes with ≥2 repeat scans" arrow>
-          <span>
-            <Select size="small" value={group ? eye ?? "" : ""} disabled={groupsBusy || running || groups.length === 0}
-              onChange={(e) => selectEye(e.target.value as string)} sx={selSx} displayEmpty>
-              {groups.length === 0 && <MenuItem value="" sx={{ fontSize: 12 }}>{groupsBusy ? "loading…" : "no eyes"}</MenuItem>}
-              {groups.map((g) => (
-                <MenuItem key={g.eye} value={g.eye} sx={{ fontSize: 12 }}>
-                  {g.eye} ({g.cases.length})
-                </MenuItem>
-              ))}
-            </Select>
+          <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--c-text-dim)", cursor: "help" }}>
+            Replicate alignment
           </span>
         </Tooltip>
+
+        <Select size="small" value={group ? eye ?? "" : ""} disabled={groupsBusy || running || groups.length === 0}
+          onChange={(e) => selectEye(e.target.value as string)} sx={selSx} displayEmpty>
+          {groups.length === 0 && <MenuItem value="" sx={{ fontSize: 12 }}>{groupsBusy ? "loading…" : "no eyes"}</MenuItem>}
+          {groups.map((g) => (
+            <MenuItem key={g.eye} value={g.eye} sx={{ fontSize: 12 }}>
+              {g.eye} ({g.cases.length})
+            </MenuItem>
+          ))}
+        </Select>
 
         <span className="text-[11px]" style={{ color: "#e879f9" }}>fixed</span>
         <Select size="small" value={group && fixedCase ? fixedCase : ""} disabled={!group || running}
