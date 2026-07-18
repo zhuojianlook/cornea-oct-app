@@ -716,3 +716,243 @@ def test_consensus_end_to_end_identity(tmp_path, monkeypatch):
     chroma = np.stack([R, Gc, B], -1)[m]
     whiteness = 1.0 - (chroma.max(-1) - chroma.min(-1)) / np.maximum(chroma.max(-1), 1.0)
     assert float(whiteness.mean()) > 0.6      # mostly-agreeing -> mostly white/grey
+
+
+# ── SCAR consensus space (space="scar") ───────────────────────────────────────
+# The label build (SAM2 + hysteresis) is monkeypatched out: these tests exercise the alignment +
+# warp + min/excess-on-binary-masks + cornea-context + skip logic, NOT the GPU segmentation.
+import orchestration as orch   # noqa: E402
+
+
+def _fake_labels(scar_boxes: dict, shape, cornea_band=(60, 140), degraded=()):
+    """Return a load_or_build_labels stand-in: cornea = a solid depth band; scar = the per-case boxes.
+    `scar_boxes`/`degraded` are keyed by the SAFE case id (e.g. 'case_cs001_od_v1')."""
+    def f(case_id, progress=None):
+        cid = orch.safe_case_id(case_id)
+        cornea = np.zeros(shape, np.uint8)
+        cornea[:, cornea_band[0]:cornea_band[1], :] = 1
+        if cid in degraded:
+            return cornea, np.zeros(shape, bool), {"source": "test", "degraded": True,
+                                                   "cornea_voxels": int(cornea.sum())}
+        scar = np.zeros(shape, bool)
+        for (l0, l1, d0, d1, f0, f1) in scar_boxes.get(cid, []):
+            scar[l0:l1, d0:d1, f0:f1] = True
+        return cornea, scar, {"source": "test", "degraded": False, "cornea_voxels": int(cornea.sum())}
+    return f
+
+
+def _run_scar_consensus(tmp_path, monkeypatch, eye, cids, fake, method="identity", shape=(40, 200, 30)):
+    """Set up N identical-image replicate cases, monkeypatch the label builder, run the scar consensus
+    to completion, and return (view, rgba_arrays) where rgba_arrays = (R,G,B,alpha) as float [0,1]."""
+    import nibabel as nib
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    monkeypatch.setattr(da, "_RENDER_ROOT", tmp_path / "render")
+    monkeypatch.setattr(da, "_LABEL_CACHE_ROOT", tmp_path / "labels")
+    monkeypatch.setattr(da, "_DENOISE_WARM_DIR", tmp_path / "no_warm")
+    monkeypatch.setattr(da, "load_or_build_labels", fake)
+    base = _slab(60, shape=shape)
+    for cid in cids:
+        _mkcase_vol(tmp_path, cid, base)          # identical image => alignment is a no-op
+    job_id = da.start_consensus(eye, method, "scar")
+    v = None
+    for _ in range(400):
+        v = da.consensus_job_view(job_id)
+        if v["status"] != "running":
+            break
+        time.sleep(0.02)
+    if v["status"] != "done":
+        return v, None
+    p = da.job_dir(job_id) / v["volume"].rsplit("/", 1)[-1]
+    arr = np.asarray(nib.load(str(p)).dataobj)
+    to01 = lambda ch: arr[ch].astype(np.float32) / 255.0
+    return v, (to01("R"), to01("G"), to01("B"), to01("A"))
+
+
+def test_start_consensus_rejects_unknown_space(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    _mkcase_vol(tmp_path, "case_cs001_os_v1", _slab(60, shape=(40, 160, 24)))
+    _mkcase_vol(tmp_path, "case_cs001_os_v2", _slab(60, shape=(40, 160, 24), seed=1))
+    with pytest.raises(ValueError):
+        da.start_consensus("cs001_os", "fixed", "bogus")
+
+
+def test_label_cache_paths_outside_store_and_keyed_on_mtime_and_params(tmp_path, monkeypatch):
+    store = tmp_path / "store"; store.mkdir()
+    monkeypatch.setattr(settings, "CASES_ROOT", store)
+    monkeypatch.setattr(da, "_LABEL_CACHE_ROOT", tmp_path / "labels")
+    _mkcase_vol(store, "case_cs001_od_v1", _slab(60, shape=(20, 80, 12)))
+    cp, sp = da.label_cache_paths("case_cs001_od_v1")
+    # NEVER inside the case store; both files live under the /tmp label cache (a sibling of the store).
+    assert settings.CASES_ROOT not in cp.parents and settings.CASES_ROOT not in sp.parents
+    assert cp.parent == tmp_path / "labels" and sp.parent == tmp_path / "labels"
+    assert cp.name.startswith("cornea__") and sp.name.startswith("scar__")
+    # a params change re-keys the cache (clean miss), so stale labels can't be served
+    h0 = da._label_params_hash()
+    monkeypatch.setitem(da.LABEL_PARAMS, "phi_percentile", 80.0)
+    assert da._label_params_hash() != h0
+    cp2, _ = da.label_cache_paths("case_cs001_od_v1")
+    assert cp2.name != cp.name
+
+
+def test_load_or_build_labels_serves_cache_without_sam2(tmp_path, monkeypatch):
+    """A cache hit returns the stored labelmaps (no SAM2 import/GPU) — via the real _save/_load path."""
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    monkeypatch.setattr(da, "_LABEL_CACHE_ROOT", tmp_path / "labels")
+    monkeypatch.setattr(da, "_DENOISE_WARM_DIR", tmp_path / "nope")
+    shape = (20, 80, 12)
+    _mkcase_vol(tmp_path, "case_cs001_od_v1", _slab(60, shape=shape))
+    cp, sp = da.label_cache_paths("case_cs001_od_v1")
+    cornea = np.zeros(shape, np.uint8); cornea[:, 40:60, :] = 1
+    scar = np.zeros(shape, np.uint8); scar[5:10, 45:55, 3:9] = 1
+    da._save_label_cache(cp, cornea)
+    da._save_label_cache(sp, scar)
+    c, s, meta = da.load_or_build_labels("case_cs001_od_v1")
+    assert meta["source"] == "cache" and meta["degraded"] is False
+    assert c.shape == shape and s.dtype == bool
+    assert int(s.sum()) == int(scar.sum())
+    assert meta["cornea_voxels"] == int((cornea >= 1).sum())
+
+
+def test_warm_from_denoise_copies_matching_shape_then_hits_cache(tmp_path, monkeypatch):
+    import nibabel as nib
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    monkeypatch.setattr(da, "_LABEL_CACHE_ROOT", tmp_path / "labels")
+    warm = tmp_path / "warm"; warm.mkdir()
+    monkeypatch.setattr(da, "_DENOISE_WARM_DIR", warm)
+    shape = (20, 80, 12)
+    _mkcase_vol(tmp_path, "case_cs001_od_v1", _slab(60, shape=shape))
+    cornea = np.zeros(shape, np.uint8); cornea[:, 40:60, :] = 1
+    scar = np.zeros(shape, np.uint8); scar[5:10, 45:55, 3:9] = 1
+    nib.save(nib.Nifti1Image(cornea, np.eye(4)), str(warm / "cornea_cs001_od_v1.nii.gz"))
+    nib.save(nib.Nifti1Image(scar, np.eye(4)), str(warm / "scar_cs001_od_v1.nii.gz"))
+    c, s, meta = da.load_or_build_labels("case_cs001_od_v1")
+    assert meta["source"] == "warm" and int(s.sum()) == int(scar.sum())
+    # the warm copy populated the cache, so a 2nd call is a plain cache hit
+    _c2, _s2, meta2 = da.load_or_build_labels("case_cs001_od_v1")
+    assert meta2["source"] == "cache"
+
+
+def test_warm_skips_on_shape_mismatch_without_building(tmp_path, monkeypatch):
+    import nibabel as nib
+    monkeypatch.setattr(settings, "CASES_ROOT", tmp_path)
+    monkeypatch.setattr(da, "_LABEL_CACHE_ROOT", tmp_path / "labels")
+    warm = tmp_path / "warm"; warm.mkdir()
+    monkeypatch.setattr(da, "_DENOISE_WARM_DIR", warm)
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), np.uint8), np.eye(4)), str(warm / "cornea_cs001_od_v1.nii.gz"))
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), np.uint8), np.eye(4)), str(warm / "scar_cs001_od_v1.nii.gz"))
+    cp, sp = tmp_path / "cornea.nii.gz", tmp_path / "scar.nii.gz"
+    assert da._warm_labels_from_denoise("case_cs001_od_v1", (20, 80, 12), cp, sp) is False
+    assert not cp.exists() and not sp.exists()
+
+
+def test_scar_consensus_agreement_is_white_no_halo(tmp_path, monkeypatch):
+    """Every replicate shares the SAME scar block -> shared == alpha, excess == 0 -> a WHITE core and
+    NO coloured disagreement halo (the tight, reproducible eye)."""
+    shape = (40, 200, 30)
+    boxA = (10, 30, 90, 110, 8, 22)
+    cids = ["case_cs007_os_v1", "case_cs007_os_v2", "case_cs007_os_v3"]
+    fake = _fake_labels({c: [boxA] for c in cids}, shape)
+    v, rgba = _run_scar_consensus(tmp_path, monkeypatch, "cs007_os", cids, fake)
+    assert v["status"] == "done", v.get("error")
+    assert v["space"] == "scar" and v["geometry"]["space"] == "scar"
+    R, G, B, A = rgba
+    scar = A > 0.5                                    # scar voxels (alpha == 1); context is alpha 0.12
+    assert scar.sum() > 0
+    chroma = np.stack([R, G, B], -1)[scar]
+    spread = chroma.max(-1) - chroma.min(-1)
+    assert float(spread.max()) < 0.02                # every scar voxel is white/grey -> agreement
+    # every replicate reports a scar volume; none skipped
+    assert all(r.get("scar_volume_mm3", 0) and r.get("scar_volume_mm3") > 0 for r in v["replicates"])
+    assert v["skipped"] == []
+
+
+def test_scar_consensus_divergence_shows_colored_halo_in_the_reps_hue(tmp_path, monkeypatch):
+    """v1/v2 share block A; v3 additionally has block B. Block A -> WHITE (all agree); block B ->
+    only v3 -> exactly v3's hue. And the divergent eye has a real halo (the broken, low-Dice eye)."""
+    shape = (40, 200, 30)
+    boxA = (10, 30, 90, 110, 8, 20)
+    boxB = (10, 30, 90, 110, 22, 28)                 # disjoint in frames -> v3 only
+    cids = ["case_cs001_od_v1", "case_cs001_od_v2", "case_cs001_od_v3"]
+    fake = _fake_labels({cids[0]: [boxA], cids[1]: [boxA], cids[2]: [boxA, boxB]}, shape)
+    v, rgba = _run_scar_consensus(tmp_path, monkeypatch, "cs001_od", cids, fake)
+    assert v["status"] == "done", v.get("error")
+    R, G, B, A = rgba
+    scar = A > 0.5
+    chroma = np.stack([R, G, B], -1)
+    spread = chroma.max(-1) - chroma.min(-1)
+    white = scar & (spread < 0.02) & (chroma.min(-1) > 0.5)
+    halo = scar & (spread > 0.1)
+    assert white.sum() > 0                            # unanimous block A -> white core
+    assert halo.sum() > 0                             # v3-only block B -> coloured halo
+    v3_col = np.asarray(da.CONSENSUS_PALETTE[2], np.float32) / 255.0   # index 2 = v3
+    hits = np.all(np.abs(chroma[scar] - v3_col) < 0.02, axis=-1)
+    assert hits.any()                                 # some halo voxel is EXACTLY v3's hue
+
+
+def test_scar_consensus_broken_eye_has_more_halo_than_a_tight_eye(tmp_path, monkeypatch):
+    """(d) A known-unstable eye (extra per-replicate scar) shows MORE coloured halo than a tight eye
+    where every replicate agrees."""
+    shape = (40, 200, 30)
+    boxA = (10, 30, 90, 110, 8, 20)
+    boxB = (10, 30, 90, 110, 22, 28)
+
+    def halo_frac(eye, cids, boxes):
+        fake = _fake_labels(boxes, shape)
+        v, rgba = _run_scar_consensus(tmp_path / eye, monkeypatch, eye, cids, fake)
+        assert v["status"] == "done", v.get("error")
+        R, G, B, A = rgba
+        scar = A > 0.5
+        chroma = np.stack([R, G, B], -1)
+        spread = chroma.max(-1) - chroma.min(-1)
+        return float((scar & (spread > 0.1)).sum()) / max(int(scar.sum()), 1)
+
+    tight_cids = ["case_cs007_os_v1", "case_cs007_os_v2", "case_cs007_os_v3"]
+    tight = halo_frac("cs007_os", tight_cids, {c: [boxA] for c in tight_cids})
+    broken_cids = ["case_cs001_od_v1", "case_cs001_od_v2", "case_cs001_od_v3"]
+    broken = halo_frac("cs001_od", broken_cids,
+                       {broken_cids[0]: [boxA], broken_cids[1]: [boxA], broken_cids[2]: [boxA, boxB]})
+    assert broken > tight
+    assert tight < 1e-6                               # tight eye: essentially no disagreement
+
+
+def test_scar_consensus_bakes_faint_cornea_context(tmp_path, monkeypatch):
+    """The optional grey cornea shell renders where NO replicate has scar: low-alpha neutral grey."""
+    shape = (40, 200, 30)
+    boxA = (10, 30, 90, 110, 8, 22)
+    cids = ["case_cs007_os_v1", "case_cs007_os_v2", "case_cs007_os_v3"]
+    fake = _fake_labels({c: [boxA] for c in cids}, shape)
+    v, rgba = _run_scar_consensus(tmp_path, monkeypatch, "cs007_os", cids, fake)
+    assert v["status"] == "done", v.get("error")
+    R, G, B, A = rgba
+    ctx = (A > 0.05) & (A < 0.2)                      # the faint shell alpha (0.12), distinct from scar (1.0)
+    assert ctx.sum() > 0
+    chroma = np.stack([R, G, B], -1)[ctx]
+    assert np.allclose(chroma, da.SCAR_CTX_GREY, atol=0.02)   # neutral grey, subtle
+    # context never overlaps the scar overlay
+    assert not ((A > 0.5) & (A < 0.2)).any()
+
+
+def test_scar_consensus_skips_degraded_replicate(tmp_path, monkeypatch):
+    """A degraded (SAM2-failed) replicate is skipped + reported; the rest still composite."""
+    shape = (40, 200, 30)
+    boxA = (10, 30, 90, 110, 8, 22)
+    cids = ["case_cs001_od_v1", "case_cs001_od_v2", "case_cs001_od_v3"]
+    fake = _fake_labels({c: [boxA] for c in cids}, shape, degraded={cids[2]})
+    v, rgba = _run_scar_consensus(tmp_path, monkeypatch, "cs001_od", cids, fake)
+    assert v["status"] == "done", v.get("error")
+    assert v["skipped"] == ["v3"]
+    reps = {r["label"]: r for r in v["replicates"]}
+    assert reps["v3"]["skipped"] is True and reps["v3"]["scar_volume_mm3"] is None
+    assert reps["v1"]["skipped"] is False and reps["v1"]["scar_volume_mm3"] > 0
+    assert rgba is not None and (rgba[3] > 0.5).sum() > 0     # RGBA still produced from v1+v2
+
+
+def test_scar_consensus_errors_when_fewer_than_two_usable(tmp_path, monkeypatch):
+    """If SAM2 degrades all but one replicate, there is no consensus to form -> a clear job error."""
+    shape = (40, 200, 30)
+    boxA = (10, 30, 90, 110, 8, 22)
+    cids = ["case_cs001_od_v1", "case_cs001_od_v2", "case_cs001_od_v3"]
+    fake = _fake_labels({c: [boxA] for c in cids}, shape, degraded={cids[1], cids[2]})
+    v, _ = _run_scar_consensus(tmp_path, monkeypatch, "cs001_od", cids, fake)
+    assert v["status"] == "error"
+    assert "at least 2" in (v["error"] or "")

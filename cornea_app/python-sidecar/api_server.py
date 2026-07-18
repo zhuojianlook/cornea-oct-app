@@ -4627,15 +4627,17 @@ def debug_align_view(job_id: str, name: str) -> FileResponse:
 class ConsensusRequest(BaseModel):
     eye: str
     method: str = "fixed"
+    space: str = "intensity"    # "intensity" (whole cornea) | "scar" (binary scar min/excess)
 
 
 @app.post("/api/debug/consensus")
 def debug_consensus(req: ConsensusRequest) -> dict:
-    """Start an N-replicate consensus render for one eye. Returns a job_id; poll
+    """Start an N-replicate consensus render for one eye, in one SPACE. Returns a job_id; poll
     /api/debug/consensus/job/{job_id}. Runs in a background thread serialised with the pairwise
-    compare job (a second click queues rather than thrashing every core)."""
+    compare job (a second click queues rather than thrashing every core). space="scar" segments each
+    replicate (SAM2 + hysteresis, cached) and composites the binary scar masks."""
     try:
-        job_id = debug_align.start_consensus(req.eye, req.method)
+        job_id = debug_align.start_consensus(req.eye, req.method, req.space)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except ValueError as exc:

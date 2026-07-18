@@ -14,6 +14,12 @@ import { api, resourceUrl } from "../api/client";
 
 export type MethodId = "identity" | "asis" | "fixed" | "bruteforce";
 export type ViewId = "bscan" | "sagittal" | "zoom";
+/** The consensus DECOMPOSITION SPACE. `intensity` = the original min/excess of windowed raw intensity
+    (whole cornea + bulk tissue). `scar` = the min/excess of the per-replicate binary SCAR masks — a sparse,
+    background-free overlay: a WHITE consensus scar core + a COLOURED disagreement halo exactly at the
+    unstable scar boundary. The scar path runs SAM2 + the production detector per replicate on the backend
+    (slow first time, cached after), so it is only requested when actually selected. */
+export type ConsensusSpace = "intensity" | "scar";
 /** The interactive 3-D content modes. All render LIVE on the GPU via niivue (SLICE_TYPE.RENDER) — free
     mouse rotate/zoom/pan — rather than pre-baked turntable frames. `overlap`/`disagreement` are PAIRWISE
     (fixed vs moving); `consensus` is EYE-LEVEL: ALL replicates of the eye at once, aligned to a common
@@ -204,6 +210,9 @@ export interface ConsensusReplicate {
   label: string; // "v1" / "v1_2" — same scheme-agnostic repLabel the pair selectors use
   color: [number, number, number];
   is_ref: boolean; // the reference replicate (aligns to itself — identity)
+  /** This replicate's scar volume in mm³ (scar space only) — shown beside its swatch so the legend also
+      reads as a per-replicate reproducibility table. Absent/null in the intensity space. */
+  scar_volume_mm3?: number | null;
 }
 
 /** The consensus render result: the single min/excess RGBA volume + the legend to draw beside it. */
@@ -214,6 +223,7 @@ export interface ConsensusResult {
   volume: string; // token-exempt RGBA .nii.gz url on the shared iso grid (min/excess baked in)
   iso_mm: number; // shared iso grid spacing
   slices?: Partial<Record<ViewId, string>>; // optional 2-D min/excess composite PNGs (same decomposition)
+  space?: ConsensusSpace; // which space this composite is (intensity | scar) — drives the legend copy
 }
 
 /** The consensus job poll payload. Mirrors AlignJob's shape (status/progress/error) plus the result
@@ -222,6 +232,10 @@ interface ConsensusJob {
   status: "running" | "done" | "error";
   progress?: number;
   error?: string | null;
+  /** A human progress line the scar space fills in per replicate ("segmenting v3/9 …") — SAM2 is slow on
+      the first render of an eye, so this keeps the UI honest instead of a frozen spinner. */
+  note?: string | null;
+  space?: ConsensusSpace | null;
   reference?: string | null;
   replicates?: ConsensusReplicate[] | null;
   agree_color?: [number, number, number] | null;
@@ -285,9 +299,16 @@ interface DebugState {
      never loops on error). The camera pose lives in the debug niivue instance, so switching method re-renders
      while keeping the angle. */
   consensusMethod: MethodId;
+  /* The consensus decomposition space. `intensity` (default, unchanged behaviour) composites windowed raw
+     intensity; `scar` composites the per-replicate binary scar masks. Switching space re-renders (drops the
+     render guard) keeping the pose, exactly like switching method. Lazy: the scar space is only requested
+     when actually selected — its SAM2 pass is expensive. */
+  consensusSpace: ConsensusSpace;
   consensus: ConsensusResult | null;
   consensusRunning: boolean;
   consensusProgress: number;
+  /** Per-replicate progress line from the poll ("segmenting v3/9 …") — surfaced during the slow scar render. */
+  consensusProgressNote: string | null;
   consensusError: string | null;
   consensusRender3d: boolean;
   consensusToken: number;
@@ -305,6 +326,7 @@ interface DebugState {
   cycleFocus: (dir: 1 | -1) => void;
   run: () => Promise<void>;
   setConsensusMethod: (m: MethodId) => void;
+  setConsensusSpace: (sp: ConsensusSpace) => void;
   runConsensus: () => Promise<void>;
 }
 
@@ -339,9 +361,12 @@ export const useDebugStore = create<DebugState>()(
 
     // Consensus is per-eye; `fixed` is the sensible default method (rigid, corrects tilt) per the backend map.
     consensusMethod: "fixed",
+    // Default to the original INTENSITY space so existing behaviour is unchanged until the user opts into scar.
+    consensusSpace: "intensity",
     consensus: null,
     consensusRunning: false,
     consensusProgress: 0,
+    consensusProgressNote: null,
     consensusError: null,
     consensusRender3d: false,
     consensusToken: 0,
@@ -405,6 +430,8 @@ export const useDebugStore = create<DebugState>()(
         s.consensusRender3d = false;
         s.consensusError = null;
         s.consensusProgress = 0;
+        s.consensusProgressNote = null;
+        // NB: consensusSpace is intentionally kept across eyes — it is a display preference, not per-eye data.
       }),
 
     setFixed: (c) =>
@@ -566,20 +593,35 @@ export const useDebugStore = create<DebugState>()(
         s.consensusMethod = m;
         s.consensusRender3d = false;
         s.consensusError = null;
+        s.consensusProgressNote = null;
       }),
 
-    // Eye-level consensus render: POST /api/debug/consensus {eye, method} → poll the job → the single
+    // Switching the consensus SPACE (intensity ↔ scar) re-renders under the same method+eye. Same discipline
+    // as setConsensusMethod: drop the render guard so the lazy effect re-fires, clear the error + stale
+    // progress line, and LEAVE the previous composite on screen until the new one lands (a volume swap keeps
+    // the camera pose). The scar space's first render for an eye is slow (SAM2); the note carries its progress.
+    setConsensusSpace: (sp) =>
+      set((s) => {
+        if (s.consensusSpace === sp) return;
+        s.consensusSpace = sp;
+        s.consensusRender3d = false;
+        s.consensusError = null;
+        s.consensusProgressNote = null;
+      }),
+
+    // Eye-level consensus render: POST /api/debug/consensus {eye, method, space} → poll the job → the single
     // min/excess RGBA volume + the replicate→colour legend. Mirrors run()'s long-job + token-guard shape so
-    // a superseded request (eye/method change) drops its writes instead of racing them. Lazy: the panel only
-    // calls this when the consensus 3-D mode is active and the current eye+method isn't loaded yet.
+    // a superseded request (eye/method/space change) drops its writes instead of racing them. Lazy: the panel
+    // only calls this when the consensus 3-D mode is active and the current eye+method+space isn't loaded yet.
     runConsensus: async () => {
-      const { eye, consensusMethod } = get();
+      const { eye, consensusMethod, consensusSpace } = get();
       if (!eye) return;
       const token = get().consensusToken + 1;
       set((s) => {
         s.consensusToken = token;
         s.consensusRunning = true;
         s.consensusProgress = 0;
+        s.consensusProgressNote = null;
         s.consensusError = null;
         s.consensusRender3d = true; // in-flight → the lazy effect won't re-fire (mirrors render3d)
       });
@@ -588,7 +630,8 @@ export const useDebugStore = create<DebugState>()(
         const { job_id } = await api.json<{ job_id: string }>(
           "/api/debug/consensus",
           "POST",
-          JSON.stringify({ eye, method: consensusMethod }),
+          // space defaults to "intensity" server-side; sending it explicitly keeps the request self-describing.
+          JSON.stringify({ eye, method: consensusMethod, space: consensusSpace }),
         );
         if (!current()) return;
         if (!job_id) throw new Error("The sidecar did not return a job id.");
@@ -608,13 +651,22 @@ export const useDebugStore = create<DebugState>()(
           if (!current()) return;
           set((s) => {
             s.consensusProgress = typeof job.progress === "number" ? job.progress : s.consensusProgress;
+            // Carry the per-replicate progress line ("segmenting v3/9 …") — the scar space's SAM2 pass is slow
+            // on first render, so this keeps the spinner honest. Keep the last note if a poll omits it.
+            if (typeof job.note === "string") s.consensusProgressNote = job.note;
             // The RGBA volume + legend arrive together once the composite is written; fold them in as soon
             // as they exist so the viewport can render (and swap the old composite out) mid-job. Guard on the
-            // CURRENT eye+method too: selectEye/setConsensusMethod can't bump the token (the finally needs
-            // current() to reset `running`), so without this a run whose eye/method changed mid-flight would
-            // write a stale composite under the new selection. Mismatched writes are dropped; the lazy effect
-            // fires a fresh run once this one's finally clears `running`.
-            if (job.volume && job.replicates && s.eye === eye && s.consensusMethod === consensusMethod) {
+            // CURRENT eye+method+space too: selectEye/setConsensusMethod/setConsensusSpace can't bump the token
+            // (the finally needs current() to reset `running`), so without this a run whose eye/method/space
+            // changed mid-flight would write a stale composite under the new selection. Mismatched writes are
+            // dropped; the lazy effect fires a fresh run once this one's finally clears `running`.
+            if (
+              job.volume &&
+              job.replicates &&
+              s.eye === eye &&
+              s.consensusMethod === consensusMethod &&
+              s.consensusSpace === consensusSpace
+            ) {
               s.consensus = {
                 reference: job.reference ?? "",
                 replicates: job.replicates,
@@ -622,6 +674,7 @@ export const useDebugStore = create<DebugState>()(
                 volume: job.volume,
                 iso_mm: typeof job.iso_mm === "number" ? job.iso_mm : 0.02,
                 slices: job.slices ?? undefined,
+                space: job.space ?? consensusSpace,
               };
             }
           });

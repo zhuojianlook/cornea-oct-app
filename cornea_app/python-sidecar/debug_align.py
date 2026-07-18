@@ -66,6 +66,7 @@ identity primary 0.3165, 2-constant fix 0.8547, rot 1.438 deg, t_eff [-0.015, -0
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import tempfile
@@ -136,6 +137,147 @@ _MAX_KEPT_JOBS = 8
 # Age after which a job dir from a PREVIOUS sidecar process is swept. _MAX_KEPT_JOBS bounds the dirs
 # of THIS process; only age can bound the ones left by a process that is gone. See sweep_render_root.
 _JOB_TTL_S = 6 * 3600.0
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Per-replicate LABEL cache (the SCAR consensus space)
+# ═════════════════════════════════════════════════════════════════════════════
+# The scar consensus needs each replicate's cornea + scar labelmap. NONE exist on disk, and SAM2 costs
+# ~100 s/vol, so the labelmaps are cached PERSISTENTLY, keyed by case_id + preview-volume mtime + a
+# params hash, in a dedicated /tmp dir. A data change (new mtime) or a params change (new hash) misses
+# cleanly. NEVER written inside the read-only case store — mirrors _RENDER_ROOT's system-temp policy.
+_LABEL_CACHE_ROOT = Path(tempfile.gettempdir()) / "cornea_debug_labels"
+# Best-effort WARM source: the reproducibility study already computed these EXACT labelmaps (same SAM2
+# vote=2 + regularize_cornea + hysteresis phi=92 recipe) for several eyes. If a mask there matches the
+# current preview volume's SHAPE it is copied into the cache instead of re-running SAM2 (~15 min for a
+# 9-rep eye). Read-only; skipped silently if absent or shape-mismatched. Overridable for tests/deploys.
+_DENOISE_WARM_DIR = Path(
+    os.environ.get("CORNEA_DEBUG_LABEL_WARM_DIR", "/home/zhuojian/Desktop/teaser_bench/denoise/masks")
+)
+# Label-generation parameters, baked into the cache key so any change invalidates cleanly. These are the
+# PRODUCTION defaults (the expC_build_masks recipe): SAM2 3-plane vote=2 -> regularize_cornea, then
+# detect_scar_hysteresis on the RAW volume.
+LABEL_PARAMS: dict = {
+    "sam2_planes": ("axial", "coronal", "sagittal"),
+    "sam2_vote": 2,
+    "regularize": True,
+    "phi_percentile": 92.0,
+    "gap": 12.0,
+    "erode_surface": 6,
+    "smooth": 2.5,
+    "min_voxels": 500,
+    "open_iter": 1,
+    "close_iter": 4,
+}
+
+
+def _label_params_hash() -> str:
+    return hashlib.md5(repr(sorted(LABEL_PARAMS.items())).encode()).hexdigest()[:12]
+
+
+def label_cache_paths(case_id: str) -> tuple[Path, Path]:
+    """(cornea_path, scar_path) for a case's cached labelmaps, keyed by case + preview mtime + params
+    hash so a data or params change misses cleanly. Paths live under the /tmp label cache and may not
+    exist yet — NEVER under the case store."""
+    case_id = orch.safe_case_id(case_id)
+    try:
+        mt = int(volume_path(case_id).stat().st_mtime)
+    except OSError:
+        mt = 0
+    key = f"{case_id}__{mt}__{_label_params_hash()}"
+    return (_LABEL_CACHE_ROOT / f"cornea__{key}.nii.gz",
+            _LABEL_CACHE_ROOT / f"scar__{key}.nii.gz")
+
+
+def _save_label_cache(path: Path, arr: np.ndarray) -> None:
+    """Write a labelmap to the cache as a gzip NIfTI, via a temp file + atomic rename so a crash mid-write
+    can never leave a half file the next run trusts. Affine is identity: only the array (native
+    [lat,depth,frames] order) is ever read back."""
+    import nibabel as nib
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{uuid.uuid4().hex[:8]}.tmp.nii.gz"
+    nib.save(nib.Nifti1Image(np.ascontiguousarray(arr), np.eye(4)), str(tmp))
+    tmp.replace(path)
+
+
+def _warm_labels_from_denoise(case_id: str, ref_shape, cornea_p: Path, scar_p: Path) -> bool:
+    """Copy the reproducibility-study cornea+scar masks into the cache when they match this case's
+    volume SHAPE (skips a ~100 s/vol SAM2 re-run). Best-effort + read-only on the warm source: returns
+    True on a verified hit, False on absent/shape-mismatch/any error."""
+    if not _DENOISE_WARM_DIR.exists():
+        return False
+    rep = case_id[len("case_"):] if case_id.startswith("case_") else case_id   # case_cs001_od_v1 -> cs001_od_v1
+    src_cornea = _DENOISE_WARM_DIR / f"cornea_{rep}.nii.gz"
+    src_scar = _DENOISE_WARM_DIR / f"scar_{rep}.nii.gz"
+    if not (src_cornea.exists() and src_scar.exists()):
+        return False
+    try:
+        import nibabel as nib
+        if tuple(nib.load(str(src_cornea)).shape) != tuple(ref_shape):
+            return False
+        if tuple(nib.load(str(src_scar)).shape) != tuple(ref_shape):
+            return False
+        _LABEL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src_cornea, cornea_p)
+        shutil.copyfile(src_scar, scar_p)
+        return True
+    except Exception:  # noqa: BLE001 — warming is best-effort; fall back to a cold SAM2 build
+        return False
+
+
+def load_or_build_labels(case_id: str, progress=None) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Per-replicate cornea ({0,1} uint8) + scar (bool) labelmaps on the case's NATIVE grid.
+
+    Cache-first: a hit returns instantly; a miss warms from the study masks if shape-matched, else runs
+    the PRODUCTION chain — SAM2 3-plane vote=2 -> regularize_cornea, then detect_scar_hysteresis on the
+    RAW volume (~100 s/vol on the 3090) — and writes the cache. `progress(phase, index, total)` is
+    forwarded to SAM2 so a caller can surface "segmenting … · axial". Returns (cornea, scar, meta) where
+    meta = {source, degraded, cornea_voxels}; a DEGRADED replicate (SAM2 plane failure or empty cornea)
+    returns an all-zero scar and is NOT cached (a later good run must be free to replace it). NEVER
+    writes into the case store — the cache lives under _LABEL_CACHE_ROOT (/tmp)."""
+    import nibabel as nib
+    case_id = orch.safe_case_id(case_id)
+    volp = volume_path(case_id)
+    if not volp.exists():
+        raise FileNotFoundError(f"No preview volume for {case_id}")
+    cornea_p, scar_p = label_cache_paths(case_id)
+
+    if cornea_p.exists() and scar_p.exists():
+        cornea = np.rint(np.asarray(nib.load(str(cornea_p)).dataobj)).astype(np.uint8)
+        scar = np.asarray(nib.load(str(scar_p)).dataobj) > 0
+        return cornea, scar, {"source": "cache", "degraded": False,
+                              "cornea_voxels": int((cornea >= 1).sum())}
+
+    base = nib.load(str(volp))
+    raw = np.asarray(base.dataobj).astype(np.float32)
+
+    if _warm_labels_from_denoise(case_id, raw.shape, cornea_p, scar_p):
+        cornea = np.rint(np.asarray(nib.load(str(cornea_p)).dataobj)).astype(np.uint8)
+        scar = np.asarray(nib.load(str(scar_p)).dataobj) > 0
+        return cornea, scar, {"source": "warm", "degraded": False,
+                              "cornea_voxels": int((cornea >= 1).sum())}
+
+    # Cold build (GPU). Lazy imports so a plain `import debug_align` (tests, api_server startup) never
+    # pulls in torch/SAM2.
+    import sam2_segment
+    import scar as scar_mod
+    _LABEL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sam2_", dir=str(_LABEL_CACHE_ROOT)) as work:
+        label, meta = sam2_segment.segment_volume(
+            volp, Path(work), planes=tuple(LABEL_PARAMS["sam2_planes"]),
+            vote=int(LABEL_PARAMS["sam2_vote"]), progress=progress)
+    cornea = scar_mod.regularize_cornea(label).astype(np.uint8)
+    cvox = int((cornea >= 1).sum())
+    if bool(meta.get("degraded")) or cvox == 0:
+        return cornea, np.zeros(cornea.shape, bool), {
+            "source": "sam2", "degraded": True, "cornea_voxels": cvox}
+    scar = scar_mod.detect_scar_hysteresis(
+        raw, cornea, phi_percentile=float(LABEL_PARAMS["phi_percentile"]),
+        gap=float(LABEL_PARAMS["gap"]), erode_surface=int(LABEL_PARAMS["erode_surface"]),
+        smooth=float(LABEL_PARAMS["smooth"]), min_voxels=int(LABEL_PARAMS["min_voxels"]),
+        open_iter=int(LABEL_PARAMS["open_iter"]), close_iter=int(LABEL_PARAMS["close_iter"])).astype(bool)
+    _save_label_cache(cornea_p, cornea.astype(np.uint8))
+    _save_label_cache(scar_p, scar.astype(np.uint8))
+    return cornea, scar, {"source": "sam2", "degraded": False, "cornea_voxels": cvox}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1344,6 +1486,16 @@ AGREE_COLOR: tuple[int, int, int] = (255, 255, 255)   # unmistakable, distinct f
 # Cap so a pathological eye cannot spawn a runaway job; the cohort maxes at 9 replicates.
 MAX_CONSENSUS_REPS = len(CONSENSUS_PALETTE)
 
+# ── scar-consensus space ──────────────────────────────────────────────────────
+CONSENSUS_SPACES = ("intensity", "scar")
+# Faint translucent grey reference-cornea shell baked into the SCAR RGBA, so the sparse scar overlay has
+# anatomical context. Kept subtle (low alpha, neutral grey) and painted ONLY where NO replicate has scar,
+# so it never dims the scar overlay nor reintroduces the background/bulk-tissue problem the scar space
+# exists to avoid. It is the CORNEA — not raw intensity — so background stays fully transparent.
+SCAR_CTX_ENABLED = True
+SCAR_CTX_GREY = 0.42
+SCAR_CTX_ALPHA = 0.12
+
 
 def eye_cases(eye: str) -> list[str]:
     """The ordered replicate case list for one eye — the SAME enumeration groups() offers, so both
@@ -1463,21 +1615,28 @@ def consensus_job_view(job_id: str) -> dict | None:
             return None
         return {
             "status": j["status"], "progress": round(float(j["progress"]), 3), "error": j["error"],
-            "eye": j["eye"], "method": j["method"], "reference": j["reference"],
+            "eye": j["eye"], "method": j["method"], "space": j.get("space", "intensity"),
+            "reference": j["reference"],
             "replicates": [dict(r) for r in j["replicates"]],
             "agree_color": list(j["agree_color"]),
             "volume": j.get("volume"), "iso_mm": j.get("iso_mm"),
             "slices": dict(j.get("slices") or {}),
             "geometry": j.get("geometry"), "note": j.get("note"),
+            "skipped": list(j.get("skipped") or []),
         }
 
 
-def start_consensus(eye: str, method: str = "fixed") -> str:
-    """Start a consensus render for one eye by one method. Returns a job_id; poll consensus_job_view.
-    Aligns every replicate to the first (reference) and composites the min/excess RGBA volume."""
+def start_consensus(eye: str, method: str = "fixed", space: str = "intensity") -> str:
+    """Start a consensus render for one eye by one method + one SPACE. Returns a job_id; poll
+    consensus_job_view. Aligns every replicate to the first (reference) and composites the min/excess
+    RGBA volume — over windowed INTENSITY (space="intensity", the whole cornea) or over binary SCAR
+    masks (space="scar", a white agreement core + a coloured disagreement halo at the unstable
+    boundary; SAM2 + hysteresis per replicate, cached)."""
     _sweep_once()
     if method not in METHODS:
         raise ValueError(f"Unknown method '{method}'. Known: {', '.join(METHODS)}")
+    if space not in CONSENSUS_SPACES:
+        raise ValueError(f"Unknown space '{space}'. Known: {', '.join(CONSENSUS_SPACES)}")
     cases = eye_cases(eye)
     if len(cases) < 2:
         raise ValueError(f"Eye '{eye}' has fewer than 2 replicate scans to compare.")
@@ -1491,8 +1650,8 @@ def start_consensus(eye: str, method: str = "fixed") -> str:
         _JOBS[job_id] = {
             "kind": "consensus",
             "status": "running", "progress": 0.0, "error": None,
-            "eye": eye, "method": method, "reference": cases[0], "cases": cases,
-            "replicates": reps, "agree_color": list(AGREE_COLOR),
+            "eye": eye, "method": method, "space": space, "reference": cases[0], "cases": cases,
+            "replicates": reps, "agree_color": list(AGREE_COLOR), "skipped": [],
             "volume": None, "iso_mm": None, "slices": {}, "geometry": None,
             "running": True, "started": time.time(), "note": note,
             # Benign pairwise-view keys so a job_view() call with this id cannot KeyError.
@@ -1500,14 +1659,14 @@ def start_consensus(eye: str, method: str = "fixed") -> str:
             "disagree_max": None,
         }
     job_dir(job_id).mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=_consensus_worker, args=(job_id, cases, method), daemon=True).start()
+    threading.Thread(target=_consensus_worker, args=(job_id, cases, method, space), daemon=True).start()
     return job_id
 
 
-def _consensus_worker(job_id: str, cases: list[str], method: str) -> None:
+def _consensus_worker(job_id: str, cases: list[str], method: str, space: str = "intensity") -> None:
     try:
         with _RUN_LOCK:                      # shared with the pairwise job — a second click queues
-            _consensus_run(job_id, cases, method)
+            _consensus_run(job_id, cases, method, space)
     except Exception as exc:  # noqa: BLE001 — a job must never take the sidecar down
         _set(job_id, status="error", error=f"{type(exc).__name__}: {exc}", progress=1.0, running=False)
     finally:
@@ -1521,7 +1680,92 @@ def _consensus_worker(job_id: str, cases: list[str], method: str) -> None:
         _prune_jobs()
 
 
-def _consensus_run(job_id: str, cases: list[str], method: str) -> None:
+def _bake_cornea_context(rgb: np.ndarray, alpha: np.ndarray, cornea_iso: np.ndarray) -> None:
+    """Overlay a very translucent grey reference-cornea shell into the SCAR RGBA IN PLACE, ONLY where no
+    replicate has scar (alpha==0) — so the scar overlay is never dimmed and the background stays fully
+    transparent. Gives the sparse scar overlay anatomical context without reintroducing the background/
+    bulk-tissue problem the scar space exists to avoid."""
+    ctx = np.asarray(cornea_iso, bool) & (alpha <= 1e-6)
+    if not ctx.any():
+        return
+    rgb[ctx] = SCAR_CTX_GREY
+    alpha[ctx] = SCAR_CTX_ALPHA
+
+
+def _consensus_scar_masks(job_id: str, cases: list[str], method: str, fi: sitk.Image,
+                          fi_iso: sitk.Image, vf: np.ndarray, spf, geom: dict,
+                          iso: float) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray | None, list[str]]:
+    """Build every replicate's binary SCAR mask on the shared reference iso grid, for the min/excess
+    decomposition. Returns (I_list, colors01, cornea_ctx_iso, skipped).
+
+    Per replicate: fetch its cached cornea+scar labelmap (SAM2 + regularize + hysteresis; see
+    load_or_build_labels), SKIP it if SAM2 is degraded (recorded), align it to the reference VOLUME with
+    the SAME transform the intensity consensus uses, warp the scar mask NEAREST-NEIGHBOUR onto the
+    reference grid, and iso-crop it (order=0) to the shared lattice as a {0,1} array. The reference
+    (cases[0]) is identity when usable. A usable replicate with ZERO scar is kept (a legitimate
+    "no scar here" vote that dissolves the white core), only SAM2 failures are skipped. cornea_ctx_iso is
+    the reference cornea on the iso grid (the faint anatomy shell) or None if the reference is degraded."""
+    n = len(cases)
+    with _JOBS_LOCK:
+        reps_legend = _JOBS[job_id]["replicates"]      # list of dicts, index-aligned to `cases`
+    I_list: list[np.ndarray] = []
+    colors01: list[np.ndarray] = []
+    cornea_ctx_iso: np.ndarray | None = None
+    skipped: list[str] = []
+    for i, c in enumerate(cases):
+        label = reps_legend[i]["label"]
+        _set(job_id, progress=0.05 + 0.80 * (i / n), note=f"segmenting {label} ({i + 1}/{n})")
+
+        def _prog(phase, idx, total, _lbl=label, _i=i):
+            _set(job_id, note=f"segmenting {_lbl} ({_i + 1}/{n}) · {phase}")
+
+        cornea, scar, meta = load_or_build_labels(c, progress=_prog)
+        col = np.asarray(reps_legend[i]["color"], np.float32) / 255.0
+        if meta.get("degraded"):
+            skipped.append(label)
+            with _JOBS_LOCK:
+                reps_legend[i]["skipped"] = True
+                reps_legend[i]["scar_volume_mm3"] = None
+            del cornea, scar
+            continue
+
+        scar_vox = int(scar.sum())
+        _set(job_id, note=f"aligning {label} ({i + 1}/{n})")
+        if i == 0:                                       # reference = identity (aligns to itself)
+            spm = spf
+            iso_mask = (_iso_crop(scar.astype(np.float32), spf, geom, iso,
+                                  order=0, antialias=False) > 0.5).astype(np.float32)
+            if SCAR_CTX_ENABLED and cornea is not None and (cornea >= 1).any():
+                cornea_ctx_iso = (_iso_crop((cornea >= 1).astype(np.float32), spf, geom, iso,
+                                            order=0, antialias=False) > 0.5)
+        else:
+            vm, spm = load_volume(c)
+            mi = to_sitk(vm, spm)
+            R, t = _consensus_transform(method, fi, mi, fi_iso, vf, vm, spf, spm)
+            sm_sitk = to_sitk(scar.astype(np.float32), spm)   # warp the SCAR mask (NN) onto the ref grid
+            warped = _from_sitk(sitk.Resample(sm_sitk, fi, _tx(R, t),
+                                              sitk.sitkNearestNeighbor, 0.0, sitk.sitkFloat32))
+            iso_mask = (_iso_crop(warped, spf, geom, iso, order=0, antialias=False) > 0.5).astype(np.float32)
+            del vm, mi, sm_sitk, warped
+
+        scar_mm3 = scar_vox * float(spm[0]) * float(spm[1]) * float(spm[2])
+        with _JOBS_LOCK:
+            reps_legend[i]["skipped"] = False
+            reps_legend[i]["scar_volume_mm3"] = round(scar_mm3, 6)
+        I_list.append(iso_mask)
+        colors01.append(col)
+        del cornea, scar
+
+    _set(job_id, skipped=skipped)
+    if len(I_list) < 2:
+        raise ValueError(
+            "Scar consensus needs at least 2 replicates with a valid cornea/scar segmentation; only "
+            f"{len(I_list)} of {n} produced one"
+            + (f" (skipped: {', '.join(skipped)})" if skipped else "") + ".")
+    return I_list, colors01, cornea_ctx_iso, skipped
+
+
+def _consensus_run(job_id: str, cases: list[str], method: str, space: str = "intensity") -> None:
     out_dir = job_dir(job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     reference, others = cases[0], cases[1:]
@@ -1539,33 +1783,53 @@ def _consensus_run(job_id: str, cases: list[str], method: str) -> None:
     lo, hi = window_from_fixed(vf)
     iso = DBG_ISO_MM
 
-    def to_I(arr: np.ndarray) -> np.ndarray:
-        return np.clip((np.asarray(arr, np.float32) - lo) / max(hi - lo, 1e-6),
-                       0.0, 1.0).astype(np.float32)
+    cornea_ctx_iso = None
+    skipped: list[str] = []
+    if space == "scar":
+        # SCAR space: min/excess over binary SCAR masks (white agreement core + coloured disagreement
+        # halo). Reuses the SAME alignment + the SAME min/excess builder — only the per-replicate input
+        # array changes (scar mask instead of windowed intensity), and I_list/colors01 span only the
+        # replicates that produced a valid segmentation.
+        I_list, colors01, cornea_ctx_iso, skipped = _consensus_scar_masks(
+            job_id, cases, method, fi, fi_iso, vf, spf, geom, iso)
+    else:
+        def to_I(arr: np.ndarray) -> np.ndarray:
+            return np.clip((np.asarray(arr, np.float32) - lo) / max(hi - lo, 1e-6),
+                           0.0, 1.0).astype(np.float32)
 
-    # Reference = identity (aligns to itself), iso-cropped once.
-    I_list = [to_I(_iso_crop(vf, spf, geom, iso, order=1))]
+        # Reference = identity (aligns to itself), iso-cropped once.
+        I_list = [to_I(_iso_crop(vf, spf, geom, iso, order=1))]
 
-    n_steps = max(len(others), 1)
-    step = 0.80 / n_steps
-    for n, other in enumerate(others):
-        _set(job_id, progress=0.10 + n * step)
-        vm, spm = load_volume(other)
-        mi = to_sitk(vm, spm)
-        R, t = _consensus_transform(method, fi, mi, fi_iso, vf, vm, spf, spm)
-        m_res = _from_sitk(sitk.Resample(mi, fi, _tx(R, t), sitk.sitkLinear, 0.0, sitk.sitkFloat32))
-        I_list.append(to_I(_iso_crop(m_res, spf, geom, iso, order=1)))
-        del vm, mi, m_res
+        n_steps = max(len(others), 1)
+        step = 0.80 / n_steps
+        for n, other in enumerate(others):
+            _set(job_id, progress=0.10 + n * step)
+            vm, spm = load_volume(other)
+            mi = to_sitk(vm, spm)
+            R, t = _consensus_transform(method, fi, mi, fi_iso, vf, vm, spf, spm)
+            m_res = _from_sitk(sitk.Resample(mi, fi, _tx(R, t), sitk.sitkLinear, 0.0, sitk.sitkFloat32))
+            I_list.append(to_I(_iso_crop(m_res, spf, geom, iso, order=1)))
+            del vm, mi, m_res
 
-    _set(job_id, progress=0.92)
+    # note is only touched for the scar space; the intensity path leaves the MAX_CONSENSUS_REPS note
+    # (set in start_consensus) exactly as it was, so space="intensity" stays byte-identical.
+    if space == "scar":
+        _set(job_id, progress=0.92, note="compositing")
+    else:
+        _set(job_id, progress=0.92)
     rgb, alpha = consensus_decompose(I_list, colors01)
+    if space == "scar" and cornea_ctx_iso is not None:
+        _bake_cornea_context(rgb, alpha, cornea_ctx_iso)
     vol_name = "consensus_rgba.nii.gz"
     _write_rgba_nifti(out_dir / vol_name, rgb, alpha, iso)
     slices = _write_consensus_slices(rgb, geom, spf, iso, out_dir, job_id)
 
-    _set(job_id,
-         volume=f"/api/debug/align/view/{job_id}/{vol_name}", iso_mm=iso, slices=slices,
-         geometry={**geom, "fixed_shape": list(vf.shape),
-                   "fixed_spacing_mm": [float(x) for x in spf], "window": [lo, hi],
-                   "iso_shape": [int(x) for x in rgb.shape[:3]]},
-         status="done", progress=1.0)
+    done_kwargs = dict(
+        volume=f"/api/debug/align/view/{job_id}/{vol_name}", iso_mm=iso, slices=slices,
+        geometry={**geom, "fixed_shape": list(vf.shape),
+                  "fixed_spacing_mm": [float(x) for x in spf], "window": [lo, hi],
+                  "iso_shape": [int(x) for x in rgb.shape[:3]], "space": space},
+        status="done", progress=1.0)
+    if space == "scar":
+        done_kwargs["note"] = f"skipped {', '.join(skipped)}" if skipped else None
+    _set(job_id, **done_kwargs)

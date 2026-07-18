@@ -106,6 +106,14 @@ const CONSENSUS3D_TIP =
   "with the method radio — identity shows the raw un-aligned scatter, the rigid methods pull the whites " +
   "together. Drag to rotate, scroll to zoom.";
 
+const SCAR_CONSENSUS3D_TIP =
+  "SCAR consensus — the reproducibility instrument. Per replicate the production scar detector's mask is " +
+  "warped onto the common reference grid, then the SAME min/excess decomposition is applied to the BINARY " +
+  "masks: WHITE = the scar core every replicate agrees on, a COLOURED HALO = the boundary voxels where a " +
+  "replicate's scar diverges. Background-free (only scar is drawn), so a thin white core inside a wide " +
+  "coloured halo reads directly as an unstable, hard-to-reproduce scar boundary. First render of an eye runs " +
+  "SAM2 + the detector per replicate (slow, cached after). Drag to rotate, scroll to zoom.";
+
 export function AlignDebugPanel() {
   const groups = useDebugStore((s) => s.groups);
   const groupsBusy = useDebugStore((s) => s.groupsBusy);
@@ -142,11 +150,14 @@ export function AlignDebugPanel() {
   const isoMm = useDebugStore((s) => s.iso_mm);
   const consensus = useDebugStore((s) => s.consensus);
   const consensusMethod = useDebugStore((s) => s.consensusMethod);
+  const consensusSpace = useDebugStore((s) => s.consensusSpace);
   const consensusRunning = useDebugStore((s) => s.consensusRunning);
   const consensusProgress = useDebugStore((s) => s.consensusProgress);
+  const consensusProgressNote = useDebugStore((s) => s.consensusProgressNote);
   const consensusError = useDebugStore((s) => s.consensusError);
   const consensusRender3d = useDebugStore((s) => s.consensusRender3d);
   const setConsensusMethod = useDebugStore((s) => s.setConsensusMethod);
+  const setConsensusSpace = useDebugStore((s) => s.setConsensusSpace);
   const runConsensus = useDebugStore((s) => s.runConsensus);
 
   const isConsensus = mode3d === "consensus";
@@ -193,7 +204,7 @@ export function AlignDebugPanel() {
   useEffect(() => {
     if (!isConsensus || !eye || consensusRunning || consensusRender3d) return;
     void runConsensus();
-  }, [isConsensus, eye, consensusRunning, consensusRender3d, runConsensus]);
+  }, [isConsensus, eye, consensusSpace, consensusRunning, consensusRender3d, runConsensus]);
 
   const label = (r: AlignResult): string =>
     r.label || ALIGN_METHODS.find((m) => m.id === r.method)?.label || r.method;
@@ -343,7 +354,7 @@ export function AlignDebugPanel() {
             the radio inside the consensus viewport. */}
         {isConsensus && (
           <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-            all {group?.cases.length ?? 0} replicates · pick the alignment method in the viewport
+            all {group?.cases.length ?? 0} replicates · pick the space (intensity / scar) + alignment method in the viewport
           </span>
         )}
 
@@ -482,7 +493,7 @@ export function AlignDebugPanel() {
 
         {/* The legend is not decoration: without it the composite (or the hot MIP) is unreadable. */}
         {isConsensus ? (
-          <Tooltip title={CONSENSUS3D_TIP} arrow>
+          <Tooltip title={(consensus?.space ?? consensusSpace) === "scar" ? SCAR_CONSENSUS3D_TIP : CONSENSUS3D_TIP} arrow>
             <span className="flex items-center gap-2 text-[11px] flex-wrap" style={{ color: "var(--c-text-dim)", cursor: "help" }}>
               {(consensus?.replicates ?? []).map((r) => (
                 <span key={r.case} className="flex items-center" style={{ gap: 3 }}>
@@ -493,7 +504,11 @@ export function AlignDebugPanel() {
               <span className="flex items-center" style={{ gap: 3 }}>
                 <span style={{ width: 9, height: 9, background: "#ffffff", borderRadius: 2, border: "1px solid var(--c-border)" }} /> agree
               </span>
-              <span style={{ opacity: 0.8 }}>— white = all replicates agree; colour = a replicate diverging</span>
+              <span style={{ opacity: 0.8 }}>
+                {(consensus?.space ?? consensusSpace) === "scar"
+                  ? "— white core = scar all replicates agree on; coloured halo = boundary where a replicate's scar disagrees"
+                  : "— white = all replicates agree; colour = a replicate diverging"}
+              </span>
             </span>
           </Tooltip>
         ) : mode3d === "disagreement" ? (
@@ -611,7 +626,10 @@ export function AlignDebugPanel() {
             consensus={consensus}
             consensusMethod={consensusMethod}
             setConsensusMethod={setConsensusMethod}
+            consensusSpace={consensusSpace}
+            setConsensusSpace={setConsensusSpace}
             consensusRunning={consensusRunning}
+            consensusProgressNote={consensusProgressNote}
             consensusError={consensusError}
           />
         ) : results.length === 0 ? (

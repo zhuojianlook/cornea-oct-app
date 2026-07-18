@@ -19,6 +19,7 @@ import {
   viewUrl,
   type AlignResult,
   type ConsensusResult,
+  type ConsensusSpace,
   type MethodId,
   type Mode3d,
 } from "../../store/debugStore";
@@ -53,7 +54,10 @@ interface Props {
   consensus?: ConsensusResult | null;
   consensusMethod?: MethodId;
   setConsensusMethod?: (m: MethodId) => void;
+  consensusSpace?: ConsensusSpace;
+  setConsensusSpace?: (sp: ConsensusSpace) => void;
   consensusRunning?: boolean;
+  consensusProgressNote?: string | null;
   consensusError?: string | null;
 }
 
@@ -69,7 +73,10 @@ export function Debug3DViewport({
   consensus,
   consensusMethod,
   setConsensusMethod,
+  consensusSpace,
+  setConsensusSpace,
   consensusRunning,
+  consensusProgressNote,
   consensusError,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -78,6 +85,8 @@ export function Debug3DViewport({
   const [ready, setReady] = useState(false);
 
   const isConsensus = mode === "consensus";
+  const space: ConsensusSpace = consensusSpace ?? "intensity";
+  const isScar = isConsensus && space === "scar";
 
   // Create the debug niivue instance for this viewport's lifetime; destroy (free the WebGL context) on
   // unmount. debugNvController defers the destroy one tick so React StrictMode's mount→unmount→mount is a
@@ -146,8 +155,32 @@ export function Debug3DViewport({
 
   return (
     <div className="flex flex-col min-h-0" style={{ height: "100%", gap: 8 }}>
-      {/* ── method switcher ── */}
+      {/* ── space + method switcher ── */}
       <div className="flex items-center gap-3 flex-wrap">
+        {/* SPACE toggle (consensus only): Intensity = raw min/excess (whole cornea + bulk tissue); Scar =
+            min/excess of the binary scar masks (sparse, background-free — a white agreement core + a coloured
+            disagreement halo). Bare ToggleButtons on purpose — a prior bug came from wrapping a Select in a
+            Tooltip, and the method toggle beside it is deliberately bare too. Switching space keeps the pose. */}
+        {isConsensus && (
+          <>
+            <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: "var(--c-text-dim)" }}>
+              Space
+            </span>
+            <ToggleButtonGroup
+              size="small"
+              exclusive
+              value={space}
+              onChange={(_, v) => v && setConsensusSpace?.(v as ConsensusSpace)}
+            >
+              <ToggleButton value="intensity" sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>
+                Intensity
+              </ToggleButton>
+              <ToggleButton value="scar" sx={{ py: 0.1, px: 1, fontSize: 11, textTransform: "none" }}>
+                Scar
+              </ToggleButton>
+            </ToggleButtonGroup>
+          </>
+        )}
         <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: "var(--c-text-dim)" }}>
           {isConsensus ? "Align by" : "Method"}
         </span>
@@ -210,9 +243,20 @@ export function Debug3DViewport({
               </div>
             ) : !haveConsensus ? (
               <div style={overlayStyle}>
-                <span className="flex items-center gap-2" style={{ color: "var(--c-text-dim)" }}>
+                <span className="flex flex-col items-center gap-2" style={{ color: "var(--c-text-dim)", textAlign: "center", maxWidth: 340 }}>
                   <CircularProgress size={16} color="inherit" />
-                  {consensusRunning ? "rendering consensus…" : "preparing consensus…"}
+                  <span>
+                    {consensusRunning
+                      ? consensusProgressNote || (isScar ? "segmenting replicates…" : "rendering consensus…")
+                      : "preparing consensus…"}
+                  </span>
+                  {/* First scar render of an eye runs SAM2 + the scar detector per replicate — slow (~100 s each),
+                      cached after, so re-renders are fast. Say so, so the wait doesn't read as a hang. */}
+                  {isScar && consensusRunning && (
+                    <span style={{ fontSize: 9, opacity: 0.7 }}>
+                      first scar render segments each replicate (SAM2) — cached after, so re-renders are fast
+                    </span>
+                  )}
                 </span>
               </div>
             ) : null
@@ -234,8 +278,8 @@ export function Debug3DViewport({
           {/* Consensus keeps its (possibly stale) composite on screen while a new method re-renders, so mark
               the in-flight state without blanking the viewport. */}
           {isConsensus && haveConsensus && consensusRunning && (
-            <div style={{ position: "absolute", top: 8, right: 8, display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "var(--c-text-dim)", background: "rgba(0,0,0,0.45)", borderRadius: 6, padding: "2px 8px", pointerEvents: "none" }}>
-              <CircularProgress size={11} color="inherit" /> re-rendering…
+            <div style={{ position: "absolute", top: 8, right: 8, display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "var(--c-text-dim)", background: "rgba(0,0,0,0.45)", borderRadius: 6, padding: "2px 8px", pointerEvents: "none", maxWidth: "70%" }}>
+              <CircularProgress size={11} color="inherit" /> {consensusProgressNote || "re-rendering…"}
             </div>
           )}
         </div>
@@ -249,7 +293,9 @@ export function Debug3DViewport({
                   <div style={{ fontSize: 12, color: "var(--c-text)", marginBottom: 4 }}>
                     {methodLabel(consensusMethod ?? "fixed")}
                   </div>
-                  <div style={{ fontSize: 8, letterSpacing: 0.5, opacity: 0.7 }}>CONSENSUS</div>
+                  <div style={{ fontSize: 8, letterSpacing: 0.5, opacity: 0.7 }}>
+                    {(consensus.space ?? space) === "scar" ? "SCAR CONSENSUS" : "INTENSITY CONSENSUS"}
+                  </div>
                   <div style={{ color: "var(--c-text)", fontSize: 13 }}>
                     <b>{consensus.replicates.length}</b> replicates
                   </div>
@@ -258,7 +304,9 @@ export function Debug3DViewport({
               )}
 
               <div style={{ border: "1px solid var(--c-border)", borderRadius: 8, padding: "8px 10px", background: "var(--c-surface)", lineHeight: 1.7 }}>
-                <div style={{ fontSize: 8, letterSpacing: 0.5, opacity: 0.7, marginBottom: 2 }}>LEGEND</div>
+                <div style={{ fontSize: 8, letterSpacing: 0.5, opacity: 0.7, marginBottom: 2 }}>
+                  LEGEND{(consensus?.space ?? space) === "scar" ? " · scar volume" : ""}
+                </div>
                 {(consensus?.replicates ?? []).map((r) => (
                   <div key={r.case} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ width: 9, height: 9, background: rgb(r.color), borderRadius: 2, flex: "none" }} />
@@ -268,15 +316,32 @@ export function Debug3DViewport({
                         REF
                       </span>
                     )}
+                    {/* scar space: the per-replicate scar volume, right-aligned — the legend doubles as a
+                        reproducibility table (how much each replicate's scar mask disagrees on total burden). */}
+                    {(consensus?.space ?? space) === "scar" && num(r.scar_volume_mm3) && (
+                      <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--c-text)", fontVariantNumeric: "tabular-nums" }}>
+                        {r.scar_volume_mm3!.toFixed(1)} mm³
+                      </span>
+                    )}
                   </div>
                 ))}
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
                   <span style={{ width: 9, height: 9, background: rgb(consensus?.agree_color ?? [255, 255, 255]), borderRadius: 2, flex: "none", border: "1px solid var(--c-border)" }} />
-                  agree (all replicates)
+                  {(consensus?.space ?? space) === "scar" ? "scar agrees (all replicates)" : "agree (all replicates)"}
                 </div>
                 <div style={{ opacity: 0.85, marginTop: 4 }}>
-                  White = every replicate agrees; a replicate's own colour = it diverges there (misalignment or a
-                  unique feature).
+                  {(consensus?.space ?? space) === "scar" ? (
+                    <>
+                      <b>White core</b> = scar every replicate agrees on; a <b>coloured halo</b> = the boundary
+                      where a replicate's scar disagrees. A thin white core with a wide halo = an unstable,
+                      hard-to-reproduce scar boundary.
+                    </>
+                  ) : (
+                    <>
+                      White = every replicate agrees; a replicate's own colour = it diverges there (misalignment
+                      or a unique feature).
+                    </>
+                  )}
                 </div>
               </div>
             </>
@@ -325,7 +390,9 @@ export function Debug3DViewport({
           )}
 
           <div style={{ opacity: 0.75, fontSize: 10, lineHeight: 1.6 }}>
-            {isConsensus
+            {isScar
+              ? "Live GPU volume render of the per-replicate SCAR masks — background-free. The reproducibility instrument: white = the scar core every replicate agrees on, colour = the unstable boundary where a replicate's scar diverges."
+              : isConsensus
               ? "Live GPU volume render — all replicates at once. The consensus is the white core; the coloured fringe is where a replicate parts from it."
               : "Live GPU volume render — no winner is declared here; judge the geometry on the residual and the pixels."}
           </div>
