@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { Niivue, SLICE_TYPE } from "@niivue/niivue";
 import { ToggleButton, ToggleButtonGroup, Slider, Tooltip } from "@mui/material";
 import { resourceUrl } from "../../api/client";
+import { releaseVolumes, destroyNiivue, withVolumeNames } from "../../niivue/nvRelease";
 
 const VIEWS = {
   render: SLICE_TYPE.RENDER,
@@ -49,17 +50,23 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
   const agreementUrl = (tol: number) =>
     resourceUrl(`/api/case/${caseId}/agreement.nii.gz?tol_mm=${tol}&t=${Date.now()}`);
 
-  // Load the faint cornea base + the agreement overlay together (loadVolumes REPLACES, so no accumulation
-  // on re-tolerance). The cornea is best-effort context: if /cornea.nii.gz is unavailable, fall back to the
-  // agreement alone so the core scar-overlap still renders. The agreement is always the LAST volume.
+  // Load the faint cornea base + the agreement overlay together. The cornea is best-effort context: if
+  // /cornea.nii.gz is unavailable, fall back to the agreement alone so the core scar-overlap still renders.
+  // The agreement is always the LAST volume.
   const loadOverlay = async (nv: Niivue, tol: number) => {
     const cmap = (nv.colormaps?.() ?? []).includes("overlap3") ? "overlap3" : "warm";
     const agr = { url: agreementUrl(tol), colormap: cmap, opacity, cal_min: 16, cal_max: 100 };
+    // loadVolumes() REPLACES the volume list by assignment, which never runs removeVolume() — the only
+    // path that drops the NVImage from niivue's strong mediaUrlMap. So without this drain every tolerance
+    // change stranded both decoded volumes for the life of this viewer (see src/niivue/nvRelease.ts).
+    // withVolumeNames additionally suppresses niivue's discarded full-size probe fetch on ?t= URLs.
+    releaseVolumes(nv);
     try {
       const cornea = { url: resourceUrl(`/api/case/${caseId}/cornea.nii.gz?t=${Date.now()}`), colormap: "gray", opacity: 1, cal_min: 0, cal_max: 4 };
-      await nv.loadVolumes([cornea, agr]);
+      await nv.loadVolumes(withVolumeNames([cornea, agr]));
     } catch {
-      await nv.loadVolumes([agr]);   // cornea context unavailable — show the agreement alone
+      releaseVolumes(nv);   // a partial load may have landed one volume before failing
+      await nv.loadVolumes(withVolumeNames([agr]));   // cornea context unavailable — show the agreement alone
     }
   };
 
@@ -94,16 +101,19 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
     (async () => {
       await loadOverlay(nv, 0);   // faint consensus cornea (context) + scar agreement (overlap core = red)
       if (cancelled) return;
+      // No updateGLVolume(): loadVolumes → addVolumesFromUrl → addVolume → setVolume already ran one per
+      // volume, and setSliceType ends in drawScene(). An extra call re-allocates the layer-1 3-D texture
+      // and orphans the live one (niivue never deletes the old handle — see nvRelease).
       nv.setSliceType(VIEWS.render);
-      nv.updateGLVolume();
       fetchStats(0);
     })()
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
-      // free the WebGL context so repeated mode switches don't exhaust the browser's context budget.
-      try { (nv as unknown as { gl?: WebGLRenderingContext }).gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* */ }
+      // Free the decoded volumes, niivue's observers (without which this instance stays reachable for the
+      // session) and the WebGL context, so repeated mode switches don't exhaust the browser's context budget.
+      destroyNiivue(nv);
       nvRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -122,8 +132,9 @@ export function OverlapViewer({ caseId, nScans }: { caseId: string; nScans: numb
     setBusy(true);
     try {
       await loadOverlay(nv, tol);   // replaces both layers (cornea base + agreement) — no accumulation
+      // setSliceType redraws and loadOverlay's loadVolumes already rebuilt the layer stack; a further
+      // updateGLVolume() would orphan a full-size layer-1 texture on EVERY tolerance-slider release.
       nv.setSliceType(VIEWS[view]);
-      nv.updateGLVolume();
       await fetchStats(tol);
     } catch (e) {
       setError(String(e));

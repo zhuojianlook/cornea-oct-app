@@ -14,6 +14,7 @@
    ────────────────────────────────────────────────────────── */
 
 import { Niivue, SLICE_TYPE, DRAG_MODE } from "@niivue/niivue";
+import { releaseVolumes, destroyNiivue, withVolumeNames } from "./nvRelease";
 
 // niivue does not export the ImageFromUrlOptions type by name — derive it from loadVolumes' signature.
 type LoadVolumeOpts = Parameters<Niivue["loadVolumes"]>[0][number];
@@ -99,6 +100,10 @@ function _onLost(e: Event): void {
 function _onRestored(): void {
   if (!_canvas) return;
   const canvas = _canvas;
+  // Tear the doomed instance down first — niivue's observers on canvas.parentElement would otherwise keep
+  // it (and its volumes) alive forever. No drain / no loseContext: GL state was just wiped and this very
+  // context is about to be reused (see destroyNiivue).
+  destroyNiivue(nv, { drainVolumes: false, loseContext: false });
   nv = null;
   _createNv(canvas);
   _contextLost = false;
@@ -193,11 +198,9 @@ function destroyNow(): void {
   _cancelPendingDestroy();
   if (nv) {
     _savedCam = _readCam() ?? _savedCam;
-    try {
-      nv.cleanup?.();
-    } catch {
-      /* best-effort */
-    }
+    // Drain the volumes as well as disconnecting the observers: the decoded NVImages are the bulk of what
+    // this viewport holds, and dropping them here frees them at close rather than at the next GC.
+    destroyNiivue(nv, { loseContext: false });   // the canvas below owns the context free
   }
   const cv = _canvas;
   if (cv) {
@@ -288,7 +291,14 @@ export async function show(content: DebugContent): Promise<void> {
     }
   }
 
-  await nv.loadVolumes(vols);
+  // Release the previously-shown volumes FIRST: nv.loadVolumes() replaces its list by assignment and so
+  // never runs removeVolume(), the only path that drops the NVImage from niivue's strong mediaUrlMap —
+  // so every method/mode switch would otherwise strand its 1-3 decoded volumes for the session (see
+  // src/niivue/nvRelease.ts). The mode switcher is driven from a toolbar, so this fires often.
+  releaseVolumes(nv);
+  // withVolumeNames: these URLs are ?t= cache-busted, which makes niivue mis-sniff the type and issue a
+  // discarded full-size probe fetch per volume before the real load.
+  await nv.loadVolumes(withVolumeNames(vols));
   if (token !== _loadToken || !nv) return; // a newer show() superseded this one
   nv.setSliceType(SLICE_TYPE.RENDER);
 

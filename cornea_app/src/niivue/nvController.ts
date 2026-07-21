@@ -5,6 +5,7 @@
    ────────────────────────────────────────────────────────── */
 
 import { Niivue, SLICE_TYPE } from "@niivue/niivue";
+import { releaseVolumes, destroyNiivue, volumeName, captureOverlayTexture, releaseOrphanedOverlayTexture } from "./nvRelease";
 
 export type ViewName = "multi" | "axial" | "coronal" | "sagittal" | "render";
 
@@ -122,7 +123,14 @@ export function attach(canvas: HTMLCanvasElement): Niivue | null {
     _listenersBound = true;
     canvas.addEventListener("webglcontextlost", (e) => { e.preventDefault(); _contextLost = true; }, false);
     canvas.addEventListener("webglcontextrestored", () => {
+      // Tear the DOOMED instance down before dropping the reference. niivue installs a ResizeObserver +
+      // MutationObserver on canvas.parentElement whose closures capture the instance; that element
+      // survives the rebuild, so merely nulling `nv` would strand the old Niivue — and every volume still
+      // held in its mediaUrlMap — for the rest of the session. Skip the volume drain and the loseContext
+      // (see destroyNiivue): GL state was just wiped and this very context is about to be reused.
+      destroyNiivue(nv, { drainVolumes: false, loseContext: false });
       nv = null;
+      segUrl = null; cropUrl = null;   // the rebuilt instance starts with no overlay — don't let the trackers lie
       if (_canvas) _createNv(_canvas);
       _contextLost = false;
       try { _onRestored?.(); } catch { /* host reload is best-effort */ }
@@ -131,10 +139,80 @@ export function attach(canvas: HTMLCanvasElement): Niivue | null {
   return inst;
 }
 
-/** Load (or replace) the grayscale base volume. */
-export async function loadVolume(url: string): Promise<void> {
-  if (!nv) throw new Error("Niivue not attached");
-  await nv.loadVolumes([{ url, colormap: "gray" }]);
+// Base-volume loads are SERIALIZED and generation-guarded. Two reasons, both hit by the triage loop
+// (open scan → inspect → approve → next, plus the openCase() that exiting Fix-columns/Fix-axial fires):
+//  (a) two overlapping nv.loadVolumes() interleave their internal `this.volumes = []` + addVolume, ending
+//      with TWO base volumes — which makes hasSegmentation() lie and lets the `length > 1` overlay drains
+//      below remove a BASE volume instead of an overlay;
+//  (b) a load that is superseded while still queued would fetch + decode ~46 MB for nothing.
+// The generation check skips superseded loads entirely, so clicking quickly through scans costs at most
+// the in-flight load plus the final one.
+let _volumeGen = 0;
+let _volumeChain: Promise<void> = Promise.resolve();
+
+/** Load (or replace) the grayscale base volume, RELEASING the outgoing one first. */
+export function loadVolume(url: string): Promise<void> {
+  if (!nv) return Promise.reject(new Error("Niivue not attached"));
+  const gen = ++_volumeGen;
+  const run = _volumeChain.then(async () => {
+    if (gen !== _volumeGen) return;          // a newer case open superseded this one while it was queued
+    const inst = nv;                          // re-read: a context-loss rebuild may have replaced the instance
+    if (!inst) throw new Error("Niivue not attached");
+    // THE LEAK FIX. nv.loadVolumes() drops the previous volume from its list by ASSIGNMENT, which bypasses
+    // removeVolume() — the only path that deletes the NVImage from niivue's strong mediaUrlMap. Without
+    // this drain every base volume ever opened (63-126 MB each) is retained for the life of the app; the
+    // measured cost was ~215 MB per case open. See src/niivue/nvRelease.ts for the full trace.
+    releaseVolumes(inst);
+    // The drain removed any segmentation/crop overlay too, so the module trackers must not claim otherwise.
+    segUrl = null; cropUrl = null;
+    // `name`: the URL carries a ?t= cache-buster that defeats niivue's extension sniffing, which makes it
+    // issue a DISCARDED probe fetch of the whole file before the real load (see volumeName).
+    await inst.loadVolumes([{ url, name: volumeName(url), colormap: "gray" }]);
+  });
+  _volumeChain = run.catch(() => undefined);  // a failed load must not wedge the queue for later opens
+  return run;
+}
+
+/**
+ * Run an OVERLAY load (segmentation / crop mask) on the SAME serialized chain as the base volume, tagged
+ * with the volume generation that was current when it was REQUESTED.
+ *
+ * WHY (this is a leak fix, not just tidiness): overlay loads used to run free of the chain, so an overlay
+ * fetch still in flight when the user clicked the next scan resolved AFTER loadVolume()'s releaseVolumes()
+ * drain. Two ways that ends badly, both observed in the triage loop:
+ *   (a) if it lands while the new base is still loading, addVolume() makes the overlay volumes[0] and the
+ *       new loadVolumes()' `this.volumes = []` strands it in mediaUrlMap forever — precisely the leak the
+ *       drain exists to remove, once per case switch;
+ *   (b) if it lands after, volumes = [B, segA] renders case A's labelmap over case B's scan, and
+ *       segUrl/segLoaded then describe an overlay belonging to a case that is no longer open.
+ * Serializing removes the interleave; the generation check drops a superseded overlay entirely (it can
+ * never be the right overlay for the case that is now open) and skips its fetch when it hasn't started.
+ *
+ * Resolves `true` when the overlay was actually applied, `false` when it was superseded — callers must not
+ * record "an overlay is loaded" on a `false`. Load FAILURES still reject (a 404 means "no segmentation yet").
+ */
+function queueOverlay(fn: (inst: Niivue) => Promise<void>): Promise<boolean> {
+  if (!nv) return Promise.reject(new Error("Niivue not attached"));
+  const gen = _volumeGen;   // NOT ++: an overlay belongs to the base volume generation current at request time
+  const run = _volumeChain.then(async () => {
+    if (gen !== _volumeGen) return false;   // a newer case open superseded the case this overlay belongs to
+    const inst = nv;                        // re-read: a context-loss rebuild may have replaced the instance
+    if (!inst) return false;
+    await fn(inst);
+    return true;
+  });
+  _volumeChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+/** Release everything the shared viewer holds — drawing, volumes, overlay trackers. Used on teardown
+ *  (VolumeCanvas unmount) so nothing survives the viewer that owns it. */
+export function releaseAll(): void {
+  if (!nv) return;
+  try { nv.setDrawingEnabled(false); nv.closeDrawing(); } catch { /* no drawing loaded */ }
+  releaseVolumes(nv);
+  segUrl = null; cropUrl = null;
+  renderDrawOverlay();   // drawBitmap + volumes are gone → clear the 2-D overlay
 }
 
 export function setView(view: ViewName): void {
@@ -645,26 +723,46 @@ export function hasDrawing(): boolean {
 // ── Segmentation overlay (Stage 2 result) ──────────────────────────────────
 let segUrl: string | null = null;
 
-/** Add/replace the segmentation labelmap as a coloured overlay on the volume. */
-export async function loadSegmentation(url: string, opacity: number): Promise<void> {
-  if (!nv) throw new Error("Niivue not attached");
-  // Remove a prior segmentation overlay (any volume past the base).
-  while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
-  // Display labels: 0=bg (transparent, below cal_min), 1=cornea (blue), 2/3/4=scar density tiers
-  // (diffuse→dense) via "corneaScar" (falls back to "warm" if the custom colormap wasn't registered).
-  let cmap = "warm";
-  try {
-    if ((nv.colormaps?.() ?? []).includes("corneaScar")) cmap = "corneaScar";
-  } catch { /* keep warm */ }
-  await nv.addVolumeFromUrl({ url, colormap: cmap, opacity, cal_min: 0.5, cal_max: 4.5 });
-  segUrl = url;
-  nv.updateGLVolume();
-  reapplyGrayscaleInterpolation();   // updateGLVolume reverted layer-0 grayscale to crisp → restore the toggle
+/** Add/replace the segmentation labelmap as a coloured overlay on the volume.
+ *  Resolves `false` if a newer case open superseded this load (see queueOverlay) — the caller must not
+ *  then record a segmentation as loaded. Rejects if the overlay itself failed to load (e.g. 404). */
+export function loadSegmentation(url: string, opacity: number): Promise<boolean> {
+  return queueOverlay(async (inst) => {
+    // Remove a prior segmentation overlay (any volume past the base).
+    while (inst.volumes.length > 1) inst.removeVolumeByIndex(inst.volumes.length - 1);
+    // Display labels: 0=bg (transparent, below cal_min), 1=cornea (blue), 2/3/4=scar density tiers
+    // (diffuse→dense) via "corneaScar" (falls back to "warm" if the custom colormap wasn't registered).
+    let cmap = "warm";
+    try {
+      if ((inst.colormaps?.() ?? []).includes("corneaScar")) cmap = "corneaScar";
+    } catch { /* keep warm */ }
+    // niivue orphans (never deletes) the layer-1 overlay TEXTURE on every layer-stack rebuild — a ~126 MB
+    // GPU allocation per op, invisible to JS heap tooling. Capture it, then free it once the replacement
+    // is in place. (See releaseOrphanedOverlayTexture.)
+    //
+    // Capture BEFORE addVolumeFromUrl and release straight after, with NO explicit updateGLVolume() in
+    // between: addVolumeFromUrl already rebuilds the layer stack internally
+    // (addVolumeFromUrl → addVolume → setVolume → updateGLVolume, niivue index.js:36763/37391/37845),
+    // so it installs exactly ONE new layer-1 texture. An extra updateGLVolume() here would allocate a
+    // SECOND one and orphan the first — which this capture/release pair, holding only the handle from
+    // before the add, could never free. That was a full-size RGBA8 3-D texture (~130 MB) leaked per call,
+    // and workflowStore reloads the overlay on every Save/Cancel correction and cornea-vet confirm.
+    const prevOverlayTex = captureOverlayTexture(inst);
+    await inst.addVolumeFromUrl({ url, name: volumeName(url), colormap: cmap, opacity, cal_min: 0.5, cal_max: 4.5 });
+    segUrl = url;
+    cropUrl = null;   // the drain above removed any crop overlay — this is the only overlay now
+    releaseOrphanedOverlayTexture(inst, prevOverlayTex);
+    reapplyGrayscaleInterpolation();   // the add's layer rebuild reverted layer-0 grayscale → restore the toggle
+  });
 }
 
 export function setSegmentationOpacity(opacity: number): void {
   if (!nv || nv.volumes.length < 2) return;
+  // setOpacity() runs a full updateGLVolume() → a fresh, orphaning layer-1 texture allocation. This fires
+  // per tick of the opacity SLIDER, so without the release a single drag leaked GB of GPU memory.
+  const prevOverlayTex = captureOverlayTexture(nv);
   nv.setOpacity(nv.volumes.length - 1, opacity);
+  releaseOrphanedOverlayTexture(nv, prevOverlayTex);
   reapplyGrayscaleInterpolation();   // setOpacity rebuilds the layer stack → restore the grayscale toggle
 }
 
@@ -676,10 +774,11 @@ export function setSegmentationOpacity(opacity: number): void {
 // opts.isNearestInterpolation means every subsequent volume load inherits the choice too. Sets the DRAW grayscale
 // (layer 0) only — a segmentation label overlay, if present, must stay nearest (fractional labels otherwise).
 // Last grayscale (layer-0) Crisp/Smooth choice — remembered so it can be RE-ASSERTED after any overlay op.
-// nv.updateGLVolume() (called by loadCropMask / loadSegmentation / setSegmentationOpacity) rebuilds ALL layer
-// textures to the GLOBAL isNearestInterpolation default (nearest), clobbering the layer-0 override → the Smooth
-// toggle silently reverted to Crisp on cropped/segmented scans only (looked like "sometimes smoothed, sometimes
-// not" when clicking between scans). Default true = the niivue construction default (crisp) until the first set.
+// Any layer-stack rebuild — nv.updateGLVolume(), reached inside addVolumeFromUrl (loadSegmentation /
+// loadCropMask) and inside setOpacity (setSegmentationOpacity) — re-creates ALL layer textures at the GLOBAL
+// isNearestInterpolation default (nearest), clobbering the layer-0 override → the Smooth toggle silently
+// reverted to Crisp on cropped/segmented scans only (looked like "sometimes smoothed, sometimes not" when
+// clicking between scans). Default true = the niivue construction default (crisp) until the first set.
 let _grayNearest = true;
 
 export function setInterpolationMode(isNearest: boolean): void {
@@ -693,7 +792,7 @@ export function setInterpolationMode(isNearest: boolean): void {
 }
 
 // Re-assert the layer-0 grayscale Crisp/Smooth choice after an overlay op rebuilt the textures (see above).
-// Call after any nv.updateGLVolume() / nv.setOpacity() that touches the layer stack.
+// Call after anything that rebuilds the layer stack — addVolumeFromUrl, nv.setOpacity(), nv.updateGLVolume().
 function reapplyGrayscaleInterpolation(): void {
   if (!nv || !nv.volumes.length) return;
   try {
@@ -706,24 +805,33 @@ function reapplyGrayscaleInterpolation(): void {
 // is highlighted over its dim tissue. Loaded in the PREPROCESSING view (no segmentation yet); loadSegmentation
 // clears it at the SAM2 stage (both are "volumes past the base"), so they never coexist.
 let cropUrl: string | null = null;
-export async function loadCropMask(url: string): Promise<void> {
-  if (!nv) return;
-  while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);   // drop a prior overlay
-  await nv.addVolumeFromUrl({ url, colormap: "red", opacity: 0.45, cal_min: 0.5, cal_max: 1.0 });
-  cropUrl = url;
-  nv.updateGLVolume();
-  reapplyGrayscaleInterpolation();   // updateGLVolume reverted layer-0 grayscale to crisp → restore the toggle
+export function loadCropMask(url: string): Promise<boolean> {
+  if (!nv) return Promise.resolve(false);
+  return queueOverlay(async (inst) => {
+    while (inst.volumes.length > 1) inst.removeVolumeByIndex(inst.volumes.length - 1);   // drop a prior overlay
+    // No explicit updateGLVolume() after the add — it would orphan a second layer-1 texture. See loadSegmentation.
+    const prevOverlayTex = captureOverlayTexture(inst);   // niivue orphans the layer-1 texture — see loadSegmentation
+    await inst.addVolumeFromUrl({ url, name: volumeName(url), colormap: "red", opacity: 0.45, cal_min: 0.5, cal_max: 1.0 });
+    cropUrl = url;
+    segUrl = null;   // the drain above removed any segmentation overlay — this is the only overlay now
+    releaseOrphanedOverlayTexture(inst, prevOverlayTex);
+    reapplyGrayscaleInterpolation();   // the add's layer rebuild reverted layer-0 grayscale → restore the toggle
+  });
 }
 export function removeCropMask(): void {
   if (!nv || cropUrl == null) return;
   while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
+  // Both trackers describe the SAME single overlay slot, and the drain above clears it — so leaving segUrl
+  // set here would make hasSegmentation() report an overlay that is no longer loaded.
   cropUrl = null;
+  segUrl = null;
 }
 
 export function removeSegmentation(): void {
   if (!nv) return;
   while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
   segUrl = null;
+  cropUrl = null;   // same single overlay slot (see removeCropMask)
 }
 
 export function hasSegmentation(): boolean {

@@ -194,6 +194,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   };
   const resetBorderView = () => { setBZoom(1); setBPan({ x: 0, y: 0 }); };
   useEffect(() => { resetBorderView(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [caseId, fixCols]);
+  // Drop the previous case's steps filmstrip. Unlike the preview lists (which each fetch REPLACES), these
+  // are inline base64 PNGs that loadSteps only clears when it is next opened — so a filmstrip viewed on
+  // one scan would sit in state, tens of MB, across every following case in a triage run.
+  useEffect(() => { setSteps([]); setStepsOpen(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [caseId]);
   const zoomBorderAt = (clientX: number, clientY: number, factor: number) => {
     const host = borderHostRef.current?.getBoundingClientRect();
     setBZoom((z) => {

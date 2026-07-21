@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import { Niivue, SLICE_TYPE } from "@niivue/niivue";
 import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { resourceUrl } from "../../api/client";
+import { destroyNiivue, volumeName, captureOverlayTexture, releaseOrphanedOverlayTexture } from "../../niivue/nvRelease";
 
 const VIEWS = {
   multi: SLICE_TYPE.MULTIPLANAR,
@@ -74,22 +75,30 @@ export function GtCompareViewer({
     }
     (async () => {
       const vol = resourceUrl(`/api/case/${caseId}/volume.nii.gz?t=${Date.now()}`);
-      await nv.loadVolumes([{ url: vol, colormap: "gray" }]);
+      // `name` on every load: the ?t= cache-buster defeats niivue's extension sniffing, which makes it
+      // issue a discarded probe fetch of the entire volume before the real one (see nvRelease.volumeName).
+      await nv.loadVolumes([{ url: vol, name: volumeName(vol), colormap: "gray" }]);
       const cmap = (nv.colormaps?.() ?? []).includes("gtcompare") ? "gtcompare" : "warm";
       if (cancelled) return;
-      await nv.addVolumeFromUrl({ url: agreementUrl(klass), colormap: cmap, opacity, cal_min: 0, cal_max: 3 });
+      const agr = agreementUrl(klass);
+      await nv.addVolumeFromUrl({ url: agr, name: volumeName(agr), colormap: cmap, opacity, cal_min: 0, cal_max: 3 });
       if (cancelled) return;
+      // No updateGLVolume() here: addVolumeFromUrl already rebuilt the layer stack internally
+      // (addVolume → setVolume → updateGLVolume) and setSliceType ends in drawScene(). A second
+      // updateGLVolume() would allocate — and orphan — another full-size layer-1 3-D texture.
       nv.setSliceType(VIEWS.multi);
-      nv.updateGLVolume();
     })()
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
-      // Free the WebGL2 context this viewer owns (matches OverlapViewer / OverlapPairViewer). Without this,
-      // each open/close of the GT-compare panel leaks a context; after the browser's ~8-16 live-context cap
-      // the comparison + main viewer render blank. VolumeCanvas mounts/unmounts this on every GT toggle.
-      try { (nv as unknown as { gl?: WebGLRenderingContext }).gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* best-effort */ }
+      // Free EVERYTHING this viewer owns (matches OverlapViewer / OverlapPairViewer): the decoded volumes,
+      // niivue's observers, and the WebGL2 context. Without the context free, each open/close of the
+      // GT-compare panel leaks a context and after the browser's ~8-16 live-context cap the comparison +
+      // main viewer render blank; without cleanup() (inside destroyNiivue) niivue's ResizeObserver on the
+      // canvas parent keeps this whole instance — and both decoded volumes — reachable for the session.
+      // VolumeCanvas mounts/unmounts this on every GT toggle.
+      destroyNiivue(nv);
       nvRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -104,8 +113,16 @@ export function GtCompareViewer({
     (async () => {
       const cmap = (nv.colormaps?.() ?? []).includes("gtcompare") ? "gtcompare" : "warm";
       while (nv.volumes.length > 1) nv.removeVolumeByIndex(nv.volumes.length - 1);
-      await nv.addVolumeFromUrl({ url: agreementUrl(klass), colormap: cmap, opacity, cal_min: 0, cal_max: 3 });
-      if (!cancelled) nv.updateGLVolume();
+      // niivue orphans (never deletes) the layer-1 overlay texture on each layer-stack rebuild, so each
+      // scar⇄cornea swap would leak a full-size 3-D texture. Free the old handle once the new one is in.
+      const prevOverlayTex = captureOverlayTexture(nv);
+      const agr = agreementUrl(klass);
+      await nv.addVolumeFromUrl({ url: agr, name: volumeName(agr), colormap: cmap, opacity, cal_min: 0, cal_max: 3 });
+      // The add's own layer rebuild installed the replacement texture and redrew — an explicit
+      // updateGLVolume() would allocate a THIRD one and orphan the second, which the handle captured
+      // above could never free. Release unconditionally: the old texture was replaced whether or not
+      // this effect was cancelled, and the helper no-ops unless niivue actually swapped the handle.
+      releaseOrphanedOverlayTexture(nv, prevOverlayTex);
     })().catch((e) => !cancelled && setError(String(e)));
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps

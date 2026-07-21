@@ -1060,7 +1060,13 @@ export const useWorkflowStore = create<WorkflowState>()(
       const caseId = useCaseStore.getState().caseId;
       if (!caseId) return;
       try {
-        await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
+        // This runs UN-AWAITED from VolumeCanvas right after a volume load, so a click on the next scan can
+        // land mid-fetch. Two guards, both needed: `applied` is false when nvController dropped the load as
+        // superseded by a newer case open, and the caseId re-check catches a switch that completed while the
+        // overlay was in flight. Without them segLoaded would claim a segmentation belonging to a case that
+        // is no longer open (every other loadSegmentation call site already re-checks caseId this way).
+        const applied = await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
+        if (!applied || useCaseStore.getState().caseId !== caseId) return;
         set((s) => {
           s.segLoaded = true;
           s.segVersion += 1;

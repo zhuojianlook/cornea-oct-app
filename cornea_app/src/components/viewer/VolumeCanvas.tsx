@@ -5,7 +5,7 @@ import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { api } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { attach, loadVolume, loadCropMask, setView, setSegmentationOpacity, setInterpolationMode, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, type ViewName } from "../../niivue/nvController";
+import { attach, loadVolume, loadCropMask, setView, setSegmentationOpacity, setInterpolationMode, webglFailure, sliceCount, getSliceIndex, setSliceIndex, setOverlayCanvas, renderDrawOverlay, scheduleOverlay, brushScreenSize, onContextRestored, screenToColumn, setDefectBands, releaseAll, type ViewName } from "../../niivue/nvController";
 
 /** True if this scan had a region cropped out (blink / off-cornea) — used to overlay the crop-mask in red. */
 function hasCrop(m: Record<string, unknown> | null): boolean {
@@ -180,7 +180,11 @@ export function VolumeCanvas() {
       ro = new ResizeObserver(() => requestAnimationFrame(() => renderDrawOverlay()));
       ro.observe(overlayRef.current.parentElement);
     }
-    return () => { ro?.disconnect(); setOverlayCanvas(null); onContextRestored(null); };
+    // Teardown: disconnect the observer, drop the overlay/context-restore callbacks (both hold this
+    // component's closures), and RELEASE the niivue payload. releaseAll matters because niivue is a
+    // module singleton that outlives this component — without it the last case's decoded volume
+    // (63-126 MB) and drawing bitmap would sit in the instance until the window is closed.
+    return () => { ro?.disconnect(); setOverlayCanvas(null); onContextRestored(null); releaseAll(); };
   }, []);
 
   useEffect(() => {

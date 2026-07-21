@@ -217,6 +217,10 @@ export const useCaseStore = create<CaseState>()(
         .then(() => api.json(`/api/case/${id}/review-flag`, "POST", JSON.stringify({ flags }))
           .catch((e) => { set((s) => { s.apiError = e instanceof Error ? e.message : String(e); }); }));
       _reviewFlagChain.set(id, next);
+      // Evict once this case's writes have drained, so the map can't retain one settled promise per case
+      // touched for the whole session. Only the LAST write clears the slot — evicting mid-chain would drop
+      // the ordering guarantee for a write already queued behind this one.
+      void next.finally(() => { if (_reviewFlagChain.get(id) === next) _reviewFlagChain.delete(id); });
       await next;
     },
 
@@ -232,6 +236,7 @@ export const useCaseStore = create<CaseState>()(
         .then(() => api.json(`/api/case/${id}/defect-marks`, "POST", JSON.stringify({ marks }))
           .catch((e) => { set((s) => { s.apiError = e instanceof Error ? e.message : String(e); }); }));
       _defectMarkChain.set(id, next);
+      void next.finally(() => { if (_defectMarkChain.get(id) === next) _defectMarkChain.delete(id); });   // see setReviewFlags
       await next;
     },
 

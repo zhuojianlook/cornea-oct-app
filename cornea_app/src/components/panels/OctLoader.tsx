@@ -417,6 +417,10 @@ export function OctLoader() {
       .catch(() => undefined)
       .then(() => api.json(`/api/case/${caseId}/classification`, "POST", body).catch(() => undefined));
     classifyChainRef.current.set(caseId, next);
+    // Evict when this case's writes have drained, so the map can't hold one settled promise per case
+    // touched for the panel's lifetime. Only the LAST write clears the slot — evicting mid-chain would
+    // lose the ordering guarantee for anything queued behind it.
+    void next.finally(() => { if (classifyChainRef.current.get(caseId) === next) classifyChainRef.current.delete(caseId); });
   };
   // Tag ONE scan Scar / Control (no scar). Updates local state + the per-scan lifecycle flag (so the
   // entry colour / timeline reflect it) and persists. Does NOT invalidate the corrected volume.
@@ -438,6 +442,7 @@ export function OctLoader() {
       .catch(() => undefined)
       .then(() => api.json(`/api/case/${caseId}/subgroup`, "POST", body).catch(() => undefined));
     classifyChainRef.current.set(caseId, next);
+    void next.finally(() => { if (classifyChainRef.current.get(caseId) === next) classifyChainRef.current.delete(caseId); });   // see persistClassification
   };
   // Group header shortcut: set EVERY (non-errored) scan in the group to the same tag at once.
   const setGroupCondition = (gid: string, condition?: Cls) => {

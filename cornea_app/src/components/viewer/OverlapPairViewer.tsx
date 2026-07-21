@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { Niivue, SLICE_TYPE } from "@niivue/niivue";
 import { ToggleButton, ToggleButtonGroup, Slider } from "@mui/material";
 import { resourceUrl } from "../../api/client";
+import { releaseVolumes, destroyNiivue, withVolumeNames } from "../../niivue/nvRelease";
 
 const VIEWS = {
   render: SLICE_TYPE.RENDER,
@@ -47,11 +48,16 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
   const loadPair = async (nv: Niivue, bb: string) => {
     loadingRef.current = true;
     try {
-      await nv.loadVolumes([
+      // loadVolumes() replaces its list by assignment and so never runs removeVolume(), the only path that
+      // drops the NVImage from niivue's strong mediaUrlMap — so each replicate switch stranded all THREE
+      // decoded region volumes for the life of this viewer (see src/niivue/nvRelease.ts). withVolumeNames
+      // also suppresses niivue's discarded full-size probe fetch, which the ?t= URLs would trigger per volume.
+      releaseVolumes(nv);
+      await nv.loadVolumes(withVolumeNames([
         { url: regionUrl("a", bb), colormap: "rgA", opacity: opA, cal_min: 0, cal_max: 2 },
         { url: regionUrl("b", bb), colormap: "rgB", opacity: opB, cal_min: 0, cal_max: 2 },
         { url: regionUrl("both", bb), colormap: "rgBoth", opacity: opBoth, cal_min: 0, cal_max: 2 },
-      ]);
+      ]));
     } finally {
       loadingRef.current = false;
     }
@@ -77,15 +83,18 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
     (async () => {
       if (b) await loadPair(nv, b);
       if (cancelled) return;
+      // No updateGLVolume(): loadPair's loadVolumes already rebuilt the layer stack (addVolume → setVolume
+      // → updateGLVolume per volume) and setSliceType ends in drawScene(). An extra call would re-allocate
+      // the layer-1 3-D texture and orphan the live one (see nvRelease).
       nv.setSliceType(VIEWS.render);
-      nv.updateGLVolume();
     })()
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
-      // free the WebGL context so repeated mode switches don't exhaust the browser's context budget.
-      try { (nv as unknown as { gl?: WebGLRenderingContext }).gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* */ }
+      // Free the decoded volumes, niivue's observers (without which this instance stays reachable for the
+      // session) and the WebGL context, so repeated mode switches don't exhaust the browser's context budget.
+      destroyNiivue(nv);
       nvRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -99,7 +108,9 @@ export function OverlapPairViewer({ caseId, members, refCid }: { caseId: string;
     let cancelled = false;
     (async () => {
       await loadPair(nv, b);
-      if (!cancelled) { nv.setSliceType(VIEWS[view]); nv.updateGLVolume(); }
+      // setSliceType redraws; the extra updateGLVolume() this used to make orphaned a layer-1 texture on
+      // every replicate swap (see nvRelease).
+      if (!cancelled) nv.setSliceType(VIEWS[view]);
     })().catch((e) => !cancelled && setError(String(e)));
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
