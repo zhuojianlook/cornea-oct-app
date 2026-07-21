@@ -2837,13 +2837,24 @@ class ReviewFlagRequest(BaseModel):
     flags: list[str] = []
 
 
+# Review-flag vocabulary: an OPEN set of slugs, not a closed allowlist — a new flag needs no backend
+# change, only an entry in the frontend's table (src/api/reviewFlags.ts) for its label/colour.
+_REVIEW_FLAG_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+_MAX_REVIEW_FLAGS = 12
+
+
 @app.post("/api/case/{case_id}/review-flag")
 def set_review_flags(case_id: str, req: ReviewFlagRequest) -> dict:
-    """Reviewer ISSUE FLAGS (#A/#B/#C) the user toggles during the cybernetic loop to mark a scan for the
-    assistant's attention. Manifest-only metadata (review_flags = sorted subset of {A,B,C}); the assistant
-    finds flagged scans by reading manifest.review_flags. Does not touch the volume, segmentation or lifecycle."""
-    allowed = {"A", "B", "C"}
-    flags = sorted({str(f).strip().upper() for f in (req.flags or []) if str(f).strip().upper() in allowed})
+    """Reviewer ISSUE FLAGS marking a scan for attention — verbose slugs naming the actual defect
+    ("zeroed-frames", "still-clipped", "crop-clamped", "residual-motion", "jagged-surface", "weak-edge").
+    Manifest-only metadata (review_flags = deduplicated, sorted list of slugs matching
+    ^[a-z][a-z0-9-]{1,31}$, capped at 12/scan); anything else is silently dropped. The assistant and the
+    sidebar filter find flagged scans by reading manifest.review_flags; the frontend renders an unknown
+    slug verbatim, so the vocabulary can grow here first. NOTE the pattern rejects the retired
+    single-letter cybernetic-loop flags (A/B/C), so a scan still carrying them cannot be re-written
+    without being renamed to the new vocabulary. Does not touch the volume, segmentation or lifecycle."""
+    slugs = {str(f).strip().lower() for f in (req.flags or [])}
+    flags = sorted(s for s in slugs if _REVIEW_FLAG_RE.match(s))[:_MAX_REVIEW_FLAGS]
     m = orch.write_manifest_value(_require_case(case_id), {"review_flags": flags})
     return {"ok": True, "review_flags": m.get("review_flags", [])}
 

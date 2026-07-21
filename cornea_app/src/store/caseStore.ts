@@ -68,8 +68,10 @@ interface CaseState {
   // output resets to "Preprocessed [Auto]" (red) so the user re-inspects it, then approves as-is. Separate from
   // approvePreprocessing so approve and apply are independent actions (the OS(4) fix).
   applyCorrections: () => Promise<void>;
-  // Reviewer issue flags (#A/#B/#C) set during the cybernetic loop; persisted to manifest.review_flags
-  // so the assistant can find flagged scans. Metadata only — does not affect the volume/segmentation.
+  // Reviewer issue flags naming the defect ("zeroed-frames", "still-clipped", …); persisted to
+  // manifest.review_flags so the assistant can find flagged scans. The backend accepts any slug matching
+  // ^[a-z][a-z0-9-]{1,31}$ and DROPS the rest, so anything else set here shows optimistically but will not
+  // survive a reload; see api/reviewFlags.ts for the known vocabulary. Metadata only — no volume/seg change.
   setReviewFlags: (flags: string[]) => Promise<void>;
   // Defect-marking: persist the full list of per-slice wrong-column marks to manifest.defect_marks so the
   // assistant reads exactly which frames/columns are wrong. Optimistic + serialized per case (mirrors flags).
