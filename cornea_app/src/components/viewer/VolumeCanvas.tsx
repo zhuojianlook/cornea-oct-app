@@ -30,6 +30,7 @@ export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);   // #paint — WebGL-independent 2-D drawing overlay
   const volumeUrl = useCaseStore((s) => s.volumeUrl);
+  const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const setCaseId = useCaseStore((s) => s.setCaseId);
   const openCase = useCaseStore((s) => s.openCase);
@@ -83,6 +84,22 @@ export function VolumeCanvas() {
   // been preprocessed — i.e. its raw snapshot (context_raw previews) was captured.
   const [hasRaw, setHasRaw] = useState(false);
   const [compareView, setCompareView] = useState(false);
+  // AUTO-OPEN before/after when the pipeline surface-cropped this scan. The clip is only visible on the
+  // ORIGINAL panel — the correction's whole purpose is that the output no longer shows it — so a scan that
+  // was auto-cropped should land straight in the view where that decision can be seen and edited, rather
+  // than requiring the user to know to go looking for it. Fires once per case, and never fights the user:
+  // it only turns the view ON, so closing it stays closed.
+  const autoCropOpenedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!caseId || !hasRaw) return;
+    if (autoCropOpenedRef.current === caseId) return;      // already handled this case
+    const it = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as
+      Record<string, unknown> | undefined;
+    if (it?.stopped === "surface_crop") {
+      autoCropOpenedRef.current = caseId;
+      setCompareView(true);
+    }
+  }, [caseId, hasRaw, caseInfo]);
   // Manual "Fix columns" correction (mark bad B-scan frames → re-run preprocessing) lives in the 2D
   // SliceGallery; on the WebGL/3D desktop path it was otherwise unreachable. This opens it. Surface-crop
   // detection is a MODE within this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a separate

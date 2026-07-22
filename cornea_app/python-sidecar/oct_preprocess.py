@@ -5208,7 +5208,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                      "auto": bool(_auto_crop), "clamped": bool(_clamped),
                                      "n_frames_total": _F_tot,
                                      "frac_frames": round(len(list(_crop_frames)) / max(1, _F_tot), 3),
-                                     "peak_slices": _peak, "pb_span": round(_pb_span, 1)}}
+                                     "peak_slices": _peak, "pb_span": round(_pb_span, 1),
+                                     # WHICH frames were treated as clipped. Only the COUNT used to be
+                                     # recorded, so an auto-detected crop could not be shown, reviewed or
+                                     # edited — the UI had nothing to mark and the user could not tell
+                                     # WHERE the pipeline thought the apex was missing. These are ARRAY
+                                     # frame indices, the same space as oct_params.surface_crop_frames,
+                                     # so an auto set can be loaded straight into the editor and amended.
+                                     "frames": sorted(int(f) for f in _crop_frames)}}
             if _crop_tune:
                 info["auto_tune"] = _crop_tune
             p_all = {**DEFAULT_PARAMS, **(params or {})}

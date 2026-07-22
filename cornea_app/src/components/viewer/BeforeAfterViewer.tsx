@@ -7,7 +7,7 @@
    pass = context (the working volume's slices). The pass count comes from manifest.oct_iter (written
    by the iterative preprocess); a non-iterative scan has one corrected pass = a plain raw|final view. */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ToggleButton, ToggleButtonGroup, Slider, CircularProgress } from "@mui/material";
 import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
@@ -23,6 +23,21 @@ interface OctIter {
   metrics?: number[]; // boundary deviation (px) of each chain volume: [raw, pass1, …, passM]
   best_pass?: number; // index of the KEPT volume (the least-deviant one); 0 = raw
   stopped?: string;
+  surface_crop?: { n_frames?: number; frames?: number[]; auto?: boolean; n_frames_total?: number };
+}
+
+// ── SURFACE-CROP MARKING ───────────────────────────────────────────────────────────────────────────
+// A surface-cropped frame is a B-scan whose corneal APEX sits above the acquisition window, so it has no
+// anterior surface to detect. The marks belong HERE, on the ORIGINAL (raw) panel, because that is the only
+// place the clip is still visible: the whole point of the correction is that the output no longer shows it.
+// In the SAGITTAL preview the frame axis runs left→right, so a marked frame is a COLUMN — which is what the
+// user is looking for. (Axial shows one frame per image, so a per-column overlay is meaningless there; the
+// per-frame toggle in the Fix-axial tool covers that view instead.)
+interface CropDetect {
+  frames: number[];        // auto-suggested set (detector, run on the RAW volume)
+  selected: number[];      // the persisted confirmed set, if the user has edited before
+  counts: Record<string, number>;  // per-frame count of sagittal slices flagged clipped → confidence
+  n_frames: number;
 }
 
 // Orientation + display filter are driven by the single top toolbar in VolumeCanvas (this panel is
@@ -36,6 +51,7 @@ export function BeforeAfterViewer({ orient, filter }: {
   const caseInfo = useCaseStore((s) => s.caseInfo);
   // Re-fetch when previews re-render (e.g. a re-preprocess bumps segVersion).
   const segSig = useWorkflowStore((s) => s.segVersion);
+  const wfSet = useWorkflowStore((s) => s.set);
 
   const octIter = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as OctIter | undefined;
   const passCount = Math.max(1, Number(octIter?.passes ?? 1));
@@ -125,6 +141,70 @@ export function BeforeAfterViewer({ orient, filter }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orient, after.length]);
 
+  // ── surface-crop marks on the ORIGINAL panel ────────────────────────────────────────────────────
+  const ocParams = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as
+    Record<string, unknown> | undefined;
+  const scPersisted = useMemo(() => {
+    const a = ocParams?.surface_crop_frames;
+    return Array.isArray(a) ? (a as number[]).map(Number) : null;
+  }, [ocParams]);
+  // The pipeline records which frames IT cropped (v0.0.211). Older runs stored only a count, so fall back
+  // to the detector for those — same detector, same raw volume, so the set is what it would have chosen.
+  const scFromRun = useMemo(() => {
+    const f = octIter?.surface_crop?.frames;
+    return Array.isArray(f) ? f.map(Number) : null;
+  }, [octIter]);
+  const wasAutoCropped = octIter?.stopped === "surface_crop";
+
+  const [scDetect, setScDetect] = useState<CropDetect | null>(null);
+  const [scMarks, setScMarks] = useState<Set<number> | null>(null);   // null until seeded
+  const [scEdit, setScEdit] = useState(false);
+  const [scBusy, setScBusy] = useState(false);
+  const [scMsg, setScMsg] = useState("");
+
+  // Seed the marks: persisted user set → the set this run actually cropped → the detector's suggestion.
+  useEffect(() => {
+    if (!caseId || orient !== "sagittal") return;
+    let cancel = false;
+    const seed = (d: CropDetect | null) => {
+      if (cancel) return;
+      const chosen = (scPersisted && scPersisted.length ? scPersisted
+        : scFromRun && scFromRun.length ? scFromRun
+        : d?.selected?.length ? d.selected
+        : d?.frames) ?? [];
+      setScMarks(new Set(chosen.map(Number)));
+    };
+    api.json<CropDetect>(`/api/case/${caseId}/oct-surface-crop/detect`, "POST", "{}")
+      .then((d) => { if (!cancel) { setScDetect(d); seed(d); } })
+      .catch(() => seed(null));   // detector unavailable → still show whatever is persisted
+    return () => { cancel = true; };
+  }, [caseId, orient, segSig, JSON.stringify(scPersisted), JSON.stringify(scFromRun)]);
+
+  const nFrames = scDetect?.n_frames ?? octIter?.surface_crop?.n_frames_total ?? 0;
+  const autoSuggested = useMemo(() => new Set((scDetect?.frames ?? []).map(Number)), [scDetect]);
+  const scDirty = useMemo(() => {
+    if (!scMarks) return false;
+    const base = (scPersisted ?? scFromRun ?? scDetect?.frames ?? []).map(Number).sort((a, b) => a - b).join(",");
+    return [...scMarks].sort((a, b) => a - b).join(",") !== base;
+  }, [scMarks, scPersisted, scFromRun, scDetect]);
+
+  const applyMarks = async (mode: "manual" | "off" | "auto") => {
+    if (!caseId || scBusy) return;
+    setScBusy(true); setScMsg(mode === "off" ? "Turning surface crop off…" : "Applying…");
+    try {
+      const frames = [...(scMarks ?? [])].sort((a, b) => a - b);
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify({
+        surface_crop_mode: mode,
+        ...(mode === "manual" ? { surface_crop_frames: frames } : {}),
+      }));
+      await useCaseStore.getState().openCase();
+      wfSet("segVersion", segSig + 1);
+      setScMsg(mode === "off" ? "Surface crop OFF for this scan."
+        : mode === "auto" ? "Reset to AUTO."
+        : `Applied ${frames.length} frame(s).`);
+    } catch { setScMsg("Failed."); } finally { setScBusy(false); }
+  };
+
   // #6: the <img> fills its (equal) panel area and scales UP to maximize the canvas; objectFit:contain +
   // equal boxes + shared slice geometry render raw and corrected at the SAME size (no "original larger").
   const imgStyle: React.CSSProperties = {
@@ -199,6 +279,57 @@ export function BeforeAfterViewer({ orient, filter }: {
         )}
       </div>
 
+      {/* Surface-crop strip. Sagittal only — that is the view where a frame reads as a column. Shown
+          whenever this scan has (or could have) a clip, so an auto-applied crop is visible without hunting. */}
+      {orient === "sagittal" && nFrames > 1 && (scMarks?.size || autoSuggested.size || wasAutoCropped) ? (
+        <div className="flex items-center gap-2 px-3 py-1 border-b flex-wrap"
+             style={{ minHeight: 30, borderColor: "var(--c-border)", background: "rgba(91,192,255,0.07)" }}>
+          <span className="text-[11px]" style={{ fontWeight: 600, color: "#5bc0ff" }}>surface crop</span>
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+            {wasAutoCropped ? "auto-applied on this scan · " : ""}
+            {scMarks?.size ?? 0} marked{autoSuggested.size ? ` · ${autoSuggested.size} suggested` : ""}
+          </span>
+          <ToggleButton size="small" value="edit" selected={scEdit} disabled={scBusy}
+                        onChange={() => setScEdit((v) => !v)}
+                        style={{ padding: "1px 8px", fontSize: 11, textTransform: "none" }}>
+            {scEdit ? "editing — click a column" : "edit marks"}
+          </ToggleButton>
+          {scDetect?.frames?.length ? (
+            <button className="text-[11px]" disabled={scBusy}
+                    onClick={() => setScMarks(new Set(scDetect.frames.map(Number)))}
+                    style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid var(--c-border)",
+                             background: "var(--c-surface)", color: "var(--c-text)", cursor: "pointer" }}>
+              use detector&apos;s {scDetect.frames.length}
+            </button>
+          ) : null}
+          <button className="text-[11px]" disabled={scBusy || !scMarks?.size}
+                  onClick={() => setScMarks(new Set())}
+                  style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid var(--c-border)",
+                           background: "var(--c-surface)", color: "var(--c-text)", cursor: "pointer" }}>
+            clear
+          </button>
+          <span style={{ flex: 1 }} />
+          {scMsg && <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>{scMsg}</span>}
+          {scBusy && <CircularProgress size={13} />}
+          <button className="text-[11px]" disabled={scBusy}
+                  onClick={() => applyMarks("off")}
+                  title="Never surface-crop this scan, even if the detector flags it (sticks across re-runs)"
+                  style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid var(--c-border)",
+                           background: "var(--c-surface)", color: "var(--c-text)", cursor: "pointer" }}>
+            turn off
+          </button>
+          <button className="text-[11px]" disabled={scBusy || !scDirty}
+                  onClick={() => applyMarks("manual")}
+                  title="Re-run preprocessing using exactly the marked frames"
+                  style={{ padding: "2px 10px", borderRadius: 6,
+                           border: `1px solid ${scDirty ? "#5bc0ff" : "var(--c-border)"}`,
+                           background: scDirty ? "#5bc0ff" : "var(--c-surface)",
+                           color: scDirty ? "#00263a" : "var(--c-text)", cursor: "pointer" }}>
+            apply &amp; re-run
+          </button>
+        </div>
+      ) : null}
+
       <div className="flex-1 min-h-0 flex items-center justify-center p-3">
         {!cur ? (
           <div className="text-center" style={{ color: "var(--c-text-dim)" }}>
@@ -220,11 +351,24 @@ export function BeforeAfterViewer({ orient, filter }: {
           >
             <div style={panelCol}>
               <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
-                original (raw)
+                original (raw){orient === "sagittal" && scMarks && scMarks.size > 0
+                  ? ` — ${scMarks.size} surface-cropped frame${scMarks.size === 1 ? "" : "s"}` : ""}
               </span>
               <div style={imgArea}>
                 {rawCur ? (
-                  <img src={imgSrc(rawCur)} alt="raw" draggable={false} style={imgStyle} />
+                  <CropMarkedImage
+                    src={imgSrc(rawCur)} style={imgStyle}
+                    // Marks only make sense on sagittal, where the frame axis runs across the image.
+                    active={orient === "sagittal" && nFrames > 1}
+                    flipped={orient === "sagittal"}
+                    nFrames={nFrames} marks={scMarks} auto={autoSuggested} counts={scDetect?.counts}
+                    editable={scEdit}
+                    onToggle={(f) => setScMarks((prev) => {
+                      const o = new Set(prev ?? []);
+                      if (o.has(f)) o.delete(f); else o.add(f);
+                      return o;
+                    })}
+                  />
                 ) : (
                   <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                     no raw slice here
@@ -256,6 +400,76 @@ export function BeforeAfterViewer({ orient, filter }: {
             value={safeIdx}
             onChange={(_, v) => setIdx(v as number)}
           />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Raw preview with the surface-crop frame marks drawn ON the image.
+// The <img> uses objectFit:contain, so the rendered picture is usually SMALLER than its box — the overlay
+// must therefore track the CONTAINED rect (derived from naturalWidth/Height), not the box, or the columns
+// would drift out of register with the anatomy. The sagittal preview is also scaleX(-1)-flipped to match
+// niivue's frame direction, so the overlay lives inside the same flipped element and needs no separate
+// mirroring: frame f is simply at x = f / nFrames.
+function CropMarkedImage({ src, style, active, flipped, nFrames, marks, auto, counts, editable, onToggle }: {
+  src: string; style: React.CSSProperties; active: boolean; flipped: boolean; nFrames: number;
+  marks: Set<number> | null; auto: Set<number>; counts?: Record<string, number>;
+  editable: boolean; onToggle: (f: number) => void;
+}) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [nat, setNat] = useState({ w: 0, h: 0 });
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = boxRef.current; if (!el) return;
+    const upd = () => setBox({ w: el.clientWidth, h: el.clientHeight });
+    const ro = new ResizeObserver(upd); ro.observe(el); upd();
+    return () => ro.disconnect();
+  }, []);
+  // the objectFit:contain rect of the image inside the box
+  let iw = 0, ih = 0, ox = 0, oy = 0;
+  if (nat.w > 0 && nat.h > 0 && box.w > 0 && box.h > 0) {
+    const s = Math.min(box.w / nat.w, box.h / nat.h);
+    iw = nat.w * s; ih = nat.h * s; ox = (box.w - iw) / 2; oy = (box.h - ih) / 2;
+  }
+  const maxCount = useMemo(() => {
+    const v = Object.values(counts ?? {}); return v.length ? Math.max(...v) : 0;
+  }, [counts]);
+  const pick = (clientX: number) => {
+    const el = boxRef.current; if (!el || iw <= 0 || nFrames < 1) return;
+    const r = el.getBoundingClientRect();
+    let fx = (clientX - r.left - ox) / iw;              // 0..1 across the IMAGE
+    if (fx < 0 || fx > 1) return;
+    if (flipped) fx = 1 - fx;                            // undo the scaleX(-1) presentation
+    onToggle(Math.max(0, Math.min(nFrames - 1, Math.floor(fx * nFrames))));
+  };
+  return (
+    <div ref={boxRef} style={{ position: "relative", width: "100%", height: "100%" }}>
+      <img src={src} alt="raw" draggable={false} style={style}
+           onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
+      {active && iw > 0 && (
+        <div style={{ position: "absolute", left: ox, top: oy, width: iw, height: ih,
+                      transform: flipped ? "scaleX(-1)" : undefined,
+                      pointerEvents: editable ? "auto" : "none",
+                      cursor: editable ? "pointer" : "default" }}
+             onPointerDown={(e) => { if (editable) pick(e.clientX); }}>
+          {Array.from({ length: nFrames }, (_, f) => {
+            const on = marks?.has(f) ?? false;
+            const sug = auto.has(f);
+            if (!on && !sug) return null;
+            // confidence = how many sagittal slices flagged this frame; drives opacity so a marginal
+            // frame reads differently from one the detector is sure about
+            const c = Number(counts?.[String(f)] ?? 0);
+            const conf = maxCount > 0 ? Math.min(1, c / maxCount) : 1;
+            return (
+              <div key={f} title={`frame ${f}${c ? ` — clipped in ${c} slices` : ""}${on ? " (marked)" : " (suggested)"}`}
+                   style={{ position: "absolute", top: 0, bottom: 0,
+                            left: `${(f / nFrames) * 100}%`, width: `${(1 / nFrames) * 100}%`,
+                            background: on ? `rgba(91,192,255,${0.25 + 0.35 * conf})` : "rgba(255,193,7,0.16)",
+                            borderLeft: on ? "1px solid rgba(91,192,255,0.9)" : "none",
+                            borderRight: on ? "1px solid rgba(91,192,255,0.9)" : "none" }} />
+            );
+          })}
         </div>
       )}
     </div>
