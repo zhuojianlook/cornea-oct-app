@@ -11,10 +11,81 @@
    Message in:  { intensity: Uint8Array, seeds: Uint8Array, nx, ny, nz, spatial }
    Message out: { type:'progress', pct } …  then  { type:'done', label: Uint8Array } (label buffer transferred) */
 
-interface InMsg { intensity: Uint8Array; seeds: Uint8Array; nx: number; ny: number; nz: number; spatial: number; }
+interface InMsg { intensity: Uint8Array; seeds: Uint8Array; nx: number; ny: number; nz: number; spatial: number;
+                  close?: boolean; closeLabel?: number; }
+
+/* Morphological CLOSE (26-conn dilate then erode) + 3-D hole fill of one label, bounded to its bbox — so a
+   magic-wand-derived scar comes back as a solid, closed shape (small gaps bridged, interior holes filled).
+   Closing only ADDS voxels (close(A) ⊇ A), so it never deletes scar; padding the bbox by 2 keeps the erosion
+   off the real shape. A guard skips the close when the scar bbox spans a large fraction of the volume (the
+   degenerate no-background-seeds case where the grown scar isn't a shape to close) so cost stays bounded. */
+function closeShapeInPlace(label: Uint8Array, nx: number, ny: number, nz: number, target: number): void {
+  const nxny = nx * ny, N = nx * ny * nz;
+  let x0 = nx, y0 = ny, z0 = nz, x1 = -1, y1 = -1, z1 = -1;
+  for (let v = 0; v < N; v++) {
+    if (label[v] !== target) continue;
+    const z = (v / nxny) | 0, r = v - z * nxny, y = (r / nx) | 0, x = r - y * nx;
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  if (x1 < 0) return;                                   // no target voxels
+  const pad = 2;
+  x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); z0 = Math.max(0, z0 - pad);
+  x1 = Math.min(nx - 1, x1 + pad); y1 = Math.min(ny - 1, y1 + pad); z1 = Math.min(nz - 1, z1 + pad);
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1, bd = z1 - z0 + 1, bwh = bw * bh, bn = bwh * bd;
+  // GUARD: a real corneal scar is a compact sub-region, so its bbox is small. If the grown scar spans a
+  // large fraction of the volume (the degenerate "wand a scar, then Smart Fill with NO background seeds" →
+  // scar becomes the geodesically-nearest seed almost everywhere), the result isn't a shape to close and
+  // closing it would allocate hundreds of MB. Skip in that case (closing whole-volume scar is meaningless).
+  if (bn > Math.min(12_000_000, N * 0.45)) return;
+  const li = (x: number, y: number, z: number) => (z - z0) * bwh + (y - y0) * bw + (x - x0);
+  const m = new Uint8Array(bn);
+  for (let z = z0; z <= z1; z++) for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++)
+    if (label[z * nxny + y * nx + x] === target) m[li(x, y, z)] = 1;
+
+  const morph = (src: Uint8Array, dilate: boolean): Uint8Array => {
+    const out = new Uint8Array(bn);
+    for (let z = 0; z < bd; z++) for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      let any = false, all = true;
+      for (let dz = -1; dz <= 1; dz++) { const zz = z + dz;
+        for (let dy = -1; dy <= 1; dy++) { const yy = y + dy;
+          for (let dx = -1; dx <= 1; dx++) { const xx = x + dx;
+            const inside = xx >= 0 && xx < bw && yy >= 0 && yy < bh && zz >= 0 && zz < bd;
+            const mv = inside ? src[zz * bwh + yy * bw + xx] : 0;
+            if (mv) any = true; else all = false;
+          } } }
+      out[z * bwh + y * bw + x] = dilate ? (any ? 1 : 0) : (all ? 1 : 0);
+    }
+    return out;
+  };
+  const closed = morph(morph(m, true), false);          // dilate → erode = close
+
+  // hole fill: flood background (closed===0) inward from the box border; any background NOT reached = hole.
+  const bg = new Uint8Array(bn);
+  let stack = new Int32Array(Math.max(1024, bn >> 4)), sp = 0;   // typed, grow-on-demand (not a number[])
+  const tryPush = (i: number) => {
+    if (closed[i] || bg[i]) return;
+    bg[i] = 1;
+    if (sp === stack.length) { const n = new Int32Array(stack.length * 2); n.set(stack); stack = n; }
+    stack[sp++] = i;
+  };
+  for (let z = 0; z < bd; z++) for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++)
+    if (x === 0 || x === bw - 1 || y === 0 || y === bh - 1 || z === 0 || z === bd - 1) tryPush(z * bwh + y * bw + x);
+  while (sp > 0) {
+    const i = stack[--sp]; const z = (i / bwh) | 0, r = i - z * bwh, y = (r / bw) | 0, x = r - y * bw;
+    if (x > 0) tryPush(i - 1); if (x < bw - 1) tryPush(i + 1);
+    if (y > 0) tryPush(i - bw); if (y < bh - 1) tryPush(i + bw);
+    if (z > 0) tryPush(i - bwh); if (z < bd - 1) tryPush(i + bwh);
+  }
+  for (let z = z0; z <= z1; z++) for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const b = li(x, y, z);
+    if (closed[b] || !bg[b]) label[z * nxny + y * nx + x] = target;   // closed shape + interior holes → target
+  }
+}
 
 self.onmessage = (e: MessageEvent<InMsg>) => {
-  const { intensity, seeds, nx, ny, nz, spatial } = e.data;
+  const { intensity, seeds, nx, ny, nz, spatial, close, closeLabel } = e.data;
   const N = nx * ny * nz;
   const nxny = nx * ny;
   const INF = 0x7fffffff;
@@ -61,6 +132,7 @@ self.onmessage = (e: MessageEvent<InMsg>) => {
     if (z > 0)      { const w = v - nxny; const nd = dv + Math.abs(iv - intensity[w]) + sp; if (nd < dist[w]) { dist[w] = nd; label[w] = lv; push(nd % nb, w); queueSize++; } }
     if (z < nz - 1) { const w = v + nxny; const nd = dv + Math.abs(iv - intensity[w]) + sp; if (nd < dist[w]) { dist[w] = nd; label[w] = lv; push(nd % nb, w); queueSize++; } }
   }
+  if (close && (closeLabel === 1 || closeLabel === 2)) closeShapeInPlace(label, nx, ny, nz, closeLabel);
   (self as unknown as Worker).postMessage({ type: "progress", pct: 100 });
   (self as unknown as Worker).postMessage({ type: "done", label }, [label.buffer]);
 };

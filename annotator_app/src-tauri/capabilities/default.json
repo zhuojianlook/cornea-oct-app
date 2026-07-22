@@ -15,6 +15,7 @@
     { "identifier": "fs:allow-write-text-file", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
     { "identifier": "fs:allow-read-dir", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
     { "identifier": "fs:allow-mkdir", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
-    { "identifier": "fs:allow-exists", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] }
+    { "identifier": "fs:allow-exists", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] },
+    { "identifier": "fs:allow-remove", "allow": [{ "path": "**" }, { "path": "$HOME/**" }, { "path": "$APPCONFIG" }, { "path": "$APPCONFIG/**" }] }
   ]
 }
