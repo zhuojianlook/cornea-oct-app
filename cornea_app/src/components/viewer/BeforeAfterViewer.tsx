@@ -418,6 +418,7 @@ function CropMarkedImage({ src, style, active, flipped, nFrames, marks, auto, co
   editable: boolean; onToggle: (f: number) => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
   const [nat, setNat] = useState({ w: 0, h: 0 });
   const [box, setBox] = useState({ w: 0, h: 0 });
   useEffect(() => {
@@ -426,6 +427,20 @@ function CropMarkedImage({ src, style, active, flipped, nFrames, marks, auto, co
     const ro = new ResizeObserver(upd); ro.observe(el); upd();
     return () => ro.disconnect();
   }, []);
+  // The overlay needs the image's INTRINSIC size to place the objectFit:contain rect. Reading it from
+  // onLoad ALONE is a bug: the raw preview is normally already in the cache, so the image is `complete`
+  // before React attaches the handler and onLoad never fires — nat stays 0, the contain-rect is 0-wide,
+  // and the marks are silently not rendered. (They then appeared on the next re-render, which is why
+  // toggling "edit marks" seemed to summon them.) Read it directly whenever src changes, and keep
+  // onLoad for the genuinely-uncached case.
+  const readNat = () => {
+    const im = imgRef.current;
+    if (im && im.naturalWidth > 0 && im.naturalHeight > 0) {
+      setNat((p) => (p.w === im.naturalWidth && p.h === im.naturalHeight
+        ? p : { w: im.naturalWidth, h: im.naturalHeight }));
+    }
+  };
+  useEffect(readNat, [src]);
   // the objectFit:contain rect of the image inside the box
   let iw = 0, ih = 0, ox = 0, oy = 0;
   if (nat.w > 0 && nat.h > 0 && box.w > 0 && box.h > 0) {
@@ -445,8 +460,7 @@ function CropMarkedImage({ src, style, active, flipped, nFrames, marks, auto, co
   };
   return (
     <div ref={boxRef} style={{ position: "relative", width: "100%", height: "100%" }}>
-      <img src={src} alt="raw" draggable={false} style={style}
-           onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
+      <img ref={imgRef} src={src} alt="raw" draggable={false} style={style} onLoad={readNat} />
       {active && iw > 0 && (
         <div style={{ position: "absolute", left: ox, top: oy, width: iw, height: ih,
                       transform: flipped ? "scaleX(-1)" : undefined,
