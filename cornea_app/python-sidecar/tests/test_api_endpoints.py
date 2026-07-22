@@ -393,3 +393,45 @@ def test_export_nnunet_dedups_duplicate_case_ids(client, make_case):
     assert body["num_training"] == 2          # duplicate "a" collapsed (was 3)
     assert len(body["results"]) == 2
     assert {x["case_id"] for x in body["results"]} == {a, b}
+
+
+# ── surface-crop MODE (user decision: auto | manual | off) ──────────────────
+def test_surface_crop_mode_off_is_durable():
+    """"off" must SUPPRESS the auto detector, not merely clear the frame set.
+
+    The encoding is load-bearing and shared with oct_preprocess: the worker reads
+    surface_crop_frames and tests it for `is None` BEFORE running the detector, then applies the
+    repair only `if _crop_frames:`. So an explicit EMPTY LIST both suppresses detection and applies
+    nothing. Popping the key instead (the old behaviour) let the next run re-detect and re-apply the
+    very crop the user had just removed."""
+    import api_server as A
+    p = A.apply_surface_crop_mode({}, "off")
+    assert p["surface_crop_mode"] == "off"
+    assert p["auto_surface_crop"] is False
+    assert p["surface_crop_frames"] == []        # explicit empty, NOT absent
+
+
+def test_surface_crop_mode_manual_keeps_only_the_user_set():
+    import api_server as A
+    p = A.apply_surface_crop_mode({"surface_crop_frames": [5, 6]}, "manual")
+    assert p["surface_crop_frames"] == [5, 6]
+    assert p["auto_surface_crop"] is False       # detector must not add to the user's set
+    # "manual" with nothing marked is "off", not "hand it back to the detector"
+    q = A.apply_surface_crop_mode({}, "manual")
+    assert q["auto_surface_crop"] is False and q["surface_crop_frames"] == []
+
+
+def test_surface_crop_mode_auto_clears_both_overrides():
+    import api_server as A
+    p = A.apply_surface_crop_mode({"auto_surface_crop": False, "surface_crop_frames": [1, 2]}, "auto")
+    assert p["surface_crop_mode"] == "auto"
+    assert "auto_surface_crop" not in p and "surface_crop_frames" not in p
+
+
+def test_surface_crop_mode_unknown_leaves_decision_untouched():
+    """An unrecognised or absent mode must not silently reset a persisted decision."""
+    import api_server as A
+    for mode in (None, "", "bogus"):
+        p = A.apply_surface_crop_mode({"surface_crop_frames": [9], "auto_surface_crop": False}, mode)
+        assert p["surface_crop_frames"] == [9] and p["auto_surface_crop"] is False
+        assert "surface_crop_mode" not in p

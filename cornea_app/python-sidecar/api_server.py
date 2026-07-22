@@ -2095,6 +2095,13 @@ class OctPreprocessRequest(BaseModel):
                                              # cropped (no top surface). A STICKY oct_param; on re-run those
                                              # frames are reconstructed by posterior continuity (bottom-edge
                                              # guidance). None = carry persisted set; [] = clear the crop.
+    surface_crop_mode: str | None = None     # USER CONTROL over the surface-crop correction (v0.0.211):
+                                             #   "auto"   — let the detector decide (the historical default)
+                                             #   "manual" — use EXACTLY surface_crop_frames, detector disabled
+                                             #   "off"    — never surface-crop this scan, even if auto-detected
+                                             # None = leave the persisted mode alone. Needed because clearing the
+                                             # frame set used to just POP the param, so the next run re-detected
+                                             # and re-applied the crop — there was no way to say "no".
     crop_lateral: List[int] | None = None    # LEGACY #9 v1 full-slice crop (kept for old cases).
     crop_region: dict | None = None          # #9 v2 "Crop": a BOX = {'lateral':[lo,hi], 'frames':[…]} — remove
                                              # certain FRAME columns over a RANGE of LATERAL slices (zeroed before
@@ -2479,6 +2486,20 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             eff_params["surface_crop_frames"] = scf
         else:
             eff_params.pop("surface_crop_frames", None)
+    # SURFACE-CROP MODE (v0.0.211) — the user's explicit decision, sticky like the frame set itself.
+    # Previously the only controls were "here is a frame set" or "clear it", and clearing merely POPPED the
+    # param, so the very next run re-ran the detector and could re-apply the same crop the user had just
+    # removed. The A/B showed why that matters: the correction genuinely rescues some scans (case_cs024_od_v3
+    # delivered dev 7.52 -> 0.89, i.e. from worst-in-store to the accepted median) and genuinely harms others
+    # (case_cs008_od_v1 4.05 -> 4.96), so neither always-on nor always-off is right — it has to be per scan.
+    #   auto   = detector decides (historical behaviour)
+    #   manual = use exactly surface_crop_frames; the detector must not add to or override the user's set
+    #   off    = never surface-crop this scan
+    # Encoding note: the worker reads oct_params.auto_surface_crop and oct_params.surface_crop_frames.
+    # `_crop_frames = params.get("surface_crop_frames")` is checked for `is None` BEFORE the auto detector
+    # runs, so an explicit EMPTY LIST both suppresses auto-detection and (being falsy) applies no repair —
+    # that is what makes "off" durable rather than advisory.
+    apply_surface_crop_mode(eff_params, req.surface_crop_mode)
     # #9 "Crop" — STICKY box crop (carried through the eff_params merge on later re-runs, like a geometric
     # property of the scan). crop_region = {'lateral':[lo,hi], 'frames':[…]} removes those frame columns over
     # the lateral-slice range (zeroed before SAM2); recorded so the compare/subgroup analytics exclude the box
@@ -2904,6 +2925,42 @@ def set_difficult_scan(case_id: str, req: DifficultRequest) -> dict:
     Difficult scans are EXCLUDED from nnU-Net training candidate selection (per_scan_segmented_cases)."""
     m = orch.write_manifest_value(_require_case(case_id), {"difficult_scan": bool(req.difficult)})
     return {"ok": True, "difficult_scan": bool(m.get("difficult_scan"))}
+
+
+def apply_surface_crop_mode(eff_params: dict, mode: str | None) -> dict:
+    """Apply the user's surface-crop DECISION to a case's effective oct_params, in place.
+
+    "auto"   — hand the decision back to the detector (clear both overrides)
+    "manual" — use EXACTLY eff_params["surface_crop_frames"]; the detector must not add to it
+    "off"    — never surface-crop this scan
+    An unrecognised / None mode leaves the persisted decision untouched.
+
+    Why a mode and not just a frame set: clearing the set used to POP the param, so the next run
+    re-ran the detector and could re-apply the very crop the user had just removed — there was no way
+    to say "no". The A/B that motivated this showed the correction genuinely rescues some scans
+    (case_cs024_od_v3 delivered dev 7.52 -> 0.89, worst-in-store to the accepted median) and genuinely
+    harms others (case_cs008_od_v1 4.05 -> 4.96), so it has to be decidable per scan.
+
+    ENCODING (relied on by oct_preprocess): the worker reads `surface_crop_frames` and checks it for
+    `is None` BEFORE running the auto detector, then applies the repair only `if _crop_frames:`. So an
+    explicit EMPTY LIST both suppresses auto-detection and applies nothing — that is what makes "off"
+    durable rather than advisory. Do not "tidy" the empty list away."""
+    m = (mode or "").strip().lower()
+    if m not in ("auto", "manual", "off"):
+        return eff_params
+    eff_params["surface_crop_mode"] = m          # recorded so the UI can show the effective state
+    if m == "auto":
+        eff_params.pop("auto_surface_crop", None)
+        eff_params.pop("surface_crop_frames", None)
+    elif m == "off":
+        eff_params["auto_surface_crop"] = False
+        eff_params["surface_crop_frames"] = []
+    else:                                         # manual — the user's set is the whole truth
+        eff_params["auto_surface_crop"] = False
+        if not eff_params.get("surface_crop_frames"):
+            # "manual" with no frames would otherwise hand control back to the detector; that is "off".
+            eff_params["surface_crop_frames"] = []
+    return eff_params
 
 
 class SurfaceCropRequest(BaseModel):
@@ -4212,6 +4269,10 @@ def cases_list() -> dict:
                 # The loader badges both so every auto-detected clip is easy to find + verify.
                 "surface_crop_auto": ((m.get("oct_iter") or {}).get("stopped") == "surface_crop"),
                 "surface_crop_manual": m.get("surface_crop_manual"),
+                # The user's explicit surface-crop DECISION (auto | manual | off) and the frame set it acts on.
+                # Distinct from surface_crop_manual, which is only a review mark and steers nothing.
+                "surface_crop_mode": ((m.get("oct_params") or {}).get("surface_crop_mode") or "auto"),
+                "surface_crop_n_frames": len(((m.get("oct_params") or {}).get("surface_crop_frames") or [])),
                 # DELIVERED-VOLUME QA (oct_iter.final_qa) — measured on the volume actually written, unlike
                 # oct_iter.metrics which describes a pre-rigid intermediate that is never delivered. ADVISORY
                 # ONLY: nothing gates on it; it exists so the review queue can be ORDERED worst-first instead

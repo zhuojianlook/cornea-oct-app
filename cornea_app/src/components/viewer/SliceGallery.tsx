@@ -924,8 +924,12 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     if (!caseId) return;
     setRerunBusy(true);
     try {
+      // Send the MODE alongside the set. A non-empty set is an explicit "manual" decision; an empty set
+      // means "off" — not "hand it back to the detector", which is what popping the param used to do
+      // (the next run re-detected and re-applied the crop the user had just cleared).
+      const frames = [...cropCols].sort((a, b) => a - b);
       await api.json(`/api/case/${caseId}/oct-preprocess`, "POST",
-        JSON.stringify({ surface_crop_frames: [...cropCols].sort((a, b) => a - b) }));
+        JSON.stringify({ surface_crop_mode: frames.length ? "manual" : "off", surface_crop_frames: frames }));
       await openCase();
       wfSet("segVersion", segSig + 1);
     } catch {

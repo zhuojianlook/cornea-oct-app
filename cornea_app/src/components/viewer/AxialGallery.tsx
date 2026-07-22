@@ -64,10 +64,62 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
+  useEffect(() => { setAnchors(cloneMap(persisted)); }, [persistedSig]);   // re-seed on case load / after Confirm
+
   const nTot = nFrames > 1 ? nFrames : (sliceTotal > 1 ? sliceTotal : 0);
   const arrayFrame = nTot > 1 ? Math.max(0, Math.min(nTot - 1, (nTot - 1) - niiSlice)) : 0;   // niivue slice → array frame
 
-  useEffect(() => { setAnchors(cloneMap(persisted)); }, [persistedSig]);   // re-seed on case load / after Confirm
+  // ── SURFACE CROP (v0.0.211) ────────────────────────────────────────────────────────────────────
+  // Marking a clipped apex is far easier HERE than in the sagittal tool: a surface-cropped frame IS one
+  // B-scan, so it is a single yes/no per frame rather than painting columns. The user scrubs, and marks
+  // the frames whose apex is above the window.
+  // MODE is a real decision, not a hint: "auto" lets the detector choose, "manual" uses exactly the marked
+  // set, "off" never crops this scan. It exists because clearing the set used to only pop the param, so the
+  // next run re-detected and re-applied the very crop the user removed. Frame indices are ARRAY indices
+  // (same space as the anchors), converted from the niivue slice the user is looking at.
+  const scMode = String(ocParams(caseInfo).surface_crop_mode ?? "auto");
+  const persistedScSig = JSON.stringify(ocParams(caseInfo).surface_crop_frames ?? []);
+  const persistedSc = useMemo(() => {
+    try { return new Set((JSON.parse(persistedScSig) as number[]).map(Number)); } catch { return new Set<number>(); }
+  }, [persistedScSig]);
+  const [scOn, setScOn] = useState(false);              // is the surface-crop marking mode active
+  const [scMark, setScMark] = useState<Set<number>>(new Set());
+  const [scModeSel, setScModeSel] = useState<string>(scMode);
+  useEffect(() => { setScMark(new Set(persistedSc)); }, [persistedScSig]);
+  useEffect(() => { setScModeSel(scMode); }, [scMode]);
+  const scDirty = useMemo(() => {
+    const a = [...scMark].sort((x, y) => x - y).join(",");
+    const b = [...persistedSc].sort((x, y) => x - y).join(",");
+    return a !== b || scModeSel !== scMode;
+  }, [scMark, persistedSc, scModeSel, scMode]);
+  const scHere = scMark.has(arrayFrame);
+  const toggleScFrame = () => setScMark((prev) => {
+    const o = new Set(prev);
+    if (o.has(arrayFrame)) o.delete(arrayFrame); else o.add(arrayFrame);
+    return o;
+  });
+  // marked frames shown as niivue-slice numbers (1-based), matching what the user scrubs
+  const scMarkedSlices = useMemo(() => [...scMark]
+    .map((f) => (nTot > 1 ? (nTot - 1 - f) : f) + 1).sort((a, b) => a - b), [scMark, nTot]);
+  const applySurfaceCrop = async () => {
+    if (!caseId || busy) return;
+    setBusy(true); setMsg("Applying surface-crop decision…");
+    try {
+      const frames = [...scMark].sort((a, b) => a - b);
+      await api.json(`/api/case/${caseId}/oct-preprocess`, "POST", JSON.stringify({
+        surface_crop_mode: scModeSel,
+        // only send the set when it is what drives the run; "auto"/"off" ignore it server-side
+        ...(scModeSel === "manual" ? { surface_crop_frames: frames } : {}),
+      }));
+      await openCase();
+      wfSet("segVersion", segVersion + 1);
+      setMsg(scModeSel === "off" ? "Surface crop OFF for this scan — re-run complete."
+        : scModeSel === "auto" ? "Surface crop set to AUTO — re-run complete."
+        : `Surface crop applied to ${frames.length} frame(s) — re-run complete.`);
+    } catch { setMsg("Surface-crop run failed."); } finally { setBusy(false); }
+  };
+
+
 
   // detected surface for the current ARRAY frame (edge over laterals). Re-fetches after a Run (segVersion).
   useEffect(() => {
@@ -197,19 +249,70 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
         <button style={btn()} disabled={busy} onClick={() => setNiiSlice(maxSlice)}>last ⏭</button>
         <span style={{ flex: 1 }} />
         {editedSlices.length > 0 && <span style={{ fontSize: 11, opacity: 0.7 }}>edited: {editedSlices.join(", ")}</span>}
+        <button style={btn({ borderColor: scOn ? "#5bc0ff" : "var(--c-border)", color: scOn ? "#5bc0ff" : "var(--c-text)" })}
+                disabled={busy} onClick={() => setScOn((v) => !v)}
+                title="Mark which B-scans have a CLIPPED APEX (top of the cornea above the window), and choose whether this scan is surface-cropped at all">
+          ⬚ Surface crop{scMode !== "auto" ? ` (${scMode})` : ""}</button>
         <button style={btn()} disabled={busy || readOnly || !(curAnchors?.size)} onClick={clearFrame}>Clear slice</button>
         <button style={btn({ borderColor: dirty ? "var(--c-accent)" : "var(--c-border)" })} disabled={busy || readOnly || !dirty} onClick={confirm}>Confirm</button>
         <button style={btn({ background: "var(--c-accent)", color: "#fff", borderColor: "var(--c-accent)" })}
                 disabled={busy || readOnly} onClick={run}>Run preprocessing</button>
         {busy && <CircularProgress size={16} />}
       </div>
+      {/* surface-crop sub-toolbar — only when the mode is open, so the default view stays uncluttered */}
+      {scOn && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 10px", flexWrap: "wrap",
+                      borderBottom: "1px solid var(--c-border)", background: "rgba(91,192,255,0.07)", flex: "none" }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "#5bc0ff" }}>Surface crop</span>
+          <select value={scModeSel} onChange={(e) => setScModeSel(e.target.value)} disabled={busy || readOnly}
+                  style={{ fontSize: 12, padding: "3px 6px", borderRadius: 6, background: "var(--c-surface)",
+                           color: "var(--c-text)", border: "1px solid var(--c-border)" }}>
+            <option value="auto">Auto — let the detector decide</option>
+            <option value="manual">Manual — use only the frames I mark</option>
+            <option value="off">Off — never surface-crop this scan</option>
+          </select>
+          {scModeSel === "manual" && (
+            <>
+              <button style={btn({ borderColor: scHere ? "#5bc0ff" : "var(--c-border)",
+                                   background: scHere ? "rgba(91,192,255,0.18)" : "var(--c-surface)" })}
+                      disabled={busy || readOnly} onClick={toggleScFrame}>
+                {scHere ? "✓ this slice is clipped" : "mark this slice clipped"}</button>
+              <button style={btn()} disabled={busy || readOnly || !scMark.size}
+                      onClick={() => setScMark(new Set())}>clear all</button>
+              <span style={{ fontSize: 11, opacity: 0.75 }}>
+                {scMark.size ? `${scMark.size} marked: ${scMarkedSlices.slice(0, 12).join(", ")}${scMarkedSlices.length > 12 ? "…" : ""}` : "none marked"}
+              </span>
+            </>
+          )}
+          <span style={{ flex: 1 }} />
+          <button style={btn({ background: scDirty ? "#5bc0ff" : "var(--c-surface)", color: scDirty ? "#00263a" : "var(--c-text)",
+                               borderColor: scDirty ? "#5bc0ff" : "var(--c-border)" })}
+                  disabled={busy || readOnly || !scDirty} onClick={applySurfaceCrop}>
+            Apply &amp; re-run</button>
+        </div>
+      )}
       {msg && <div style={{ fontSize: 11, padding: "2px 10px", opacity: 0.8, flex: "none" }}>{msg}</div>}
       {/* editor */}
       <div ref={hostRef} style={{ flex: 1, minHeight: 0, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", padding: 8, overflow: "hidden" }}>
         {!edge || nLateral < 2 ? (
           <div style={{ opacity: 0.6, fontSize: 13 }}>{busy ? "Loading…" : "No axial surface — preprocess this scan first."}</div>
         ) : dispW > 1 && dispH > 1 ? (
-          <div style={{ position: "relative", width: dispW, height: dispH }}>
+          <div style={{ position: "relative", width: dispW, height: dispH,
+                        // a marked frame gets an unmistakable border + top band: when scrubbing you must be
+                        // able to tell at a glance whether THIS B-scan is in the clipped set
+                        outline: scOn && scHere ? "2px solid #5bc0ff" : "none", outlineOffset: 2 }}>
+            {scOn && scHere && (
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 4, background: "#5bc0ff",
+                            zIndex: 3, pointerEvents: "none" }} />
+            )}
+            {scOn && (
+              <div style={{ position: "absolute", top: 6, left: 8, zIndex: 3, pointerEvents: "none",
+                            fontSize: 11, fontWeight: 600, padding: "1px 6px", borderRadius: 4,
+                            background: scHere ? "#5bc0ff" : "rgba(0,0,0,0.55)",
+                            color: scHere ? "#00263a" : "#cfe8ff" }}>
+                {scHere ? "clipped apex" : "not clipped"}
+              </div>
+            )}
             <div style={{ position: "absolute", inset: 0, transform: "scaleX(-1)" }}>
               {imgSrc && <img src={imgSrc} alt="axial B-scan" draggable={false}
                 style={{ display: "block", width: "100%", height: "100%", objectFit: "fill",
@@ -232,7 +335,9 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
         ) : <div style={{ opacity: 0.6, fontSize: 13 }}>Sizing…</div>}
       </div>
       <div style={{ fontSize: 11, padding: "3px 10px", opacity: 0.6, flex: "none", borderTop: "1px solid var(--c-border)" }}>
-        Drag the red surface line onto the true corneal band where the auto-detector is off, then Confirm → Run. Corrections are saved per scan and re-applied on every re-run.
+        {scOn
+          ? "Surface crop: scrub to a B-scan whose corneal apex is cut off at the top, mark it, then Apply & re-run. Auto = the detector decides; Manual = only your marked frames; Off = never crop this scan (the decision sticks across re-runs)."
+          : "Drag the red surface line onto the true corneal band where the auto-detector is off, then Confirm → Run. Corrections are saved per scan and re-applied on every re-run."}
       </div>
     </div>
   );
