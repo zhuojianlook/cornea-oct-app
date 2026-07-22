@@ -15,12 +15,23 @@
 set -uo pipefail
 
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
-DATA_DIR="${CORNEA_DATA_DIR:-/home/zhuojian/Desktop/Integration/review_cases}"
+# WHICH CASE STORE THE APP OPENS — get this wrong and the app looks empty / unvetted.
+# Setting CORNEA_DATA_DIR here does NOTHING: the Tauri shell computes the OS app-data dir itself and
+# OVERWRITES it before spawning the sidecar. The real lever is XDG_DATA_HOME, because the shell resolves
+# <XDG_DATA_HOME>/com.cornea.oct. The repo keeps `.work/xdg/com.cornea.oct` as a symlink to review_cases
+# precisely so this works — that symlink is LOAD-BEARING, not scratch (deleting it strands all 308 cases).
+# Default (no XDG_DATA_HOME) resolves to ~/.local/share/com.cornea.oct, a STALE parallel store: same 308
+# case ids, but 1 vetted instead of 130. So an app pointed there looks like the user's review work vanished.
+XDG_ROOT="${CORNEA_XDG_ROOT:-/home/zhuojian/Desktop/Integration/.work/xdg}"
 APP="${1:-$(ls -t "$BIN_DIR"/Cornea.OCT_*_amd64.AppImage 2>/dev/null | head -1)}"
 LOG="/tmp/cornea-dev/app.log"
 mkdir -p /tmp/cornea-dev
 
 [ -x "$APP" ] || { echo "ERROR: no executable AppImage at '$APP'"; exit 1; }
+STORE="$XDG_ROOT/com.cornea.oct"
+[ -e "$STORE" ] || { echo "ERROR: $STORE missing — the app would silently open the STALE store at"; \
+                     echo "       ~/.local/share/com.cornea.oct (1 vetted, not 130). Recreate with:"; \
+                     echo "       ln -sfn /home/zhuojian/Desktop/Integration/review_cases $STORE"; exit 1; }
 
 # every pid whose executable lives inside a mounted Cornea AppImage (the window, its WebKit helpers,
 # the bundled sidecar) — regardless of what its command line says
@@ -64,7 +75,7 @@ done
 echo "  clean: no instance processes, port 8765 free"
 
 echo "== starting $(basename "$APP") =="
-DISPLAY="${DISPLAY:-:0}" CORNEA_DATA_DIR="$DATA_DIR" \
+DISPLAY="${DISPLAY:-:0}" XDG_DATA_HOME="$XDG_ROOT" \
   setsid nohup "$APP" > "$LOG" 2>&1 < /dev/null &
 
 for _ in $(seq 1 40); do
@@ -82,5 +93,8 @@ n_port=$(lsof -ti:8765 2>/dev/null | wc -l)
 echo "== running =="
 echo "  shell_version : ${ver:-<no response>}"
 echo "  instances     : $n_inst   port-8765 listeners: $n_port   (both must be 1)"
+echo "  case store    : $(readlink -f "$STORE")"
+echo "  cases/vetted  : $(curl -s "http://localhost:8765/api/cases/list?limit=400" 2>/dev/null \
+  | python3 -c 'import sys,json;c=json.load(sys.stdin).get("cases") or [];print("%d cases, %d vetted"%(len(c),sum(1 for x in c if (x.get("life") or {}).get("preproc_vetted"))))' 2>/dev/null)"
 [ -n "${ver:-}" ] && [ "$n_inst" = "1" ] && [ "$n_port" = "1" ] \
   || { echo "  *** NOT healthy — check $LOG ***"; exit 1; }
