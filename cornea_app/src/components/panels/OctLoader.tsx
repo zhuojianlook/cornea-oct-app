@@ -324,6 +324,8 @@ export function OctLoader() {
   const busyRef = useRef(false);
   busyRef.current = busy;
   const scansRef = useRef<OctScan[]>([]);
+  // last group set ingest() built — used to restore if groups are ever lost while scans remain
+  const lastGroupsRef = useRef<OctGroup[]>([]);
   scansRef.current = scans;
   const warmedRef = useRef<Set<string>>(new Set());
   // Per-caseId chain of classification writes → last user action is the last write to land (no out-of-order clobber).
@@ -360,12 +362,32 @@ export function OctLoader() {
   }, [loaded]);
 
   // Drop groups that no longer hold any scan (e.g. after moving the last scan out).
+  //
+  // GUARD: never prune EVERY group while scans still exist. The sidebar list renders on
+  // `loaded && groups.length > 0`, so groups=[] with scans=308 produces the pathological state we hit:
+  // an empty sidebar whose counts ("Wipe all saved cases (308)", "Run SAM2 + consensus (308)") are all
+  // correct, because those read `scans`. It is also unrecoverable without a reload, since nothing
+  // rebuilds groups outside ingest(). Zero matches never means "all groups are genuinely empty" — every
+  // scan carries the groupId ingest() gave it — it means `groups` and `scans` were momentarily from
+  // different generations. Keeping the old groups lets the next render reconcile instead of wedging.
   useEffect(() => {
     setGroups((cur) => {
+      if (!cur.length) return cur;
       const nonEmpty = cur.filter((g) => scans.some((s) => s.groupId === g.id));
+      if (!nonEmpty.length && scans.length) return cur;      // cross-generation, not empty groups
       return nonEmpty.length === cur.length ? cur : nonEmpty;
     });
   }, [scans]);
+
+  // SELF-HEAL: if we ever end up with scans but no groups, put the groups back rather than showing an
+  // empty sidebar. Belt-and-braces for the state above — whatever produced it, the user must never be
+  // left staring at a blank list next to a populated case count. Restores from the last set ingest()
+  // built (keeping the real patient/eye labels), limited to groups that still hold a scan.
+  useEffect(() => {
+    if (!scans.length || groups.length) return;
+    const live = lastGroupsRef.current.filter((g) => scans.some((s) => s.groupId === g.id));
+    if (live.length) setGroups(live);
+  }, [scans, groups.length]);
 
   // How many cases are already persisted on disk (re-uploads reuse these folders + their old
   // segmentation; the Wipe button clears them for a clean slate).
@@ -516,6 +538,7 @@ export function OctLoader() {
         condition: ((c.life?.scar_classification as Cls | null | undefined) ?? undefined) || undefined,
       });
     }
+    lastGroupsRef.current = order;
     setGroups(order);
     setScans(newScans);
     clearFilter();   // a stale filter must never make a freshly loaded folder look empty
