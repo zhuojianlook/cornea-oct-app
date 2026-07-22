@@ -4217,10 +4217,16 @@ def cases_list() -> dict:
                 # ONLY: nothing gates on it; it exists so the review queue can be ORDERED worst-first instead
                 # of alphabetically. Present only on scans preprocessed since this was added, so the loader
                 # must treat null as "not measured", NOT as "clean".
+                # `coverage` and `path` are NOT optional extras: dev is deflated by destroyed volume, so
+                # two scans are only comparable at similar coverage and within the same path stratum.
+                # `score` (= dev + 0.5*axial) is the exact quantity the pipeline itself minimises.
                 "final_qa": (lambda q: {
-                    "dev": q.get("dev"), "axial": q.get("axial"), "tilt_total": q.get("tilt_total"),
+                    "dev": q.get("dev"), "axial": q.get("axial"), "score": q.get("score"),
+                    "coverage": q.get("coverage"), "path": q.get("path"),
+                    "reported_dev": q.get("reported_dev"), "tilt_total": q.get("tilt_total"),
                     "max_jitter": q.get("max_jitter"), "needs_review": bool(q.get("needs_review")),
                     "review_reasons": list(q.get("review_reasons") or []),
+                    "qa_errors": list(q.get("qa_errors") or []),
                 } if isinstance(q, dict) and q else None)((m.get("oct_iter") or {}).get("final_qa")),
             },
         })

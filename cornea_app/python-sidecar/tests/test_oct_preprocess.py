@@ -581,8 +581,11 @@ def test_refine_freeze_periphery():
 
 
 # ── delivered-volume QA (measure_delivered_qa) ────────────────────────────────
-def _dome_volume(F=24, D=160, L=96, seed=0):
-    """Tiny synthetic dome + speckle, in the pipeline's native (frames, depth, lateral) order."""
+def _dome_volume(F=72, D=160, L=96, seed=0):
+    """Tiny synthetic dome + speckle, in the pipeline's native (frames, depth, lateral) order.
+    F must be >= 64: below that _cap_edge_descent's size gate (2*(10+4+16)+4) short-circuits and the
+    one block that consumes the caller's array as vol= never runs, so a mutation test would pass
+    vacuously."""
     rng = np.random.default_rng(seed)
     vol = np.zeros((F, D, L), dtype=np.float32)
     yy = np.arange(L)
@@ -594,8 +597,8 @@ def _dome_volume(F=24, D=160, L=96, seed=0):
 
 
 def test_delivered_qa_never_mutates_the_volume():
-    """QA runs immediately BEFORE write_volume_nifti, so it must be strictly read-only —
-    a mutation here would silently change the delivered result."""
+    """QA runs alongside write_volume_nifti, so it must be strictly read-only — a mutation would
+    silently change the delivered result."""
     vol = _dome_volume()
     before = vol.copy()
     qa = M.measure_delivered_qa(vol, {}, workers=1)
@@ -604,11 +607,46 @@ def test_delivered_qa_never_mutates_the_volume():
     assert qa and qa["dev"] >= 0.0 and qa["axial"] >= 0.0
 
 
-def test_delivered_qa_is_advisory_and_failure_isolated():
-    """QA must never be able to break a preprocessing run, and must be disableable."""
-    assert M.measure_delivered_qa(_dome_volume(), {"final_qa": False}, workers=1) == {}
+def test_delivered_qa_does_not_move_pass_selection():
+    """The coverage twin must not perturb disp_mean — that is the objective iterate_smooth_volume
+    minimises to choose best_pass, so any drift there could change which pass ships for the
+    already-accepted scans."""
+    vol = _dome_volume()
+    a = M.smooth_volume(vol, {}, workers=1, return_metric=True)
+    b = M.smooth_volume(vol, {}, workers=1, return_metric=True, return_coverage=True)
+    assert a[1] == b[1]                                      # disp_mean bit-identical
+    assert a[2] == b[2]                                      # axial roughness bit-identical
+    assert np.array_equal(a[0], b[0])                        # warped volume unchanged
+    assert b[4] == 1.0                                       # intact volume -> full coverage
+    assert b[3] == b[1]                                      # at full coverage the twin IS disp_mean
 
-    class _Boom:                                             # anything that explodes on use
+
+def test_delivered_qa_coverage_tracks_destroyed_volume():
+    """coverage must fall as tissue is zeroed. It is the guard on `dev`: `dev` is deflated by
+    destroyed volume (the RANSAC fit hugs the surviving frames), so a damaged scan reads
+    artificially clean and may only be compared at like coverage."""
+    vol = _dome_volume()
+    full = M.measure_delivered_qa(vol, {}, workers=1)
+    assert full["coverage"] == 1.0
+    holed = vol.copy()
+    holed[:holed.shape[0] // 3] = 0.0                        # destroy a third of the frames
+    part = M.measure_delivered_qa(holed, {}, workers=1)
+    assert part["coverage"] < 0.75
+    assert "low-coverage" in part["review_reasons"] or part["coverage"] >= 0.60
+
+
+def test_delivered_qa_cannot_break_a_run():
+    """The central guarantee: QA must never raise. Every one of these inputs raised before the
+    flag arithmetic was brought inside the try."""
+    vol = _dome_volume()
+    assert M.measure_delivered_qa(vol, {"final_qa": False}, workers=1) == {}
+    for params, rhr in (({}, "x"), ({}, []), ({}, {"max_jitter": "n/a"}),
+                        ({"qa_jitter_flag": None}, None), ({"qa_dev_flag": None}, None),
+                        ({"qa_coverage_flag": None}, None)):
+        r = M.measure_delivered_qa(vol, params, workers=1, rhr_info=rhr)
+        assert isinstance(r, dict)                           # did not raise
+
+    class _Boom:
         shape = (1, 1, 1)
 
         def __getattr__(self, n):
@@ -617,15 +655,25 @@ def test_delivered_qa_is_advisory_and_failure_isolated():
     assert M.measure_delivered_qa(_Boom(), {}, workers=1) == {}
 
 
-def test_delivered_qa_flags_are_threshold_driven():
-    """needs_review is advisory: it must be derived from the documented thresholds, and a
-    clean scan with no jitter reported must not be flagged."""
+def test_delivered_qa_unmeasurable_is_null_not_zero():
+    """A missing measurement must be an explicit null plus a qa_errors note. Recording it as 0.0
+    would read as 'no motion' on exactly the scans where motion was never measured — the
+    surface-crop path, where rigid_height_refine never runs."""
     vol = _dome_volume()
-    hi = M.measure_delivered_qa(vol, {}, workers=1, rhr_info={"max_jitter": 99.0})
-    assert hi["needs_review"] and "motion" in hi["review_reasons"]
-    lo = M.measure_delivered_qa(vol, {"qa_dev_flag": 1e9, "qa_tilt_flag": 1e9}, workers=1,
-                                rhr_info={"max_jitter": 0.1})
-    assert lo["needs_review"] is False and lo["review_reasons"] == []
+    r = M.measure_delivered_qa(vol, {}, workers=1)            # no rhr_info, as on the surface-crop path
+    assert r["max_jitter"] is None
+    assert "max_jitter" in r.get("qa_errors", [])
+    assert "motion" not in r["review_reasons"]                # absence must not fire, nor suppress silently
+
+
+def test_delivered_qa_tilt_is_recorded_but_never_flags():
+    """tilt_total is recorded (it is the in-plane metric's null space) but must raise no flag:
+    delivered post-flatten tilt is O(10 px) while the old threshold was a PRE-flatten 150, and
+    measured tilt is INVERTED against the human verdict (AUC 0.411)."""
+    vol = _dome_volume()
+    r = M.measure_delivered_qa(vol, {}, workers=1, rhr_info={"max_jitter": 0.1})
+    assert "tilt_total" in r
+    assert "tilt" not in r["review_reasons"]
 
 
 def test_height_refine_reports_jitter_even_when_reverted():

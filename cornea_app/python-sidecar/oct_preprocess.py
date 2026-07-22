@@ -99,7 +99,12 @@ DEFAULT_PARAMS: dict = {
                                   #   Costs one extra detector pass; set False to skip.
     "qa_jitter_flag": 3.0,        # advisory review flag: residual per-frame depth jitter (px). ADVISORY, never rejects.
     "qa_dev_flag": 2.0,           # advisory review flag: delivered boundary deviation (px)
-    "qa_tilt_flag": 150.0,        # advisory review flag: |global frame-direction tilt| (px) — matches detilt_min_total
+    "qa_coverage_flag": 0.60,     # advisory: below this valid-column fraction, `dev` is not trustworthy — a zeroed /
+                                  #   black-padded volume measures artificially CLEAN, so flag rather than rank it.
+                                  # NOTE: there is deliberately NO qa_tilt_flag. tilt_total is RECORDED (it is the
+                                  # in-plane metric's null space) but flags nothing: delivered post-flatten tilt is
+                                  # O(10 px) whereas the old 150.0 was copied from detilt_min_total (a PRE-flatten
+                                  # trigger), and measured tilt is INVERTED vs the human verdict (AUC 0.411).
     "rhr_iters": 4,               # iterations of the dome-fit → median-residual → subtract loop
     "rhr_smooth": 3.0,            # gaussian sigma (frames) splitting removable jitter (HF) from the real dome trajectory (LF)
     "rhr_max": 8.0,               # px cap on the per-frame height correction
@@ -3105,6 +3110,7 @@ def _map_slices(worker, items, progress, lo, hi, workers):
 
 def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
                   workers: int | None = None, return_metric: bool = False,
+                  return_coverage: bool = False,
                   detect_volume: np.ndarray | None = None,
                   provided_edges: np.ndarray | None = None,
                   clip_report: dict | None = None,
@@ -3387,6 +3393,30 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     # iterative-refinement convergence signal + abs_floor calibration) — measured on the PRE-smoothing
     # field so its meaning is unchanged by #3's inter-slice smoothing (which only affects the warp).
     disp_mean = float(np.mean(np.abs(disp_field))) if disp_field.size else 0.0
+    # Tissue-column-restricted twin of disp_mean + the valid fraction, for QA ONLY. Computed HERE, at the
+    # same pre-smoothing point, so that at full coverage it is EXACTLY disp_mean (any later apex de-tear /
+    # inter-slice smoothing would otherwise make the two incomparable — verified: 1.6202 vs 1.6202).
+    # HONEST LIMIT: restricting the mean does NOT remove the destroyed-volume bias. Measured on a synthetic
+    # dome, zeroing 12 of 24 frames drops the metric 1.62 -> 0.16 whether or not the dead columns are
+    # masked out, because the deviation is a residual from a RANSAC quadratic fit ALONG the frame axis:
+    # with half the frames gone the fit has fewer points to satisfy and hugs the survivors more tightly,
+    # so the residual shrinks on the columns that remain. Masking only removes the trivially-zero terms.
+    # `coverage` is therefore the real guard: it does not repair `dev`, it tells you when `dev` cannot be
+    # trusted or compared. Never rank two scans on `dev` at different coverage.
+    _dev_valid = disp_mean
+    _coverage = 1.0
+    if return_coverage and disp_field.size:
+        _valid = np.zeros(disp_field.shape, dtype=bool)
+        for _i in range(min(n, disp_field.shape[0])):
+            _v = np.any(sag[_i] != 0, axis=0)[:disp_field.shape[1]].copy()   # column carries tissue?
+            for _bad in (zero_cols_list[_i], clip_cols_list[_i]):            # deliberately-suppressed
+                if getattr(_bad, "size", 0):
+                    _b = np.asarray(_bad, dtype=int)
+                    _v[_b[(_b >= 0) & (_b < _v.size)]] = False
+            _valid[_i, :_v.size] = _v
+        _nv = int(_valid.sum())
+        _dev_valid = float(np.mean(np.abs(disp_field[_valid]))) if _nv else float("nan")
+        _coverage = _nv / float(_valid.size)
 
     # 3a-apex) APEX DE-TEAR (#apex): smooth the displacement field along the FRAME axis (within each slice)
     #   with a small Gaussian. The warp injects any high-frequency STEP in the detected edge (disp = quad -
@@ -3533,71 +3563,155 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     if return_metric:
         # disp_mean (deviation from fit, pre-smoothing) + axial roughness of the DETECTED boundary (the
         # en-face jaggedness the keep-best selection should also minimise, #3).
+        if return_coverage:
+            # disp_mean is deliberately LEFT UNCHANGED: it is the objective iterate_smooth_volume
+            # minimises to pick best_pass, so altering it would change which pass ships and could move
+            # the 130 accepted scans. Pass selection keeps the historical number; QA also gets the
+            # tissue-column-restricted twin and the valid fraction (both computed above, pre-smoothing).
+            return corrected, disp_mean, _axial_roughness(edges), _dev_valid, _coverage
         return corrected, disp_mean, _axial_roughness(edges)
     return corrected
 
 
 def _boundary_deviation(volume: np.ndarray, params: dict | None = None,
-                        workers: int | None = None, detect_volume: np.ndarray | None = None):
+                        workers: int | None = None, detect_volume: np.ndarray | None = None,
+                        return_coverage: bool = False):
     """Score a candidate volume's boundary quality on its own terms (no warp kept). Returns
     (in_plane_deviation, axial_roughness): the mean per-column deviation of the DETECTED boundary from
     its quadratic fit (how jagged WITHIN each sagittal slice), and the mean inter-slice first-difference
     (how jagged ACROSS slices = the en-face/axial 'hairiness', #3). Both in pixels; lower = better."""
+    if return_coverage:   # QA only — adds the tissue-column-restricted metric + valid fraction
+        _, m, ax, mv, cov = smooth_volume(volume, params, workers=workers, return_metric=True,
+                                          return_coverage=True, detect_volume=detect_volume)
+        return float(m), float(ax), float(mv), float(cov)
     _, m, ax = smooth_volume(volume, params, workers=workers, return_metric=True, detect_volume=detect_volume)
     return float(m), float(ax)
 
 
 def measure_delivered_qa(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
-                         rhr_info: dict | None = None) -> dict:
+                         rhr_info: dict | None = None, path: str | None = None,
+                         reported_dev: float | None = None) -> dict:
     """Measure quality on the volume that is ACTUALLY WRITTEN — the only honest QA point.
 
     Why this exists: metrics[]/axial_metrics[]/scores[]/best_pass are computed inside
     iterate_smooth_volume and returned BEFORE rigid_height_refine, rigid_frame_derotate, the GT anchors
-    and the crops mutate the volume. The delivered result is therefore never scored; the reported number
-    describes an intermediate that is never written (measured median |delivered − reported| = 0.28 px,
-    up to 3.6 px). This re-measures the same two quantities on `volume` as delivered, so `final_qa.dev`
-    is directly comparable to metrics[-1] and `final_qa.axial` to axial_metrics[-1].
+    and the crops mutate the volume. The delivered result is therefore never scored.
 
-    Also records the global frame-direction tilt, which the in-plane metric is provably BLIND to: the
-    warp target is a quadratic fit along frames and the metric is the residual from that same fit, so
-    anything in span{1, x, x²} — including a pure linear tilt — contributes exactly 0 px to `dev`.
+    COMPARABILITY: `dev` is the coverage-corrected deviation (tissue-bearing columns only), so it is NOT
+    numerically identical to metrics[]. The honest comparison target is metrics[best_pass] — the pass the
+    delivered volume actually descends from, NOT metrics[-1]: iterate_smooth_volume picks best_pass by
+    argmin, and in 38 of 271 scans the last pass is not the best (worst gap 3.30 px, case_cs017_os_v4).
+    The caller passes it in as `reported_dev` so the two sit side by side.
 
-    `needs_review` is advisory ONLY. Nothing gates, rejects or branches on it; it exists so the review UI
-    can order the queue. Thresholds are deliberately loose (recall over precision) — on the current store
-    max_jitter>3.0 flags 78/132 rejected vs 13/130 accepted, so ~10% of accepted scans are flagged too.
-    Returns {} on any failure: QA must never be able to break a preprocessing run."""
-    p = {**DEFAULT_PARAMS, **(params or {})}
-    if not p.get("final_qa", True):
-        return {}
-    out: dict = {}
+    `coverage` is the fraction of (slice, frame) columns that carried tissue, and it is LOAD-BEARING:
+    `dev` is DEFLATED by destroyed volume. A zeroed crop_region frame or the black padding of a
+    surface-crop canvas removes points from the RANSAC quadratic fit that `dev` is the residual of, so
+    the fit hugs the survivors more tightly and the deviation shrinks — measured, zeroing half the
+    frames takes the metric 1.62 -> 0.16, i.e. a badly damaged scan reads ~10x CLEANER than an intact
+    one. Restricting the mean to tissue columns does NOT repair this (verified: near-identical either
+    way); it only makes the number well-defined. So `coverage` is a guard, not a correction:
+    NEVER rank two scans on `dev` at different coverage, and never rank across `path` strata (a
+    surface-crop scan is measured on an extended, partly-padded canvas). Below qa_coverage_flag the
+    scan is flagged `low-coverage` precisely because its `dev` is not believable.
+
+    `needs_review` is advisory ONLY — nothing gates, rejects or branches on it. Absent values are
+    recorded as explicit null with a note in `qa_errors`, so "not measured" can never be read as "clean".
+
+    Returns {} if disabled or if the primary measurement fails. QA must never break a preprocessing run:
+    every leg, including the flag arithmetic, is inside a try."""
     try:
+        p = {**DEFAULT_PARAMS, **(params or {})}
+        if not p.get("final_qa", True):
+            return {}
+        out: dict = {"qa_errors": []}
+
+        def _f(v, default):
+            """float() that cannot raise — a malformed param must not take down the run."""
+            try:
+                f = float(v)
+                return f if np.isfinite(f) else default
+            except (TypeError, ValueError):
+                return default
+
+        # Measuring params, NOT correcting params: iterate_smooth_volume strips these before scoring
+        # (they steer the warp, so leaving them in changes the number — measured -28% from a surface_cut
+        # alone on identical voxels). Strip them here too so QA scores geometry, not user overrides.
+        qp = dict(params or {})
+        for _k in ("force_columns", "good_columns", "surface_cut"):
+            qp.pop(_k, None)
+
         det_vol = _fill_black_bands(volume)          # same treatment the pass-scorer gives a warped volume
-        dev, ax = _boundary_deviation(volume, params, workers=workers, detect_volume=det_vol)
-        out["dev"] = round(float(dev), 4)
-        out["axial"] = round(float(ax), 4)
-        out["score"] = round(float(dev) + 0.5 * float(ax), 4)   # same combination as the pass score
+        try:
+            _dev_all, ax, dev, cov = _boundary_deviation(volume, qp, workers=workers,
+                                                         detect_volume=det_vol, return_coverage=True)
+        except Exception:  # noqa: BLE001
+            return {}
+        if not (np.isfinite(dev) and np.isfinite(ax)):
+            # A NaN would silently SUPPRESS needs_review (nan > x is False) and, worse, json.dumps writes
+            # a bare NaN that starlette's allow_nan=False renderer rejects — one bad scan would 500 the
+            # whole /api/cases/list. Drop the keys instead.
+            out["qa_errors"].append("dev")
+        else:
+            out["dev"] = round(float(dev), 4)
+            out["axial"] = round(float(ax), 4)
+            out["score"] = round(float(dev) + 0.5 * float(ax), 4)   # same combination as the pass score
+            out["dev_uncorrected"] = round(float(_dev_all), 4)      # the historical, coverage-blind number
+        out["coverage"] = round(float(cov), 4) if np.isfinite(cov) else None
+        if path:
+            out["path"] = str(path)                  # stratum: never pool across diminishing/grew/surface_crop
+        if reported_dev is not None:
+            out["reported_dev"] = round(_f(reported_dev, float("nan")), 4)
+
+        # TILT — the in-plane metric's documented null space (a pure frame-direction tilt contributes
+        # exactly 0 px to dev). Detected on det_vol, matching the dev leg: every delivered volume carries
+        # black padding from the rigid shifts, and detecting on the unfilled volume measures the padding.
+        # dp_scar_guard off: it is 10-13x slower here and returns the same tilt (44.73 vs 44.66 measured).
+        try:
+            _tp = {**p, "dp_scar_guard": False}
+            det = detect_surface_all(reformat_to_sagittal(det_vol), _tp, workers=workers)
+            _slope, _total, _fd = estimate_global_tilt(det, int(volume.shape[0]), _tp)
+            # estimate_global_tilt returns 0.0 when too few frames yield a robust depth — indistinguishable
+            # from a genuinely level scan. Treat an all-zero result as unmeasured rather than as "level".
+            if _total is None or not np.isfinite(_total) or (_slope == 0.0 and _total == 0.0):
+                out["tilt_total"] = None
+                out["qa_errors"].append("tilt")
+            else:
+                out["tilt_total"] = round(abs(float(_total)), 2)
+        except Exception:  # noqa: BLE001
+            out["tilt_total"] = None
+            out["qa_errors"].append("tilt")
+
+        # MOTION — max_jitter is measured INPUT severity. It is unavailable on paths where
+        # rigid_height_refine has not run (notably surface-crop, which returns before it), and a missing
+        # value must read as UNKNOWN, not as "no motion": it is the strongest known discriminator.
+        jit = (rhr_info if isinstance(rhr_info, dict) else {}).get("max_jitter")
+        if jit is None:
+            out["max_jitter"] = None
+            out["qa_errors"].append("max_jitter")
+        else:
+            out["max_jitter"] = _f(jit, None)
+            if out["max_jitter"] is None:
+                out["qa_errors"].append("max_jitter")
+
+        reasons = []
+        if out.get("max_jitter") is not None and out["max_jitter"] > _f(p.get("qa_jitter_flag"), 3.0):
+            reasons.append("motion")
+        if out.get("dev") is not None and out["dev"] > _f(p.get("qa_dev_flag"), 2.0):
+            reasons.append("boundary")
+        if out.get("coverage") is not None and out["coverage"] < _f(p.get("qa_coverage_flag"), 0.60):
+            reasons.append("low-coverage")           # dev is not trustworthy on this scan
+        # NOTE: tilt is recorded but deliberately does NOT raise a flag. Measured on the store, delivered
+        # (post-flatten) tilt is O(10 px) while qa_tilt_flag was copied from detilt_min_total=150, a
+        # PRE-flatten trigger — so the threshold could essentially never fire. Worse, measured tilt is
+        # INVERTED against the human verdict (AUC 0.411: accepted scans median 70, rejected 48), so
+        # flagging on it would preferentially flag GOOD scans. Left unflagged pending real calibration.
+        out["needs_review"] = bool(reasons)
+        out["review_reasons"] = reasons
+        if not out["qa_errors"]:
+            out.pop("qa_errors")
+        return out
     except Exception:  # noqa: BLE001
         return {}
-    try:                                              # tilt: the metric's documented null space
-        det = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)
-        _slope, _total, _fd = estimate_global_tilt(det, int(volume.shape[0]), p)
-        if _total is not None and np.isfinite(_total):
-            out["tilt_total"] = round(abs(float(_total)), 2)
-    except Exception:  # noqa: BLE001
-        pass
-    jit = (rhr_info or {}).get("max_jitter")
-    if jit is not None:
-        out["max_jitter"] = float(jit)
-    reasons = []
-    if jit is not None and float(jit) > float(p.get("qa_jitter_flag", 3.0)):
-        reasons.append("motion")                      # residual per-frame depth jitter (input severity)
-    if out.get("dev", 0.0) > float(p.get("qa_dev_flag", 2.0)):
-        reasons.append("boundary")                    # delivered boundary still deviant
-    if out.get("tilt_total", 0.0) > float(p.get("qa_tilt_flag", 150.0)):
-        reasons.append("tilt")                        # matches detilt_min_total, the propose threshold
-    out["needs_review"] = bool(reasons)
-    out["review_reasons"] = reasons
-    return out
 
 
 def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
@@ -5112,18 +5226,21 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             # Origin stays (0,0,0) like every other volume: consensus registration canonicalises origin+direction
             # (_canon) and aligns the cornea by the optimiser, so a taller clipped replicate registers to its
             # repeats by pose, not by header geometry (verified on the extended volume).
-            # DELIVERED-VOLUME QA on the surface-crop path too. This branch hardcodes metrics=[] /
-            # apex_clipped=0 (it never runs the iterate loop, so it has no per-pass metrics), which left
-            # these scans with NO quality number at all — that, not genuine cleanliness, is why this class
-            # looked "perfectly specific": no other detector could physically fire on these manifests.
-            _fqa = measure_delivered_qa(corrected, params, workers=workers)
-            if _fqa:
-                info["final_qa"] = _fqa
             if _amc_info:                     # was dropped on this path — recorded only on the normal path
                 info["axial_motion_correct"] = _amc_info
             if _ifd_info:
                 info["intra_frame_dewarp"] = _ifd_info
             write_volume_nifti(corrected, out_nifti, sp)
+            # DELIVERED-VOLUME QA on the surface-crop path too. This branch hardcodes metrics=[] /
+            # apex_clipped=0 (it never runs the iterate loop, so it has no per-pass metrics), which left
+            # these scans with NO quality number at all — that, not genuine cleanliness, is why this class
+            # looked "perfectly specific": no other detector could physically fire on these manifests.
+            # Measured AFTER the write: QA costs ~3x the volume in peak RAM and a Linux OOM kill is not
+            # catchable, so it must never run at the one moment when the output does not yet exist.
+            # rigid_height_refine never runs on this path, so max_jitter is recorded as an explicit null.
+            _fqa = measure_delivered_qa(corrected, params, workers=workers, path="surface_crop")
+            if _fqa:
+                info["final_qa"] = _fqa
             info["out"] = str(out_nifti)
             if _auto_cr:
                 info["auto_crop_region"] = _auto_cr
@@ -5152,6 +5269,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         if n_crop:
             info["crop"] = {"n_voxels": n_crop}
         write_volume_nifti(corrected, out_nifti, sp)
+        # QA on the fix-columns path too. Like the surface-crop branch this hardcodes metrics=[] /
+        # axial_metrics=[] (it is a single same-canvas warp, no iterate loop), so without this the
+        # delivered volume carries no quality number at all. Latent today (0/308 are 'redetect') but
+        # this is the write path every user-RESCUED scan takes, i.e. the Phase 1 loop's own output —
+        # exactly the volumes whose quality most needs measuring.
+        _fqa = measure_delivered_qa(corrected, params, workers=workers, path="redetect")
+        if _fqa:
+            info["final_qa"] = _fqa
         info["out"] = str(out_nifti)
         if _auto_cr:
             info["auto_crop_region"] = _auto_cr
@@ -5291,13 +5416,22 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         corrected, _cic = _crop_incomplete_cornea(corrected, params, workers=workers)
         if _cic[0] or _cic[1]:
             info["crop_incomplete_cornea"] = {"left": _cic[0], "right": _cic[1], "new_lateral": int(corrected.shape[2])}
+    write_volume_nifti(corrected, out_nifti, sp)
     # DELIVERED-VOLUME QA (telemetry only, gates nothing): every mutation above — the rigid stages, the GT
-    # anchors, the crops — happened AFTER the pass score was computed, so nothing has scored what we are
-    # about to write. Measure it here, immediately before the write, so final_qa describes the real output.
-    _fqa = measure_delivered_qa(corrected, params, workers=workers, rhr_info=info.get("rigid_height_refine"))
+    # anchors, the crops — happened AFTER the pass score was computed, so nothing has scored what was just
+    # written. Measured AFTER the write, not before: QA costs ~3x the volume in peak RAM and a Linux OOM
+    # kill cannot be caught by try/except, so it must not run while the output does not yet exist. Nothing
+    # below mutates `corrected` (only `info`), so measuring here is equivalent.
+    # reported_dev is metrics[best_pass] — the pass the delivered volume descends from — NOT metrics[-1]:
+    # in 38 of 271 scans the last pass is not the best one (worst gap 3.30 px).
+    _mets = info.get("metrics") or []
+    _bp = info.get("best_pass")
+    _rep = _mets[_bp] if (isinstance(_bp, int) and 0 <= _bp < len(_mets)) else (_mets[-1] if _mets else None)
+    _fqa = measure_delivered_qa(corrected, params, workers=workers,
+                                rhr_info=info.get("rigid_height_refine"),
+                                path=info.get("stopped"), reported_dev=_rep)
     if _fqa:
         info["final_qa"] = _fqa
-    write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     if _auto_cr:
         info["auto_crop_region"] = _auto_cr
