@@ -2313,12 +2313,22 @@ def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, work
     edges = detect if detect is not None else detect_surface_all(sag, p, workers=workers)
     n, depth_vox, F = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
     counts = np.zeros(F, dtype=int)
+    # Keep the FULL (lateral, frame) clip mask, not just the per-frame tally. The tally answers "is this
+    # B-scan clipped", which is what the sagittal view needs (there a frame IS a column). The AXIAL view
+    # shows one B-scan as lateral×depth, so there the clipped region is a set of LATERAL columns within the
+    # frame — the transpose of this mask. Without it the axial view has nothing to draw.
+    mask = np.zeros((n, F), dtype=bool)
     for i in range(n):
-        cm = _clip_mask(np.ascontiguousarray(sag[i]).astype(np.float32), edges[i], p)
-        counts[np.asarray(cm, dtype=bool)] += 1
+        cm = np.asarray(_clip_mask(np.ascontiguousarray(sag[i]).astype(np.float32), edges[i], p), dtype=bool)
+        mask[i, :cm.size] = cm[:F]
+        counts[cm] += 1
     min_slices = max(1, int(p.get("crop_min_slices", 3)))
     frames = [int(f) for f in range(F) if counts[f] >= min_slices]
+    # Per-frame clipped LATERALS, emitted only for the detected frames so the payload stays bounded
+    # (a clipped frame is typically clipped over a contiguous run of laterals around the apex).
+    lateral_by_frame = {int(f): [int(i) for i in np.nonzero(mask[:, f])[0]] for f in frames}
     return {"frames": frames, "counts": {int(f): int(counts[f]) for f in range(F) if counts[f] > 0},
+            "lateral_by_frame": lateral_by_frame,
             "n_slices": n, "depth_vox": depth_vox, "n_frames": F}
 
 

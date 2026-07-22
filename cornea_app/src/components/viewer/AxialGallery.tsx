@@ -85,8 +85,40 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
   const [scOn, setScOn] = useState(false);              // is the surface-crop marking mode active
   const [scMark, setScMark] = useState<Set<number>>(new Set());
   const [scModeSel, setScModeSel] = useState<string>(scMode);
-  useEffect(() => { setScMark(new Set(persistedSc)); }, [persistedScSig]);
+  // The detector's own answer, fetched on open. REQUIRED, not a nicety: for an auto-cropped scan
+  // oct_params.surface_crop_frames is EMPTY (the pipeline cropped it without ever persisting which frames),
+  // so seeding from the persisted set alone left the editor blank on exactly the scans that were cropped.
+  // Precedence: the user's persisted set → what this run actually cropped → the detector's suggestion.
+  const [scDetect, setScDetect] = useState<
+    { frames: number[]; selected: number[]; counts: Record<string, number>;
+      lateral_by_frame: Record<string, number[]>; n_frames: number } | null>(null);
+  const scRunFrames = useMemo(() => {
+    const f = (((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as
+      Record<string, unknown> | undefined)?.surface_crop as Record<string, unknown> | undefined)?.frames;
+    return Array.isArray(f) ? (f as number[]).map(Number) : [];
+  }, [caseInfo]);
+  useEffect(() => {
+    if (!caseId) return;
+    let cancel = false;
+    const seed = (d: typeof scDetect) => {
+      if (cancel) return;
+      const chosen = persistedSc.size ? [...persistedSc]
+        : scRunFrames.length ? scRunFrames
+        : d?.selected?.length ? d.selected
+        : d?.frames ?? [];
+      setScMark(new Set(chosen.map(Number)));
+    };
+    api.json<NonNullable<typeof scDetect>>(`/api/case/${caseId}/oct-surface-crop/detect`, "POST", "{}")
+      .then((d) => { if (!cancel) { setScDetect(d); seed(d); } })
+      .catch(() => seed(null));
+    return () => { cancel = true; };
+  }, [caseId, segVersion, persistedScSig, JSON.stringify(scRunFrames)]);
   useEffect(() => { setScModeSel(scMode); }, [scMode]);
+  // clipped LATERAL columns for the frame on screen — what "surface crop columns" means in the axial view
+  const scLaterals = useMemo(() => {
+    const l = scDetect?.lateral_by_frame?.[String(arrayFrame)];
+    return Array.isArray(l) ? l.map(Number) : [];
+  }, [scDetect, arrayFrame]);
   const scDirty = useMemo(() => {
     const a = [...scMark].sort((x, y) => x - y).join(",");
     const b = [...persistedSc].sort((x, y) => x - y).join(",");
@@ -281,6 +313,7 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
                       onClick={() => setScMark(new Set())}>clear all</button>
               <span style={{ fontSize: 11, opacity: 0.75 }}>
                 {scMark.size ? `${scMark.size} marked: ${scMarkedSlices.slice(0, 12).join(", ")}${scMarkedSlices.length > 12 ? "…" : ""}` : "none marked"}
+                {scLaterals.length ? ` · ${scLaterals.length} clipped column(s) on this slice` : ""}
               </span>
             </>
           )}
@@ -321,6 +354,15 @@ export function AxialGallery({ filterCss, readOnly = false, initialSlice = 0, sl
                    onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}
                    style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
                             cursor: readOnly ? "default" : "row-resize", touchAction: "none" }}>
+                {/* SURFACE-CROP COLUMNS. In the axial view a B-scan is lateral×depth, so the clipped
+                    region is a set of LATERAL columns — the laterals where this frame's apex sits above
+                    the acquisition window and there is no anterior surface to detect. Drawn inside the
+                    same scaleX(-1) element as the image, so lateral l is simply at x = l with no separate
+                    mirroring. Only shown in surface-crop mode so the fix-surface view stays uncluttered. */}
+                {scOn && scLaterals.length > 0 && scLaterals.map((l) => (
+                  <rect key={`sc${l}`} x={l} y={0} width={1} height={depthVox}
+                        fill={scHere ? "rgba(91,192,255,0.30)" : "rgba(255,193,7,0.22)"} />
+                ))}
                 {/* detected / dragged anterior surface (red) — the line you drag onto the true band */}
                 <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
                           strokeWidth={dirty ? 1.3 : 0.9} opacity={dirty ? 0.95 : 0.75} points={spanPts()} />
