@@ -578,3 +578,61 @@ def test_refine_freeze_periphery():
     on = M.smooth_volume(vol, {"refine_freeze_frac": 0.25}, workers=1)
     # the feathered CENTRE is byte-identical to the ordinary warp (only the limbus is re-smoothed)
     assert np.array_equal(on[:, :, L // 2 - 4:L // 2 + 4], plain[:, :, L // 2 - 4:L // 2 + 4])
+
+
+# ── delivered-volume QA (measure_delivered_qa) ────────────────────────────────
+def _dome_volume(F=24, D=160, L=96, seed=0):
+    """Tiny synthetic dome + speckle, in the pipeline's native (frames, depth, lateral) order."""
+    rng = np.random.default_rng(seed)
+    vol = np.zeros((F, D, L), dtype=np.float32)
+    yy = np.arange(L)
+    for f in range(F):
+        surf = (40 + 0.004 * (yy - L / 2) ** 2 + 0.6 * np.sin(f / 3)).astype(int)
+        for l in range(L):
+            vol[f, surf[l]:surf[l] + 45, l] = 180 + rng.normal(0, 8, 45)
+    return np.ascontiguousarray(vol)
+
+
+def test_delivered_qa_never_mutates_the_volume():
+    """QA runs immediately BEFORE write_volume_nifti, so it must be strictly read-only —
+    a mutation here would silently change the delivered result."""
+    vol = _dome_volume()
+    before = vol.copy()
+    qa = M.measure_delivered_qa(vol, {}, workers=1)
+    assert np.array_equal(vol, before)                       # byte-identical
+    assert vol.shape == before.shape
+    assert qa and qa["dev"] >= 0.0 and qa["axial"] >= 0.0
+
+
+def test_delivered_qa_is_advisory_and_failure_isolated():
+    """QA must never be able to break a preprocessing run, and must be disableable."""
+    assert M.measure_delivered_qa(_dome_volume(), {"final_qa": False}, workers=1) == {}
+
+    class _Boom:                                             # anything that explodes on use
+        shape = (1, 1, 1)
+
+        def __getattr__(self, n):
+            raise RuntimeError("boom")
+
+    assert M.measure_delivered_qa(_Boom(), {}, workers=1) == {}
+
+
+def test_delivered_qa_flags_are_threshold_driven():
+    """needs_review is advisory: it must be derived from the documented thresholds, and a
+    clean scan with no jitter reported must not be flagged."""
+    vol = _dome_volume()
+    hi = M.measure_delivered_qa(vol, {}, workers=1, rhr_info={"max_jitter": 99.0})
+    assert hi["needs_review"] and "motion" in hi["review_reasons"]
+    lo = M.measure_delivered_qa(vol, {"qa_dev_flag": 1e9, "qa_tilt_flag": 1e9}, workers=1,
+                                rhr_info={"max_jitter": 0.1})
+    assert lo["needs_review"] is False and lo["review_reasons"] == []
+
+
+def test_height_refine_reports_jitter_even_when_reverted():
+    """max_jitter is MEASURED INPUT SEVERITY, not a result of the correction, so it must be
+    present on the revert path too — its absence there is what capped jitter-based triage recall."""
+    vol = _dome_volume()
+    out, info = M.rigid_height_refine(vol, {}, workers=1)
+    assert "max_jitter" in info                              # present regardless of applied/reverted
+    if not info.get("applied"):
+        assert np.array_equal(out, vol)                      # revert returns the untouched volume

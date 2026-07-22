@@ -93,6 +93,13 @@ DEFAULT_PARAMS: dict = {
                                   #   iteratively re-estimate the leftover per-frame depth JITTER vs a robust smooth dome,
                                   #   keep only its HIGH-FREQ part (dome trajectory preserved, NOT flattened) and rigidly
                                   #   shift each B-scan by it. Self-gated: kept only if surface roughness drops. Rigid only.
+    "final_qa": True,             # measure boundary deviation + axial roughness + global tilt on the volume that is
+                                  #   actually WRITTEN (the pass metrics describe a pre-rigid intermediate that is never
+                                  #   delivered). Telemetry ONLY — emitted into oct_iter.final_qa, gates nothing.
+                                  #   Costs one extra detector pass; set False to skip.
+    "qa_jitter_flag": 3.0,        # advisory review flag: residual per-frame depth jitter (px). ADVISORY, never rejects.
+    "qa_dev_flag": 2.0,           # advisory review flag: delivered boundary deviation (px)
+    "qa_tilt_flag": 150.0,        # advisory review flag: |global frame-direction tilt| (px) — matches detilt_min_total
     "rhr_iters": 4,               # iterations of the dome-fit → median-residual → subtract loop
     "rhr_smooth": 3.0,            # gaussian sigma (frames) splitting removable jitter (HF) from the real dome trajectory (LF)
     "rhr_max": 8.0,               # px cap on the per-frame height correction
@@ -3540,6 +3547,59 @@ def _boundary_deviation(volume: np.ndarray, params: dict | None = None,
     return float(m), float(ax)
 
 
+def measure_delivered_qa(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
+                         rhr_info: dict | None = None) -> dict:
+    """Measure quality on the volume that is ACTUALLY WRITTEN — the only honest QA point.
+
+    Why this exists: metrics[]/axial_metrics[]/scores[]/best_pass are computed inside
+    iterate_smooth_volume and returned BEFORE rigid_height_refine, rigid_frame_derotate, the GT anchors
+    and the crops mutate the volume. The delivered result is therefore never scored; the reported number
+    describes an intermediate that is never written (measured median |delivered − reported| = 0.28 px,
+    up to 3.6 px). This re-measures the same two quantities on `volume` as delivered, so `final_qa.dev`
+    is directly comparable to metrics[-1] and `final_qa.axial` to axial_metrics[-1].
+
+    Also records the global frame-direction tilt, which the in-plane metric is provably BLIND to: the
+    warp target is a quadratic fit along frames and the metric is the residual from that same fit, so
+    anything in span{1, x, x²} — including a pure linear tilt — contributes exactly 0 px to `dev`.
+
+    `needs_review` is advisory ONLY. Nothing gates, rejects or branches on it; it exists so the review UI
+    can order the queue. Thresholds are deliberately loose (recall over precision) — on the current store
+    max_jitter>3.0 flags 78/132 rejected vs 13/130 accepted, so ~10% of accepted scans are flagged too.
+    Returns {} on any failure: QA must never be able to break a preprocessing run."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not p.get("final_qa", True):
+        return {}
+    out: dict = {}
+    try:
+        det_vol = _fill_black_bands(volume)          # same treatment the pass-scorer gives a warped volume
+        dev, ax = _boundary_deviation(volume, params, workers=workers, detect_volume=det_vol)
+        out["dev"] = round(float(dev), 4)
+        out["axial"] = round(float(ax), 4)
+        out["score"] = round(float(dev) + 0.5 * float(ax), 4)   # same combination as the pass score
+    except Exception:  # noqa: BLE001
+        return {}
+    try:                                              # tilt: the metric's documented null space
+        det = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)
+        _slope, _total, _fd = estimate_global_tilt(det, int(volume.shape[0]), p)
+        if _total is not None and np.isfinite(_total):
+            out["tilt_total"] = round(abs(float(_total)), 2)
+    except Exception:  # noqa: BLE001
+        pass
+    jit = (rhr_info or {}).get("max_jitter")
+    if jit is not None:
+        out["max_jitter"] = float(jit)
+    reasons = []
+    if jit is not None and float(jit) > float(p.get("qa_jitter_flag", 3.0)):
+        reasons.append("motion")                      # residual per-frame depth jitter (input severity)
+    if out.get("dev", 0.0) > float(p.get("qa_dev_flag", 2.0)):
+        reasons.append("boundary")                    # delivered boundary still deviant
+    if out.get("tilt_total", 0.0) > float(p.get("qa_tilt_flag", 150.0)):
+        reasons.append("tilt")                        # matches detilt_min_total, the propose threshold
+    out["needs_review"] = bool(reasons)
+    out["review_reasons"] = reasons
+    return out
+
+
 def iterate_smooth_volume(volume: np.ndarray, params: dict | None = None,
                           max_iter: int = 5, min_improvement: float = 0.15,
                           abs_floor: float = 0.3, progress=None, workers: int | None = None,
@@ -3961,7 +4021,12 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
     except Exception:  # noqa: BLE001
         r1 = r0 + 1.0
     if not (r1 < r0):                               # no improvement → revert (never worse)
-        return volume, {"applied": False, "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+        # max_jitter is the MEASURED input motion severity, not a result of the correction — so it must be
+        # reported even when the correction is reverted. Omitting it here made the field structurally absent
+        # on exactly the scans whose refinement failed (the ones most likely to be bad), which capped any
+        # jitter-based triage at ~44% recall. The revert still returns the untouched volume.
+        return volume, {"applied": False, "max_jitter": round(float(np.max(np.abs(jitter))), 2),
+                        "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
     return out, {"applied": bool(nadj), "frames_adjusted": int(nadj), "max_jitter": round(float(np.max(np.abs(jitter))), 2),
                  "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
 
@@ -5047,6 +5112,17 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             # Origin stays (0,0,0) like every other volume: consensus registration canonicalises origin+direction
             # (_canon) and aligns the cornea by the optimiser, so a taller clipped replicate registers to its
             # repeats by pose, not by header geometry (verified on the extended volume).
+            # DELIVERED-VOLUME QA on the surface-crop path too. This branch hardcodes metrics=[] /
+            # apex_clipped=0 (it never runs the iterate loop, so it has no per-pass metrics), which left
+            # these scans with NO quality number at all — that, not genuine cleanliness, is why this class
+            # looked "perfectly specific": no other detector could physically fire on these manifests.
+            _fqa = measure_delivered_qa(corrected, params, workers=workers)
+            if _fqa:
+                info["final_qa"] = _fqa
+            if _amc_info:                     # was dropped on this path — recorded only on the normal path
+                info["axial_motion_correct"] = _amc_info
+            if _ifd_info:
+                info["intra_frame_dewarp"] = _ifd_info
             write_volume_nifti(corrected, out_nifti, sp)
             info["out"] = str(out_nifti)
             if _auto_cr:
@@ -5215,6 +5291,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         corrected, _cic = _crop_incomplete_cornea(corrected, params, workers=workers)
         if _cic[0] or _cic[1]:
             info["crop_incomplete_cornea"] = {"left": _cic[0], "right": _cic[1], "new_lateral": int(corrected.shape[2])}
+    # DELIVERED-VOLUME QA (telemetry only, gates nothing): every mutation above — the rigid stages, the GT
+    # anchors, the crops — happened AFTER the pass score was computed, so nothing has scored what we are
+    # about to write. Measure it here, immediately before the write, so final_qa describes the real output.
+    _fqa = measure_delivered_qa(corrected, params, workers=workers, rhr_info=info.get("rigid_height_refine"))
+    if _fqa:
+        info["final_qa"] = _fqa
     write_volume_nifti(corrected, out_nifti, sp)
     info["out"] = str(out_nifti)
     if _auto_cr:

@@ -4212,6 +4212,16 @@ def cases_list() -> dict:
                 # The loader badges both so every auto-detected clip is easy to find + verify.
                 "surface_crop_auto": ((m.get("oct_iter") or {}).get("stopped") == "surface_crop"),
                 "surface_crop_manual": m.get("surface_crop_manual"),
+                # DELIVERED-VOLUME QA (oct_iter.final_qa) — measured on the volume actually written, unlike
+                # oct_iter.metrics which describes a pre-rigid intermediate that is never delivered. ADVISORY
+                # ONLY: nothing gates on it; it exists so the review queue can be ORDERED worst-first instead
+                # of alphabetically. Present only on scans preprocessed since this was added, so the loader
+                # must treat null as "not measured", NOT as "clean".
+                "final_qa": (lambda q: {
+                    "dev": q.get("dev"), "axial": q.get("axial"), "tilt_total": q.get("tilt_total"),
+                    "max_jitter": q.get("max_jitter"), "needs_review": bool(q.get("needs_review")),
+                    "review_reasons": list(q.get("review_reasons") or []),
+                } if isinstance(q, dict) and q else None)((m.get("oct_iter") or {}).get("final_qa")),
             },
         })
     return {"cases": out}
