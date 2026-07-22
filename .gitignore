@@ -35,3 +35,30 @@ cornea_app/python-sidecar/.sidecar_state.json
 
 # Playwright MCP automation artifacts (snapshots, console logs, screenshots)
 .playwright-mcp/
+
+# ── Research data & scratch (on disk, never tracked) ──────────────────────────
+# The app's real case store: per-case OCT volumes, manifests, labelmaps (~165 GB).
+# Irreplaceable user data — kept on disk, never committed.
+review_cases/
+
+# Source .OCT acquisitions + companion .txt as exported from the scanner (~27 GB).
+# NOTE: gitignore takes the space literally — do not quote the path.
+Raw Data/
+
+# Agent/analysis scratch: benchmark harnesses, intermediate volumes, montages.
+.work/
+
+# Per-run QA montage output (qa_CS001OS/, qa_defects/, qa_raw/, ...) at repo root.
+/qa_*/
+
+# Ad-hoc screenshots and console dumps dropped at the repo root during debugging.
+/*.png
+/*.out
+/*.err
+
+# One-off diagnostic scripts pinned to ephemeral paths (/tmp/ctwt, .work/...).
+# Kept on disk for reference; not part of the app.
+/dp_diag.py
+/gcheck.py
+/vetchange.py
+/install_virtualbox_7_2.sh
