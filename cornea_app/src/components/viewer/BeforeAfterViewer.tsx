@@ -450,6 +450,27 @@ function CropMarkedImage({ src, style, active, flipped, nFrames, marks, auto, co
   const maxCount = useMemo(() => {
     const v = Object.values(counts ?? {}); return v.length ? Math.max(...v) : 0;
   }, [counts]);
+
+  // WebKitGTK COMPOSITING NUDGE. The mark <div>s are in the DOM, visible, opacity 1, correctly placed
+  // (verified in Chrome — they render there) but the DESKTOP WebKitGTK compositor does not PAINT this
+  // absolutely-positioned overlay layer until a style invalidation touches it. That is why the marks only
+  // appeared after clicking "edit marks": that toggles the overlay's pointerEvents/cursor, which
+  // invalidates the layer and forces a re-composite. Same class of bug the annotator app fought for many
+  // versions. Here we trigger the SAME invalidation ourselves, imperatively, whenever the overlay becomes
+  // active or the marks change: flip the transform across two animation frames so WebKitGTK repaints the
+  // freshly-rendered marks with no user interaction. A pure no-op on Chromium.
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const marksSig = useMemo(() => [...(marks ?? [])].sort((a, b) => a - b).join(","), [marks]);
+  useEffect(() => {
+    const ov = overlayRef.current;
+    if (!ov || !(active && iw > 0)) return;
+    const base = flipped ? "scaleX(-1)" : "";
+    ov.style.transform = `${base} translateZ(0)`.trim();   // promote + invalidate the layer
+    const id = requestAnimationFrame(() => {
+      if (overlayRef.current) overlayRef.current.style.transform = base;   // settle back
+    });
+    return () => cancelAnimationFrame(id);
+  }, [active, iw, ih, ox, oy, marksSig, flipped]);
   const pick = (clientX: number) => {
     const el = boxRef.current; if (!el || iw <= 0 || nFrames < 1) return;
     const r = el.getBoundingClientRect();
@@ -462,7 +483,8 @@ function CropMarkedImage({ src, style, active, flipped, nFrames, marks, auto, co
     <div ref={boxRef} style={{ position: "relative", width: "100%", height: "100%" }}>
       <img ref={imgRef} src={src} alt="raw" draggable={false} style={style} onLoad={readNat} />
       {active && iw > 0 && (
-        <div style={{ position: "absolute", left: ox, top: oy, width: iw, height: ih,
+        <div ref={overlayRef}
+             style={{ position: "absolute", left: ox, top: oy, width: iw, height: ih,
                       transform: flipped ? "scaleX(-1)" : undefined,
                       pointerEvents: editable ? "auto" : "none",
                       cursor: editable ? "pointer" : "default" }}
