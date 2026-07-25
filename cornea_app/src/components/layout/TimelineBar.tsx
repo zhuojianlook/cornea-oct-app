@@ -62,6 +62,7 @@ export function TimelineBar() {
   const setDifficult = useCaseStore((s) => s.setDifficult);
   const setSurfaceCrop = useCaseStore((s) => s.setSurfaceCrop);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
+  const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
   // Ground-truth capture: this scan carries a manual border correction (Fix-columns anchors) → Approving records
   // it as CONFIRMED ground truth for the auto-detector training corpus. The toggle lets the user EXCLUDE an
   // idealised case (e.g. a motion-corrupted scan whose hand-drawn border is not real geometry) from the corpus.
@@ -439,6 +440,20 @@ export function TimelineBar() {
           startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification. Accepts the CURRENT output as-is; does NOT apply any auto-detected correction.">
           {busyAction === "approve" && caseBusy ? "Approving…" : "✓ Approve preprocessing"}
+        </Button>
+        {/* Full AUTO re-run from the raw .OCT (fresh surface detect + surface-crop detect + warp). Keeps sticky
+            manual surface-crop / crop params; DISCARDS Fix-columns border corrections, so it is guarded by a confirm
+            when the scan has any. Useful to un-stick a scan (e.g. one left in a bad manual state) or pick up an
+            improved detector without hunting through Fix-columns → Run. */}
+        <Button size="small" variant="outlined" color="warning" disabled={busy}
+          onClick={() => {
+            if (hasBorderCorrection && !window.confirm(
+              "Re-run AUTO preprocessing from the raw .OCT?\n\nThis DISCARDS the Fix-columns border corrections on this scan (surface-crop / crop marks and classification are kept). Continue?")) return;
+            setBusyAction("rerun"); void rerunPreprocess();
+          }}
+          startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title="Re-run the full AUTO preprocessing from the raw .OCT — fresh corneal-surface detection, surface-crop detection and warp. Keeps sticky manual surface-crop / crop params; DISCARDS Fix-columns border corrections (asks first if any exist). Resets to Auto — re-inspect, then Approve.">
+          {busyAction === "rerun" && caseBusy ? "Re-running…" : "↻ Re-run auto"}
         </Button>
         {proposals.hasProposal && (
           <Button size="small" variant="outlined" color="secondary" disabled={busy}

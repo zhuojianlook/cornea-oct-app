@@ -98,7 +98,14 @@ export function VolumeCanvas() {
     if (it?.stopped === "surface_crop") {
       autoCropOpenedRef.current = caseId;
       setCompareView(true);
+      // Surface-crop marks are SAGITTAL-only (a frame reads as a column there); the mark seed, the strip and
+      // the CropMarkedImage overlay in BeforeAfterViewer are all gated on orient==="sagittal". `view` is NOT
+      // reset on a case switch, so a carried-over axial/coronal view from a prior scan (e.g. after Fix-axial,
+      // or reviewing a de-tilt proposal — which forces axial) would leave this auto-opened before/after
+      // non-sagittal and the marks would never seed. Force sagittal here so the clip marks always appear.
+      if (view !== "sagittal") onView(null, "sagittal");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId, hasRaw, caseInfo]);
   // Manual "Fix columns" correction (mark bad B-scan frames → re-run preprocessing) lives in the 2D
   // SliceGallery; on the WebGL/3D desktop path it was otherwise unreachable. This opens it. Surface-crop
@@ -240,6 +247,11 @@ export function VolumeCanvas() {
     const id = caseInfo?.case_id;
     if (!id) { setHasRaw(false); return; }
     let cancelled = false;
+    // Reset to false for the NEW case BEFORE the async check. Otherwise the surface-crop auto-open effect
+    // (above) can fire on the PREVIOUS case's stale hasRaw=true during the case-change commit, get clobbered
+    // by the case-change reset (below), and — because it fired once — never re-open. Forcing a false→true
+    // transition when THIS case's raw snapshot is confirmed re-triggers the auto-open cleanly, after the reset.
+    setHasRaw(false);
     api
       .json<{ images: unknown[] }>(`/api/case/${id}/previews/context_raw`)
       .then((r) => !cancelled && setHasRaw((r.images || []).length > 0))
@@ -259,6 +271,7 @@ export function VolumeCanvas() {
   // segmented scan should land on its segmentation, not raw Slices); otherwise Slices (greyed until SAM2).
   useEffect(() => {
     setCompareView(false); setFixColsView(false); setFixAxialView(false); setStepsView(false);
+    autoCropOpenedRef.current = null;   // clear the once-per-case guard so the surface-crop auto-open can fire
     wfSet("showSegmentation", hasSegmentation(manifest));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseInfo?.case_id]);

@@ -1075,9 +1075,14 @@ def _clip_mask(sl: np.ndarray, edge: np.ndarray, p: dict) -> np.ndarray:
     # fails and the clip is missed). A binary closing fills internal gaps ≤ clip_close_gap WITHOUT growing the
     # outer extent — restoring the contiguous central run the gates expect. No-op for the already-contiguous
     # legacy mask and for a normal scan's (empty/sparse) mask, so it can't create a false clip.
+    # OR with the pre-closing mask so the closing can only FILL gaps, never ERODE. binary_closing's erosion
+    # step (border_value=0) sheds the first ~gap frames of a clip that runs to the FRAME-ARRAY EDGE — a
+    # WHOLE-EDGE clip (cornea off the top along an entire edge), not a central apex. Without this, an edge
+    # clip loses its boundary frames and the surface-crop stops short of the true edge (CS002_OS(5)). In the
+    # interior, closing is extensive (⊇ mask), so central apex clips are byte-unchanged.
     gap = int(p.get("clip_close_gap", 4))
     if gap > 0 and mask.any():
-        mask = ndimage.binary_closing(mask, structure=np.ones(2 * gap + 1, dtype=bool))
+        mask = mask | ndimage.binary_closing(mask, structure=np.ones(2 * gap + 1, dtype=bool))
     return mask
 
 
@@ -2322,8 +2327,34 @@ def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, work
         cm = np.asarray(_clip_mask(np.ascontiguousarray(sag[i]).astype(np.float32), edges[i], p), dtype=bool)
         mask[i, :cm.size] = cm[:F]
         counts[cm] += 1
+    # HYSTERESIS frame selection (not a bare per-frame count >= min_slices threshold). A physically-continuous
+    # clip has its per-frame clipped-slice count DIP below crop_min_slices at interior frames (a few px of
+    # detector noise) and at the marginal frame-array EDGE frames — a hard threshold then punches interior
+    # HOLES into the clipped band and DROPS the edge frames (validated across the surface-crop set: the misses
+    # are ALL under-detection, never over). Fix: keep any contiguous run of even-weakly-clipped frames
+    # (count >= crop_hys_min_slices) that CONTAINS a strong seed (count >= crop_min_slices). This bridges
+    # interior holes and extends the band to the array edge in one pass, while an isolated weak run with no
+    # strong seed (stray noise) is still rejected — so it cannot introduce a false clip. No-op when the
+    # thresholded set is already a solid contiguous run.
     min_slices = max(1, int(p.get("crop_min_slices", 3)))
-    frames = [int(f) for f in range(F) if counts[f] >= min_slices]
+    weak_min = max(1, int(p.get("crop_hys_min_slices", 1)))
+    strong = counts >= min_slices
+    if strong.any():
+        weak = counts >= weak_min
+        lbl, _n = ndimage.label(weak)
+        strong_labels = set(int(x) for x in np.unique(lbl[strong]) if x > 0)
+        sel = np.array([lbl[f] in strong_labels for f in range(F)], dtype=bool)
+        # GAP-FILL: bridge interior holes where the count dropped to 0 (below even the weak floor) — a
+        # physically-continuous apex still clips there but a few px of detector noise zeroed the frame's
+        # tally. Close holes up to crop_frame_close_gap wide, unioned with the pre-close mask so the band
+        # edges are never eroded (same boundary-safe idiom as _clip_mask). A gap wider than this (a genuine
+        # break between two separate clips, or a diagonal fragmentation) is left alone.
+        g = int(p.get("crop_frame_close_gap", 4))
+        if g > 0:
+            sel = sel | ndimage.binary_closing(sel, structure=np.ones(2 * g + 1, dtype=bool))
+        frames = [int(f) for f in range(F) if sel[f]]
+    else:
+        frames = []
     # Per-frame clipped LATERALS, emitted only for the detected frames so the payload stays bounded
     # (a clipped frame is typically clipped over a contiguous run of laterals around the apex).
     lateral_by_frame = {int(f): [int(i) for i in np.nonzero(mask[:, f])[0]] for f in frames}
@@ -2450,13 +2481,28 @@ def warp_surface_crop_extend(sag: np.ndarray, posterior: np.ndarray, crop_frames
     # posterior parabola per slice (RANSAC = robust to a clip mis-lock), smoothed across slices for 3-D consistency
     Pb = np.stack([_fit_quadratic_ransac(posterior[i].astype(np.float64), res) for i in range(n)])
     Pb = ndimage.gaussian_filter1d(Pb, sigma=float(p.get("crop_slice_smooth", 2.0)), axis=0)
-    # corneal thickness per slice from the NON-cut-off (in-frame) flanks → top-edge parabola (apex/edge may be <0)
-    floor = float(p.get("clip_edge_floor", 8.0)); Ts = np.full(n, np.nan)
+    # Corneal thickness → top-edge parabola Pa = Pb − thickness (apex/edge may sit <0 = ABOVE the old top).
+    # PER-FRAME thickness PROPAGATED from the ADJACENT un-cut frames, not a global median: measure thickness
+    # only where the anterior is valid (un-cut, in-window), then interpolate ACROSS FRAMES into the cut band,
+    # HELD at the ends. A cut frame therefore inherits the thickness of its NEAREST un-cut neighbours — the
+    # corneal shape varies smoothly frame-to-frame — instead of a global median that a thin peripheral/limbus
+    # frame drags down (under-reconstructing the apex, so the extended canvas fell short of the true above-
+    # window apex). Smoothed across slices for 3-D consistency; a slice with <3 valid frames falls back to the
+    # cross-slice-filled per-slice median.
+    floor = float(p.get("clip_edge_floor", 8.0))
+    allf = np.arange(F, dtype=np.float64)
+    Th = np.full((n, F), np.nan); Ts = np.full(n, np.nan)
     for i in range(n):
-        nonc = [f for f in range(F) if f not in cf and np.isfinite(det[i, f]) and det[i, f] >= floor]
-        if len(nonc) >= 3:
-            Ts[i] = float(np.median(posterior[i, nonc] - det[i, nonc]))
-    Ts = _fill_nan_1d(Ts); Pa = Pb - Ts[:, None]
+        thick = posterior[i] - det[i]
+        valid = np.array([(f not in cf) and np.isfinite(det[i, f]) and det[i, f] >= floor for f in range(F)])
+        if int(valid.sum()) >= 3:
+            Ts[i] = float(np.median(thick[valid]))
+            Th[i] = np.interp(allf, allf[valid], thick[valid])   # held at ends → nearest-un-cut extrapolation into the cut band
+    Ts = _fill_nan_1d(Ts)
+    bad = ~np.isfinite(Th).all(axis=1)
+    Th[bad] = Ts[bad, None]
+    Th = ndimage.gaussian_filter1d(Th, sigma=float(p.get("crop_slice_smooth", 2.0)), axis=0)
+    Pa = Pb - Th
     # robust per-column shift: parabola − median-smoothed posterior, clipped so an outlier can't inflate the pad
     post_rob = np.stack([ndimage.median_filter(posterior[i].astype(np.float64), size=int(p.get("crop_target_med", 11)))
                          for i in range(n)])
@@ -4069,8 +4115,13 @@ def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers
         if abs(M[f]) > 0.05:
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -M[f]), subpixel=True)
             nadj += 1
+    # `shift` = the per-frame rigid depth shift APPLIED (each B-scan moved by -M[f]). Surface-crop detection
+    # runs on this de-tilted volume, where a clipped apex that was pinned at the raw frame TOP now sits at
+    # ~M[f]; adding M[f] back recovers the raw-top-relative surface for the "edge within N px of the top"
+    # clip criterion. Purely informational (callers only log the summary fields).
     return out, {"applied": bool(nadj), "frames_adjusted": int(nadj),
-                 "motion_std": round(float(np.std(M)), 2), "max_shift": round(float(np.max(np.abs(M))), 1)}
+                 "motion_std": round(float(np.std(M)), 2), "max_shift": round(float(np.max(np.abs(M))), 1),
+                 "shift": [round(float(x), 3) for x in M]}
 
 
 def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers: int | None = None):

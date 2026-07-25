@@ -163,20 +163,27 @@ export function BeforeAfterViewer({ orient, filter }: {
   const [scMsg, setScMsg] = useState("");
 
   // Seed the marks: persisted user set → the set this run actually cropped → the detector's suggestion.
+  // Seed SYNCHRONOUSLY from the manifest (persisted set, else the frames THIS run cropped) the instant the scan
+  // opens, so an auto-cropped scan shows its marked columns immediately. The detector round-trip below only
+  // REFINES the "suggested" set + per-frame confidence; it must not be what first populates the marks —
+  // previously scMarks was set ONLY inside the async .then, so on open it stayed empty ("0 marked", no overlay)
+  // until a later interaction (e.g. toggling "edit marks") re-rendered it.
   useEffect(() => {
     if (!caseId || orient !== "sagittal") return;
     let cancel = false;
-    const seed = (d: CropDetect | null) => {
-      if (cancel) return;
-      const chosen = (scPersisted && scPersisted.length ? scPersisted
-        : scFromRun && scFromRun.length ? scFromRun
-        : d?.selected?.length ? d.selected
-        : d?.frames) ?? [];
-      setScMarks(new Set(chosen.map(Number)));
-    };
+    const fromManifest = (scPersisted && scPersisted.length ? scPersisted
+      : scFromRun && scFromRun.length ? scFromRun : null);
+    if (fromManifest) setScMarks(new Set(fromManifest.map(Number)));   // instant marks — no round-trip wait
     api.json<CropDetect>(`/api/case/${caseId}/oct-surface-crop/detect`, "POST", "{}")
-      .then((d) => { if (!cancel) { setScDetect(d); seed(d); } })
-      .catch(() => seed(null));   // detector unavailable → still show whatever is persisted
+      .then((d) => {
+        if (cancel) return;
+        setScDetect(d);
+        if (!fromManifest) {   // nothing in the manifest → fall back to the detector's own choice
+          const chosen = (d?.selected?.length ? d.selected : d?.frames) ?? [];
+          setScMarks(new Set(chosen.map(Number)));
+        }
+      })
+      .catch(() => { if (!cancel && !fromManifest) setScMarks(new Set()); });   // keep manifest marks on detector failure
     return () => { cancel = true; };
   }, [caseId, orient, segSig, JSON.stringify(scPersisted), JSON.stringify(scFromRun)]);
 
