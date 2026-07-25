@@ -565,6 +565,24 @@ DEFAULT_PARAMS: dict = {
     # taller volume. Detection (detect_surface_crop_frames / _clip_mask) runs automatically; a substantial clip
     # (auto gate below) triggers the correction. Manual surface_crop_frames overrides the auto set.
     "auto_surface_crop": True,    # auto-detect + auto-correct a clipped cornea as part of preprocessing
+    # WHICH frame rule decides the clipped set. "geom" = the validated flank-extrapolated APEX rule
+    # (_sc_geom_frames: micro-F1 0.931 / precision 0.937 / recall 0.925 over the 37 GT surface-crop scans, 0
+    # false frames on the CS010 peripheral-limbus trap, 0 of 129 vetted non-clipped scans firing). "count" =
+    # the legacy _clip_mask per-slice tally + hysteresis — a complete, no-migration revert. The geom rule needs
+    # the surface evidence threaded from the pipeline (see detect_surface_crop_frames); where that is
+    # unavailable it falls back to "count" on its own.
+    "crop_detect": "geom",
+    # The three params below are read by the "count" rule only. They existed as inline .get() fallbacks;
+    # declared here so they are discoverable (values identical to those fallbacks).
+    "crop_hys_min_slices": 1,     # count rule: weak floor for the hysteresis run-extend
+    "crop_frame_close_gap": 4,    # count rule: HALF the maximum interior hole bridged (reach = 2x this = 8)
+    # "this scan is a write-off" cap on the AUTO correction: refuse to reconstruct when more than this fraction
+    # of frames is flagged, because that is a failed / fully-off-axis acquisition rather than a localized clip.
+    # Per rule, because the two rules have very different over-selection behaviour — see the veto site in
+    # preprocess_oct_to_nifti for the measurements behind 0.75. (Both existed only as inline .get() fallbacks;
+    # declared here so they are discoverable. Values unchanged for the count rule.)
+    "crop_auto_max_frac": 0.5,        # count rule
+    "crop_auto_max_frac_geom": 0.75,  # geom rule (GT itself reaches 0.574; rule selects 0.000 on all negatives)
     "crop_auto_min_frames": 6,    # auto gate: need >= this many frames flagged clipped (>= crop_min_slices slices)
     "crop_auto_min_slices": 12,   # auto gate: AND the most-clipped frame flagged in >= this many slices (ABSOLUTE —
                                   # a central apex clip only spans the central lateral slices, so a fraction-of-all
@@ -1072,9 +1090,12 @@ def _clip_mask(sl: np.ndarray, edge: np.ndarray, p: dict) -> np.ndarray:
            (top / colmax > float(p.get("clip_top_frac", 0.5)))
     # Consolidate small gaps: the DP detector can place 1-3 columns of a clipped apex a few px DEEPER than the
     # top floor, fragmenting the run (so those columns leak into the dome fit as outliers → the inlier gate
-    # fails and the clip is missed). A binary closing fills internal gaps ≤ clip_close_gap WITHOUT growing the
-    # outer extent — restoring the contiguous central run the gates expect. No-op for the already-contiguous
-    # legacy mask and for a normal scan's (empty/sparse) mask, so it can't create a false clip.
+    # fails and the clip is missed). A binary closing fills internal gaps WITHOUT growing the outer extent —
+    # restoring the contiguous central run the gates expect. No-op for the already-contiguous legacy mask and
+    # for a normal scan's (empty/sparse) mask, so it can't create a false clip.
+    # REACH: the structuring element is ones(2*clip_close_gap+1), which closes holes up to 2*clip_close_gap
+    # wide — i.e. 8 at the default of 4, NOT 4 (measured: widths 3-8 fill, 9 does not). Read the param as
+    # "half the maximum gap bridged".
     # OR with the pre-closing mask so the closing can only FILL gaps, never ERODE. binary_closing's erosion
     # step (border_value=0) sheds the first ~gap frames of a clip that runs to the FRAME-ARRAY EDGE — a
     # WHOLE-EDGE clip (cornea off the top along an entire edge), not a central apex. Without this, an edge
@@ -1084,6 +1105,147 @@ def _clip_mask(sl: np.ndarray, edge: np.ndarray, p: dict) -> np.ndarray:
     if gap > 0 and mask.any():
         mask = mask | ndimage.binary_closing(mask, structure=np.ones(2 * gap + 1, dtype=bool))
     return mask
+
+
+# ── SURFACE-CROP FRAME RULE ("geom"): flank-extrapolated APEX recovery ────────────────────────────────────
+# The legacy rule (_clip_mask + per-frame slice tally) asks "is the detected edge pinned near the top AND is
+# the top band bright". That conflates a clipped central APEX with a PERIPHERAL LIMBUS graze, and it reads
+# only the geometry it is handed — so on a motion-corrected volume it fires on frames whose apex is actually
+# in-frame (CS010: 7 false frames) while MISSING the tapering tails of real clips.
+#
+# This rule instead estimates the corneal APEX per frame on BOTH geometries and asks the user's actual
+# question: "is the apex within ~2 px of the RAW top". Validated over the 37 GT surface-crop scans (user
+# marks) at micro-F1 0.931 / precision 0.937 / recall 0.925, with 0 false frames on the CS010 limbus-graze
+# trap and 0 of 129 vetted non-clipped scans firing. Reference implementation and the design history live in
+# .work/wf/surface_crop_detect.py; these helpers are a faithful transplant of it (see tests).
+#
+# Why the apex must be EXTRAPOLATED rather than read off: the DP detector PINS a clipped apex inconsistently
+# anywhere in rows 0-8, so a naive min(S_raw) <= 2 test has recall 0.23. Fitting the descending dome FLANKS
+# (excluding the pinned plateau) and extrapolating to the vertex recovers where the apex WOULD be, including
+# above row 0. Why both geometries: axial_motion_correct shifts a clipped apex DOWN to ~row M[f], so the
+# motion-corrected apex plus M[f] recovers the raw-top-relative apex; and on strongly TILTED scans raw
+# detection mislocates the apex outright (cs008_od_v3: raw apex 17-20 is wrong) so the mc flanks carry the
+# signal. Reading only one geometry is what makes the legacy rule fail in both directions.
+_SC_ALGO_VERSION = "apex-recover-v1"
+# Thresholds are MODULE constants, deliberately NOT DEFAULT_PARAMS keys: they are a single jointly-validated
+# operating point, and a per-case oct_params copy would silently drift individual scans off it.
+_SC_A_RAW = 5.0        # seed: smoothed raw apex near the top (the user's criterion, on the SMOOTHED profile
+                       #   so a 1-2 px detector spike cannot qualify)
+_SC_A_BAND = 3         # seed: >= N laterals of the raw apex at row <= 2 (a real clip is a BAND, not a column)
+_SC_A_M = 0.0          # seed: motion-recovered raw apex (rmc + M) at/above the top
+_SC_A_VY = 2.0         # seed: two-flanked dome vertex extrapolates to the top
+_SC_A_VYNEG = -8.0     # seed: one-sided vertex extrapolates well ABOVE the frame (trusted only when strong)
+_SC_A_DEEP = 1.0       # seed: motion-corrected apex essentially at the top
+_SC_W_RAW = 4.0        # weak (run-extend): raw apex
+_SC_W_MC = 6.0         # weak: motion-corrected apex
+_SC_W_M = 2.0          # weak: motion-recovered apex
+_SC_W_VY = 4.0         # weak: two-flanked dome vertex
+_SC_GAP = 3            # bridge gaps of <= this many frames between kept runs (tapering tails)
+_SC_MED_K = 7          # lateral median-smoothing window
+_SC_RAW_NEAR = 30.0    # physical-consistency gate: raw apex this shallow → trust it, frame is clip-eligible
+_SC_RAW_FAR = 70.0     # ...or up to here IF the motion-recovered apex is also sane
+_SC_RAWAPEX_FLOOR = -12.0   # a real clipped apex is never hundreds of px above the frame (broken S_mc excursion)
+
+
+def _sc_lateral_median(A: np.ndarray, k: int = _SC_MED_K) -> np.ndarray:
+    """Median-smooth EVERY frame's lateral profile at once: A=(laterals, frames) → same shape, float64.
+
+    Bit-identical to the reference per-column loop (`np.median(a[max(0,i-h):min(n,i+h+1)])` for each i) but
+    ~260x faster (4.6 s → 0.018 s per geometry per scan), which is what keeps the rule free in the pipeline
+    AND in the /oct-surface-crop/detect request thread. Two details are load-bearing for exactness:
+      • the input dtype is PRESERVED (no float64 upcast first). The 2*h truncated EDGE windows have EVEN
+        length, so their median is a mean of two elements — computed in float32 vs float64 that differs in
+        the last bits, and the equality test in tests/ would fail.
+      • the interior uses the full odd-length window (median = exact middle element), the edges are computed
+        explicitly with the same truncated bounds as the reference.
+    """
+    A = np.asarray(A)
+    L = int(A.shape[0]); h = int(k) // 2
+    out = np.empty(A.shape, dtype=np.float64)
+    if L > 2 * h:
+        win = np.lib.stride_tricks.sliding_window_view(A, 2 * h + 1, axis=0)   # (L-2h, frames, k)
+        out[h:L - h] = np.median(win, axis=-1)
+        edge_rows = list(range(0, h)) + list(range(L - h, L))
+    else:
+        edge_rows = list(range(L))          # window never fits: every row is a truncated edge window
+    for i in edge_rows:
+        out[i] = np.median(A[max(0, i - h):min(L, i + h + 1)], axis=0)
+    return out
+
+
+def _sc_flank_vertex(s: np.ndarray, sm: np.ndarray, rmin: float, ax: int):
+    """Fit a parabola to the descending dome FLANKS (excluding the pinned near-apex plateau and detector
+    spikes) and return (vertex_row, two_sided, curvature). The vertex may be NEGATIVE = apex above the
+    window, which is exactly the clipped case the tally-based rule cannot see."""
+    L = len(s); x = np.arange(L)
+    nospike = np.abs(s - sm) < 8
+    flank = nospike & (sm > rmin + 6.0)
+    two = (int((flank & (x < ax)).sum()) >= 25) & (int((flank & (x > ax)).sum()) >= 25)
+    vy = np.inf; curv = 0.0
+    if flank.sum() >= 30:
+        A = np.polyfit(x[flank], s[flank], 2); curv = float(A[0])
+        if A[0] > 1e-6:                      # opens downward in row-space = a real dome
+            vy = A[2] - A[1] ** 2 / (4 * A[0])
+    return float(vy), bool(two), curv
+
+
+def _sc_frame_evidence(s_mc, smc, s_raw, sraw, m: float):
+    """(seed, weak) for ONE frame. `seed` = a confident clip; `weak` = enough to EXTEND a run that already
+    contains a seed. Smoothed profiles are passed in (hoisted out of the frame loop)."""
+    rmc = float(smc.min()); ax = int(smc.argmin())
+    vy, two, curv = _sc_flank_vertex(s_mc, smc, rmc, ax)
+    rraw = float(sraw.min()); n2 = int((sraw <= 2).sum())
+    rawapex = rmc + m
+    # PHYSICAL-CONSISTENCY gate: raw is the truth geometry, so a clip needs the raw apex near the top. The one
+    # exception is a heavy-motion frame where the raw detector mislocates the apex moderately deep (rraw<=70)
+    # yet the motion-recovered apex is a plausible SMALL clip. This rejects broken S_mc excursions (rmc
+    # plunging hundreds of px negative while the true raw surface sits deep in-frame) without excluding any
+    # genuine clip (verified: 0 of 937 GT frames excluded).
+    if not ((rraw <= _SC_RAW_NEAR) or (rraw <= _SC_RAW_FAR and rawapex >= _SC_RAWAPEX_FLOOR)):
+        return False, False
+    seed = ((rraw <= _SC_A_RAW) or (n2 >= _SC_A_BAND) or (rawapex <= _SC_A_M) or
+            (two and curv > 0 and vy <= _SC_A_VY) or (curv > 0 and vy <= _SC_A_VYNEG) or
+            (rmc <= _SC_A_DEEP))
+    weak = ((rraw <= _SC_W_RAW) or (rmc <= _SC_W_MC) or (rawapex <= _SC_W_M) or
+            (n2 >= 1) or (two and curv > 0 and vy <= _SC_W_VY))
+    return bool(seed), bool(weak)
+
+
+def _sc_geom_frames(S_mc: np.ndarray, S_raw: np.ndarray, M: np.ndarray) -> list[int]:
+    """The clipped FRAME set. S_mc / S_raw are (laterals, frames) anterior-surface rows on the
+    motion-corrected and RAW geometries (row 0 = top of the window); M is the per-frame rigid depth shift
+    axial_motion_correct APPLIED, oriented so raw_row = corrected_row + M[f].
+
+    Seeds are deliberately strict, so the peripheral-limbus trap (top-grazing pixels but the apex genuinely
+    in-frame) fires NONE of them: its smoothed raw apex stays >= 6, it has no raw top band, its
+    motion-recovered apex is > 0 and its dome vertex extrapolates in-frame. Real clips are CONTIGUOUS runs
+    around the apex frame, so each seed is GROWN along the frame axis through the looser weak criterion and
+    short gaps are bridged. A scan with NO seed emits nothing — which is what keeps the trap empty rather
+    than relying on a per-scan exception."""
+    S_mc = np.asarray(S_mc); S_raw = np.asarray(S_raw)
+    M = np.asarray(M, dtype=np.float64).ravel()
+    F = int(S_mc.shape[1])
+    SM_mc = _sc_lateral_median(S_mc); SM_raw = _sc_lateral_median(S_raw)
+    seed = np.zeros(F, bool); weak = np.zeros(F, bool)
+    for i in range(F):
+        seed[i], weak[i] = _sc_frame_evidence(S_mc[:, i], SM_mc[:, i], S_raw[:, i], SM_raw[:, i], float(M[i]))
+    # frame-axis HYSTERESIS: keep each maximal weak run only if it contains a seed
+    keep = np.zeros(F, bool); i = 0
+    while i < F:
+        if weak[i]:
+            j = i
+            while j < F and weak[j]:
+                j += 1
+            if seed[i:j].any():
+                keep[i:j] = True
+            i = j
+        else:
+            i += 1
+    idx = np.nonzero(keep)[0]
+    for a, b in zip(idx[:-1], idx[1:]):        # bridge short breaks between kept runs (tapering tails)
+        if b - a <= _SC_GAP:
+            keep[a:b + 1] = True
+    return [int(f) for f in np.nonzero(keep)[0]]
 
 
 def _longest_run(mask: np.ndarray) -> int:
@@ -2307,13 +2469,24 @@ def detect_noise_frames(sag: np.ndarray, params: dict | None = None, workers: in
 
 
 def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
-                               detect: np.ndarray | None = None) -> dict:
+                               detect: np.ndarray | None = None,
+                               sc_s_mc: np.ndarray | None = None, sc_s_raw: np.ndarray | None = None,
+                               sc_shift: np.ndarray | None = None) -> dict:
     """AUTO-SUGGEST the surface-CROPPED frames (B-scan columns whose corneal apex rises ABOVE the acquisition
-    window, so the frame has no anterior surface). Runs the validated per-slice clip detector (_clip_mask) over
-    every sagittal slice and counts, per frame, how many slices flag it clipped. Returns
-    {frames:[...], counts:{frame: n_slices}, n_slices, depth_vox}: `frames` = those clipped in ≥crop_min_slices
-    slices (the default selection the user verifies/edits); `counts` drives a per-frame confidence bar. The
-    posterior-continuity reconstruction (build_surface_crop_edges) is what actually corrects the confirmed set."""
+    window, so the frame has no anterior surface). Returns
+    {frames:[...], counts:{frame: n_slices}, lateral_by_frame:{...}, rule, n_slices, depth_vox, n_frames}:
+    `frames` = the default selection the user verifies/edits; `counts` drives a per-frame confidence bar. The
+    posterior-continuity reconstruction (build_surface_crop_edges) is what actually corrects the confirmed set.
+
+    TWO rules, selected by crop_detect:
+      • "geom" (DEFAULT) — the validated flank-extrapolated APEX rule (_sc_geom_frames, micro-F1 0.931 on the
+        37 GT scans, 0 false frames on the CS010 limbus trap). It needs the caller to pass the surface
+        EVIDENCE, because this function is handed only ONE geometry: sc_s_raw (anterior on the RAW geometry),
+        sc_s_mc (anterior AFTER axial_motion_correct) and sc_shift (that call's per-frame shift M, oriented
+        raw_row = corrected_row + M[f]). Without all three it silently falls back to "count".
+      • "count" — the legacy per-slice _clip_mask tally + hysteresis. Still computed either way, because
+        `counts` and `lateral_by_frame` feed the confidence bar, is_substantial_clip and the axial overlay.
+    `rule` in the result says which one produced `frames`."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     edges = detect if detect is not None else detect_surface_all(sag, p, workers=workers)
     n, depth_vox, F = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
@@ -2336,19 +2509,50 @@ def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, work
     # interior holes and extends the band to the array edge in one pass, while an isolated weak run with no
     # strong seed (stray noise) is still rejected — so it cannot introduce a false clip. No-op when the
     # thresholded set is already a solid contiguous run.
+    # RULE SELECTION. crop_detect="geom" (default) uses the validated flank-extrapolated APEX rule, which needs
+    # the caller to supply the surface EVIDENCE (both geometries + the motion shift) because this function only
+    # receives ONE geometry. When that evidence is absent — every existing caller that passes detect= only, the
+    # legacy detector path, an axial_motion_correct no-op — we fall back to the count rule below, so those call
+    # sites are byte-unchanged. crop_detect="count" forces the legacy rule outright: a complete, no-migration
+    # revert. The geom branch is wrapped so a failure DEGRADES to the count rule rather than aborting a
+    # preprocess run, and `rule` is reported so the UI/QA can tell which one produced the frames.
+    rule = "count"
+    frames: list[int] | None = None
+    sm_top = None
+    if str(p.get("crop_detect", "geom")).lower() == "geom" \
+            and sc_s_mc is not None and sc_s_raw is not None and sc_shift is not None:
+        try:
+            frames = [int(f) for f in _sc_geom_frames(sc_s_mc, sc_s_raw, sc_shift) if 0 <= int(f) < F]
+            # Per-lateral distance to the RAW top, taking whichever geometry places the surface higher. On a
+            # TILTED scan the raw detector mislocates the apex tens of px deep (cs008_od_v3: rows 17-20 for a
+            # frame whose apex is actually cut off), so a raw-only profile would report NO clipped laterals
+            # there; the motion-corrected surface plus that frame's shift recovers the true raw row. Used only
+            # for the axial overlay below, never for selection.
+            _mm = np.asarray(sc_shift, dtype=np.float64).ravel()
+            sm_top = np.minimum(_sc_lateral_median(np.asarray(sc_s_raw)),
+                                _sc_lateral_median(np.asarray(sc_s_mc)) + _mm[None, :])
+            rule = "geom"
+        except Exception:  # noqa: BLE001 — never let the new rule break a preprocess run
+            frames = None
+            sm_top = None
+            rule = "count-fallback"
     min_slices = max(1, int(p.get("crop_min_slices", 3)))
     weak_min = max(1, int(p.get("crop_hys_min_slices", 1)))
     strong = counts >= min_slices
-    if strong.any():
+    if frames is not None:
+        pass                                    # geom rule already decided the frame set
+    elif strong.any():
         weak = counts >= weak_min
         lbl, _n = ndimage.label(weak)
         strong_labels = set(int(x) for x in np.unique(lbl[strong]) if x > 0)
         sel = np.array([lbl[f] in strong_labels for f in range(F)], dtype=bool)
         # GAP-FILL: bridge interior holes where the count dropped to 0 (below even the weak floor) — a
         # physically-continuous apex still clips there but a few px of detector noise zeroed the frame's
-        # tally. Close holes up to crop_frame_close_gap wide, unioned with the pre-close mask so the band
-        # edges are never eroded (same boundary-safe idiom as _clip_mask). A gap wider than this (a genuine
-        # break between two separate clips, or a diagonal fragmentation) is left alone.
+        # tally. Unioned with the pre-close mask so the band edges are never eroded (same boundary-safe idiom
+        # as _clip_mask). A gap wider than the reach (a genuine break between two separate clips, or a
+        # diagonal fragmentation) is left alone.
+        # REACH: ones(2*crop_frame_close_gap+1) closes holes up to 2*crop_frame_close_gap wide — 8 frames at
+        # the default of 4, NOT 4. Read the param as "half the maximum hole bridged".
         g = int(p.get("crop_frame_close_gap", 4))
         if g > 0:
             sel = sel | ndimage.binary_closing(sel, structure=np.ones(2 * g + 1, dtype=bool))
@@ -2358,8 +2562,27 @@ def detect_surface_crop_frames(sag: np.ndarray, params: dict | None = None, work
     # Per-frame clipped LATERALS, emitted only for the detected frames so the payload stays bounded
     # (a clipped frame is typically clipped over a contiguous run of laterals around the apex).
     lateral_by_frame = {int(f): [int(i) for i in np.nonzero(mask[:, f])[0]] for f in frames}
+    # UI FALLBACK for the geom rule: the geom frame set is NOT derived from `mask`, and 22% of geom-selected
+    # frames have an all-False _clip_mask column (that disagreement is the whole point of the new rule). The
+    # axial view draws lateral_by_frame, so without this it renders NOTHING on exactly the frames the rule
+    # improves — which reads to the reviewing user as "the fix did nothing". Derive those laterals from the
+    # already-smoothed raw apex profile instead. Computed AFTER `frames` is final so it cannot influence
+    # selection, and `counts` is left untouched so is_substantial_clip / peak_slices keep their old evidence.
+    if sm_top is not None:
+        _floor = float(p.get("clip_edge_floor", 8.0))
+        for f in frames:
+            if not lateral_by_frame.get(f) and f < sm_top.shape[1]:
+                prof = sm_top[:, f]
+                sel_lat = prof <= _floor
+                if not sel_lat.any():
+                    # Both geometries put this frame's whole profile below the floor — the rule still selected
+                    # it (e.g. from an extrapolated dome vertex above the window, where no lateral is literally
+                    # pinned at the top). Mark the band around the frame's own apex so the overlay shows WHERE
+                    # the reconstruction applies. The argmin always qualifies, so this is never empty.
+                    sel_lat = prof <= float(np.nanmin(prof)) + _floor
+                lateral_by_frame[f] = [int(i) for i in np.nonzero(sel_lat)[0]]
     return {"frames": frames, "counts": {int(f): int(counts[f]) for f in range(F) if counts[f] > 0},
-            "lateral_by_frame": lateral_by_frame,
+            "lateral_by_frame": lateral_by_frame, "rule": rule,
             "n_slices": n, "depth_vox": depth_vox, "n_frames": F}
 
 
@@ -4053,7 +4276,8 @@ def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, wor
                  "n_frames": n_frames, "cols_adjusted": int(n_moved_cols)}
 
 
-def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
+                         detect: np.ndarray | None = None):
     """Correct slow-scan (frame-axis) inter-frame AXIAL EYE MOTION (v0.0.159).
 
     During the slow scan across frames the eye drifts/saccades AXIALLY, so each B-scan (frame) is acquired at
@@ -4077,7 +4301,12 @@ def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers
         workers = auto_workers()
     F, depth = int(volume.shape[0]), int(volume.shape[1])
     try:
-        S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
+        # `detect` lets the caller SHARE an anterior detection it already ran on this same (pre-correction)
+        # volume — the codebase's existing reuse idiom (detect= on detect_surface_crop_frames and
+        # warp_surface_crop_extend). The surface-crop "geom" rule needs that same RAW-geometry surface, so
+        # passing it in keeps the pipeline pass-count neutral instead of adding a third detect pass.
+        S = detect if detect is not None else \
+            detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
     except Exception:  # noqa: BLE001
         return volume, {"applied": False}
     L = int(S.shape[0])
@@ -5086,13 +5315,46 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # rigidly re-aligning each B-scan in depth to a smooth 3-D dome, so de-tilt/flatten see de-motioned data and
     # the sagittal surface comes out smooth. Strict NO-OP on a motion-free scan (approved scans unchanged).
     _amc_info = None
+    # ── SURFACE-CROP EVIDENCE (crop_detect="geom"). The apex rule needs the anterior surface on BOTH the RAW
+    # and the motion-corrected geometry plus the shift between them, and only THIS point in the pipeline has
+    # both. Build S_raw BEFORE axial_motion_correct and hand it to AMC (which needs the same detection), then
+    # re-detect immediately AFTER AMC. Capturing S_mc here — after AMC and the dewarp but BEFORE the de-tilt
+    # and before _apply_crop — is what makes the evidence match the geometry the rule was validated on: the
+    # de-tilt rebases every row by pad_top+shifts[f] and _apply_crop zeroes whole frames, either of which
+    # would feed the rule a surface in a different basis than its thresholds assume.
+    _S_raw = _S_mc = _M = None
+    _want_sc = (provided_edges is None
+                and (params or {}).get("surface_crop_frames") is None    # a manual GT set: never auto-detect
+                and _pcr.get("auto_surface_crop", True)
+                and str(_pcr.get("crop_detect", "geom")).lower() == "geom"
+                and str(_pcr.get("detector", "dp")).lower() != "legacy"
+                and bool(_pcr.get("axial_motion_correct", False))        # no AMC → no S_mc/M → count rule
+                and not bool(_pcr.get("intra_frame_dewarp", True)))      # IFD would move rows after AMC
+    if _want_sc:
+        try:
+            _S_raw = detect_surface_all(reformat_to_sagittal(vol), params, workers=workers)
+        except Exception:  # noqa: BLE001 — hoisting this pass out of AMC must not remove AMC's own guard:
+            _S_raw = None  # on failure do NOT pass detect= to AMC (it re-detects and degrades to a no-op)
     if provided_edges is None and bool(_pcr.get("axial_motion_correct", False)):
-        vol, _amc_info = axial_motion_correct(vol, params, workers=workers)
+        vol, _amc_info = axial_motion_correct(vol, params, workers=workers, detect=_S_raw)
     # INTRA-frame saccade de-distortion (v0.0.159): re-warp only the genuinely saccade-distorted B-scans onto
     # the smooth 3-D dome before the flatten. Strict no-op on a clean scan.
     _ifd_info = None
     if provided_edges is None and bool(_pcr.get("intra_frame_dewarp", True)):
         vol, _ifd_info = intra_frame_dewarp(vol, params, workers=workers)
+    if _want_sc and _S_raw is not None:
+        # Only a motion correction that was actually APPLIED gives a meaningful (S_mc, M) pair. On a no-op AMC
+        # returns the volume unmodified, so S_mc would equal S_raw with M=0 — a configuration the rule was
+        # never validated in; fall back to the count rule there rather than guess.
+        if _amc_info and _amc_info.get("applied") and _amc_info.get("shift") is not None:
+            try:
+                _sag_mc = reformat_to_sagittal(vol)
+                _S_mc = detect_surface_all(_sag_mc, params, workers=workers)
+                _M = np.asarray(_amc_info["shift"], dtype=np.float64)
+                if _S_mc.shape != (int(vol.shape[2]), int(vol.shape[0])) or _M.size != int(vol.shape[0]):
+                    _S_mc = _M = None                      # shape guard: wrong axes ⇒ do not feed the rule
+            except Exception:  # noqa: BLE001
+                _S_mc = _M = None
     _auto_cr = None                                                # auto crop-region box → surfaced in info → persisted
     # PERF: the noise-crop check and the surface-crop check BOTH run the ~12s anterior detector on the SAME raw
     # volume with the SAME (pre-auto-tune) detector params. The detector output is independent of crop_region /
@@ -5101,6 +5363,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     # (then it recomputes on the cropped volume) — so a cropped scan is byte-identical, the common no-crop scan
     # saves a full detect pass.
     _det_cache: dict = {}
+    if _S_mc is not None:
+        # PASS-COUNT NEUTRAL: the surface-crop evidence pass above already detected the anterior on exactly the
+        # current `vol` (post-AMC, post-dewarp, pre-de-tilt, pre-crop) with the same `params`, which is what
+        # _cur_sag_det would compute on first use. Seed it rather than paying for a second identical pass. Any
+        # later mutation of `vol` clears the cache as before, so this cannot go stale.
+        _det_cache["sag"] = _sag_mc
+        _det_cache["det"] = _S_mc
 
     def _cur_sag_det(_p):
         """(sag, anterior-detection) for the CURRENT `vol`, computed once and reused while `vol` is unchanged."""
@@ -5223,7 +5492,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             and str(_pcc.get("detector", "dp")).lower() != "legacy":
         try:
             _s1, _d1 = _cur_sag_det(params)                       # reused from the noise check when no crop was applied
-            _ci = detect_surface_crop_frames(_s1, params, workers=workers, detect=_d1)
+            # The evidence variables are kept OUTSIDE _det_cache on purpose: the cache is cleared when the
+            # de-tilt or _apply_crop mutates `vol`, but the rule must still see the pre-de-tilt geometry it was
+            # validated on. If _apply_crop ran, `_s1`/`_d1` are the cropped re-detect while the evidence is not
+            # — that is fine, since the evidence alone decides `frames` and `_d1` only feeds counts.
+            _ci = detect_surface_crop_frames(_s1, params, workers=workers, detect=_d1,
+                                             sc_s_mc=_S_mc, sc_s_raw=_S_raw, sc_shift=_M)
             if is_substantial_clip(_ci, params):
                 # AUTO-APPLY (was: propose, apply only if the user approved). The clip detector is reliable (no
                 # false-fire on non-clipped scans) and — with the strong cross-slice smoothing above — the
@@ -5252,7 +5526,17 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         _lo, _hi = int(0.3 * _sagv.shape[0]), int(0.7 * _sagv.shape[0])
         _pb_span = float(np.ptp(np.median(_Pb[_lo:_hi], axis=0)))      # posterior span across frames (diagnostic)
         _frac = len(list(_crop_frames)) / max(1, int(_sagv.shape[2]))
-        if _auto_crop and _frac > float(_pc.get("crop_auto_max_frac", 0.5)):
+        # RULE-AWARE cap. The 0.5 default was calibrated against the legacy count rule, which could flag most
+        # of a noisy scan. It is too tight for the user's OWN ground truth: 6 GT surface-crop scans exceed
+        # frac 0.45 and one reaches 0.574 (p1_od_v1, 58 of 101 frames genuinely clipped), so a 0.5 cap refuses
+        # to correct scans that ARE correctable. The geom rule earns the looser cap: its worst-case selection
+        # over the 37 GT scans is 0.545, and over all 129 vetted non-clipped scans it selects NOTHING (frac
+        # 0.000 everywhere) — there is no creep toward the threshold to guard against. A genuinely failed /
+        # fully-off-axis scan still lands near 1.0 and is still refused. 0.75 matches crop_noise_max_frac,
+        # which encodes the same "this scan is a write-off" judgement.
+        _cap = float(_pc.get("crop_auto_max_frac_geom", 0.75)) if _ci.get("rule") == "geom" \
+            else float(_pc.get("crop_auto_max_frac", 0.5))
+        if _auto_crop and _frac > _cap:
             # SANITY only: if MORE than half the frames are flagged clipped, this is a failed / fully-off-axis scan,
             # NOT a localized apex clip — reconstructing it is meaningless, so fall through to the normal pipeline
             # (keep-clipped). The old pad/span/clamped rejection is GONE: it existed because the un-smoothed warp
@@ -5270,6 +5554,12 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                      "n_frames_total": _F_tot,
                                      "frac_frames": round(len(list(_crop_frames)) / max(1, _F_tot), 3),
                                      "peak_slices": _peak, "pb_span": round(_pb_span, 1),
+                                     # WHICH rule produced `frames`, and the algorithm version. This payload is
+                                     # a persisted SNAPSHOT that the mark editors prefer over a live detection,
+                                     # so without a version stamp an improved detector stays invisible on every
+                                     # already-processed scan and there is no way to tell a stale set apart.
+                                     "rule": _ci.get("rule") if _auto_crop else "manual",
+                                     "algo": _SC_ALGO_VERSION,
                                      # WHICH frames were treated as clipped. Only the COUNT used to be
                                      # recorded, so an auto-detected crop could not be shown, reviewed or
                                      # edited — the UI had nothing to mark and the user could not tell

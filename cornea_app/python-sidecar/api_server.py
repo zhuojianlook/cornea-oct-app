@@ -3485,8 +3485,23 @@ def oct_surface_crop_detect(case_id: str, req: OctPreprocessRequest) -> dict:
     try:
         arr = _load_border_vol(_ensure_raw_border_nifti(case_id))   # (lateral, depth, frames) = sagittal, cached
         p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
-        res = oct_mod.detect_surface_crop_frames(arr, p)
+        # Feed the SAME evidence the preprocessing pipeline feeds the rule, so the editor suggests what a
+        # re-run would actually do. Without this the endpoint stays on the legacy count rule and keeps
+        # re-suggesting its false positives (e.g. the CS010 peripheral-limbus graze) the moment a scan has no
+        # persisted set and no run snapshot to fall back on. S_raw is the cached baseline surface, so a warm
+        # call is CHEAPER than before (the old code ran an uncached detect pass on every request).
+        S_raw = _baseline_surface(case_id, arr, p)
+        S_mc, M = _sc_evidence(case_id, arr, p)
+        res = oct_mod.detect_surface_crop_frames(arr, p, detect=S_raw,
+                                                sc_s_mc=S_mc, sc_s_raw=S_raw, sc_shift=M)
         res["selected"] = sorted(int(f) for f in ((m.get("oct_params") or {}).get("surface_crop_frames") or []))
+        res["algo"] = getattr(oct_mod, "_SC_ALGO_VERSION", None)
+        # Was the persisted run snapshot produced by an OLDER rule? The mark editors PREFER that snapshot over
+        # this live suggestion (so a user's reviewed set is never silently overwritten), which also means an
+        # improved detector would stay invisible on every already-processed scan. Expose staleness and let the
+        # UI decide — it demotes the snapshot only when there is no confirmed set to protect.
+        _snap = ((m.get("oct_iter") or {}).get("surface_crop") or {})
+        res["stale_snapshot"] = bool(_snap) and _snap.get("algo") != res["algo"]
         return res
     except HTTPException:
         raise
@@ -3727,6 +3742,59 @@ def _baseline_surface(case_id: str, arr, p: dict):
                         params_sig=psig)
     os.replace(tmp, cp)
     return surface
+
+
+def _sc_evidence_cache_path(case_id: str) -> Path:
+    return orch.case_root(case_id) / "border_cache" / "sc_evidence.npz"
+
+
+def _sc_evidence(case_id: str, arr, p: dict):
+    """(S_mc, M) for the surface-crop "geom" rule: the anterior surface AFTER axial motion correction, plus
+    that correction's per-frame shift. Returns (None, None) if the correction is a no-op or fails, which makes
+    detect_surface_crop_frames fall back to the legacy count rule.
+
+    `arr` is the cached raw-border volume in SAGITTAL order (lateral, depth, frames). The float32 cast before
+    the correction is DELIBERATE: it reproduces the geometry the rule was validated on
+    (.work/sc_dump_surfaces.py) bit-exactly, and it is harmless here because this corrected volume is used
+    only to detect a surface and then discarded. Cached per-case beside the baseline surface — border_cache is
+    already rmtree'd whenever preprocessing params change, so invalidation is free."""
+    import os
+    import numpy as np
+    raw = _ensure_raw_border_nifti(case_id)
+    F = int(arr.shape[2])
+    # _DETECT_PARAM_KEYS covers the surface DETECTOR only — no crop_*/clip_* key — so bake the rule's own
+    # version in as well, otherwise a change to the crop rule would silently reuse stale evidence.
+    psig = _detect_params_sig(p) + ";sc=" + str(getattr(oct_mod, "_SC_ALGO_VERSION", "?"))
+    cp = _sc_evidence_cache_path(case_id)
+    if cp.exists():
+        try:
+            z = np.load(cp, allow_pickle=False)
+            if (abs(float(z["raw_mtime"]) - float(os.path.getmtime(raw))) <= 1e-6
+                    and str(z["params_sig"]) == psig):
+                s = np.asarray(z["S_mc"], dtype=np.float32); mm = np.asarray(z["M"], dtype=np.float64)
+                if s.shape == (int(arr.shape[0]), F) and mm.size == F:
+                    return s, mm
+        except Exception:  # noqa: BLE001 — a corrupt/old cache just forces a recompute
+            pass
+    try:
+        S_raw = _baseline_surface(case_id, arr, p)        # already cached; also AMC's own detection
+        vol = np.ascontiguousarray(arr.transpose(2, 1, 0)).astype(np.float32)   # → (frames, depth, lateral)
+        out, info = oct_mod.axial_motion_correct(vol, p, detect=S_raw)
+        if not (info.get("applied") and info.get("shift") is not None):
+            return None, None                            # no-op correction ⇒ unvalidated configuration
+        S_mc = oct_mod.detect_surface_all(oct_mod.reformat_to_sagittal(out), p)
+        M = np.asarray(info["shift"], dtype=np.float64)
+    except Exception:  # noqa: BLE001 — evidence is best-effort; the count rule still works
+        return None, None
+    try:
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cp.with_name("sc_evidence.tmp.npz")   # MUST end .npz (np.savez_compressed appends it otherwise)
+        np.savez_compressed(tmp, S_mc=S_mc.astype(np.float32), M=M,
+                            raw_mtime=float(os.path.getmtime(raw)), params_sig=psig)
+        os.replace(tmp, cp)
+    except Exception:  # noqa: BLE001 — a cache write failure must not fail the request
+        pass
+    return S_mc, M
 
 
 def _redetect_surface_fresh(case_id: str, anchors: dict):
