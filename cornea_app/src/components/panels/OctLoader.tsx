@@ -78,6 +78,20 @@ const scOf = (life?: Record<string, unknown>): boolean => {
   return m != null ? Boolean(m) : scAutoOf(life);
 };
 
+// AWAITING PREPROCESSING APPROVAL — hoisted out like scOf above so the row badge, the per-group count and
+// the filter option all read the SAME rule. A scan qualifies once it HAS a preprocessed volume but nobody has
+// pressed "Approve preprocessing" (preproc_vetted).
+//
+// This deliberately does NOT go through scanStep(): that returns 4+ the moment sam2_meta exists, so a scan
+// that was segmented before anyone vetted its preprocessing reports "Cornea" and its pending approval became
+// INVISIBLE in the row — the backlog silently shrank. Reading preproc_vetted directly means a later step can
+// never mask an earlier unmet one.
+//
+// `status === "done"` is checked alongside the manifest flag because a scan preprocessed in THIS session is
+// locally "done" long before its `life` refreshes (that only happens on a segVersion bump).
+const needsApproval = (s: OctScan): boolean =>
+  s.status !== "error" && (Boolean(s.life?.oct_preprocessed) || s.status === "done") && !s.life?.preproc_vetted;
+
 // One filter option. `test` is a PURE read of the scan's own state — no network, no manifest write
 // (filtering is view-only). Every predicate must be truthiness-based and tolerate life === undefined:
 // a row's `life` is absent until cases/list hydrates, and over its lifetime it alternates between the
@@ -101,6 +115,11 @@ const FILTER_OPTIONS: FilterOpt[] = [
     key: `flag:${f.slug}`, group: "Needs attention", label: `⚑ ${f.label}`,
     test: (s) => reviewFlagsOf(s.life).includes(f.slug),
   })),
+  // Promoted from "Lifecycle" into "Needs attention": this IS the vetting backlog — the queue of scans
+  // waiting on a human decision — so it belongs beside the other things asking for the user's attention
+  // rather than buried among the neutral lifecycle buckets.
+  { key: "unvetted", group: "Needs attention", label: "⧗ Awaiting my approval",
+    test: needsApproval },
   { key: "difficult", group: "Needs attention", label: "⚠ Difficult",
     test: (s) => Boolean(s.life?.difficult_scan) },
   // defect_marks is DUAL-SHAPE: a COUNT in the cases/list payload, the raw ARRAY on the open scan.
@@ -112,10 +131,6 @@ const FILTER_OPTIONS: FilterOpt[] = [
   // status "done" long before its `life` refreshes (that only happens on a segVersion bump).
   { key: "raw", group: "Lifecycle", label: "Not preprocessed",
     test: (s) => s.status !== "error" && s.status !== "done" && !s.life?.oct_preprocessed },
-  // NOT scanStep(life) === 2 — scanStep returns 4+ as soon as sam2_meta is set, so a
-  // segmented-but-never-vetted scan would silently drop out of the vetting backlog.
-  { key: "unvetted", group: "Lifecycle", label: "Preprocessed · not vetted",
-    test: (s) => s.status !== "error" && (Boolean(s.life?.oct_preprocessed) || s.status === "done") && !s.life?.preproc_vetted },
   // /api/oct/load-dir returns rows with NO `life` until a cases/list hydration lands, so every other
   // predicate hides them. Give them a bucket rather than letting a fresh folder load look broken.
   { key: "nodata", group: "Lifecycle", label: "No lifecycle data yet",
@@ -1102,6 +1117,23 @@ export function OctLoader() {
               {nHiddenSelected} selected scan{nHiddenSelected === 1 ? "" : "s"} hidden — batch actions skip them
             </span>
           )}
+          {/* APPROVAL BACKLOG — always on screen, not hidden behind the dropdown. The size of the vetting
+              queue is the one number that decides what to do next, and previously it was only discoverable by
+              opening the filter list. Clicking jumps straight to that filter (and back), so it doubles as the
+              shortcut into the queue. Hidden entirely at zero (nothing to nag about) and while the counts are
+              still provisional, where a 0 would mean "not loaded yet" rather than "none left". */}
+          {!countsProvisional && filterCounts["unvetted"] > 0 && (
+            <button
+              onClick={() => setFilter(filter === "unvetted" ? "all" : "unvetted")}
+              title={filter === "unvetted"
+                ? "Showing only scans awaiting approval — click to show all scans again"
+                : "Show only the scans whose preprocessing still needs your approval"}
+              style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left",
+                fontSize: 10, color: "#fbbf24", textDecoration: filter === "unvetted" ? "underline" : "none" }}>
+              ⧗ {filterCounts["unvetted"]} scan{filterCounts["unvetted"] === 1 ? "" : "s"} awaiting your approval
+              {filter === "unvetted" ? " — showing" : ""}
+            </button>
+          )}
           {/* NOT gated on `filtering`: this is the note that explains a provisional "(0?)" in the dropdown,
               so it has to be on screen while the user is looking AT the dropdown — i.e. before they have
               managed to pick a filter. Straight after a folder load the counts are all 0 until hydrateLife
@@ -1140,6 +1172,7 @@ export function OctLoader() {
             // mutated here, so the user's manual collapse state returns intact when the filter clears.
             const isCollapsed = !filtering && collapsed.has(g.id);
             const nDoneInGroup = groupScans.filter((s) => s.status === "done").length;
+            const nToApproveInGroup = groupScans.filter(needsApproval).length;
             return (
               <div key={g.id} className="rounded" style={{ border: "1px solid var(--c-border)" }}>
                 {/* Group header: editable patient/eye + Scar/Control tag for the whole group. */}
@@ -1195,6 +1228,15 @@ export function OctLoader() {
                     <span className="text-[10px]" style={{ marginLeft: "auto", color: nDoneInGroup ? "var(--c-green)" : "var(--c-text-dim)" }}>
                       {groupScans.length}{nHiddenInGroup > 0 ? ` of ${allGroupScans.length}` : ""} scan{(nHiddenInGroup > 0 ? allGroupScans.length : groupScans.length) === 1 ? "" : "s"}{nDoneInGroup ? ` · ${nDoneInGroup} done ✓` : ""}
                     </span>
+                    {/* How many of THIS eye's scans are still waiting on approval, so the backlog is visible
+                        per group without opening a single scan. Counted over the VISIBLE rows, matching the
+                        "N of M scans" figure beside it. */}
+                    {nToApproveInGroup > 0 && (
+                      <span className="text-[10px]" title={`${nToApproveInGroup} scan(s) in this group still need “✓ Approve preprocessing”`}
+                        style={{ color: "#fbbf24", flex: "none" }}>
+                        · {nToApproveInGroup} to approve ⧗
+                      </span>
+                    )}
                     {nDoneInGroup > 0 && (
                       <button title={nHiddenInGroup > 0
                         ? `Download the ${nDoneInGroup} preprocessed scan(s) VISIBLE under the current filter as a .zip — ${nHiddenInGroup} scan(s) in this group are hidden and excluded`
@@ -1270,6 +1312,14 @@ export function OctLoader() {
                                 style={{ color: "#38bdf8", fontWeight: 700, flex: "none" }}>⬚{scM != null ? "✓" : ""}</span>
                             ) : null;
                           })()}
+                          {/* AWAITING APPROVAL: an explicit amber ⧗ on every scan whose preprocessing has not
+                              been approved yet. Deliberately independent of the lifecycle pill next to it —
+                              that pill shows the HIGHEST step reached, so a scan segmented before it was vetted
+                              reads "Cornea" and its pending approval would otherwise be invisible here. */}
+                          {needsApproval(s) && (
+                            <span title="Preprocessing NOT yet approved — open the scan, review it (Before/after · Fix-columns), then press “✓ Approve preprocessing”"
+                              style={{ color: "#fbbf24", fontWeight: 700, flex: "none" }}>⧗</span>
+                          )}
                           {Boolean(s.life?.difficult_scan) && (
                             <span title="Marked DIFFICULT — excluded from training" style={{ color: "#ef4444", fontWeight: 700, flex: "none" }}>⚠</span>
                           )}

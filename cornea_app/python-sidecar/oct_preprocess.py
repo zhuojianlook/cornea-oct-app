@@ -582,7 +582,13 @@ DEFAULT_PARAMS: dict = {
     # preprocess_oct_to_nifti for the measurements behind 0.75. (Both existed only as inline .get() fallbacks;
     # declared here so they are discoverable. Values unchanged for the count rule.)
     "crop_auto_max_frac": 0.5,        # count rule
-    "crop_auto_max_frac_geom": 0.75,  # geom rule (GT itself reaches 0.574; rule selects 0.000 on all negatives)
+    # geom rule: 0.60 sits just ABOVE the largest ground-truth crop the user has ever marked (0.574 = 58 of 101
+    # frames on p1_od_v1), so every real clip in the corpus is admitted, and just BELOW the over-reaches.
+    # Calibrated the hard way: at 0.75 the rule "corrected" cs015_od_v1 (74 frames, 0.73) and p5_os_v1_4 (70,
+    # 0.69) — both steeply tilted, largely-off-window acquisitions — and the reconstruction came out WORSE than
+    # leaving them clipped (surface detached across the volume). A >60%-clipped scan is not a localized apex
+    # clip; keep-clipped-clean is the right answer there.
+    "crop_auto_max_frac_geom": 0.60,
     "crop_auto_min_frames": 6,    # auto gate: need >= this many frames flagged clipped (>= crop_min_slices slices)
     "crop_auto_min_slices": 12,   # auto gate: AND the most-clipped frame flagged in >= this many slices (ABSOLUTE —
                                   # a central apex clip only spans the central lateral slices, so a fraction-of-all
@@ -5534,8 +5540,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         # 0.000 everywhere) — there is no creep toward the threshold to guard against. A genuinely failed /
         # fully-off-axis scan still lands near 1.0 and is still refused. 0.75 matches crop_noise_max_frac,
         # which encodes the same "this scan is a write-off" judgement.
-        _cap = float(_pc.get("crop_auto_max_frac_geom", 0.75)) if _ci.get("rule") == "geom" \
-            else float(_pc.get("crop_auto_max_frac", 0.5))
+        # NOTE the _auto_crop guard on reading _ci: on the MANUAL path the user supplied surface_crop_frames
+        # directly, the detector never ran, and _ci does not exist. The cap is an AUTO-only sanity gate anyway
+        # (a manual crop is a deliberate human decision and is never refused), so resolve it inside the guard.
+        _cap = 0.0
+        if _auto_crop:
+            _cap = float(_pc.get("crop_auto_max_frac_geom", 0.75)) if _ci.get("rule") == "geom" \
+                else float(_pc.get("crop_auto_max_frac", 0.5))
         if _auto_crop and _frac > _cap:
             # SANITY only: if MORE than half the frames are flagged clipped, this is a failed / fully-off-axis scan,
             # NOT a localized apex clip — reconstructing it is meaningless, so fall through to the normal pipeline

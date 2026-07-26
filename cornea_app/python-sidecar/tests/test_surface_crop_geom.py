@@ -190,3 +190,21 @@ def test_shared_detection_is_still_reused_by_axial_motion_correct():
     b, ib = ocp.axial_motion_correct(vol.copy(), p, detect=S)
     assert np.array_equal(a, b)
     assert ia.get("applied") == ib.get("applied")
+
+
+def test_manual_crop_path_does_not_touch_the_auto_only_cap():
+    """REGRESSION (caught in the live app, not by the gates): the rule-aware frac cap read the detector result
+    to pick its threshold, but on the MANUAL path the user supplies surface_crop_frames directly, the detector
+    never runs, and that variable does not exist — every manual-GT preprocess died with UnboundLocalError. The
+    auto gates must be unreachable when a human chose the frames.
+
+    Asserted structurally (a full preprocess needs a real .OCT): the cap must be resolved INSIDE an `_auto_crop`
+    guard, never in a statement that evaluates unconditionally."""
+    import inspect
+    src = inspect.getsource(ocp.preprocess_oct_to_nifti)
+    lines = [ln.strip() for ln in src.splitlines()]
+    cap_reads = [i for i, ln in enumerate(lines) if "_ci.get(" in ln and "rule" in ln]
+    assert cap_reads, "cap no longer consults the detector rule - update this test"
+    for i in cap_reads:
+        guard = " ".join(lines[max(0, i - 3):i + 1])
+        assert "_auto_crop" in guard, f"line {i} reads the detector result without an _auto_crop guard: {lines[i]}"
