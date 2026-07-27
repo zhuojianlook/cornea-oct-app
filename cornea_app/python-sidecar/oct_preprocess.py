@@ -159,6 +159,19 @@ DEFAULT_PARAMS: dict = {
                                   #   them). A smooth edge merely sitting off an extrapolation is not a defect
     "rfr_seam_step_px": 1.0,      # px: floor on the step the pass may create where the edge block meets the interior.
                                   #   Approved corneas have none, so a step here is by definition this pass's own artefact
+    "rfr_edge_tilt": True,        # DEFAULT ON: correct the accepted edge blocks with a rigid depth shift AND a lateral
+                                  #   TILT. A uniform shift can only remove the AVERAGE of a defect that varies across the
+                                  #   B-scan's width; on cs039_os_v1's leading frame the deviation ramps 21.7->42.9px, so
+                                  #   shifting by the central-band value left ~10px of over-lift at one sagittal end — the
+                                  #   "right edge goes upwards against the corneal curvature near slice 513" report. The ramp
+                                  #   is a ROTATION of the B-scan, not a deformation, so it is permitted; same quantity and
+                                  #   same application (a linear per-column depth ramp) as rigid_frame_derotate
+    "rfr_edge_max_tilt_deg": 1.5, # cap on that rotation. Real inter-frame torsion is under ~1.5 deg; cs039 needs 0.92
+    "rfr_edge_tilt_min_px": 4.0,  # px of across-width spread below which no rotation is fitted — otherwise per-frame
+                                  #   estimator noise becomes a spurious rotation, which is what sank the full 3-DOF fit
+    "rfr_bands": 10,              # lateral bands used to see ACROSS the width (the central-band profile cannot)
+    "rfr_band_margin": 0.05,      # outermost lateral fraction excluded from those bands — the boundary estimate there is
+                                  #   noise (cs039_os_v1 laterals 2 and 508 read 193px and 115px off the arc)
     "rfr_seam_step_frac": 0.35,   # ...but the cap is max(px, frac x ask): a real edge defect BEGINS at the seam and grows
                                   #   outward, so a small step there is the price of removing a large one. What this refuses
                                   #   is a block moved UNIFORMLY, where the step is most of the correction — an offset, which
@@ -4294,7 +4307,8 @@ def _rfr_deviation(volume: np.ndarray, p: dict):
     drop = _dropout_frames(volume, p)
     dev[drop] = np.nan
     prof[drop] = np.nan
-    return dev, prof
+    S[drop] = np.nan
+    return dev, prof, S
 
 
 def _r2(v):
@@ -4497,6 +4511,119 @@ def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = No
     return out
 
 
+def _rfr_lateral_bands(L: int, p: dict):
+    """Lateral bands used to see ACROSS the width. The per-frame profile everything else uses is a median
+    over the central laterals, which by construction cannot see a defect that varies from one side of the
+    B-scan to the other. The outermost `rfr_band_margin` fraction is excluded: there the boundary estimate is
+    unreliable (on cs039_os_v1 laterals 2 and 508 read -193 px and -115 px off the arc, pure estimator noise)."""
+    mrg = float(p.get("rfr_band_margin", 0.05))
+    n = int(p.get("rfr_bands", 10))
+    lo, hi = int(mrg * L), int((1.0 - mrg) * L)
+    if hi - lo < 8 * n:
+        return []
+    edges = np.linspace(lo, hi, n + 1).astype(int)
+    return [(edges[i], edges[i + 1]) for i in range(n)]
+
+
+def _rfr_band_edge_dev(S: np.ndarray, p: dict):
+    """Edge deviation per (lateral band, frame), against each band's OWN seam-anchored local curvature.
+
+    Returns (bands, centres, dev) with dev shape (n_bands, n_frames), NaN outside the edge blocks."""
+    F, L = int(S.shape[0]), int(S.shape[1])
+    bands = _rfr_lateral_bands(L, p)
+    dev = np.full((len(bands), F), np.nan)
+    if not bands:
+        return bands, np.zeros(0), dev
+    x = np.arange(F, dtype=np.float64)
+    for bi, (lo, hi) in enumerate(bands):
+        with np.errstate(all="ignore"):
+            pr = np.nanmedian(S[:, lo:hi], axis=1)
+        for side in ("lead", "trail"):
+            w = _rfr_side_windows(F, side, p)
+            if w is None:
+                continue
+            fit, blk, seam = w
+            pred = _rfr_edge_fit(pr, fit, seam, p)
+            if pred is None or not np.isfinite(pr[seam]):
+                continue
+            dev[bi, blk] = pr[blk] - (pred[blk] + (pr[seam] - pred[seam]))
+    return bands, np.array([(lo + hi) / 2.0 for lo, hi in bands]), dev
+
+
+def _rfr_edge_spread(S: np.ndarray, p: dict) -> float:
+    """Worst across-the-width spread of the edge deviation, in px. This is the quantity a reviewer sees as
+    'the edge goes upward against the corneal curvature only on the far sagittal slices' — a defect that is
+    invisible to every central-band measure, because the central band is exactly where it vanishes."""
+    _b, _c, dev = _rfr_band_edge_dev(S, p)
+    if dev.size == 0 or not np.isfinite(dev).any():
+        return float("nan")
+    have = np.isfinite(dev).any(axis=0)              # frames outside every edge block are all-NaN by design
+    if not have.any():
+        return float("nan")
+    with np.errstate(all="ignore"):
+        rng = np.nanmax(dev[:, have], axis=0) - np.nanmin(dev[:, have], axis=0)
+    return float(np.nanmax(rng)) if np.isfinite(rng).any() else float("nan")
+
+
+def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict):
+    """Per-frame lateral TILT of the accepted edge blocks, as a depth ramp in px per lateral column.
+
+    A rigid depth shift is uniform across the B-scan, so it can only ever remove the AVERAGE of a defect that
+    varies across the width. On cs039_os_v1's leading frame the deviation ramps from +21.7 px at one lateral
+    end to +42.9 px at the other; shifting by the central-band value (+32.8) corrected the centre and left
+    ~10 px of over-lift at one end and under-lift at the other. The reviewer saw exactly that: "the last few
+    sagittal frames near 513 have the right edge slightly going upwards against the general cornea curvature".
+
+    That across-width ramp is a ROTATION of the B-scan, not a deformation, so it is allowed — it is the same
+    quantity `rigid_frame_derotate` corrects, applied here to the acquisition-edge frames it does not reach,
+    and applied the same way (a linear per-column depth ramp; distances within the B-scan are preserved).
+    Measured on that frame the tilt is 20.7 px across the width = 0.92 degrees, comfortably inside real
+    inter-frame torsion.
+
+    Returns a per-frame slope array (px per lateral column), zero wherever the tilt is not supported."""
+    F, L = int(S.shape[0]), int(S.shape[1])
+    tilt = np.zeros(F, dtype=np.float64)
+    if not bool(p.get("rfr_edge_tilt", True)):
+        return tilt
+    bands, ctr, dev = _rfr_band_edge_dev(S, p)
+    if len(bands) < 4:
+        return tilt
+    sx = float(p.get("oct_spacing_lateral", 0.0078))
+    sz = float(p.get("oct_spacing_depth", 0.0031))
+    max_slope = np.tan(np.radians(float(p.get("rfr_edge_max_tilt_deg", 1.5)))) * (sx / sz)
+    mid = (L - 1) / 2.0
+    for f in range(F):
+        if not np.isfinite(edev[f]):          # only frames the side gates actually accepted
+            continue
+        v = dev[:, f]
+        ok = np.isfinite(v)
+        if int(ok.sum()) < 4:
+            continue
+        c = np.polyfit(ctr[ok], v[ok], 1)
+        for _ in range(2):                    # a single bad band must not set the rotation
+            r = v - np.polyval(c, ctr)
+            sd = np.nanstd(r[ok])
+            if not np.isfinite(sd) or sd <= 0:
+                break
+            ok2 = ok & (np.abs(r) < 2.0 * sd)
+            if int(ok2.sum()) < 4:
+                break
+            c = np.polyfit(ctr[ok2], v[ok2], 1)
+            ok = ok2
+        slope = float(c[0])
+        resid = v[ok] - np.polyval(c, ctr[ok])
+        spread = float(np.nanmax(v[ok]) - np.nanmin(v[ok])) if int(ok.sum()) else 0.0
+        # Only rotate when a straight line across the width genuinely explains the spread, and when there is
+        # a spread worth removing. Otherwise this fits per-frame estimator noise into a spurious rotation —
+        # the failure mode that sank the full 3-DOF fit (every fitted lateral shift came out positive).
+        if spread < float(p.get("rfr_edge_tilt_min_px", 4.0)):
+            continue
+        if float(np.sqrt(np.mean(resid ** 2))) > 0.5 * spread:
+            continue
+        tilt[f] = float(np.clip(slope, -max_slope, max_slope))
+    return tilt
+
+
 def _rfr_plan(dev: np.ndarray, edev: np.ndarray, p: dict) -> np.ndarray:
     """The per-frame RIGID depth shift to apply: interior frames levelled by their own deviation from the
     per-lateral corneal curve, edge frames by their deviation from the anchored local corneal curvature."""
@@ -4579,7 +4706,7 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                       the local quadratic; not a perfect reference at the extremes, but it cannot be gamed by
                       the thing being judged.
         """
-        dv, pr = _rfr_deviation(vol, p)
+        dv, pr, Sb = _rfr_deviation(vol, p)
         det = {} if want_detail else None
         ai = _rfr_interior_plan(dv, p)
         ed = _rfr_edge_deviation(pr, p, a_int=ai, detail=det)
@@ -4609,8 +4736,9 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                 far = float(np.sqrt(np.nanmean(res ** 2))) if np.isfinite(res).any() else float("nan")
             except Exception:  # noqa: BLE001
                 pass
-        return {"dev": dv, "prof": pr, "edev": ed, "a_int": ai, "rms": r,
-                "seam_step": float(step), "far_dev": far, "detail": det}
+        return {"dev": dv, "prof": pr, "edev": ed, "a_int": ai, "rms": r, "S": Sb,
+                "seam_step": float(step), "far_dev": far, "detail": det,
+                "edge_spread": _rfr_edge_spread(Sb, p)}
 
     try:
         m0 = _measure(volume, want_detail=True)
@@ -4649,10 +4777,21 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                         "seam_step": round(m0["seam_step"], 2), "far_dev": _r2(m0["far_dev"]),
                         "sides": m0["detail"]}
 
+    # The accepted edge blocks also get a lateral TILT where the defect varies across the B-scan's width.
+    # That ramp is a rigid ROTATION (the B-scan's internal distances are preserved), applied exactly as
+    # rigid_frame_derotate applies one; the INTERIOR keeps a pure depth shift, because adding free parameters
+    # to the interior was measured and is bias-dominated at that residual level.
+    try:
+        b_tilt = _rfr_edge_tilt(m0["S"], edev0, p)
+    except Exception:  # noqa: BLE001
+        b_tilt = np.zeros(F)
+    lat_off = np.arange(L, dtype=np.float64) - (L - 1) / 2.0
     out = volume.copy()
     for f in range(F):
-        if abs(a[f]) > 0.05:
-            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -a[f]), subpixel=True)
+        if abs(a[f]) <= 0.05 and abs(b_tilt[f]) <= 1e-6:
+            continue
+        d = a[f] + b_tilt[f] * lat_off
+        out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), -d, subpixel=True)
 
     # NON-REGRESSION, scored against references this pass did NOT use. cs041_os_v1 arrived with an already
     # excellent boundary (0.48 px rms) and an earlier centroid-driven pass "improved" its own driving metric
@@ -4677,11 +4816,18 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
         bad.append(f"seam step {step0:.2f}->{step1:.2f}")
     if np.isfinite(far0) and np.isfinite(far1) and far1 > far0 + float(p.get("rfr_edge_regress_px", 0.25)):
         bad.append(f"edge vs independent reference {far0:.2f}->{far1:.2f}")
+    # ACROSS-THE-WIDTH. Every other metric here is a central-band median, which is blind by construction to a
+    # defect that only shows on the far sagittal slices — the one the reviewer found after the depth-only
+    # version shipped. This is the measure that can see it.
+    sp0, sp1 = m0.get("edge_spread", float("nan")), m1.get("edge_spread", float("nan"))
+    if np.isfinite(sp0) and np.isfinite(sp1) and sp1 > sp0 + float(p.get("rfr_edge_regress_px", 0.25)):
+        bad.append(f"across-width edge spread {sp0:.2f}->{sp1:.2f}")
     if bad:
         return volume, {"applied": False, "reason": "would regress: " + "; ".join(bad),
                         "dev_rms_before": round(rms0, 3), "dev_rms_after": _r3(rms1),
                         "seam_step_before": round(step0, 2), "seam_step_after": round(step1, 2),
                         "far_dev_before": _r2(far0), "far_dev_after": _r2(far1),
+                        "edge_spread_before": _r2(sp0), "edge_spread_after": _r2(sp1),
                         "sides": m0["detail"]}
     edge_n = int(p.get("rfr_edge_n", 12))
     return out, {"applied": True, "frames_moved": int(np.sum(np.abs(a) > 0.05)),
@@ -4690,6 +4836,11 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                  "dev_rms_before": round(rms0, 3), "dev_rms_after": _r3(rms1),
                  "seam_step_before": round(step0, 2), "seam_step_after": round(step1, 2),
                  "far_dev_before": _r2(far0), "far_dev_after": _r2(far1),
+                 "edge_spread_before": _r2(sp0), "edge_spread_after": _r2(sp1),
+                 "max_tilt_deg": round(float(np.degrees(np.arctan(
+                     np.max(np.abs(b_tilt)) * float(p.get("oct_spacing_depth", 0.0031))
+                     / float(p.get("oct_spacing_lateral", 0.0078))))), 2),
+                 "frames_tilted": int(np.sum(np.abs(b_tilt) > 1e-6)),
                  "sides": m0["detail"],
                  "shift": [round(float(v), 3) for v in a]}
 

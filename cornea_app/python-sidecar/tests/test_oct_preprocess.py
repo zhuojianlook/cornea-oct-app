@@ -877,7 +877,7 @@ def test_rfr_never_pushes_tissue_out_of_the_canvas():
     out, info = M.rigid_frame_refine(vol, _RFR_P)
     if info.get("applied"):
         assert float((out > 100).sum()) > tissue_before * 0.98
-        _dv, pr = M._rfr_deviation(out, {**M.DEFAULT_PARAMS, **_RFR_P})
+        _dv, pr, _S = M._rfr_deviation(out, {**M.DEFAULT_PARAMS, **_RFR_P})
         assert np.nanmin(pr) >= 0.0
 
 
@@ -899,3 +899,48 @@ def test_rfr_can_be_disabled_and_then_is_bit_identical():
     vol = _rfr_volume_from(_rfr_profile(edge_ramp=3.0))
     out, info = M.rigid_frame_refine(vol, {**_RFR_P, "rigid_frame_refine": False})
     assert not info["applied"] and out is vol
+
+
+def test_rfr_corrects_an_edge_defect_that_varies_across_the_width():
+    """A rigid depth shift is uniform across the B-scan, so on its own it can only remove the AVERAGE of a
+    defect that varies from one sagittal end to the other. On cs039_os_v1's leading frame the deviation ramps
+    from +21.7 px at one lateral end to +42.9 px at the other; shifting by the central-band value left ~10 px
+    of over-lift at one end, which the reviewer saw as "the right edge slightly going upwards against the
+    general cornea curvature" on the last sagittal slices. The ramp is a ROTATION, not a deformation."""
+    F, D, L = 64, 300, 200
+    rng = np.random.default_rng(11)
+    prof = _rfr_profile(F=F, edge_ramp=3.0)
+    vol = np.zeros((F, D, L), dtype=np.float32)
+    x = np.linspace(-1.0, 1.0, L)
+    tilt = np.zeros(F)
+    tilt[-6:] = np.linspace(0.02, 0.10, 6)                   # the defect grows across the width at the edge
+    for f in range(F):
+        top = prof[f] + 14 * x ** 2 + tilt[f] * (np.arange(L) - (L - 1) / 2.0)
+        for l in range(L):
+            t = int(round(top[l]))
+            vol[f, t:t + 45, l] = 200.0
+    vol = np.ascontiguousarray(vol + rng.normal(0, 3, vol.shape).astype(np.float32))
+    q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8, "rfr_band_margin": 0.05}
+    _dv, _pr, S = M._rfr_deviation(vol, q)
+    spread_before = M._rfr_edge_spread(S, q)
+    assert spread_before > 8.0                               # the across-width defect is really there
+
+    out, info = M.rigid_frame_refine(vol, {**_RFR_P, "rfr_bands": 8})
+    assert info["applied"], info
+    assert info["frames_tilted"] >= 3
+    assert 0.05 < info["max_tilt_deg"] <= 1.5
+    assert info["edge_spread_after"] < info["edge_spread_before"]
+
+
+def test_rfr_does_not_invent_a_rotation_from_noise():
+    """The full 3-DOF rigid fit was rejected because at this residual level extra parameters are
+    bias-dominated (every fitted lateral shift came out positive, median +0.50 px). So a tilt is fitted only
+    when a straight line across the width genuinely explains a spread worth removing."""
+    F, L = 64, 200
+    rng = np.random.default_rng(5)
+    S = np.repeat(_rfr_profile(F=F, edge_ramp=3.0)[:, None], L, axis=1) + rng.normal(0, 1.5, (F, L))
+    q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8}
+    edev = np.full(F, np.nan)
+    edev[-6:] = 5.0                                          # pretend the side was accepted
+    tilt = M._rfr_edge_tilt(S, edev, q)
+    assert np.all(np.abs(tilt) * (L - 1) < 4.0)              # no meaningful rotation out of pure noise
