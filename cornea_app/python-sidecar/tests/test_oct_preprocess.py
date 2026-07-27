@@ -684,3 +684,134 @@ def test_height_refine_reports_jitter_even_when_reverted():
     assert "max_jitter" in info                              # present regardless of applied/reverted
     if not info.get("applied"):
         assert np.array_equal(out, vol)                      # revert returns the untouched volume
+
+
+# ── rigid_frame_refine: the final boundary-driven rigid per-frame pass ───────────────────────────────
+# Its whole justification is that it reaches the LOW-FREQUENCY acquisition-EDGE offset that the passes
+# before it structurally cannot (rigid_height_refine keeps only the high-freq part of its correction and
+# caps it at rhr_max=8 px), while never degrading a scan that is already good. Both halves are tested.
+_RFR_P = {"rfr_lead": 8, "rfr_tail": 4, "rfr_edge_n": 6, "rfr_edge_fit": 20}
+
+
+def _rfr_volume(F=64, D=200, L=64, bump_frame=None, bump_px=0.0, edge_px=0.0, edge_n=6, seed=1):
+    """Dome in (frames, depth, lateral) with an optional interior step and an optional EDGE offset."""
+    rng = np.random.default_rng(seed)
+    vol = np.zeros((F, D, L), dtype=np.float32)
+    x = np.linspace(-1.0, 1.0, L)
+    for f in range(F):
+        fx = (f - (F - 1) / 2) / ((F - 1) / 2)
+        top = 60 + 18 * fx ** 2 + 14 * x ** 2
+        if bump_frame is not None and f == bump_frame:
+            top = top + bump_px
+        if f >= F - edge_n:
+            top = top + edge_px
+        for l in range(L):
+            t = int(round(top[l]))
+            vol[f, t:t + 45, l] = 200.0
+    return np.ascontiguousarray(vol + rng.normal(0, 3, vol.shape).astype(np.float32))
+
+
+def test_rfr_recovers_an_edge_offset_and_an_interior_bump():
+    """The two defects found over and over in review: an edge that has left the corneal curve
+    ('overtly steep', up to 40 px on CS041_OS_v1) and a smaller interior step (CS002_OS_3 at
+    sagittal slice 182). Both must be measured with the right SIGN and removed."""
+    vol = _rfr_volume(bump_frame=30, bump_px=6.0, edge_px=22.0)
+    out, info = M.rigid_frame_refine(vol, _RFR_P)
+    assert info["applied"]
+    shift = info["shift"]
+    assert abs(shift[30] - 6.0) < 1.0                        # interior step recovered
+    assert abs(shift[-1] - 22.0) < 1.5                       # edge offset recovered
+    assert info["edge_dev_after"] < info["edge_dev_before"] / 4
+    assert not np.array_equal(out, vol)
+
+
+def test_rfr_is_a_strict_noop_on_a_clean_volume():
+    """The approved corpus must come through byte-unchanged — a pass that churns already-good scans
+    cannot be shipped under a no-regressions requirement."""
+    vol = _rfr_volume()
+    out, info = M.rigid_frame_refine(vol, _RFR_P)
+    assert not info["applied"] and info["reason"] == "already smooth"
+    assert out is vol or np.array_equal(out, vol)
+
+
+def test_rfr_refuses_when_the_measure_is_unreliable():
+    """A partial-shadow band dims the tissue without collapsing it, so the dropout test misses it and
+    the boundary estimate reads tens of px off (cs021_od_v3: 117 px over 42 frames). Refusing beats
+    writing garbage."""
+    vol = _rfr_volume()
+    rng = np.random.default_rng(2)
+    for f in range(20, 44):                                   # a wandering false surface, far off the dome
+        vol[f] = np.roll(vol[f], int(30 + 25 * np.sin(f)), axis=0) * rng.uniform(0.9, 1.0)
+    out, info = M.rigid_frame_refine(vol, {**_RFR_P, "rfr_wild_rms": 8.0})
+    if not info["applied"]:
+        assert np.array_equal(out, vol)                       # untouched, not partially corrected
+
+
+def test_rfr_interior_and_edge_regions_are_disjoint():
+    """They are judged against DIFFERENT references, so an overlap makes them fight: with the review
+    harness's tuning the last 7 frames were both inside the interior curve fit and given an edge shift,
+    and moving them degraded the interior deviation on approved scans (cs001_od_v1 0.154 -> 0.253 px)."""
+    p = {"rfr_lead": 14, "rfr_tail": 5, "rfr_edge_n": 12}
+    lead, tail = M._rfr_split(p)
+    assert lead >= p["rfr_edge_n"] and tail >= p["rfr_edge_n"]
+    F = 101
+    interior = set(range(lead, F - tail))
+    edges = set(range(p["rfr_edge_n"])) | set(range(F - p["rfr_edge_n"], F))
+    assert not (interior & edges)
+
+
+def test_rfr_edge_reference_is_local_curvature_not_extrapolation():
+    """A polynomial EXTRAPOLATES at its endpoints and can swing the wrong way: on cs041_os_v1 the
+    global fit rose toward the trailing edge while the cornea correctly descended, and correcting to
+    it bent the cornea upward by ~58 px. On a dome whose edges genuinely descend and are ON the curve,
+    the edge reference must therefore report ~no deviation."""
+    F = 64
+    prof = np.array([60 + 18 * ((f - (F - 1) / 2) / ((F - 1) / 2)) ** 2 for f in range(F)])
+    edev = M._rfr_edge_deviation(prof, _RFR_P)
+    assert np.nanmax(np.abs(edev)) < 1.0                     # a genuine descent is not "an edge defect"
+    prof2 = prof.copy(); prof2[-6:] += 20.0
+    edev2 = M._rfr_edge_deviation(prof2, _RFR_P)
+    assert abs(np.nanmax(np.abs(edev2)) - 20.0) < 1.5        # a real offset is measured at full size
+
+
+def test_rfr_saturation_rejection_cannot_blank_the_measurement():
+    """Rejecting saturated A-scans is right (specular columns and eyelashes broke the earlier
+    estimator) but it must stay RARE: on a near-uniform-peak volume the rule flags everything, and
+    honouring it would leave nothing to measure at all."""
+    vol = _rfr_volume(bump_frame=30, bump_px=6.0)             # synthetic: every A-scan peaks at ~200
+    S = M._anterior_boundary(vol, {})
+    assert np.isfinite(S).mean() > 0.9                        # the rule was correctly ignored
+
+
+def test_rfr_never_moves_a_dropout_frame():
+    """A blink / full-width shadow gives the estimator nothing to lock onto; it dives, which reads as a
+    huge false displacement."""
+    vol = _rfr_volume(edge_px=22.0)
+    vol[10] *= 0.05                                           # signal collapsed
+    drop = M._dropout_frames(vol, {})
+    assert bool(drop[10])
+    out, info = M.rigid_frame_refine(vol, _RFR_P)
+    if info.get("applied"):
+        assert abs(info["shift"][10]) <= 0.05                 # measured as unmeasurable -> not moved
+
+
+def test_rfr_can_be_disabled_and_then_is_bit_identical():
+    vol = _rfr_volume(bump_frame=30, bump_px=6.0, edge_px=22.0)
+    out, info = M.rigid_frame_refine(vol, {**_RFR_P, "rigid_frame_refine": False})
+    assert not info["applied"] and out is vol
+
+
+def test_rfr_declines_an_implausible_edge_instead_of_clamping_to_it():
+    """An edge frame tens of px off the local curvature is the estimator on an EYELASH, not motion —
+    cs011_os_v3 measures 122 px there and the user's verdict on that scan was 'obviously some kind of
+    artefact on the right edge, likely eyelash, but the correction for the cornea part seems correct'.
+    Clamping would still move it by the full 45 px clamp, chasing the artefact."""
+    F = 64
+    prof = np.array([60 + 18 * ((f - (F - 1) / 2) / ((F - 1) / 2)) ** 2 for f in range(F)])
+    prof[-6:] -= 122.0                                        # eyelash: boundary reads far too shallow
+    edev = M._rfr_edge_deviation(prof, _RFR_P)
+    assert not np.isfinite(edev[-6:]).any()                   # that side declined outright, not clamped
+    prof2 = prof.copy(); prof2[:6] += 15.0                    # a plausible offset on the OTHER side
+    edev2 = M._rfr_edge_deviation(prof2, _RFR_P)
+    assert abs(np.nanmax(np.abs(edev2[:6])) - 15.0) < 1.5     # still corrected — the decline is per side
+    assert not np.isfinite(edev2[-6:]).any()

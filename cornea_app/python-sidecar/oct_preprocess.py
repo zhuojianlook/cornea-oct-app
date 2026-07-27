@@ -122,6 +122,32 @@ DEFAULT_PARAMS: dict = {
                                   #   (worked on centred scans by luck) — it can't represent a tilt that varies frame-to-frame.
     "rfd_iters": 3,               # v0.0.198 CLOSED-LOOP: rotate → re-detect → re-measure the tilt, repeat, so each frame's
                                   #   tilt actually REACHES the reference (the open-loop single-shot formula under-delivered).
+    "rigid_frame_refine": True,   # DEFAULT ON (v0.0.217): FINAL residual per-frame rigid depth correction, driven by the
+                                  #   ANTERIOR BOUNDARY (DP-independent) rather than by the DP surface + smooth dome that
+                                  #   drive AMC/rhr/rfd. Reaches what those structurally cannot: rigid_height_refine keeps
+                                  #   only the HIGH-FREQ part of its correction (σ=rhr_smooth, cap rhr_max=8px), so a LOW-freq
+                                  #   20-40px offset at the ACQUISITION-EDGE frames survives it — the "edge doesn't follow the
+                                  #   corneal curvature, overtly steep" defect found on scan after scan in review. Edge frames
+                                  #   are referenced to the cornea's OWN LOCAL CURVATURE (a polynomial extrapolates the wrong
+                                  #   way there). Self-gated on the re-measured boundary: never worse, byte no-op if smooth.
+    "rfr_lead": 14,               # leading frames excluded from the per-lateral reference fit (they must not shape the curve
+    "rfr_tail": 5,                #   they are judged against); trailing likewise. Asymmetric: the scan start is the noisier end
+    "rfr_edge_n": 12,             # how many frames per end get the LOCAL-CURVATURE reference instead of the interior curve
+    "rfr_edge_fit": 28,           # frames just inside the edge whose quadratic continues the cornea's actual curvature
+    "rfr_lat_lo": 0.20,           # central lateral band used for every per-frame median — the dim, speckled periphery is
+    "rfr_lat_hi": 0.80,           #   unreliable (its per-slice roughness runs ~4x the centre) and drags the number off
+    "rfr_min_dev": 1.0,           # px: interior frames deviating less than this are left alone (sub-pixel churn is noise)
+    "rfr_edge_min_dev": 0.8,      # px: same threshold at the edges, slightly tighter (the defect there is large and obvious)
+    "rfr_max_shift": 45.0,        # px cap on the per-frame rigid depth shift
+    "rfr_edge_wild_px": 45.0,     # an EDGE frame further than this off the local corneal curvature is an eyelash /
+                                  #   specular streak, not motion — that SIDE's edge correction is declined, not clamped
+    "rfr_sat_frac": 0.98,         # A-scans peaking above this x the 99.5th pct are SATURATED (specular/eyelash) → not measured
+    "rfr_sat_max_frac": 0.05,     # ...but only if the rule stays RARE; above this share it is misfiring, so it is ignored
+    "rfr_dropout_frac": 0.55,     # frames below this x the median signal have collapsed (blink/shadow) → never measured or moved
+    "rfr_wild_px": 25.0,          # sanity: an interior frame deviating more than this is the MEASURE failing, not eye motion
+    "rfr_wild_max": 3,            #   this many such frames (or rfr_wild_rms overall) refuses the pass instead of writing garbage
+    "rfr_wild_rms": 8.0,
+    "rfr_regress_tol": 1.15,      # non-regression: discard the result unless the re-measured boundary deviation held or improved
     "crop_incomplete_cornea": False,  # DEFAULT OFF (v0.0.197): RETIRED. SAM2 fuses axial+coronal+sagittal by 2-of-3 majority
                                   #   vote, so a truncated cornea in the SAGITTAL view alone is outvoted by the two intact
                                   #   views → no crop needed. (The v0.0.196 crop was also inconsistent at the very edges.)
@@ -4133,6 +4159,268 @@ def _surface_rms(B: np.ndarray) -> float:
     return float(np.sqrt(np.mean((B.ravel() - A @ coef) ** 2)))
 
 
+def _anterior_boundary(volume: np.ndarray, p: dict) -> np.ndarray:
+    """The ANTERIOR CORNEAL BOUNDARY per (frame, lateral) — the quantity a reviewer actually judges.
+
+    Deliberately INDEPENDENT of the DP detector used everywhere else in this module, because the DP detector
+    is precisely what fails where the residual defects live: it flattens off the descending cornea at the
+    acquisition-edge frames (so a residual computed from it there has the OPPOSITE SIGN to the real error)
+    and it is pulled by specular columns. Two earlier alternatives were tried and rejected:
+
+    * a plain threshold-crossing estimator locks onto eyelashes and saturation streaks;
+    * the corneal band's intensity CENTROID is immune to all of that, but it tracks the centre of MASS, which
+      can sit still while the boundary moves. Correcting cs041_os_v1 to flatten its centroid drove the
+      anterior boundary from 0.48 px rms to 1.67 px — it manufactured the very bumps the review kept finding.
+
+    So: first crossing of the halfway level between each A-scan's own background and its own peak, with
+    SATURATED columns rejected outright (NaN) rather than measured. `volume` is (frames, depth, lateral);
+    returns (frames, lateral) with NaN where there is no usable boundary."""
+    sm = ndimage.uniform_filter1d(volume.astype(np.float32, copy=False), size=7, axis=1)
+    bg = np.percentile(sm, 20, axis=1)
+    pk = sm.max(axis=1)
+    above = sm >= (bg + 0.5 * (pk - bg))[:, None, :]
+    idx = np.argmax(above, axis=1).astype(np.float64)
+    idx[~above.any(axis=1)] = np.nan
+    sat = pk > np.percentile(pk, 99.5) * float(p.get("rfr_sat_frac", 0.98))
+    # Saturation artefacts are RARE by definition. If this rule flags a large share of the A-scans it is not
+    # finding specular columns — the peak intensity is simply near-uniform (a clipped or synthetic volume) —
+    # and honouring it would blank the whole measurement. Ignore it in that case rather than measure nothing.
+    if sat.mean() <= float(p.get("rfr_sat_max_frac", 0.05)):
+        idx[sat] = np.nan
+    return idx
+
+
+def _dropout_frames(volume: np.ndarray, p: dict) -> np.ndarray:
+    """Frames whose tissue signal has COLLAPSED — a blink, a full-width shadow, a dropout band.
+
+    The boundary estimate has nothing to lock onto in such a frame and dives to the bottom of the window,
+    which reads as a huge apparent displacement: on cs021_od_v3 a dropout band produced a 117 px "deviation"
+    over 42 frames and would have moved every one of them to the clamp, chasing an artefact. A frame below
+    `rfr_dropout_frac` of the scan-median signal is excluded from BOTH the reference fit and the correction —
+    with no tissue there is nothing to align."""
+    sig = np.nanmedian(volume.max(axis=1), axis=1).astype(np.float64)     # (frames,)
+    med = float(np.nanmedian(sig))
+    return (sig < float(p.get("rfr_dropout_frac", 0.55)) * med) if med > 0 else np.zeros(sig.shape, bool)
+
+
+def _lateral_frame_curve(S: np.ndarray, lead: int, tail: int, deg: int = 4) -> np.ndarray:
+    """Per-LATERAL robust degree-`deg` fit of the boundary ACROSS frames, fitted on the INTERIOR frames only
+    and evaluated everywhere. Excluding the acquisition edges from the fit is the point: they must not
+    influence the curve they are then judged against. S is (frames, lateral); returns the same shape."""
+    F, L = S.shape
+    x = np.arange(F, dtype=np.float64)
+    interior = np.zeros(F, bool)
+    interior[lead:F - tail] = True
+    out = np.full((F, L), np.nan)
+    need = 4 * (deg + 1)
+    for i in range(L):
+        y = S[:, i]
+        ok = np.isfinite(y) & interior
+        if int(ok.sum()) < need:
+            continue
+        c = np.polyfit(x[ok], y[ok], deg)
+        for _ in range(2):
+            r = y - np.polyval(c, x)
+            s = np.nanstd(r[ok])
+            if not np.isfinite(s) or s <= 0:
+                break
+            ok2 = ok & (np.abs(r) < 2.0 * s)
+            if int(ok2.sum()) < need:
+                break
+            c = np.polyfit(x[ok2], y[ok2], deg)
+            ok = ok2
+        out[:, i] = np.polyval(c, x)
+    return out
+
+
+def _rfr_split(p: dict):
+    """(lead, tail) frames excluded from the interior — i.e. the boundary between the two corrections.
+
+    The two regions MUST be disjoint. They are measured against different references and correct different
+    things, so an overlap makes them fight: with the tuning inherited from the review harness (lead 14,
+    tail 5, edge 12) the last 7 frames were BOTH inside the interior curve fit AND given an edge shift, so
+    moving them changed the very curve the interior was judged against. Measured on the approved corpus, that
+    showed up as the interior deviation degrading (e.g. cs001_od_v1 0.154 -> 0.253 px) on scans where the
+    edge correction was otherwise a clear win. Widening the exclusion to at least `rfr_edge_n` removes it."""
+    edge_n = int(p.get("rfr_edge_n", 12))
+    return max(int(p.get("rfr_lead", 14)), edge_n), max(int(p.get("rfr_tail", 5)), edge_n)
+
+
+def _rfr_deviation(volume: np.ndarray, p: dict):
+    """Per-frame boundary deviation `dev` (interior) and `prof` (the per-frame boundary depth used at the
+    edges). Both are medians over the CENTRAL laterals: the periphery is dim and speckled, its estimate is
+    unreliable, and including it drags the per-frame number off (peripheral per-slice roughness runs ~4x the
+    centre). Dropout frames are NaN in both."""
+    F, L = int(volume.shape[0]), int(volume.shape[2])
+    lead, tail = _rfr_split(p)
+    band = slice(int(float(p.get("rfr_lat_lo", 0.20)) * L), int(float(p.get("rfr_lat_hi", 0.80)) * L))
+    S = _anterior_boundary(volume, p)
+    C = _lateral_frame_curve(S, lead, tail)
+    with np.errstate(all="ignore"):
+        dev = np.nanmedian((S - C)[:, band], axis=1)
+        prof = np.nanmedian(S[:, band], axis=1)
+    drop = _dropout_frames(volume, p)
+    dev[drop] = np.nan
+    prof[drop] = np.nan
+    return dev, prof
+
+
+def _rfr_edge_deviation(prof: np.ndarray, p: dict) -> np.ndarray:
+    """Per-frame deviation of the EDGE frames from the cornea's OWN LOCAL CURVATURE. NaN everywhere else.
+
+    Why the edges need a reference of their own: the per-lateral degree-4 curve EXTRAPOLATES at the first/last
+    frames, and a polynomial endpoint can swing the wrong way. On cs041_os_v1 it rose toward the trailing edge
+    while the tissue correctly descended, so correcting to it bent the cornea UPWARD by ~58 px — spotted
+    instantly on inspection. A quadratic fitted to the `rfr_edge_fit` frames JUST INSIDE the edge continues the
+    curvature the cornea is already following, which asks an edge frame the right question. On that same scan
+    this recovered a +40 px trailing-edge offset AND a -10 px leading-edge one that the interior reference read
+    as under 2.4 px."""
+    F = int(prof.size)
+    edge_n, nfit = int(p.get("rfr_edge_n", 12)), int(p.get("rfr_edge_fit", 28))
+    out = np.full(F, np.nan)
+    if edge_n <= 0:
+        return out
+    x = np.arange(F, dtype=np.float64)
+    wild = float(p.get("rfr_edge_wild_px", 45.0))
+    for fit_rng, edge_rng in ((range(edge_n, edge_n + nfit), range(edge_n)),
+                              (range(F - edge_n - nfit, F - edge_n), range(F - edge_n, F))):
+        fr = np.array([f for f in fit_rng if 0 <= f < F], dtype=int)
+        ok = np.isfinite(prof[fr]) if fr.size else np.zeros(0, bool)
+        if int(ok.sum()) < 12:
+            continue
+        pred = np.polyval(np.polyfit(fr[ok], prof[fr][ok], 2), x)
+        side = np.array([(float(prof[f] - pred[f]) if np.isfinite(prof[f]) else np.nan) for f in edge_rng])
+        # PLAUSIBILITY, per side. A corneal edge frame that is off by more than `rfr_edge_wild_px` from the
+        # curvature the cornea is following is not eye motion — it is the boundary estimator sitting on an
+        # EYELASH or a specular streak, which reads shallow by a large margin. cs011_os_v3 measures 122 px
+        # there, and the user's own verdict on that scan was "obviously some kind of artefact on the right
+        # edge, likely eyelash, but the correction for the cornea part seems correct". Clamping such a frame
+        # would still move it by the full clamp, chasing the artefact, so it is declined instead. Declined per
+        # SIDE rather than per frame: dropping single frames out of the middle of an edge would leave a step
+        # between a moved and an unmoved neighbour, which is a worse defect than the one being fixed.
+        if np.isfinite(side).any() and float(np.nanmax(np.abs(side))) > wild:
+            continue
+        for f, d in zip(edge_rng, side):
+            if np.isfinite(d):
+                out[f] = float(d)
+    return out
+
+
+def _rfr_plan(dev: np.ndarray, edev: np.ndarray, p: dict) -> np.ndarray:
+    """The per-frame RIGID depth shift to apply: interior frames levelled by their own deviation from the
+    per-lateral corneal curve, edge frames by their deviation from the local corneal curvature."""
+    F = int(dev.size)
+    lead, tail = _rfr_split(p)
+    min_dev, clamp = float(p.get("rfr_min_dev", 1.0)), float(p.get("rfr_max_shift", 45.0))
+    a = np.zeros(F, dtype=np.float64)
+    for f in range(lead, F - tail):
+        if np.isfinite(dev[f]) and abs(dev[f]) > min_dev:
+            a[f] = float(np.clip(dev[f], -clamp, clamp))
+    emin = float(p.get("rfr_edge_min_dev", 0.8))
+    for f in range(F):
+        if np.isfinite(edev[f]) and abs(edev[f]) > emin:
+            a[f] = float(np.clip(edev[f], -clamp, clamp))
+    return a
+
+
+def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """FINAL residual rigid per-frame correction driven by the ANTERIOR BOUNDARY (v0.0.217).
+
+    `axial_motion_correct` -> `rigid_frame_warp` -> `rigid_height_refine` -> `rigid_frame_derotate` already
+    align the frames, but all four are driven by the DP-detected surface and by a smooth 3-D dome, and
+    `rigid_height_refine` additionally keeps only the HIGH-FREQUENCY part of its correction (gaussian
+    sigma=`rhr_smooth`, capped at `rhr_max`=8 px) so that the real dome trajectory survives. That is the right
+    call in the interior, and it is exactly why a LOW-frequency, LARGE offset at the acquisition-EDGE frames
+    survives every one of them. Ten scans reviewed one-by-one with the user found that same defect over and
+    over — "the left-most edge of the sagittal sections doesn't follow the overall corneal curvature, overtly
+    steep" (CS018_OD_3), the same on CS023_OS_v2, both edges on CS041_OS_v1 at up to 40 px — plus smaller
+    interior bumps (CS002_OS_3 at sagittal slice 182).
+
+    Each frame is moved RIGIDLY in depth by one displacement for the whole B-scan, so every A-scan shifts
+    together and nothing inside a B-scan is deformed. A B-scan is captured instantaneously; its internal
+    geometry is truth.
+
+    WHY DEPTH-TRANSLATION ONLY. The full in-plane rigid group is {lateral translation, depth translation,
+    rotation}; the pivot adds no freedom (a rotation about any point equals one about the centre plus a
+    translation) and the order is irrelevant. That complete 3-DOF fit was implemented and measured: it
+    explains 11% of the residual against 8% for depth-only, but APPLYING it made things WORSE — at this
+    residual level the extra parameters are bias-dominated (100% of fitted lateral shifts came out positive,
+    median +0.50 px, an estimator artefact rather than motion) and the boundary rms rose from 0.49 to 0.84 px.
+    The rotation term is already covered, self-gated, by `rigid_frame_derotate`.
+
+    WHAT IT CANNOT DO, by design: the residual left after this varies from one sagittal slice to the next
+    (across the width a tilt explains 0-17% of it, a quartic only 13%), so no rigid per-frame transform can
+    reach it. Removing it would mean deforming the B-scan, which is forbidden.
+
+    Guarded four ways, each from an observed failure: dropout frames are never moved; an implausible
+    measurement refuses the whole pass rather than writing garbage; the shift is clamped; and the boundary
+    deviation is RE-MEASURED after the move, with the result discarded unless it actually improved. A scan
+    that arrives smooth is returned byte-unchanged. `volume` is (frames, depth, lateral)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("rigid_frame_refine", True)):
+        return volume, {"applied": False}
+    F, L = int(volume.shape[0]), int(volume.shape[2])
+    lead, tail = _rfr_split(p)
+    if F < lead + tail + 24 or L < 32:
+        return volume, {"applied": False, "reason": "too few frames"}
+    k = slice(lead, F - tail)
+
+    def _score(vol):
+        """(interior deviation rms, worst edge deviation) — the two quantities this pass is allowed to move.
+        Both are re-measured after the correction; BOTH have to hold, because they are independent: the
+        interior rms is blind to the edge frames (they are excluded from it by construction), so gating on it
+        alone would let a bad edge move through unchecked."""
+        dv, pr = _rfr_deviation(vol, p)
+        ed = _rfr_edge_deviation(pr, p)
+        with np.errstate(all="ignore"):
+            r = float(np.sqrt(np.nanmean(dv[k] ** 2))) if np.isfinite(dv[k]).any() else float("nan")
+            e = float(np.nanmax(np.abs(ed))) if np.isfinite(ed).any() else 0.0
+        return dv, ed, r, e
+
+    try:
+        dev0, edev0, rms0, emax0 = _score(volume)
+    except Exception:  # noqa: BLE001 — a refinement must never break a preprocess run
+        return volume, {"applied": False, "reason": "measure failed"}
+
+    n_big = int(np.sum(np.abs(np.nan_to_num(dev0[k])) > float(p.get("rfr_wild_px", 25.0))))
+    # SANITY. Tens of px across many frames is not eye motion, it is the measure failing — typically on a
+    # partial-shadow band that dims the tissue without collapsing it, so the dropout test misses it. Refuse.
+    if n_big >= int(p.get("rfr_wild_max", 3)) or not np.isfinite(rms0) or rms0 > float(p.get("rfr_wild_rms", 8.0)):
+        return volume, {"applied": False, "reason": "measure unreliable",
+                        "frames_over_25px": n_big, "dev_rms": None if not np.isfinite(rms0) else round(rms0, 3)}
+
+    a = _rfr_plan(dev0, edev0, p)
+    if not np.any(np.abs(a) > 0.05):
+        return volume, {"applied": False, "reason": "already smooth",
+                        "dev_rms": round(rms0, 3), "edge_dev": round(emax0, 2)}
+
+    out = volume.copy()
+    for f in range(F):
+        if abs(a[f]) > 0.05:
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -a[f]), subpixel=True)
+
+    # NON-REGRESSION on the boundary itself. cs041_os_v1 arrived with an already-excellent boundary
+    # (0.48 px rms) and the earlier centroid-driven pass "improved" its own driving metric while making the
+    # boundary 3.5x worse. Never ship a pass that degrades what is being judged.
+    try:
+        _, _, rms1, emax1 = _score(out)
+    except Exception:  # noqa: BLE001
+        rms1 = emax1 = float("inf")
+    tol = float(p.get("rfr_regress_tol", 1.15))
+    if not np.isfinite(rms1) or rms1 > max(0.25, rms0) * tol or emax1 > max(1.0, emax0) * tol:
+        return volume, {"applied": False, "reason": "would regress the boundary",
+                        "dev_rms_before": round(rms0, 3), "edge_dev_before": round(emax0, 2),
+                        "dev_rms_after": None if not np.isfinite(rms1) else round(rms1, 3),
+                        "edge_dev_after": None if not np.isfinite(emax1) else round(emax1, 2)}
+    edge_n = int(p.get("rfr_edge_n", 12))
+    return out, {"applied": True, "frames_moved": int(np.sum(np.abs(a) > 0.05)),
+                 "max_shift": round(float(np.max(np.abs(a))), 2),
+                 "edge_shift_max": round(float(np.max(np.abs(np.r_[a[:edge_n], a[-edge_n:]]))), 2),
+                 "dev_rms_before": round(rms0, 3), "dev_rms_after": round(rms1, 3),
+                 "edge_dev_before": round(emax0, 2), "edge_dev_after": round(emax1, 2),
+                 "shift": [round(float(v), 3) for v in a]}
+
+
 def axial_refine_volume(v_sag: np.ndarray, params: dict | None = None, workers: int | None = None):
     """#2 ping-pong refine: after the sagittal correction, run an axial pass and KEEP it PER FRAME only
     where it reduces that frame's lateral boundary roughness (the user's 'axial correction for hairy
@@ -5763,6 +6051,13 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if _rigid and p_all.get("rigid_frame_derotate", True):
         corrected, rfd = rigid_frame_derotate(corrected, params, workers=workers)
         info["rigid_frame_derotate"] = rfd
+    # FINAL residual pass, driven by the ANTERIOR BOUNDARY instead of the DP surface + dome that drive all three
+    # passes above. It is the only one that can reach the LOW-frequency acquisition-EDGE offset (rigid_height_refine
+    # deliberately keeps only the high-freq part, capped at 8 px), which review found on scan after scan. Runs last
+    # of the rigid passes, self-gated on the re-measured boundary, still before the user-GT anchors so those win.
+    if _rigid and p_all.get("rigid_frame_refine", True):
+        corrected, rfr = rigid_frame_refine(corrected, params, workers=workers)
+        info["rigid_frame_refine"] = rfr
     # AXIAL fix-tool GT: apply the annotator's axial-plane surface corrections (drawn on an axial B-scan across
     # laterals) as a post-hoc additive per-frame warp onto the corrected result — reaches the apex/limbus defects
     # the sagittal fix-columns tool can't. Sticky + idempotent (re-diffs the drawn target vs the re-detected surface).
@@ -6125,6 +6420,21 @@ def preprocess_steps(oct_path, params=None, volume_index=0, companion_txt=None,
                     branch="the rotation axis is the surface point (not the array centre) → pure tilt-levelling, no spurious lateral shear; the angle itself is pivot-independent")
         else:
             add("⑤ Rigid derotate — no-op", _blank, kind="decision", branch="SKIPPED — self-gate: no roughness improvement")
+    if _rigid and p.get("rigid_frame_refine", True):
+        try:
+            v, rfr = rigid_frame_refine(v, p, workers=workers)
+        except Exception:  # noqa: BLE001
+            rfr = {"applied": False, "reason": "error"}
+        if rfr.get("applied"):
+            add("⑥ Boundary refine — residual rigid depth shift, measured on the ANTERIOR BOUNDARY", surf_overlay(v),
+                kind="decision",
+                branch=(f"APPLIED — {rfr.get('frames_moved', '?')} frames · max {rfr.get('max_shift', '?')}px "
+                        f"(edge {rfr.get('edge_shift_max', '?')}px) · boundary deviation "
+                        f"{rfr.get('dev_rms_before', '?')}→{rfr.get('dev_rms_after', '?')}px; the EDGE frames are "
+                        "referenced to the cornea's own local curvature, not to a polynomial that extrapolates there"))
+        else:
+            add("⑥ Boundary refine — no-op", _blank, kind="decision",
+                branch=f"SKIPPED — {rfr.get('reason', 'self-gate: boundary already smooth')}")
     add("Final corrected surface (red)", surf_overlay(v), kind="decision", lane="full",
         branch="every frame's rigid pose (depth + tilt) corrected; the instantaneous B-scan geometry preserved throughout")
     return n, idx, steps

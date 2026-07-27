@@ -520,6 +520,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // sagittal preview, so the button is discoverable on ANY view (Slices OR Segmentation); clicking
   // it switches to the corrected sagittal view where the column band is shown.
   const nFrames = rawImages.find((i) => i.orientation === "sagittal")?.source_height ?? 0;
+  // Mirror the SAGITTAL frame axis so this view agrees with every other view of the same volume (the
+  // fix-columns editor, the before/after strip and the axial gallery all run reversed vs the array).
+  // Applied to the panel CONTAINER; the three screen-x → source-fraction mappings invert to match.
+  const mirrorSag = orient === "sagittal";
   // Depth voxel count = the sagittal preview's SOURCE width (rgb is frames×depth pre-rotation), used to
   // convert a vertical screen drag → a depth-voxel shift for #2 drag-to-correct.
   const depthVox = rawImages.find((i) => i.orientation === "sagittal")?.source_width ?? 0;
@@ -804,7 +808,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     // Edge basis: the frame under the cursor is floor(fraction × nFrames), matching the band span
     // [f/nFrames,(f+1)/nFrames] drawn above — so click and highlight land on the same texel. (#1)
     if (orient === "sagittal") {
-      const ffx = (clientX - rect.left) / rect.width;
+      // getBoundingClientRect is transform-aware, so this fraction is in DISPLAY space; the panel is
+      // scaleX(-1)-mirrored (see correctedPanel), so invert it to get the source frame fraction.
+      const ffx0 = (clientX - rect.left) / rect.width;
+      const ffx = mirrorSag ? 1 - ffx0 : ffx0;
       return ffx < 0 || ffx > 1 ? null : Math.min(nFrames - 1, Math.max(0, Math.floor(ffx * nFrames)));
     }
     if (orient === "coronal") {
@@ -1086,7 +1093,8 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     if (!hintMode || !cur) return;
     const img = e.currentTarget;
     const rect = img.getBoundingClientRect();
-    const fx = (e.clientX - rect.left) / rect.width;
+    const fx = mirrorSag ? 1 - (e.clientX - rect.left) / rect.width      // undo the scaleX(-1) panel mirror
+                         : (e.clientX - rect.left) / rect.width;
     const fy = (e.clientY - rect.top) / rect.height;
     if (fx < 0 || fy < 0 || fx > 1 || fy > 1) return;
     const px = fx * (cur.image_width ?? img.naturalWidth);
@@ -1125,7 +1133,11 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     const img = imgRef.current, cv = canvasRef.current;
     if (!img || !cur) return;
     const rect = img.getBoundingClientRect();
-    const fx = (e.clientX - rect.left) / rect.width;
+    // SOURCE fraction (mirror undone). One inversion serves both uses: brushVoxels needs source coords, and
+    // the cursor circle is drawn into a canvas that is itself inside the mirrored container — so drawing at
+    // the source fraction lands it back under the pointer.
+    const fx = mirrorSag ? 1 - (e.clientX - rect.left) / rect.width
+                         : (e.clientX - rect.left) / rect.width;
     const fy = (e.clientY - rect.top) / rect.height;
     if (fx < 0 || fy < 0 || fx > 1 || fy > 1) return;
     for (const v of brushVoxels(cur, fx, fy, scarBrush)) voxelsRef.current.set(v.join(","), v);
@@ -1186,7 +1198,15 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // (showRaw) without duplicating the panel. The relative-positioned <div> must stay the single
   // positioning context for the absolute overlays, so it's kept intact as one unit.
   const correctedPanel = cur ? (
-    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%" }}>
+    // MIRRORED on SAGITTAL so every view of this volume numbers the frame axis the same way. The fix-columns
+    // editor (scaleX(-1), see its panel below), the before/after strip (BeforeAfterViewer) and the axial
+    // gallery's frame labels all run REVERSED vs the array; this plain slice view was the only surface still
+    // running in array order, so the same frame was "column 40" here and "frame 61" there. The flip lives on
+    // the CONTAINER, which is the single positioning context for the canvas, the column bands and the hint
+    // markers — so every overlay mirrors WITH the image and none of them needs its own handling. Only the
+    // three screen-x → source-fraction mappings (frameAt, onImgClick, paintAt) invert, each marked below.
+    <div style={{ position: "relative", display: "inline-block", maxHeight: "100%", maxWidth: "100%",
+                  transform: mirrorSag ? "scaleX(-1)" : undefined }}>
       <img
         ref={imgRef}
         src={imgSrc(cur)}
