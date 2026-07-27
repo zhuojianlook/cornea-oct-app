@@ -923,7 +923,9 @@ def test_rfr_corrects_an_edge_defect_that_varies_across_the_width():
     q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8, "rfr_band_margin": 0.05}
     _dv, _pr, S, _C = M._rfr_deviation(vol, q)
     spread_before = M._rfr_edge_spread(S, q)
-    assert spread_before > 8.0                               # the across-width defect is really there
+    # _rfr_edge_spread is a MEAN over the edge frames (the max carries a 2.74 px sub-pixel resampling floor,
+    # measured under a geometry-preserving uniform shift), and the synthetic tilts only half the block.
+    assert spread_before > 4.0                               # the across-width defect is really there
 
     out, info = M.rigid_frame_refine(vol, {**_RFR_P, "rfr_bands": 8})
     assert info["applied"], info

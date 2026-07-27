@@ -166,6 +166,23 @@ DEFAULT_PARAMS: dict = {
                                   #   the rejected 3-DOF fit: no lateral translation, and it fires only above a per-scan null
     "rfr_int_tilt_min_px": 3.0,   # px of across-width ramp below which no interior rotation is fitted
     "rfr_int_tilt_ratio": 4.0,    # ...and it must also stand this far clear of the median interior frame's own ramp
+    # Acceptance-gate tolerances. Each is set above that metric's measured sub-pixel RESAMPLING FLOOR: a
+    # uniform per-frame shift moves the whole volume rigidly, so any drift it produces is interpolation
+    # artefact, and an exact-INTEGER shift (no interpolation) drifts ~0, which identifies the mechanism.
+    # The previous single 0.25px tolerance was below three of the five floors — the edge one by 11x.
+    "rfr_gate_rms_px": 0.05,          # interior rms; the pass's own real corrections move it up by max 0.009
+    "rfr_gate_step_px": 0.25,         # seam step, per-scan allowance; real-plan headroom p99 0.507
+    "rfr_gate_edge_spread_px": 0.75,  # edge spread (MEAN over frames; the MAX aggregate is unusable)
+    "rfr_gate_int_spread_px": 0.10,   # interior spread (MEAN); at 0.25 a 6px interior rotation is invisible
+    "rfr_gate_bsd_px": 0.5,           # along-frame banded roughness — the one gate the tilt fitters cannot game
+    "rfr_jit_sigma": 2.0,         # frames: low-pass separating the edge block's frame-to-frame JITTER from its overall
+                                  #   offset. The offset is only as good as a quadratic extrapolated 12 frames past its
+                                  #   window (hence the sham-null gate), but that error is SMOOTH in frame index — a
+                                  #   polynomial cannot zigzag — so the jitter is real per-frame motion and is trusted
+                                  #   even on blocks whose offset is refused. Before this, a declined block kept its wobble
+    "rfr_jit_min_px": 1.2,        # px floor on a jitter correction
+    "rfr_jit_ratio": 4.0,         # ...and it must stand this far clear of the scan's own INTERIOR jitter rms
+                                  #   (cs044_os_v1: edge 1.72px vs interior 0.18px, a 10x ratio, on the marked frames)
     "rfr_int_max_tilt_deg": 1.0,  # cap on the interior rotation (tighter than the edge: rigid_frame_derotate already ran)
     "rfr_edge_tilt": True,        # DEFAULT ON: correct the accepted edge blocks with a rigid depth shift AND a lateral
                                   #   TILT. A uniform shift can only remove the AVERAGE of a defect that varies across the
@@ -177,6 +194,10 @@ DEFAULT_PARAMS: dict = {
     "rfr_edge_max_tilt_deg": 1.5, # cap on that rotation. Real inter-frame torsion is under ~1.5 deg; cs039 needs 0.92
     "rfr_edge_tilt_min_px": 4.0,  # px of across-width spread below which no rotation is fitted — otherwise per-frame
                                   #   estimator noise becomes a spurious rotation, which is what sank the full 3-DOF fit
+    "rfr_edge_tilt_smooth": 1.5,  # gaussian sigma (frames) on the fitted rotation sequence. B-scans are ~40ms apart so a
+                                  #   real torsion trajectory is SMOOTH (cs039_os_v1: 20.7, 16.5, 7.4, 3.4px, one sign);
+                                  #   a line fitted to noisy band medians ALTERNATES (cs044_os_v1: +10.0, +4.7, -12.0,
+                                  #   -12.7px). Low-passing keeps the first and cancels the second
     "rfr_bands": 10,              # lateral bands used to see ACROSS the width (the central-band profile cannot)
     "rfr_band_margin": 0.05,      # outermost lateral fraction excluded from those bands — the boundary estimate there is
                                   #   noise (cs039_os_v1 laterals 2 and 508 read 193px and 115px off the arc)
@@ -4299,23 +4320,49 @@ def _rfr_split(p: dict):
     return max(int(p.get("rfr_lead", 14)), edge_n), max(int(p.get("rfr_tail", 5)), edge_n)
 
 
+def _rfr_from_surface(S: np.ndarray, p: dict):
+    """dev / prof / C from an already-known boundary map. Everything downstream reads only these."""
+    L = int(S.shape[1])
+    lead, tail = _rfr_split(p)
+    band = slice(int(float(p.get("rfr_lat_lo", 0.20)) * L), int(float(p.get("rfr_lat_hi", 0.80)) * L))
+    C = _lateral_frame_curve(S, lead, tail)
+    with np.errstate(all="ignore"):
+        dev = np.nanmedian((S - C)[:, band], axis=1)
+        prof = np.nanmedian(S[:, band], axis=1)
+    return dev, prof, C
+
+
+def _rfr_predict_surface(S: np.ndarray, shift: np.ndarray, tilt: np.ndarray) -> np.ndarray:
+    """The boundary map a RIGID plan produces, computed ANALYTICALLY rather than by re-detecting.
+
+    Scoring by re-detection is not translation-invariant. `_warp_by_displacement` interpolates each A-scan,
+    which moves where `_anterior_boundary`'s half-max crossing lands by a fraction of a pixel, and the
+    acceptance metrics amplify that: measured over 378 (scan, control) pairs, a UNIFORM per-frame shift —
+    which moves the whole volume as one rigid body and cannot change any geometry — drifts edge_spread by
+    3.47 px at p90, and the composite gate then DISCARDS the result on 54% of approved scans. A net-zero
+    round trip (+0.5 px then -0.5 px, ending exactly where it started) is discarded on 38%. The artefact is a
+    function of the interpolation PHASE, not the distance: -0.5 and -1.5 px drift identically, while an exact
+    integer shift drifts 0.0000 because it does not interpolate at all.
+
+    Because every correction this pass makes is rigid, its effect on the boundary is exact and closed-form —
+    a depth shift moves the whole A-scan column, a tilt adds a linear ramp — so predicting it removes the
+    artefact by construction instead of tolerating it, and saves the second detection pass as well."""
+    L = int(S.shape[1])
+    lat = np.arange(L, dtype=np.float64) - (L - 1) / 2.0
+    return S - shift[:, None] - tilt[:, None] * lat[None, :]
+
+
 def _rfr_deviation(volume: np.ndarray, p: dict):
     """Per-frame boundary deviation `dev` (interior) and `prof` (the per-frame boundary depth used at the
     edges). Both are medians over the CENTRAL laterals: the periphery is dim and speckled, its estimate is
     unreliable, and including it drags the per-frame number off (peripheral per-slice roughness runs ~4x the
     centre). Dropout frames are NaN in both."""
-    F, L = int(volume.shape[0]), int(volume.shape[2])
-    lead, tail = _rfr_split(p)
-    band = slice(int(float(p.get("rfr_lat_lo", 0.20)) * L), int(float(p.get("rfr_lat_hi", 0.80)) * L))
     S = _anterior_boundary(volume, p)
-    C = _lateral_frame_curve(S, lead, tail)
-    with np.errstate(all="ignore"):
-        dev = np.nanmedian((S - C)[:, band], axis=1)
-        prof = np.nanmedian(S[:, band], axis=1)
     drop = _dropout_frames(volume, p)
+    S[drop] = np.nan
+    dev, prof, C = _rfr_from_surface(S, p)
     dev[drop] = np.nan
     prof[drop] = np.nan
-    S[drop] = np.nan
     return dev, prof, S, C
 
 
@@ -4391,7 +4438,37 @@ def _rfr_second_diff_rms(prof: np.ndarray, idx: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.diff(v, 2) ** 2)))
 
 
-def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = None, detail: dict | None = None):
+def _rfr_hf(v: np.ndarray, sigma: float) -> np.ndarray:
+    """The frame-to-frame (high-frequency) part of a per-frame series: v minus a gaussian low-pass of it.
+
+    NaN-SAFE. Replacing a missing frame with 0 and then differencing against the smoothed series invents a
+    deviation the size of the local level — measured at 6.4 px on a dropout frame, which the pass would then
+    have "corrected" by moving a B-scan that has no tissue to align. Missing entries are filled from their
+    neighbours for the smoothing only, and returned as NaN so nothing downstream can act on them."""
+    x = np.asarray(v, dtype=np.float64)
+    ok = np.isfinite(x)
+    if not ok.any():
+        return np.full(x.shape, np.nan)
+    idx = np.arange(x.size, dtype=np.float64)
+    filled = np.interp(idx, idx[ok], x[ok])
+    hf = filled - ndimage.gaussian_filter1d(filled, sigma, mode="nearest")
+    return np.where(ok, hf, np.nan)
+
+
+def _rfr_interior_jitter(dev: np.ndarray, p: dict) -> float:
+    """RMS frame-to-frame jitter of the INTERIOR per-frame deviation — this scan's own null for the wobble
+    measure. On cs044_os_v1 it is 0.18 px while the trailing edge block sits at 1.72 px, a 10x ratio."""
+    F = int(dev.size)
+    lead, tail = _rfr_split(p)
+    seg = dev[lead:F - tail]
+    if seg.size < 12 or not np.isfinite(seg).any():
+        return float("nan")
+    hf = _rfr_hf(seg, float(p.get("rfr_jit_sigma", 2.0)))
+    return float(np.sqrt(np.mean(hf ** 2)))
+
+
+def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = None, detail: dict | None = None,
+                        dev: np.ndarray | None = None):
     """Per-frame deviation of the EDGE frames from the cornea's own local curvature. NaN outside acted-on sides.
 
     Every gate here exists because a measured belief turned out to be wrong.
@@ -4428,6 +4505,7 @@ def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = No
     if int(p.get("rfr_edge_n", 12)) <= 0:
         return out
     ai = a_int if a_int is not None else np.zeros(F)
+    dev_full = dev
     wild = float(p.get("rfr_edge_wild_px", 45.0))
     gate_abs = float(p.get("rfr_gate_abs_px", 3.0))
     gate_ratio = float(p.get("rfr_gate_ratio", 1.2))
@@ -4481,6 +4559,21 @@ def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = No
         thr = max(gate_abs, gate_ratio * pmed) if np.isfinite(pmed) else gate_abs
         rec["threshold"] = round(float(thr), 2)
 
+        # JITTER, measured separately and trusted further. The block-level ask is dominated by how well a
+        # quadratic extrapolates 12 frames past its window, which is why it must be gated against a sham null.
+        # But that error is SMOOTH in frame index — a polynomial cannot zigzag — so the frame-to-frame
+        # component of the deviation is real per-frame motion regardless of how wrong the reference's overall
+        # level is. cs044_os_v1: the trailing block's jitter is 3.21 px max / 1.72 rms against 0.62 / 0.18 in
+        # the same scan's interior, and it peaks on exactly the frames a reviewer marked as "small corneal
+        # surface unevenness". Before this, a DECLINED block kept its jitter along with its offset.
+        jit = _rfr_hf(dev, float(p.get("rfr_jit_sigma", 2.0)))
+        null_j = _rfr_interior_jitter(dev_full, p) if dev_full is not None else float("nan")
+        thr_j = max(float(p.get("rfr_jit_min_px", 1.2)),
+                    float(p.get("rfr_jit_ratio", 4.0)) * (null_j if np.isfinite(null_j) else 0.0))
+        rec["jitter_rms"] = round(float(np.sqrt(np.mean(jit ** 2))), 2)
+        rec["jitter_null"] = _r2(null_j)
+        rec["jitter_thr"] = round(float(thr_j), 2)
+
         if ask > wild:
             rec["decline"] = "implausible (artefact, e.g. an eyelash)"
         elif not (ask > thr):
@@ -4514,6 +4607,13 @@ def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = No
                 out[blk] = dev
                 rec["applied"] = True
                 rec["route"] = "kink" if kinked else "large-and-smooth"
+        if not rec.get("applied") and rec.get("decline") != "implausible (artefact, e.g. an eyelash)":
+            # the block offset stays, but its frame-to-frame wobble does not have to
+            big = np.abs(jit) > thr_j
+            if big.any() and float(np.max(np.abs(jit))) > thr_j:
+                out[blk] = np.where(big, jit, 0.0)
+                rec["jitter_frames"] = int(big.sum())
+                rec["route"] = "jitter-only"
         if detail is not None:
             detail[side] = rec
     return out
@@ -4558,6 +4658,31 @@ def _rfr_band_edge_dev(S: np.ndarray, p: dict):
     return bands, np.array([(lo + hi) / 2.0 for lo, hi in bands]), dev
 
 
+def _rfr_banded_second_diff(S: np.ndarray, p: dict) -> float:
+    """Roughness ALONG the frame axis, measured inside each lateral band.
+
+    The one acceptance metric the tilt fitters cannot satisfy by construction. `_rfr_edge_tilt` and
+    `_rfr_interior_tilt` least-squares-fit a line ACROSS bands and subtract it, so any metric of across-band
+    spread is partly self-fulfilling — it improves whenever a tilt is fitted, which is exactly when an
+    independent check is needed. This differences along the OTHER axis.
+
+    It is also the sharpest detector of the failure that motivated the tilt smoothing: on a 6 px ALTERNATING
+    edge rotation (the "+10.0, +4.7, -12.0, -12.7 px" fit that spurious noise produced on cs044_os_v1) it
+    fires on 96.8% of scans against edge_spread's 75%. Correctly silent on a benign smooth dome ramp, which
+    has no second difference at all — and, by the same token, blind to a SMOOTH rotation, so it complements
+    edge_spread rather than replacing it."""
+    L = int(S.shape[1])
+    bands = _rfr_lateral_bands(L, p)
+    if not bands:
+        return float("nan")
+    with np.errstate(all="ignore"):
+        V = np.array([np.nanmedian(S[:, lo:hi], axis=1) for lo, hi in bands])
+        D = V[:, :-2] - 2.0 * V[:, 1:-1] + V[:, 2:]
+        if not np.isfinite(D).any():
+            return float("nan")
+        return float(np.sqrt(np.nanmean(D ** 2)))
+
+
 def _rfr_edge_spread(S: np.ndarray, p: dict) -> float:
     """Worst across-the-width spread of the edge deviation, in px. This is the quantity a reviewer sees as
     'the edge goes upward against the corneal curvature only on the far sagittal slices' — a defect that is
@@ -4570,7 +4695,13 @@ def _rfr_edge_spread(S: np.ndarray, p: dict) -> float:
         return float("nan")
     with np.errstate(all="ignore"):
         rng = np.nanmax(dev[:, have], axis=0) - np.nanmin(dev[:, have], axis=0)
-    return float(np.nanmax(rng)) if np.isfinite(rng).any() else float("nan")
+    # MEAN over the edge frames, not max. Measured under a uniform per-frame shift — a correction that moves
+    # the whole volume rigidly and therefore cannot change any geometry — the max drifts by 2.74 px (p90,
+    # 20 scans) purely from sub-pixel resampling perturbing where the boundary estimator's half-max crossing
+    # lands; the mean drifts 0.74. An exact INTEGER shift, which does not interpolate, drifts ~0 for both,
+    # which is what identifies the mechanism. The mean is also the better detector: on an alternating-sign
+    # 1 degree per-frame rotation it separates from the control on 100% of scans against the max's 86%.
+    return float(np.nanmean(rng)) if np.isfinite(rng).any() else float("nan")
 
 
 def _rfr_band_residual(S: np.ndarray, C: np.ndarray, p: dict):
@@ -4631,7 +4762,9 @@ def _rfr_interior_spread(S: np.ndarray, C: np.ndarray, p: dict) -> float:
         return float("nan")
     with np.errstate(all="ignore"):
         rng = np.nanmax(vals[:, lead:F - tail], axis=0) - np.nanmin(vals[:, lead:F - tail], axis=0)
-    return float(np.nanmax(rng)) if np.isfinite(rng).any() else float("nan")
+    # MEAN, for the same reason as the edge version: the max carries a 0.48 px resampling floor and detects
+    # per-frame noise on only 43% of scans, while the mean carries 0.04 px and detects it on 93%.
+    return float(np.nanmean(rng)) if np.isfinite(rng).any() else float("nan")
 
 
 def _rfr_interior_tilt(S: np.ndarray, C: np.ndarray, p: dict):
@@ -4684,7 +4817,7 @@ def _rfr_interior_tilt(S: np.ndarray, C: np.ndarray, p: dict):
     return tilt, info
 
 
-def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict):
+def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict, allow: np.ndarray | None = None):
     """Per-frame lateral TILT of the accepted edge blocks, as a depth ramp in px per lateral column.
 
     A rigid depth shift is uniform across the B-scan, so it can only ever remove the AVERAGE of a defect that
@@ -4712,8 +4845,9 @@ def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict):
     max_slope = np.tan(np.radians(float(p.get("rfr_edge_max_tilt_deg", 1.5)))) * (sx / sz)
     mid = (L - 1) / 2.0
     for f in range(F):
-        if not np.isfinite(edev[f]):          # only frames the side gates actually accepted
+        if not np.isfinite(edev[f]):
             continue
+
         v = dev[:, f]
         ok = np.isfinite(v)
         if int(ok.sum()) < 4:
@@ -4740,6 +4874,22 @@ def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict):
         if float(np.sqrt(np.mean(resid ** 2))) > 0.5 * spread:
             continue
         tilt[f] = float(np.clip(slope, -max_slope, max_slope))
+
+    # SMOOTH ACROSS ADJACENT FRAMES. Two B-scans are ~40 ms apart, so a real torsion trajectory is smooth:
+    # on cs039_os_v1 the fitted ramps decay 20.7, 16.5, 7.4, 3.4, 5.2, 3.6 px, same sign throughout. Fitting
+    # a straight line to noisy band medians instead produces ALTERNATING values — cs044_os_v1's outermost
+    # frames fitted +10.0, +4.7, -12.0, -12.7, -6.6 px, which pushed its across-width spread 10.66 -> 15.76.
+    # Low-passing the sequence keeps the first and cancels the second, which is exactly the discrimination
+    # wanted, and it needs no extra threshold.
+    sig = float(p.get("rfr_edge_tilt_smooth", 1.5) or 0.0)
+    if sig > 0:
+        for side in ("lead", "trail"):
+            w = _rfr_side_windows(int(S.shape[0]), side, p)
+            if w is None:
+                continue
+            blk = w[1]
+            tilt[blk] = ndimage.gaussian_filter1d(tilt[blk], sig, mode="nearest")
+    tilt[np.abs(tilt) * (L - 1) < float(p.get("rfr_edge_tilt_min_px", 4.0))] = 0.0
     return tilt
 
 
@@ -4809,29 +4959,31 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
         return volume, {"applied": False, "reason": "too few frames"}
     k = slice(lead, F - tail)
 
-    def _measure(vol, want_detail=False):
-        """Everything the pass needs about a volume, and everything used to judge it afterwards.
+    def _metrics(S_in, want_detail=False):
+        """Every quantity the pass plans from and is judged on, computed from a boundary map.
 
-        `seam_step` and `far_dev` are scored against references this pass did NOT use, which is the whole
-        point of them. The previous acceptance metric re-measured the result with the same plain quadratic
-        that had generated the shift, so `edge_dev_after` was driven just under the trigger BY CONSTRUCTION —
-        every applied scan recorded 0.66-0.85 px, including cs039_os_v1's flawless "31.12 -> 0.79" on exactly
-        the side a reviewer then rejected. A gate that cannot fail is not a gate.
+        Called ONCE on the detected surface and then on the ANALYTICALLY PREDICTED surface, never by
+        re-detecting the warped voxels — see `_rfr_predict_surface` for why that matters (the composite gate
+        discarded a provably harmless rigid translation on 54% of approved scans, purely from sub-pixel
+        interpolation moving the half-max crossing).
 
-          seam_step — the jump in the measured profile across each seam. Approved corneas have none (their
-                      second difference straddling the seam is 1.00 px, identical to the interior), so any
-                      step here is this pass's own artefact.
-          far_dev   — distance from the deg-4 `_lateral_frame_curve` continued into the edges. Independent of
-                      the local quadratic; not a perfect reference at the extremes, but it cannot be gamed by
-                      the thing being judged.
+          rms        interior boundary deviation; catches per-frame NOISE (detected on 100% of scans)
+          seam_step  the jump across each seam; catches a BLOCK OFFSET (100%)
+          edge/int_spread  worst across-width spread; edge_spread is the only one of these that catches a
+                     ROTATION (100%), which rms and int_spread miss entirely
+          far_dev    TELEMETRY ONLY, no longer a gate — see the acceptance block
         """
-        dv, pr, Sb, Cb = _rfr_deviation(vol, p)
+        dv, pr, Cc = _rfr_from_surface(S_in, p)
         det = {} if want_detail else None
         ai = _rfr_interior_plan(dv, p)
-        ed = _rfr_edge_deviation(pr, p, a_int=ai, detail=det)
+        ed = _rfr_edge_deviation(pr, p, a_int=ai, detail=det, dev=dv)
         with np.errstate(all="ignore"):
             r = float(np.sqrt(np.nanmean(dv[k] ** 2))) if np.isfinite(dv[k]).any() else float("nan")
-            step = 0.0
+            # NaN, not 0.0, when a seam cannot be measured. Initialising to 0.0 and only raising it inside
+            # the finite check made an UNMEASURABLE seam score as a PERFECT one: blanking frames 11/12/88/89
+            # on cs001_od gives step 0.000 against a 0.541 baseline, so destroying a seam reads as improving
+            # it. Same null-vs-zero trap as edge_dev and max_jitter before it.
+            step = float("nan")
             for side in ("lead", "trail"):
                 w = _rfr_side_windows(F, side, p)
                 if w is None:
@@ -4843,25 +4995,24 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                     nb = np.arange(max(0, seam - 5), min(F, seam + 6))
                     gd = np.isfinite(pr[nb])
                     sl = np.polyfit(nb[gd], pr[nb][gd], 1)[0] if int(gd.sum()) >= 4 else 0.0
-                    step = max(step, abs(float(pr[j] - pr[seam] - sl * (j - seam))))
-            far = float("nan")
-            try:
-                S = _anterior_boundary(vol, p)
-                C = _lateral_frame_curve(S, *_rfr_split(p))
-                L4 = int(vol.shape[2])
-                band = slice(int(float(p.get("rfr_lat_lo", 0.20)) * L4), int(float(p.get("rfr_lat_hi", 0.80)) * L4))
-                edges = np.r_[np.arange(int(p.get("rfr_edge_n", 12))), np.arange(F - int(p.get("rfr_edge_n", 12)), F)]
-                res = np.nanmedian((S - C)[:, band], axis=1)[edges]
-                far = float(np.sqrt(np.nanmean(res ** 2))) if np.isfinite(res).any() else float("nan")
-            except Exception:  # noqa: BLE001
-                pass
-        return {"dev": dv, "prof": pr, "edev": ed, "a_int": ai, "rms": r, "S": Sb, "C": Cb,
+                    v = abs(float(pr[j] - pr[seam] - sl * (j - seam)))
+                    step = v if not np.isfinite(step) else max(step, v)
+            L4 = int(S_in.shape[1])
+            band = slice(int(float(p.get("rfr_lat_lo", 0.20)) * L4), int(float(p.get("rfr_lat_hi", 0.80)) * L4))
+            en = int(p.get("rfr_edge_n", 12))
+            res = np.nanmedian((S_in - Cc)[:, band], axis=1)[np.r_[np.arange(en), np.arange(F - en, F)]]
+            far = float(np.sqrt(np.nanmean(res ** 2))) if np.isfinite(res).any() else float("nan")
+        return {"dev": dv, "prof": pr, "edev": ed, "a_int": ai, "rms": r, "S": S_in, "C": Cc,
                 "seam_step": float(step), "far_dev": far, "detail": det,
-                "edge_spread": _rfr_edge_spread(Sb, p),
-                "int_spread": _rfr_interior_spread(Sb, Cb, p)}
+                "edge_spread": _rfr_edge_spread(S_in, p),
+                "int_spread": _rfr_interior_spread(S_in, Cc, p),
+                "bsd": _rfr_banded_second_diff(S_in, p),
+                "n_finite": int(np.isfinite(pr).sum())}
 
     try:
-        m0 = _measure(volume, want_detail=True)
+        _S0 = _anterior_boundary(volume, p)
+        _S0[_dropout_frames(volume, p)] = np.nan
+        m0 = _metrics(_S0, want_detail=True)
     except Exception:  # noqa: BLE001 — a refinement must never break a preprocess run
         return volume, {"applied": False, "reason": "measure failed"}
     dev0, edev0, prof0, rms0 = m0["dev"], m0["edev"], m0["prof"], m0["rms"]
@@ -4884,11 +5035,6 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     # Reaching that geometry needs the canvas EXTENDED, which is the surface-crop path's job, not this one.
     margin = float(p.get("rfr_canvas_margin", 4.0))
     depth = int(volume.shape[1])
-    for f in range(F):
-        if abs(a[f]) <= 0.05 or not np.isfinite(prof0[f]):
-            continue
-        a[f] = float(np.clip(a[f], prof0[f] - (depth - 1 - margin), prof0[f] - margin))
-    a[np.abs(a) <= 0.05] = 0.0
     if not np.any(np.abs(a) > 0.05) and not np.any(np.abs(_rfr_precheck_tilt(m0, p)) > 1e-9):
         return volume, {"applied": False,
                         "reason": "already smooth" if np.isfinite(emax0) else "nothing to correct",
@@ -4911,6 +5057,34 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     except Exception:  # noqa: BLE001
         i_info = {"frames": 0}
     lat_off = np.arange(L, dtype=np.float64) - (L - 1) / 2.0
+
+    # CANVAS PRECONDITION, checked on the FULL-WIDTH plan INCLUDING the rotation. The previous version
+    # clamped against `prof0`, the CENTRAL-BAND MEDIAN, while the constraint — tissue leaving the volume —
+    # applies across the whole width; and it ran BEFORE the tilt was added, so a rotation could lift a
+    # lateral end out of the canvas with nothing checking. Measured on the approved corpus, cs027_os was
+    # applied with no complaint and lost 33 tissue voxels off the top. The leak is small on vetted scans
+    # (2 of 47 lose any tissue, under 0.2%) but unbounded on the damaged scans this pass targets — and until
+    # now it was masked by far_dev accidentally vetoing those same scans, protection that disappeared when
+    # far_dev correctly became telemetry.
+    #
+    # Only the TRUSTED laterals count: at the extreme columns the boundary estimate is noise (readings 190 px
+    # off the arc), and a minimum taken over those would refuse corrections on the strength of garbage.
+    _bands = _rfr_lateral_bands(L, p)
+    if _bands:
+        trusted = np.arange(_bands[0][0], _bands[-1][1])
+        Spred = _rfr_predict_surface(m0["S"], a, b_tilt)
+        with np.errstate(all="ignore"):
+            top = np.nanmin(Spred[:, trusted], axis=1)
+            bot = np.nanmax(Spred[:, trusted], axis=1)
+        for f in range(F):
+            if abs(a[f]) <= 0.05 and abs(b_tilt[f]) <= 1e-9:
+                continue
+            if np.isfinite(top[f]) and top[f] < margin:
+                a[f] -= (margin - float(top[f]))            # lower the frame until it fits
+            if np.isfinite(bot[f]) and bot[f] > depth - 1 - margin:
+                a[f] += float(bot[f]) - (depth - 1 - margin)
+    a[np.abs(a) <= 0.05] = 0.0
+
     out = volume.copy()
     for f in range(F):
         if abs(a[f]) <= 0.05 and abs(b_tilt[f]) <= 1e-6:
@@ -4923,37 +5097,73 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     # while making the boundary 3.5x worse; the version before this one then repeated the mistake at the edge,
     # re-measuring the result with the same quadratic that had produced it.
     try:
-        m1 = _measure(out)
+        m1 = _metrics(_rfr_predict_surface(m0["S"], a, b_tilt))
     except Exception:  # noqa: BLE001
         m1 = None
     if m1 is None:
         return volume, {"applied": False, "reason": "could not verify the result"}
     rms1, step1, far1 = m1["rms"], m1["seam_step"], m1["far_dev"]
     step0, far0 = m0["seam_step"], m0["far_dev"]
-    tol = float(p.get("rfr_regress_tol", 1.15))
+    # TOLERANCES. Each sits above that metric's measured RESAMPLING FLOOR — the drift it shows under a
+    # uniform per-frame shift, which cannot change geometry at all — and each metric is kept only for the
+    # insult it demonstrably detects. Measured over 14-20 approved scans (floor = control p90 |drift|;
+    # power = fraction of scans separating the insult from the control):
+    #   rms        floor 0.015  catches per-frame NOISE 100%
+    #   seam_step  floor 0.748  catches a BLOCK OFFSET 100%, noise 86%
+    #   far_dev    floor 0.114  catches a BLOCK OFFSET 93%, noise 100%
+    #   edge_mean  floor 0.742  catches ROTATION 100% — and nothing else here does (rms 0%, int_mean 0%)
+    #   int_mean   floor 0.037  catches per-frame NOISE 93%
+    # A legitimate smooth dome change (a 10 px ramp across the frame axis) trips none of them (0-14%),
+    # so they do not fire on real geometry.
+    # TOLERANCES. Scoring is now ANALYTIC, so the resampling floor is float64 round-off (1e-13) rather than
+    # the 0.7-3.5 px it was under re-detection. Every tolerance is therefore set by POWER and by the headroom
+    # the pass's OWN real corrections need — not by a noise floor. Measured over 63 approved scans (headroom
+    # = how far the metric moves up under the pass's genuine plan, n=47):
+    #   rms       +0.05  headroom max 0.009  -> 1.5px interior bump 94%, 0.3px per-frame noise 92%
+    #   seam_step +0.25  headroom p99 0.507  -> 3px block offset 87%
+    #   edge      +0.75  headroom max 0.609  -> 6px alternating rotation 75%, 4px smooth 46%
+    #   int       +0.10  headroom max 0.060  -> 6px interior rotation 86%, 12px 100%
+    #   bsd       +0.50  headroom max 0.465  -> 6px alternating rotation 97%, silent on a benign dome ramp
+    # An earlier draft loosened these to clear the OLD floor, costing 86 points of detection on a 6px
+    # interior rotation and 46 on the cs044_os_v1 alternating mode in exchange for nothing.
     step_cap = float(p.get("rfr_seam_step_px", 1.0))
     bad = []
-    if not np.isfinite(rms1) or rms1 > max(0.25, rms0) * tol:
+    if not np.isfinite(rms1) or rms1 > rms0 + float(p.get("rfr_gate_rms_px", 0.05)):
         bad.append(f"interior {rms0:.3f}->{rms1:.3f}")
     # A step at the seam is the reviewer's actual complaint, so it is a hard cap rather than a tolerance —
     # and it is capped in ABSOLUTE terms because the pass must not be allowed to introduce one at all.
-    if step1 > max(step_cap, step0 + 0.01):
+    if np.isfinite(step0) and not np.isfinite(step1):
+        bad.append("seam step became unmeasurable")
+    elif np.isfinite(step1) and step1 > max(step_cap, (step0 if np.isfinite(step0) else 0.0)
+                                            + float(p.get("rfr_gate_step_px", 0.25))):
         bad.append(f"seam step {step0:.2f}->{step1:.2f}")
-    if np.isfinite(far0) and np.isfinite(far1) and far1 > far0 + float(p.get("rfr_edge_regress_px", 0.25)):
-        bad.append(f"edge vs independent reference {far0:.2f}->{far1:.2f}")
+    # Losing measurable frames is damage that every nan-aggregate here would otherwise score as improvement.
+    if int(m1.get("n_finite", 0)) < int(m0.get("n_finite", 0)):
+        bad.append(f"frames became unmeasurable {m0.get('n_finite')}->{m1.get('n_finite')}")
+    bsd0, bsd1 = m0.get("bsd", float("nan")), m1.get("bsd", float("nan"))
+    if np.isfinite(bsd0) and np.isfinite(bsd1) and bsd1 > bsd0 + float(p.get("rfr_gate_bsd_px", 0.5)):
+        bad.append(f"along-frame roughness {bsd0:.2f}->{bsd1:.2f}")
+    # far_dev is TELEMETRY, not a gate. It scores the edge frames against `_lateral_frame_curve` extrapolated
+    # into them — which is exactly the reference the edge path exists BECAUSE it is invalid there (see
+    # `_rfr_edge_deviation`: "a polynomial extrapolates the wrong way"). So it vetoes precisely the
+    # corrections that are right: of 47 approved scans, 14 had an edge block accepted and only 3 survived —
+    # 10 of the 11 rejections were this term, including cs050_od_v1, whose correction was verified by eye.
+    # It is also redundant for detection: rms catches per-frame noise on 100% of scans and seam_step catches
+    # a block offset on 100%, which is everything far_dev was contributing.
     # ACROSS-THE-WIDTH. Every other metric here is a central-band median, which is blind by construction to a
     # defect that only shows on the far sagittal slices — the one the reviewer found after the depth-only
     # version shipped. This is the measure that can see it.
     sp0, sp1 = m0.get("edge_spread", float("nan")), m1.get("edge_spread", float("nan"))
-    if np.isfinite(sp0) and np.isfinite(sp1) and sp1 > sp0 + float(p.get("rfr_edge_regress_px", 0.25)):
+    if np.isfinite(sp0) and np.isfinite(sp1) and sp1 > sp0 + float(p.get("rfr_gate_edge_spread_px", 0.75)):
         bad.append(f"across-width edge spread {sp0:.2f}->{sp1:.2f}")
     ip0, ip1 = m0.get("int_spread", float("nan")), m1.get("int_spread", float("nan"))
-    if np.isfinite(ip0) and np.isfinite(ip1) and ip1 > ip0 + float(p.get("rfr_edge_regress_px", 0.25)):
+    if np.isfinite(ip0) and np.isfinite(ip1) and ip1 > ip0 + float(p.get("rfr_gate_int_spread_px", 0.10)):
         bad.append(f"across-width interior spread {ip0:.2f}->{ip1:.2f}")
     if bad:
         return volume, {"applied": False, "reason": "would regress: " + "; ".join(bad),
                         "dev_rms_before": round(rms0, 3), "dev_rms_after": _r3(rms1),
-                        "seam_step_before": round(step0, 2), "seam_step_after": round(step1, 2),
+                        "seam_step_before": _r2(step0), "seam_step_after": _r2(step1),
+                        "bsd_before": _r2(bsd0), "bsd_after": _r2(bsd1),
                         "far_dev_before": _r2(far0), "far_dev_after": _r2(far1),
                         "edge_spread_before": _r2(sp0), "edge_spread_after": _r2(sp1),
                         "int_spread_before": _r2(ip0), "int_spread_after": _r2(ip1),
@@ -4963,7 +5173,8 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                  "max_shift": round(float(np.max(np.abs(a))), 2),
                  "edge_shift_max": round(float(np.max(np.abs(np.r_[a[:edge_n], a[-edge_n:]]))), 2),
                  "dev_rms_before": round(rms0, 3), "dev_rms_after": _r3(rms1),
-                 "seam_step_before": round(step0, 2), "seam_step_after": round(step1, 2),
+                 "seam_step_before": _r2(step0), "seam_step_after": _r2(step1),
+                 "bsd_before": _r2(m0.get("bsd", float("nan"))), "bsd_after": _r2(m1.get("bsd", float("nan"))),
                  "far_dev_before": _r2(far0), "far_dev_after": _r2(far1),
                  "edge_spread_before": _r2(sp0), "edge_spread_after": _r2(sp1),
                  "max_tilt_deg": round(float(np.degrees(np.arctan(
