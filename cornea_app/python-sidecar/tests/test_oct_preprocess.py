@@ -877,7 +877,7 @@ def test_rfr_never_pushes_tissue_out_of_the_canvas():
     out, info = M.rigid_frame_refine(vol, _RFR_P)
     if info.get("applied"):
         assert float((out > 100).sum()) > tissue_before * 0.98
-        _dv, pr, _S = M._rfr_deviation(out, {**M.DEFAULT_PARAMS, **_RFR_P})
+        _dv, pr, _S, _C = M._rfr_deviation(out, {**M.DEFAULT_PARAMS, **_RFR_P})
         assert np.nanmin(pr) >= 0.0
 
 
@@ -921,7 +921,7 @@ def test_rfr_corrects_an_edge_defect_that_varies_across_the_width():
             vol[f, t:t + 45, l] = 200.0
     vol = np.ascontiguousarray(vol + rng.normal(0, 3, vol.shape).astype(np.float32))
     q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8, "rfr_band_margin": 0.05}
-    _dv, _pr, S = M._rfr_deviation(vol, q)
+    _dv, _pr, S, _C = M._rfr_deviation(vol, q)
     spread_before = M._rfr_edge_spread(S, q)
     assert spread_before > 8.0                               # the across-width defect is really there
 
@@ -944,3 +944,47 @@ def test_rfr_does_not_invent_a_rotation_from_noise():
     edev[-6:] = 5.0                                          # pretend the side was accepted
     tilt = M._rfr_edge_tilt(S, edev, q)
     assert np.all(np.abs(tilt) * (L - 1) < 4.0)              # no meaningful rotation out of pure noise
+
+
+def test_rfr_corrects_an_interior_frame_rotation():
+    """A reviewer marked ONE column of cs035_od_v1_4 at sagittal slice 73 and the same column at slice 475 —
+    the two ends of a 7.7 px across-width ramp whose frame MEDIAN is 0.07 px. Every central-band measure in
+    this pass is blind to that by construction, so a depth-only correction cannot see it, let alone fix it.
+    A per-frame rotation is rigid, so it is allowed."""
+    F, D, L = 64, 300, 200
+    rng = np.random.default_rng(21)
+    prof = _rfr_profile(F=F)
+    vol = np.zeros((F, D, L), dtype=np.float32)
+    x = np.linspace(-1.0, 1.0, L)
+    lat = np.arange(L) - (L - 1) / 2.0
+    bad = 30
+    for f in range(F):
+        top = prof[f] + 14 * x ** 2 + (0.05 * lat if f == bad else 0.0)   # one frame is rotated
+        for l in range(L):
+            t = int(round(top[l]))
+            vol[f, t:t + 45, l] = 200.0
+    vol = np.ascontiguousarray(vol + rng.normal(0, 3, vol.shape).astype(np.float32))
+    q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8}
+    _dv, pr, S, C = M._rfr_deviation(vol, q)
+    assert abs(pr[bad] - np.median(pr[bad - 3:bad + 4])) < 1.0    # invisible to the frame median
+    tilt, ginfo = M._rfr_interior_tilt(S, C, q)
+    assert abs(tilt[bad]) > 1e-9 and ginfo["frames"] >= 1
+    assert sum(abs(t) > 1e-9 for t in tilt) <= 3                  # the clean frames are left alone
+
+    out, info = M.rigid_frame_refine(vol, {**_RFR_P, "rfr_bands": 8})
+    assert info["applied"]
+    assert info["int_spread_after"] < info["int_spread_before"]
+
+
+def test_rfr_interior_rotation_needs_to_clear_the_scans_own_noise():
+    """This is NOT the 3-DOF fit that was rejected — that one added rotation to every frame from a per-frame
+    least-squares fit and was bias-dominated. A rotation is fitted only where it stands clear of THIS scan's
+    own per-frame tilt noise, so a uniformly noisy scan gets none."""
+    F, L = 64, 200
+    rng = np.random.default_rng(9)
+    prof = _rfr_profile(F=F)
+    S = np.repeat(prof[:, None], L, axis=1) + rng.normal(0, 2.0, (F, L))
+    C = np.repeat(np.polyval(np.polyfit(np.arange(F), prof, 4), np.arange(F))[:, None], L, axis=1)
+    q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8}
+    tilt, ginfo = M._rfr_interior_tilt(S, C, q)
+    assert ginfo["frames"] == 0

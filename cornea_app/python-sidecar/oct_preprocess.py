@@ -159,6 +159,14 @@ DEFAULT_PARAMS: dict = {
                                   #   them). A smooth edge merely sitting off an extrapolation is not a defect
     "rfr_seam_step_px": 1.0,      # px: floor on the step the pass may create where the edge block meets the interior.
                                   #   Approved corneas have none, so a step here is by definition this pass's own artefact
+    "rfr_interior_tilt": True,    # DEFAULT ON: the INTERIOR frames also get a rigid rotation where one stands clear of
+                                  #   the scan's own per-frame tilt noise. A reviewer marked one column of cs035_od_v1_4 at
+                                  #   sagittal slice 73 AND at slice 475 — the two ends of a 7.7px across-width ramp whose
+                                  #   frame-MEDIAN is 0.07px, so every central-band measure here was blind to it. This is not
+                                  #   the rejected 3-DOF fit: no lateral translation, and it fires only above a per-scan null
+    "rfr_int_tilt_min_px": 3.0,   # px of across-width ramp below which no interior rotation is fitted
+    "rfr_int_tilt_ratio": 4.0,    # ...and it must also stand this far clear of the median interior frame's own ramp
+    "rfr_int_max_tilt_deg": 1.0,  # cap on the interior rotation (tighter than the edge: rigid_frame_derotate already ran)
     "rfr_edge_tilt": True,        # DEFAULT ON: correct the accepted edge blocks with a rigid depth shift AND a lateral
                                   #   TILT. A uniform shift can only remove the AVERAGE of a defect that varies across the
                                   #   B-scan's width; on cs039_os_v1's leading frame the deviation ramps 21.7->42.9px, so
@@ -4308,7 +4316,7 @@ def _rfr_deviation(volume: np.ndarray, p: dict):
     dev[drop] = np.nan
     prof[drop] = np.nan
     S[drop] = np.nan
-    return dev, prof, S
+    return dev, prof, S, C
 
 
 def _r2(v):
@@ -4565,6 +4573,117 @@ def _rfr_edge_spread(S: np.ndarray, p: dict) -> float:
     return float(np.nanmax(rng)) if np.isfinite(rng).any() else float("nan")
 
 
+def _rfr_band_residual(S: np.ndarray, C: np.ndarray, p: dict):
+    """Per-frame boundary residual measured in each lateral band. (centres, values(bands, frames)).
+
+    Everything else in this pass collapses the laterals to one median, which cannot see a defect that is
+    deep on one side of the B-scan and shallow on the other — and that is precisely how a per-frame ROTATION
+    presents. On cs035_od_v1_4 a reviewer marked one column at sagittal slice 73 and the same column at
+    slice 475: the two ends of a 7.7 px ramp whose frame-median is 0.07 px, i.e. invisible to every other
+    measure here."""
+    F, L = int(S.shape[0]), int(S.shape[1])
+    bands = _rfr_lateral_bands(L, p)
+    if not bands:
+        return np.zeros(0), np.zeros((0, F))
+    R = S - C
+    with np.errstate(all="ignore"):
+        vals = np.array([np.nanmedian(R[:, lo:hi], axis=1) for lo, hi in bands])
+    return np.array([(lo + hi) / 2.0 for lo, hi in bands]), vals
+
+
+def _rfr_fit_tilt(ctr: np.ndarray, v: np.ndarray, p: dict):
+    """Robust (slope, spread, residual-rms) of one frame's across-width residual. slope is px per lateral."""
+    ok = np.isfinite(v)
+    if int(ok.sum()) < 4:
+        return None
+    c = np.polyfit(ctr[ok], v[ok], 1)
+    for _ in range(2):
+        r = v - np.polyval(c, ctr)
+        sd = np.nanstd(r[ok])
+        if not np.isfinite(sd) or sd <= 0:
+            break
+        ok2 = ok & (np.abs(r) < 2.0 * sd)
+        if int(ok2.sum()) < 4:
+            break
+        c = np.polyfit(ctr[ok2], v[ok2], 1)
+        ok = ok2
+    resid = v[ok] - np.polyval(c, ctr[ok])
+    return float(c[0]), float(np.nanmax(v[ok]) - np.nanmin(v[ok])), float(np.sqrt(np.mean(resid ** 2)))
+
+
+def _rfr_precheck_tilt(m: dict, p: dict) -> np.ndarray:
+    """The interior rotation the pass would apply — consulted before the early-out, because a scan can need a
+    rotation while needing no depth shift at all (cs035_od_v1_4's marked column: 7.7 px across the width,
+    0.07 px in the frame median)."""
+    try:
+        return _rfr_interior_tilt(m["S"], m["C"], p)[0]
+    except Exception:  # noqa: BLE001
+        return np.zeros(int(m["prof"].size))
+
+
+def _rfr_interior_spread(S: np.ndarray, C: np.ndarray, p: dict) -> float:
+    """Worst across-the-width spread of the INTERIOR per-frame residual, in px. The quantity a reviewer sees
+    as 'a very small notch' that appears at one sagittal slice and reverses at another."""
+    F = int(S.shape[0])
+    lead, tail = _rfr_split(p)
+    ctr, vals = _rfr_band_residual(S, C, p)
+    if vals.size == 0:
+        return float("nan")
+    with np.errstate(all="ignore"):
+        rng = np.nanmax(vals[:, lead:F - tail], axis=0) - np.nanmin(vals[:, lead:F - tail], axis=0)
+    return float(np.nanmax(rng)) if np.isfinite(rng).any() else float("nan")
+
+
+def _rfr_interior_tilt(S: np.ndarray, C: np.ndarray, p: dict):
+    """Per-frame lateral TILT of the INTERIOR frames, as a depth ramp in px per lateral column.
+
+    WHY THIS IS NOT THE 3-DOF FIT THAT WAS REJECTED. That attempt added lateral translation AND rotation to
+    EVERY frame from a per-frame least-squares fit, and it was bias-dominated: 100% of fitted lateral shifts
+    came out positive (median +0.50 px, an estimator artefact) and the boundary rms rose 0.49 -> 0.84 px. Here
+    there is no lateral translation, and a rotation is fitted only where it stands clear of THIS scan's own
+    per-frame tilt noise — the same per-scan null the edge gates use, rather than a constant that fits no scan.
+
+    On cs035_od_v1_4 the marked column measures a 7.7 px ramp across the width (0.34 deg) while the median
+    interior frame measures 0.5 px, so it stands ~6x clear. `rigid_frame_derotate` runs earlier and removes
+    the bulk of the inter-frame torsion, but it is driven by the DP surface and levels tilt to a smooth
+    across-frames baseline; what survives it is exactly this kind of isolated single-frame residual."""
+    F, L = int(S.shape[0]), int(S.shape[1])
+    tilt = np.zeros(F, dtype=np.float64)
+    info = {"frames": 0, "max_px": 0.0}
+    if not bool(p.get("rfr_interior_tilt", True)):
+        return tilt, info
+    lead, tail = _rfr_split(p)
+    ctr, vals = _rfr_band_residual(S, C, p)
+    if vals.shape[0] < 4:
+        return tilt, info
+    fits = {}
+    for f in range(lead, F - tail):
+        r = _rfr_fit_tilt(ctr, vals[:, f], p)
+        if r is not None:
+            fits[f] = r
+    if len(fits) < 12:
+        return tilt, info
+    width = float(L - 1)
+    across = np.array([abs(v[0]) * width for v in fits.values()])
+    null = float(np.median(across))                       # this scan's own per-frame tilt noise
+    thr = max(float(p.get("rfr_int_tilt_min_px", 3.0)), float(p.get("rfr_int_tilt_ratio", 4.0)) * null)
+    sx = float(p.get("oct_spacing_lateral", 0.0078))
+    sz = float(p.get("oct_spacing_depth", 0.0031))
+    max_slope = np.tan(np.radians(float(p.get("rfr_int_max_tilt_deg", 1.0)))) * (sx / sz)
+    for f, (slope, spread, rms) in fits.items():
+        if abs(slope) * width < thr:
+            continue
+        # a straight line must actually explain it, or this is noise being shaped into a rotation
+        if rms > 0.5 * max(spread, 1e-6):
+            continue
+        tilt[f] = float(np.clip(slope, -max_slope, max_slope))
+    info = {"frames": int(np.sum(np.abs(tilt) > 1e-9)), "null_px": round(null, 2),
+            "threshold_px": round(thr, 2),
+            "max_px": round(float(np.max(np.abs(tilt)) * width), 2),
+            "max_deg": round(float(np.degrees(np.arctan(np.max(np.abs(tilt)) * sz / sx))), 3)}
+    return tilt, info
+
+
 def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict):
     """Per-frame lateral TILT of the accepted edge blocks, as a depth ramp in px per lateral column.
 
@@ -4706,7 +4825,7 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                       the local quadratic; not a perfect reference at the extremes, but it cannot be gamed by
                       the thing being judged.
         """
-        dv, pr, Sb = _rfr_deviation(vol, p)
+        dv, pr, Sb, Cb = _rfr_deviation(vol, p)
         det = {} if want_detail else None
         ai = _rfr_interior_plan(dv, p)
         ed = _rfr_edge_deviation(pr, p, a_int=ai, detail=det)
@@ -4736,9 +4855,10 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                 far = float(np.sqrt(np.nanmean(res ** 2))) if np.isfinite(res).any() else float("nan")
             except Exception:  # noqa: BLE001
                 pass
-        return {"dev": dv, "prof": pr, "edev": ed, "a_int": ai, "rms": r, "S": Sb,
+        return {"dev": dv, "prof": pr, "edev": ed, "a_int": ai, "rms": r, "S": Sb, "C": Cb,
                 "seam_step": float(step), "far_dev": far, "detail": det,
-                "edge_spread": _rfr_edge_spread(Sb, p)}
+                "edge_spread": _rfr_edge_spread(Sb, p),
+                "int_spread": _rfr_interior_spread(Sb, Cb, p)}
 
     try:
         m0 = _measure(volume, want_detail=True)
@@ -4769,7 +4889,7 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
             continue
         a[f] = float(np.clip(a[f], prof0[f] - (depth - 1 - margin), prof0[f] - margin))
     a[np.abs(a) <= 0.05] = 0.0
-    if not np.any(np.abs(a) > 0.05):
+    if not np.any(np.abs(a) > 0.05) and not np.any(np.abs(_rfr_precheck_tilt(m0, p)) > 1e-9):
         return volume, {"applied": False,
                         "reason": "already smooth" if np.isfinite(emax0) else "nothing to correct",
                         "dev_rms": round(rms0, 3),
@@ -4785,6 +4905,11 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
         b_tilt = _rfr_edge_tilt(m0["S"], edev0, p)
     except Exception:  # noqa: BLE001
         b_tilt = np.zeros(F)
+    try:
+        i_tilt, i_info = _rfr_interior_tilt(m0["S"], m0["C"], p)
+        b_tilt = np.where(np.abs(b_tilt) > 1e-9, b_tilt, i_tilt)   # edge blocks keep their own fit
+    except Exception:  # noqa: BLE001
+        i_info = {"frames": 0}
     lat_off = np.arange(L, dtype=np.float64) - (L - 1) / 2.0
     out = volume.copy()
     for f in range(F):
@@ -4822,13 +4947,17 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     sp0, sp1 = m0.get("edge_spread", float("nan")), m1.get("edge_spread", float("nan"))
     if np.isfinite(sp0) and np.isfinite(sp1) and sp1 > sp0 + float(p.get("rfr_edge_regress_px", 0.25)):
         bad.append(f"across-width edge spread {sp0:.2f}->{sp1:.2f}")
+    ip0, ip1 = m0.get("int_spread", float("nan")), m1.get("int_spread", float("nan"))
+    if np.isfinite(ip0) and np.isfinite(ip1) and ip1 > ip0 + float(p.get("rfr_edge_regress_px", 0.25)):
+        bad.append(f"across-width interior spread {ip0:.2f}->{ip1:.2f}")
     if bad:
         return volume, {"applied": False, "reason": "would regress: " + "; ".join(bad),
                         "dev_rms_before": round(rms0, 3), "dev_rms_after": _r3(rms1),
                         "seam_step_before": round(step0, 2), "seam_step_after": round(step1, 2),
                         "far_dev_before": _r2(far0), "far_dev_after": _r2(far1),
                         "edge_spread_before": _r2(sp0), "edge_spread_after": _r2(sp1),
-                        "sides": m0["detail"]}
+                        "int_spread_before": _r2(ip0), "int_spread_after": _r2(ip1),
+                        "interior_tilt": i_info, "sides": m0["detail"]}
     edge_n = int(p.get("rfr_edge_n", 12))
     return out, {"applied": True, "frames_moved": int(np.sum(np.abs(a) > 0.05)),
                  "max_shift": round(float(np.max(np.abs(a))), 2),
@@ -4841,6 +4970,8 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                      np.max(np.abs(b_tilt)) * float(p.get("oct_spacing_depth", 0.0031))
                      / float(p.get("oct_spacing_lateral", 0.0078))))), 2),
                  "frames_tilted": int(np.sum(np.abs(b_tilt) > 1e-6)),
+                 "int_spread_before": _r2(ip0), "int_spread_after": _r2(ip1),
+                 "interior_tilt": i_info,
                  "sides": m0["detail"],
                  "shift": [round(float(v), 3) for v in a]}
 
