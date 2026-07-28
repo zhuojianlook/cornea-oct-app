@@ -194,6 +194,12 @@ DEFAULT_PARAMS: dict = {
     "rfr_edge_max_tilt_deg": 1.5, # cap on that rotation. Real inter-frame torsion is under ~1.5 deg; cs039 needs 0.92
     "rfr_edge_tilt_min_px": 4.0,  # px of across-width spread below which no rotation is fitted — otherwise per-frame
                                   #   estimator noise becomes a spurious rotation, which is what sank the full 3-DOF fit
+    "rfr_edge_tilt_ratio": 1.5,   # the across-width ramp must also beat 1.5x THIS scan's own sham-edge tilt null.
+                                  #   A constant threshold fits no scan: cs044_os_v1_3's null p90 is 4.8px and its two
+                                  #   real rotations read 9.1 and 11.2, while cs044_os_v1_2's noisier periphery pushes
+                                  #   the null to 7.8px, so its largest edge tilt (6.9) is INSIDE the null and inert
+    "rfr_edge_tilt_fit": 0.35,    # a straight line must explain the spread this well (residual/spread) — the cleanest
+                                  #   separator between a real rotation (0.09-0.16) and a line through noise (0.3-0.6)
     "rfr_edge_tilt_smooth": 1.5,  # gaussian sigma (frames) on the fitted rotation sequence. B-scans are ~40ms apart so a
                                   #   real torsion trajectory is SMOOTH (cs039_os_v1: 20.7, 16.5, 7.4, 3.4px, one sign);
                                   #   a line fitted to noisy band medians ALTERNATES (cs044_os_v1: +10.0, +4.7, -12.0,
@@ -4743,13 +4749,23 @@ def _rfr_fit_tilt(ctr: np.ndarray, v: np.ndarray, p: dict):
 
 
 def _rfr_precheck_tilt(m: dict, p: dict) -> np.ndarray:
-    """The interior rotation the pass would apply — consulted before the early-out, because a scan can need a
-    rotation while needing no depth shift at all (cs035_od_v1_4's marked column: 7.7 px across the width,
-    0.07 px in the frame median)."""
+    """Every rotation the pass would apply, interior AND edge — consulted before the early-out, because a scan
+    can need a rotation while needing no depth shift at all. Two reviewer findings landed here: cs035_od_v1_4's
+    marked column carries a 7.7 px across-width ramp with a 0.07 px frame median, and cs044_os_v1_3's marked
+    columns carry 11.2 px and 9.1 px ramps on a scan whose every block offset sits inside its own null. Leaving
+    the edge tilt out of this check made the second case exit as "nothing to correct" before it was computed."""
+    n = int(m["prof"].size)
+    out = np.zeros(n)
     try:
-        return _rfr_interior_tilt(m["S"], m["C"], p)[0]
+        out = _rfr_interior_tilt(m["S"], m["C"], p)[0]
     except Exception:  # noqa: BLE001
-        return np.zeros(int(m["prof"].size))
+        pass
+    try:
+        et = _rfr_edge_tilt(m["S"], np.full(n, np.nan), p)
+        out = np.where(np.abs(et) > 1e-9, et, out)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _rfr_interior_spread(S: np.ndarray, C: np.ndarray, p: dict) -> float:
@@ -4817,6 +4833,48 @@ def _rfr_interior_tilt(S: np.ndarray, C: np.ndarray, p: dict):
     return tilt, info
 
 
+def _in_edge_block(f: int, F: int, p: dict) -> bool:
+    en = int(p.get("rfr_edge_n", 12))
+    return f < en or f >= F - en
+
+
+def _rfr_edge_tilt_null(S: np.ndarray, p: dict) -> float:
+    """This scan's own null for the edge across-width tilt: the same fit run at interior SHAM positions.
+
+    The block-offset gate already works this way, and the tilt needs it for the same reason — the statistic
+    has a per-scan floor set by how noisy that scan's band medians are, and a constant threshold fits no scan.
+    Measured: cs044_os_v1_3's null p90 is 4.80 px while its two genuinely rotated frames read 9.07 and 11.16;
+    on cs044_os_v1_2, whose periphery is far noisier, the null runs to 7.83 px and the largest edge tilt
+    (6.86) sits INSIDE it and must not be acted on."""
+    F, L = int(S.shape[0]), int(S.shape[1])
+    bands = _rfr_lateral_bands(L, p)
+    if len(bands) < 4:
+        return float("nan")
+    ctr = np.array([(lo + hi) / 2.0 for lo, hi in bands])
+    prof_b = [np.nanmedian(S[:, lo:hi], axis=1) for lo, hi in bands]
+    vals = []
+    for side in ("lead", "trail"):
+        for j in [int(v) for v in (p.get("rfr_placebo_offsets") or (12, 18, 24, 30, 36))]:
+            w = _rfr_side_windows(F, side, p, inward=j)
+            if w is None:
+                continue
+            fit, blk, seam = w
+            rows = []
+            for pr in prof_b:
+                pred = _rfr_edge_fit(pr, fit, seam, p)
+                if pred is None or not np.isfinite(pr[seam]):
+                    rows.append(np.full(len(blk), np.nan))
+                else:
+                    rows.append(pr[blk] - (pred[blk] + (pr[seam] - pred[seam])))
+            sub = np.array(rows)
+            for i in range(sub.shape[1]):
+                v = sub[:, i]
+                ok = np.isfinite(v)
+                if int(ok.sum()) >= 4:
+                    vals.append(abs(float(np.polyfit(ctr[ok], v[ok], 1)[0] * (L - 1))))
+    return float(np.percentile(vals, 90)) if vals else float("nan")
+
+
 def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict, allow: np.ndarray | None = None):
     """Per-frame lateral TILT of the accepted edge blocks, as a depth ramp in px per lateral column.
 
@@ -4844,8 +4902,15 @@ def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict, allow: np.ndarray |
     sz = float(p.get("oct_spacing_depth", 0.0031))
     max_slope = np.tan(np.radians(float(p.get("rfr_edge_max_tilt_deg", 1.5)))) * (sx / sz)
     mid = (L - 1) / 2.0
+    # Fitted for EVERY edge frame, not only those whose block offset was accepted. A declined block used to
+    # get no rotation at all, because edev is NaN there — so a frame that was rotated but not displaced was
+    # invisible to this pass. A reviewer found exactly that on cs044_os_v1_3: display columns 7 and 11 carry
+    # clean 11.2 px and 9.1 px across-width ramps (linear-fit residuals 0.93 and 1.28) on a scan whose block
+    # offsets were all within their own null.
+    null = _rfr_edge_tilt_null(S, p)
+    thr_null = (float(p.get("rfr_edge_tilt_ratio", 1.5)) * null) if np.isfinite(null) else 0.0
     for f in range(F):
-        if not np.isfinite(edev[f]):
+        if not _in_edge_block(f, F, p):
             continue
 
         v = dev[:, f]
@@ -4869,27 +4934,28 @@ def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict, allow: np.ndarray |
         # Only rotate when a straight line across the width genuinely explains the spread, and when there is
         # a spread worth removing. Otherwise this fits per-frame estimator noise into a spurious rotation —
         # the failure mode that sank the full 3-DOF fit (every fitted lateral shift came out positive).
-        if spread < float(p.get("rfr_edge_tilt_min_px", 4.0)):
+        across = abs(slope) * (L - 1)
+        if across < max(float(p.get("rfr_edge_tilt_min_px", 4.0)), thr_null):
             continue
-        if float(np.sqrt(np.mean(resid ** 2))) > 0.5 * spread:
+        # A straight line must genuinely explain it. This is what separates a real rotation from a line
+        # fitted through noisy band medians: on cs044_os_v1_3 the two real ones have residuals 0.93 and 1.28
+        # against spreads of 9.8 and 8.1, while the marginal frames sit at 1.9-3.5.
+        if float(np.sqrt(np.mean(resid ** 2))) > float(p.get("rfr_edge_tilt_fit", 0.35)) * spread:
             continue
         tilt[f] = float(np.clip(slope, -max_slope, max_slope))
 
-    # SMOOTH ACROSS ADJACENT FRAMES. Two B-scans are ~40 ms apart, so a real torsion trajectory is smooth:
-    # on cs039_os_v1 the fitted ramps decay 20.7, 16.5, 7.4, 3.4, 5.2, 3.6 px, same sign throughout. Fitting
-    # a straight line to noisy band medians instead produces ALTERNATING values — cs044_os_v1's outermost
-    # frames fitted +10.0, +4.7, -12.0, -12.7, -6.6 px, which pushed its across-width spread 10.66 -> 15.76.
-    # Low-passing the sequence keeps the first and cancels the second, which is exactly the discrimination
-    # wanted, and it needs no extra threshold.
-    sig = float(p.get("rfr_edge_tilt_smooth", 1.5) or 0.0)
-    if sig > 0:
-        for side in ("lead", "trail"):
-            w = _rfr_side_windows(int(S.shape[0]), side, p)
-            if w is None:
-                continue
-            blk = w[1]
-            tilt[blk] = ndimage.gaussian_filter1d(tilt[blk], sig, mode="nearest")
-    tilt[np.abs(tilt) * (L - 1) < float(p.get("rfr_edge_tilt_min_px", 4.0))] = 0.0
+    # ALTERNATION TEST, replacing a blanket low-pass. Low-passing the sequence does cancel the noise pattern
+    # it was aimed at, but it also cancels an ISOLATED genuine rotation — cs044_os_v1_3's two real frames are
+    # single-frame and a gaussian would have attenuated 11.2 px to ~3 and dropped them. What actually
+    # distinguishes noise is that it ALTERNATES against comparably-sized neighbours, so test for that
+    # directly and leave an isolated, well-explained, above-null rotation alone.
+    for f in range(F):
+        if abs(tilt[f]) <= 1e-9:
+            continue
+        nb = [tilt[g] for g in (f - 1, f + 1) if 0 <= g < F and _in_edge_block(g, F, p)]
+        opp = [x for x in nb if x * tilt[f] < 0 and abs(x) > 0.5 * abs(tilt[f])]
+        if len(opp) >= 1 and len(nb) >= 2 and all(x * tilt[f] < 0 for x in nb):
+            tilt[f] = 0.0
     return tilt
 
 
