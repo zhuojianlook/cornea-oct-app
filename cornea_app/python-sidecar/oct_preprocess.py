@@ -6086,6 +6086,56 @@ def smooth_corrected_volume(volume: np.ndarray, params: dict | None = None, work
     return out, {"applied": bool(moved.sum()), "frames_adjusted": int(moved.sum()), "cols_adjusted": int(n_cols)}
 
 
+def apply_manual_patch(volume: np.ndarray, patch) -> tuple[np.ndarray, int]:
+    """Per-frame RIGID ground-truth patch: {frame: [depth_px, tilt_px_across_width]}.
+
+    The reviewer-facing sibling of `manual_shifts`, which is depth-only and integer. Most of the residual
+    defects review actually finds are ROTATIONS — a frame deep at one sagittal end and shallow at the other —
+    and no depth nudge can express one. This applies both terms as a single sub-pixel rigid move: a uniform
+    depth offset plus a linear across-lateral ramp, which is a rotation of the B-scan, so the instantaneous
+    B-scan geometry is preserved exactly as the auto passes preserve it.
+
+    STICKY and applied LAST, like `manual_shifts`: it is ground truth and must outrank every automatic guard.
+    Storing a patch as PARAMETERS rather than baking it into voxels is the whole point — the preprocess
+    endpoint re-runs every stage from the .OCT, so a voxel edit is erased on the next run, whereas this is
+    re-applied. It also means the accumulated patches ARE the corpus the automatic passes must later learn to
+    reproduce: each entry is a measured (shift, rotation) the reviewer accepted.
+
+    `tilt_px_across_width` is the depth change from one lateral edge to the other; positive = deeper at
+    increasing lateral index. Returns (volume, n_frames_patched)."""
+    pairs = []
+    if isinstance(patch, dict):
+        pairs = list(patch.items())
+    elif isinstance(patch, (list, tuple)):
+        for item in patch:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                pairs.append((item[0], item[1]))
+    F, depth, L = int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2])
+    lat = np.arange(L, dtype=np.float64) - (L - 1) / 2.0
+    out = volume.copy()
+    n = 0
+    for f, val in pairs:
+        try:
+            fi = int(f)
+            if isinstance(val, (list, tuple)):
+                sh = float(val[0])
+                tl = float(val[1]) if len(val) > 1 else 0.0
+            else:
+                sh, tl = float(val), 0.0
+        except (TypeError, ValueError, OverflowError, IndexError):
+            continue
+        if not (0 <= fi < F) or not (math.isfinite(sh) and math.isfinite(tl)):
+            continue
+        if abs(sh) < 0.02 and abs(tl) < 0.02:
+            continue
+        if abs(sh) >= depth:
+            continue                      # never erase a whole frame
+        d = sh + (tl / max(1.0, L - 1)) * lat
+        out[fi] = _warp_by_displacement(np.ascontiguousarray(out[fi]), d, subpixel=True)
+        n += 1
+    return out, n
+
+
 def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
     """#2 fix-columns drag-to-correct: shift a specific frame (B-scan) UP/DOWN in DEPTH by an explicit
     pixel offset the annotator dragged in the fix-columns view — a per-frame manual ground-truth nudge
@@ -6903,6 +6953,11 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if ms:
         corrected, n_ms = apply_manual_shifts(corrected, ms)
         info["manual_shifts"] = {"n_frames": int(n_ms)}
+    # Reviewer-accepted rigid patches (depth + rotation), applied after everything else because they are GT.
+    mp = p_all.get("manual_patch")
+    if mp:
+        corrected, n_mp = apply_manual_patch(corrected, mp)
+        info["manual_patch"] = {"n_frames": int(n_mp)}
     corrected, n_crop = _apply_crop(corrected, p_all)
     if n_crop:
         info["crop"] = {"n_voxels": n_crop}

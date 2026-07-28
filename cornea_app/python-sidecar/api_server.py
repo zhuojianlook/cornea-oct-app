@@ -2109,6 +2109,12 @@ class OctPreprocessRequest(BaseModel):
                                              # lost box. None = carry persisted; {} or empty frames = clear the crop.
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
+    manual_patch: dict | None = None         # reviewer-accepted RIGID patch: {frame_index: [depth_px, tilt_px]}.
+                                             # Sticky like manual_shifts and applied after it. Carries a ROTATION
+                                             # term, which manual_shifts cannot express and which is the defect
+                                             # class review most often finds; stored as params so a re-preprocess
+                                             # re-applies it instead of erasing it, and so the accumulated set
+                                             # doubles as the corpus the auto passes must learn to reproduce.
     manual_shifts: dict | None = None        # #2 drag-to-correct: {frame_index: depth_px} manual per-frame
                                              # depth nudges (positive = DOWN), applied LAST as manual ground truth
     slice_index: int | None = None           # steps viewer: which sagittal slice to render the border+fit on
@@ -2532,6 +2538,8 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # ground truth stays applied on every later re-run. Flows to the worker inside eff_params (--params).
     if req.manual_shifts is not None:
         eff_params["manual_shifts"] = req.manual_shifts
+    if req.manual_patch is not None:                       # a request set REPLACES; omitted carries the persisted set
+        eff_params["manual_patch"] = req.manual_patch
     # AXIAL fix-tool GT (sticky, like manual_shifts): a request set REPLACES; omitted carries the persisted set
     # through (merged from oct_params above) so the axial correction re-applies on every re-run. Never popped by the
     # normal-auto supersede / use_redetect blocks below → it composes with (survives) a sagittal fix-columns Run.

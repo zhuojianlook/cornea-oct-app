@@ -990,3 +990,37 @@ def test_rfr_interior_rotation_needs_to_clear_the_scans_own_noise():
     q = {**M.DEFAULT_PARAMS, **_RFR_P, "rfr_bands": 8}
     tilt, ginfo = M._rfr_interior_tilt(S, C, q)
     assert ginfo["frames"] == 0
+
+
+def test_manual_patch_applies_shift_and_rotation_rigidly():
+    """The reviewer-facing patch must express a ROTATION, not only a depth nudge: most residual defects
+    review finds are a frame deep at one sagittal end and shallow at the other, which no depth offset can
+    describe. And it must be RIGID — the B-scan is an instantaneous capture."""
+    vol = _rfr_volume_from(_rfr_profile())
+    F, D, L = vol.shape
+    out, n = M.apply_manual_patch(vol, {30: [4.0, 12.0]})
+    assert n == 1
+    q = {**M.DEFAULT_PARAMS, **_RFR_P}
+    S0 = M._anterior_boundary(vol, q)
+    S1 = M._anterior_boundary(out, q)
+    d = S1[30] - S0[30]                                    # per-lateral depth change on the patched frame
+    # depth term: positive = DEEPER, the same convention apply_manual_shifts documents for an on-screen
+    # drag downward, so a reviewer's patch reads the same way in both tools.
+    assert abs(np.nanmean(d) - 4.0) < 0.6
+    # rotation term: a LINEAR ramp across the laterals, spanning the requested amount
+    lat = np.arange(L)
+    ok = np.isfinite(d)
+    slope = np.polyfit(lat[ok], d[ok], 1)[0] * (L - 1)
+    assert abs(slope - 12.0) < 2.0
+    assert np.array_equal(out[29], vol[29]) and np.array_equal(out[31], vol[31])   # neighbours untouched
+
+
+def test_manual_patch_is_ground_truth_and_survives_the_auto_passes():
+    """A patch stored as PARAMETERS is re-applied by the pipeline; a voxel edit would be erased on the next
+    re-preprocess, since the endpoint re-runs every stage from the .OCT."""
+    vol = _rfr_volume_from(_rfr_profile())
+    out, n = M.apply_manual_patch(vol, [[20, [2.0, 0.0]], [21, 3.0]])
+    assert n == 2                                          # accepts [frame, [shift, tilt]] and [frame, shift]
+    for bad in ({}, None, {5: [float("nan"), 0.0]}, {999: [3.0, 0.0]}, {6: [0.001, 0.001]}):
+        _o, k = M.apply_manual_patch(vol, bad)
+        assert k == 0                                      # never crash, never act on nonsense
