@@ -3,6 +3,7 @@ import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogT
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore } from "../../store/caseStore";
 import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, type LifecycleStep } from "../../api/lifecycle";
+import { useReviewQueueStore, nextAfter } from "../../store/reviewQueueStore";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
@@ -56,6 +57,7 @@ export function TimelineBar() {
   const status = useWorkflowStore((s) => s.status);
 
   const caseInfo = useCaseStore((s) => s.caseInfo);
+  const activeCaseId = useCaseStore((s) => s.caseId);
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
@@ -108,6 +110,13 @@ export function TimelineBar() {
   // OWN button shows a spinner — these all flip the shared segBusy/scarBusy/caseBusy, so we name the
   // specific one here and clear it when the work settles.
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  // REVIEW LOOP — approve/reject then jump to the next scan awaiting approval, so a pass through the backlog
+  // is one click per scan instead of click-approve, hunt for the next row, click it.
+  const reviewQueue = useReviewQueueStore((s) => s.queue);
+  const openCaseInSidebar = useReviewQueueStore((s) => s.open);
+  const [rejecting, setRejecting] = useState(false);      // the reason box is open
+  const [rejectReason, setRejectReason] = useState("");
+  const [queueNote, setQueueNote] = useState<string | null>(null);   // "backlog is empty" / advance errors
   useEffect(() => { if (!busy) setBusyAction(null); }, [busy]);
   // Short live-progress label for the running scar button (e.g. SAM2 per-plane %). Falls back to a verb.
   const scarProgress = status.kind === "working" ? status.detail : "";
@@ -357,6 +366,80 @@ export function TimelineBar() {
   // Full scar controls = detect + refine, shown together in the Scar-correction step (7) so you can iterate.
   const ScarReRun = classification !== "control" ? <>{ScarDetect}{ScarRefine}</> : null;
 
+  // Move to the next scan awaiting approval. Called AFTER the approve/reject write has landed, so the scan
+  // just handled has already left the queue and `nextAfter` falls through to the first remaining entry.
+  const advance = async () => {
+    const next = nextAfter(reviewQueue.filter((id) => id !== activeCaseId), activeCaseId);
+    if (!next || !openCaseInSidebar) {
+      setQueueNote(next ? "Cannot open the next scan — the scan list is still loading." : "No scans left awaiting approval.");
+      return;
+    }
+    setQueueNote(null);
+    await openCaseInSidebar(next);
+  };
+
+  const approveAndNext = async () => {
+    setBusyAction("approve");
+    try {
+      await approvePreprocessing(corpusEligible);
+      await advance();
+    } finally { setBusyAction(null); }
+  };
+
+  const rejectAndNext = async () => {
+    setBusyAction("reject");
+    try {
+      // The reason rides along with the flag in one write, so a rejection can never land without its why.
+      await setDifficult(true, rejectReason);
+      setRejecting(false);
+      setRejectReason("");
+      await advance();
+    } finally { setBusyAction(null); }
+  };
+
+  // The two review-loop buttons + the reason box, shared by every step that offers approval.
+  const ReviewLoop = (
+    <span className="flex items-center gap-1">
+      <Button size="small" variant="contained" color="success" disabled={busy || rejecting}
+        onClick={() => void approveAndNext()}
+        startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title={`Approve this scan's preprocessing and open the next one awaiting approval (${reviewQueue.length} in the queue).`}>
+        {busyAction === "approve" ? "Approving…" : `✓ Approve → next${reviewQueue.length ? ` (${reviewQueue.length})` : ""}`}
+      </Button>
+      {!rejecting ? (
+        <Button size="small" variant="outlined" color="error" disabled={busy}
+          onClick={() => setRejecting(true)}
+          title="Reject this scan (flags it Difficult, excluding it from training), record why, and open the next scan awaiting approval.">
+          ✗ Reject…
+        </Button>
+      ) : (
+        <>
+          <input
+            autoFocus
+            value={rejectReason}
+            onChange={(e) => setRejectReason(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") { e.preventDefault(); void rejectAndNext(); }
+              if (e.key === "Escape") { setRejecting(false); setRejectReason(""); }
+            }}
+            placeholder="why? e.g. the places I marked are where the surface is too wavy"
+            style={{ fontSize: 11, width: 380, color: "var(--c-text)", background: "var(--c-surface2)",
+                     border: "1px solid var(--c-border)", borderRadius: 4, padding: "3px 6px" }}
+          />
+          <Button size="small" variant="contained" color="error" disabled={busy}
+            onClick={() => void rejectAndNext()}
+            startIcon={busyAction === "reject" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+            title="Record the rejection with this reason and open the next scan. Enter also works; Escape cancels.">
+            {busyAction === "reject" ? "Rejecting…" : "✗ Reject → next"}
+          </Button>
+          <Button size="small" variant="text" disabled={busy}
+            onClick={() => { setRejecting(false); setRejectReason(""); }}>cancel</Button>
+        </>
+      )}
+      {queueNote && <span className="text-[11px]" style={{ color: "var(--c-amber, #d9a441)" }}>{queueNote}</span>}
+    </span>
+  );
+
   const sep = <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />;
 
   // Auto-populated scans reach Cornea (SAM2) WITHOUT a human approving the preprocessing (preproc_vetted unset,
@@ -435,12 +518,10 @@ export function TimelineBar() {
             : "Review + correct in Fix-columns (the correction becomes ground truth on Approve), then:"}
         </span>
         {CorpusToggle}
-        <Button size="small" variant="contained" color="warning" disabled={busy}
-          onClick={() => { setBusyAction("approve"); approvePreprocessing(corpusEligible); }}
-          startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title="Mark the preprocessing as manually vetted (turns the scan orange) — unlocks classification. Accepts the CURRENT output as-is; does NOT apply any auto-detected correction.">
-          {busyAction === "approve" && caseBusy ? "Approving…" : "✓ Approve preprocessing"}
-        </Button>
+        {/* The review LOOP lives here: approve (or reject with a reason) and the next scan awaiting approval
+            opens straight away. Working through the backlog is the dominant activity at this step, and the
+            old single "✓ Approve preprocessing" left the reviewer to find the next row themselves. */}
+        {ReviewLoop}
         {/* Full AUTO re-run from the raw .OCT (fresh surface detect + surface-crop detect + warp). Keeps sticky
             manual surface-crop / crop params; DISCARDS Fix-columns border corrections, so it is guarded by a confirm
             when the scan has any. Useful to un-stick a scan (e.g. one left in a bad manual state) or pick up an

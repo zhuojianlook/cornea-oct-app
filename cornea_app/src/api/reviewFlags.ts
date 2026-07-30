@@ -18,6 +18,11 @@ export interface ReviewFlagMeta {
 // sky = informational (matches the ⬚ surface-crop badge, which is the same subsystem), warm amber/
 // yellow + violet = statistical outliers from a round's distribution, not necessarily wrong.
 export const REVIEW_FLAGS: ReviewFlagMeta[] = [
+  // The CURATED review queue: the scans this pass is working through, in the order they were queued. Not a
+  // defect — it is a worklist, so it leads the list and uses the neutral accent green rather than an alarm
+  // colour. Filtering to it makes "✓ Approve → next" walk exactly this set instead of the whole backlog.
+  { slug: "to-review", label: "◆ To review (queued)", short: "Queue", color: "#39d353",
+    description: "Queued for this review pass. Filter to this, then Approve → next walks the queue in order." },
   { slug: "zeroed-frames", label: "Zeroed frames", short: "Zeroed", color: "#ef4444",       // red (worst)
     description: "The automatic off-cornea noise-crop blanked a contiguous block of B-scans." },
   { slug: "still-clipped", label: "Still clipped", short: "Clipped", color: "#fb923c",      // orange

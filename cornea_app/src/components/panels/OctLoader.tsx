@@ -10,6 +10,7 @@ import { Button, Typography, TextField, LinearProgress, Slider, Checkbox, Toggle
 import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
+import { useReviewQueueStore } from "../../store/reviewQueueStore";
 import type { ConsensusReport } from "../../api/types";
 import { scanStep, LIFECYCLE_STEPS } from "../../api/lifecycle";
 import { REVIEW_FLAGS, reviewFlagMeta, reviewFlagsOf } from "../../api/reviewFlags";
@@ -800,6 +801,28 @@ export function OctLoader() {
     }
   };
 
+  // REVIEW QUEUE — publish the visible approval backlog, in the sidebar's own order, plus an opener, so the
+  // timeline's "Approve → next" / "Reject → next" can advance without a trip back to this panel. The order is
+  // group order then within-group order, which is exactly how the rows render below (Array#sort is stable, so
+  // the `scans` order survives inside each group).
+  //
+  // The opener is a STABLE wrapper over a ref: `preview` is rebuilt every render, and publishing it directly
+  // would make every render a store write, re-rendering every subscriber.
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
+  const openRef = useRef((caseId: string) => previewRef.current(caseId));
+  const publishQueue = useReviewQueueStore((s) => s.publish);
+  useEffect(() => {
+    const groupOrder = new Map(groups.map((g, i) => [g.id, i]));
+    const q = scans
+      .filter((s) => s.caseId && visibleIds.has(s.id) && needsApproval(s) && !s.life?.difficult_scan)
+      .sort((a, b) => (groupOrder.get(a.groupId) ?? 0) - (groupOrder.get(b.groupId) ?? 0))
+      .map((s) => s.caseId as string);
+    publishQueue(q, openRef.current);
+    // `visibleIds` is a fresh Set every render, so this effect runs every render by design — publishQueue
+    // dedupes by content, and the queue must track the filter/search the reviewer is working through.
+  });
+
   // Changing params invalidates any already-corrected scans (result is now stale).
   const setParam = (key: string, v: number) => {
     setParams((cur) => ({ ...cur, [key]: v }));
@@ -1321,7 +1344,13 @@ export function OctLoader() {
                               style={{ color: "#fbbf24", fontWeight: 700, flex: "none" }}>⧗</span>
                           )}
                           {Boolean(s.life?.difficult_scan) && (
-                            <span title="Marked DIFFICULT — excluded from training" style={{ color: "#ef4444", fontWeight: 700, flex: "none" }}>⚠</span>
+                            // The rejection reason rides in the tooltip, so WHY a scan was rejected is
+                            // readable from the list without opening it — the flag alone says a scan is
+                            // unusable but not what to fix, and that is the thing needed months later.
+                            <span title={typeof s.life?.difficult_reason === "string" && s.life.difficult_reason
+                              ? `Rejected — excluded from training\n\n“${s.life.difficult_reason}”`
+                              : "Marked DIFFICULT — excluded from training"}
+                              style={{ color: "#ef4444", fontWeight: 700, flex: "none" }}>⚠</span>
                           )}
                           {done && s.caseId && (
                             <button title="Download this preprocessed scan (.nii.gz) for manual segmentation"

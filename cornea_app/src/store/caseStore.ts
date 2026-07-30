@@ -77,7 +77,9 @@ interface CaseState {
   // assistant reads exactly which frames/columns are wrong. Optimistic + serialized per case (mirrors flags).
   setDefectMarks: (marks: DefectMark[]) => Promise<void>;
   // "Difficult scan" toggle → manifest.difficult_scan (needs manual help). Optimistic, mirrors setReviewFlags.
-  setDifficult: (difficult: boolean) => Promise<void>;
+  // `reason` is the reviewer's own words for WHY, persisted as manifest.difficult_reason and cleared with the
+  // flag; omitting it leaves any existing reason alone so a plain toggle-on does not wipe one.
+  setDifficult: (difficult: boolean, reason?: string) => Promise<void>;
   // "Surface-crop" manual mark → manifest.surface_crop_manual (human review of the auto-detected clipped-cornea set).
   setSurfaceCrop: (surfaceCrop: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
@@ -240,12 +242,23 @@ export const useCaseStore = create<CaseState>()(
       await next;
     },
 
-    setDifficult: async (difficult) => {
+    setDifficult: async (difficult, reason) => {
       const id = get().caseId;
       if (!id) return;
-      set((s) => { if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).difficult_scan = difficult; });
+      const text = (reason ?? "").trim();
+      set((s) => {
+        if (!s.caseInfo) return;
+        const m = s.caseInfo.manifest as Record<string, unknown>;
+        m.difficult_scan = difficult;
+        // Mirror the server's rule locally so the optimistic view matches what lands on disk: clearing the
+        // flag clears the reason, and a reason is only recorded when one was actually given.
+        if (!difficult) m.difficult_reason = null;
+        else if (text) m.difficult_reason = { text, ts: Date.now() / 1000 };
+      });
       try {
-        await api.json(`/api/case/${id}/difficult`, "POST", JSON.stringify({ difficult }));
+        const body: Record<string, unknown> = { difficult };
+        if (text) body.reason = text;
+        await api.json(`/api/case/${id}/difficult`, "POST", JSON.stringify(body));
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
       }

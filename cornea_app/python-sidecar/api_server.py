@@ -2924,15 +2924,34 @@ def set_defect_marks(case_id: str, req: DefectMarksRequest) -> dict:
 
 class DifficultRequest(BaseModel):
     difficult: bool = True
+    # WHY the scan was rejected, in the reviewer's own words ("the places I marked are where the surface is
+    # too wavy"). The flag alone says a scan is unusable but not what to fix, and by the time the algorithm
+    # work happens the reason has been lost — so it is captured at the moment of rejection, next to the marks
+    # that motivated it. Cleared whenever the flag is cleared, so a stale reason can never outlive its flag.
+    reason: str | None = None
 
 
 @app.post("/api/case/{case_id}/difficult")
 def set_difficult_scan(case_id: str, req: DifficultRequest) -> dict:
     """Flag this scan as a DIFFICULT SCAN needing manual help (persisted to manifest.difficult_scan). Toggle
     the user sets in the viewer; the assistant reads it to know which scans to hand-correct. Manifest-only.
-    Difficult scans are EXCLUDED from nnU-Net training candidate selection (per_scan_segmented_cases)."""
-    m = orch.write_manifest_value(_require_case(case_id), {"difficult_scan": bool(req.difficult)})
-    return {"ok": True, "difficult_scan": bool(m.get("difficult_scan"))}
+    Difficult scans are EXCLUDED from nnU-Net training candidate selection (per_scan_segmented_cases).
+
+    An optional free-text `reason` is persisted alongside as manifest.difficult_reason (with the time it was
+    given), and is cleared when the flag is cleared."""
+    difficult = bool(req.difficult)
+    values: dict = {"difficult_scan": difficult}
+    if not difficult:
+        values["difficult_reason"] = None
+    else:
+        text = (req.reason or "").strip()
+        if text:
+            # `ts` as an epoch float, matching the defect-marks record just above — the module has no
+            # datetime import and one timestamp idiom per file is worth more than a prettier string.
+            values["difficult_reason"] = {"text": text[:2000], "ts": round(time.time(), 1)}
+    m = orch.write_manifest_value(_require_case(case_id), values)
+    return {"ok": True, "difficult_scan": bool(m.get("difficult_scan")),
+            "difficult_reason": m.get("difficult_reason")}
 
 
 def apply_surface_crop_mode(eff_params: dict, mode: str | None) -> dict:
@@ -4340,6 +4359,10 @@ def cases_list() -> dict:
                 # both the sidebar and the assistant can see them (count only for the marks, to keep the list light).
                 "defect_marks": (len(m.get("defect_marks")) if isinstance(m.get("defect_marks"), list) else 0),
                 "difficult_scan": bool(m.get("difficult_scan")),
+                # The rejection reason travels with the flag so the sidebar can show WHY a scan was rejected
+                # on hover, without opening it. Text only — the timestamp stays in the manifest.
+                "difficult_reason": (((m.get("difficult_reason") or {}).get("text"))
+                                     if isinstance(m.get("difficult_reason"), dict) else None),
                 # Surface-crop (clipped cornea): AUTO = the pipeline took the surface-crop path
                 # (oct_iter.stopped == "surface_crop"); MANUAL = the human's review override (True/False/None).
                 # The loader badges both so every auto-detected clip is easy to find + verify.
