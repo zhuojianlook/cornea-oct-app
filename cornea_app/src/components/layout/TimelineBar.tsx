@@ -114,9 +114,17 @@ export function TimelineBar() {
   // is one click per scan instead of click-approve, hunt for the next row, click it.
   const reviewQueue = useReviewQueueStore((s) => s.queue);
   const openCaseInSidebar = useReviewQueueStore((s) => s.open);
+  const queueSettled = useReviewQueueStore((s) => s.settled);
+  const markSettled = useReviewQueueStore((s) => s.markSettled);
   const [rejecting, setRejecting] = useState(false);      // the reason box is open
   const [rejectReason, setRejectReason] = useState("");
   const [queueNote, setQueueNote] = useState<string | null>(null);   // "backlog is empty" / advance errors
+  // Opening the NEXT scan is tracked separately from the approve/reject WRITE. They were one flag, so the
+  // button sat on "Rejecting…" while the next volume loaded — and a first-time surface-crop detection can take
+  // 25 s or more, which reads as a hang even though the rejection had already reached disk.
+  const [navigating, setNavigating] = useState(false);
+  // What is genuinely left: the published queue minus anything settled in this session and minus the open scan.
+  const nLeft = reviewQueue.filter((id) => id !== activeCaseId && !queueSettled.has(id)).length;
   useEffect(() => { if (!busy) setBusyAction(null); }, [busy]);
   // Short live-progress label for the running scar button (e.g. SAM2 per-plane %). Falls back to a verb.
   const scarProgress = status.kind === "working" ? status.detail : "";
@@ -369,45 +377,83 @@ export function TimelineBar() {
   // Move to the next scan awaiting approval. Called AFTER the approve/reject write has landed, so the scan
   // just handled has already left the queue and `nextAfter` falls through to the first remaining entry.
   const advance = async () => {
-    const next = nextAfter(reviewQueue.filter((id) => id !== activeCaseId), activeCaseId);
+    // The FULL queue, so nextAfter can find the current scan's position and step forward from it. Passing a
+    // pre-filtered queue made indexOf return -1 and every advance jumped back to the top of the list.
+    const next = nextAfter(reviewQueue, activeCaseId, queueSettled);
     if (!next || !openCaseInSidebar) {
       setQueueNote(next ? "Cannot open the next scan — the scan list is still loading." : "No scans left awaiting approval.");
       return;
     }
     setQueueNote(null);
-    await openCaseInSidebar(next);
+    setNavigating(true);
+    try {
+      // BOUNDED. Opening a scan can be slow the first time (the surface-crop detection is computed on open and
+      // is not cached yet), and without a bound a slow open leaves the review loop looking wedged with no way
+      // out. On timeout the verdict is already saved — only the navigation failed — so say exactly that.
+      await Promise.race([
+        Promise.resolve(openCaseInSidebar(next)),
+        new Promise((_r, rej) => setTimeout(() => rej(new Error("timeout")), 60000)),
+      ]);
+    } catch {
+      setQueueNote("Your verdict was saved, but the next scan is slow to open — click it in the list.");
+    } finally { setNavigating(false); }
+  };
+
+  // Wait for the write, but not forever. The store applies every one of these optimistically, so the UI is
+  // already correct when the click lands; the await is only to catch an outright failure. `fetch` here has no
+  // timeout, and a POST can sit queued behind a long-running request on the same sidecar (opening a
+  // surface-crop scan computes its crop detection, which takes 25 s+ uncached) — which left the button reading
+  // "Rejecting…" long after the rejection had reached disk. The request is never aborted: that could drop a
+  // verdict. It simply finishes in the background.
+  const settleWrite = async (write: Promise<unknown>, what: string) => {
+    let slow = false;
+    const timer = setTimeout(() => {
+      slow = true;
+      setQueueNote(`${what} saved — the sidecar is busy, so it is still confirming in the background.`);
+    }, 6000);
+    try {
+      await Promise.race([write, new Promise((r) => setTimeout(r, 6000))]);
+    } finally {
+      clearTimeout(timer);
+      if (!slow) setQueueNote(null);
+    }
+    void write.catch(() => setQueueNote(`${what} may NOT have saved — check the scan before moving on.`));
   };
 
   const approveAndNext = async () => {
     setBusyAction("approve");
     try {
-      await approvePreprocessing(corpusEligible);
-      await advance();
+      if (activeCaseId) markSettled(activeCaseId);
+      await settleWrite(approvePreprocessing(corpusEligible), "Approval");
     } finally { setBusyAction(null); }
+    await advance();
   };
 
   const rejectAndNext = async () => {
     setBusyAction("reject");
     try {
       // The reason rides along with the flag in one write, so a rejection can never land without its why.
-      await setDifficult(true, rejectReason);
+      if (activeCaseId) markSettled(activeCaseId);
+      await settleWrite(setDifficult(true, rejectReason), "Rejection");
       setRejecting(false);
       setRejectReason("");
-      await advance();
     } finally { setBusyAction(null); }
+    await advance();
   };
 
   // The two review-loop buttons + the reason box, shared by every step that offers approval.
   const ReviewLoop = (
     <span className="flex items-center gap-1">
-      <Button size="small" variant="contained" color="success" disabled={busy || rejecting}
+      <Button size="small" variant="contained" color="success" disabled={busy || rejecting || navigating}
         onClick={() => void approveAndNext()}
         startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-        title={`Approve this scan's preprocessing and open the next one awaiting approval (${reviewQueue.length} in the queue).`}>
-        {busyAction === "approve" ? "Approving…" : `✓ Approve → next${reviewQueue.length ? ` (${reviewQueue.length})` : ""}`}
+        title={`Approve this scan's preprocessing and open the next one awaiting approval (${nLeft} in the queue).`}>
+        {busyAction === "approve" ? "Approving…"
+          : navigating ? "Opening next…"
+          : `✓ Approve → next${nLeft ? ` (${nLeft})` : ""}`}
       </Button>
       {!rejecting ? (
-        <Button size="small" variant="outlined" color="error" disabled={busy}
+        <Button size="small" variant="outlined" color="error" disabled={busy || navigating}
           onClick={() => setRejecting(true)}
           title="Reject this scan (flags it Difficult, excluding it from training), record why, and open the next scan awaiting approval.">
           ✗ Reject…
@@ -426,7 +472,7 @@ export function TimelineBar() {
             style={{ fontSize: 11, width: 380, color: "var(--c-text)", background: "var(--c-surface2)",
                      border: "1px solid var(--c-border)", borderRadius: 4, padding: "3px 6px" }}
           />
-          <Button size="small" variant="contained" color="error" disabled={busy}
+          <Button size="small" variant="contained" color="error" disabled={busy || navigating}
             onClick={() => void rejectAndNext()}
             startIcon={busyAction === "reject" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
             title="Record the rejection with this reason and open the next scan. Enter also works; Escape cancels.">

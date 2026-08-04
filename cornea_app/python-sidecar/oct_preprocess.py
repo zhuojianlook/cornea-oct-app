@@ -395,6 +395,35 @@ DEFAULT_PARAMS: dict = {
     # never produces one) → reset to the trend. Width-gated so a real limbus flank / smooth dome is a strict
     # no-op. Independent of frame confidence (catches a local spike on an otherwise-confident frame). False disables.
     "despike_lateral": True,
+    # ── UNTRUSTED-SURFACE REPAIR ── (surface-break + artifact correction; reviewer-directed, 2026-08)
+    # The dominant defect in the reviewed corpus is per-frame UNDULATION: the detected surface departing from the
+    # clean quadratic a corneal B-scan should follow. Measured over 4,033 frames its median is 1.23 px and its p99
+    # is 135 px, and the p99 frames are not shape at all — they are frames where the detector emits a boundary on
+    # image regions that contain NO cornea (uniform speckle at the acquisition edge) or that are OCCLUDED by an
+    # eyelash/eyelid/reflection. Neither is correctable by moving the frame, so no rigid stage can help; the fix is
+    # to stop trusting the surface there and replace those columns with the frame's own robust quadratic.
+    #
+    # Four independent signals, each scored against the SCAN'S OWN median rather than a constant (the absolute
+    # levels vary far too much between scans to threshold globally — coherence separates hallucinating frames from
+    # calm ones at AUC 0.93 while overlapping badly in absolute value):
+    #   coherence  — an A-scan that stops resembling its lateral neighbours: no band to lock onto
+    #   shadow     — tissue under the surface much darker than the rest of the slice: the beam was blocked
+    #   bright     — signal in the air ABOVE the surface: the blocker itself
+    #   jump       — the surface departing sharply from its own frame's quadratic: the "sharp V"
+    # Validated against the reviewer's 20 marked artifact locations: 17/20 caught (edge 4/4, eyelid 4/4,
+    # reflection 2/2, eyelash 4/5, motion 2/4 — a motion artifact leaves the tissue bright and coherent, so it is
+    # a CORRECTION problem for the rigid pass, not a detection problem for this).
+    "surface_repair": False,        # DEFAULT OFF until the corpus regression is reviewed
+    "srep_coh_drop": 0.06,          # coherence this far below the scan median = untrusted (keeps 97.3% of calm
+                                    #   frames, refuses 46.4% of hallucinating ones)
+    "srep_shadow_frac": 0.85,       # tissue below the surface dimmer than this x the slice's own level
+    "srep_bright_frac": 1.25,       # air above the surface brighter than this x the slice's own level
+    "srep_jump_px": 6.0,            # surface this far off its frame's robust quadratic
+    "srep_max_frac": 0.45,          # NEVER replace more than this fraction of one frame's laterals. A mark can
+                                    #   span most of the frame axis (cs020_os_v4: app columns 19-101), and past
+                                    #   that point there is not enough trusted surface left to fit a quadratic
+                                    #   to — replacing it all would be inventing a surface, not repairing one.
+    "srep_min_trusted": 120,        # a frame needs at least this many trusted laterals to be repaired at all
     "despike_win": 31,            # lateral median-trend window (odd; wider than any real narrow spike)
     "despike_dev": 13.0,          # |surface − trend| px above which a narrow run is a spike/notch
     "despike_max_w": 12,          # max lateral run width treated as a spike (a real limbus flank is longer → kept)
@@ -2267,6 +2296,10 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # EDGE REGULARIZATION: smooth the faint FOV-boundary laterals' jagged border across frames (depth-preserving),
     # a strict no-op on the confident interior. Handles the sagittal edge-slice jitter (CS001 OD__4 lateral 0/1)
     # AND, via the outer-band floor sigma, the BRIGHT tissue-bearing FOV edge (CS001 OD__4 visual-left / array-right).
+    # UNTRUSTED-SURFACE REPAIR: replace columns the image gives no reason to trust (no band, an
+    # eyelash/eyelid shadow, a reflection, or a sharp V) with the frame's own robust quadratic, so
+    # every later stage sees a corneal surface rather than a trace over speckle. Default OFF.
+    out = _repair_untrusted_surface(out, sag, p)
     out = _edge_regularize_surface(out, sag, p)
     # NOTE: _parabola_edge_constrain is DELIBERATELY NOT applied here. detect_surface_all is the detection
     # baseline used by the NOISE-CROP (detect_noise_frames), the surface-crop, the confidence scores and the
@@ -2276,6 +2309,100 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # artifact correction is applied ONLY to the final WARP surface (smooth_volume), so the OUTPUT edges follow
     # the parabola while the detectors still see the real tissue.
     return out
+
+
+def _repair_untrusted_surface(edges: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarray:
+    """Replace surface columns the image gives no reason to trust with the frame's own robust quadratic.
+
+    This is a DETECTION repair, not a warp: it changes what the pipeline believes the surface is, so every later
+    stage (the rigid fit, the crop, the labels) sees a corneal surface instead of a boundary traced over speckle
+    or an eyelash. Nothing is deformed, so it is orthogonal to the rigid-only constraint rather than bounded by it.
+
+    A column is untrusted when ANY of four signals fires, each measured against the SCAN'S OWN median:
+      * its A-scan stops resembling its lateral neighbours (no band present to lock onto);
+      * the tissue beneath the surface is much darker than the rest of that slice (the beam was blocked);
+      * there is signal in the air above the surface (the blocker);
+      * the surface sits far off its own frame's robust quadratic (the "sharp V").
+
+    The replacement is the quadratic fitted to that frame's TRUSTED columns only, so the repaired region continues
+    the cornea the frame itself shows. Frames with too few trusted columns, or where too much of the frame would
+    be replaced, are left ALONE — past that point there is no evidence left to interpolate from and a "repair"
+    would be an invention. edges=(n_lateral, n_frames), sag=(n_lateral, depth, n_frames).
+    """
+    if not bool(p.get("surface_repair", False)):
+        return edges
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2 or sag is None or sag.ndim != 3 or sag.shape[0] != e.shape[0] or sag.shape[2] != e.shape[1]:
+        return edges
+    L, F = e.shape
+    if L < 60 or F < 8:
+        return edges
+    v = np.asarray(sag, dtype=np.float32)
+    D = v.shape[1]
+    lat = np.arange(L, dtype=np.float64)
+
+    # 1 — lateral coherence: does each A-scan resemble its neighbour?
+    A = ndimage.uniform_filter1d(v, size=5, axis=1)
+    A = A - A.mean(axis=1, keepdims=True)
+    nrm = np.sqrt((A * A).sum(axis=1))
+    coh = (A[:-1] * A[1:]).sum(axis=1) / np.maximum(nrm[:-1] * nrm[1:], 1e-6)
+    coh = np.vstack([coh, coh[-1:]])
+    coh = ndimage.uniform_filter(coh, size=(6, 3), mode="nearest")
+    coh_bad = coh < (float(np.median(coh)) - float(p.get("srep_coh_drop", 0.06)))
+
+    # 2/3 — the frame's own robust quadratic, then brightness below and above it
+    exp = np.full((L, F), np.nan)
+    dev = np.full((L, F), np.nan)
+    for f in range(F):
+        y = e[:, f]
+        g = np.isfinite(y)
+        if int(g.sum()) < 40:
+            continue
+        c0 = np.polyfit(lat[g], y[g], 2)
+        r0 = y[g] - np.polyval(c0, lat[g])
+        k = np.abs(r0) <= np.percentile(np.abs(r0), 80)
+        q = np.polyval(np.polyfit(lat[g][k], y[g][k], 2), lat)
+        exp[:, f] = q
+        dev[:, f] = np.abs(y - q)
+    below = np.full((L, F), np.nan)
+    above = np.full((L, F), np.nan)
+    for i in range(L):
+        for f in range(F):
+            b = exp[i, f]
+            if not np.isfinite(b):
+                continue
+            bi = int(round(b))
+            l1, h1 = max(0, bi + 5), min(D, bi + 60)
+            l2, h2 = max(0, bi - 70), max(1, bi - 10)
+            if h1 > l1:
+                below[i, f] = v[i, l1:h1, f].mean()
+            if h2 > l2:
+                above[i, f] = v[i, l2:h2, f].mean()
+    def _norm(X):
+        med = float(np.nanmedian(X)) if np.isfinite(X).any() else 1.0
+        return ndimage.uniform_filter(np.nan_to_num(X, nan=med), size=(6, 3), mode="nearest") / max(med, 1e-6)
+    below_n, above_n = _norm(below), _norm(above)
+    bad = (coh_bad
+           | (below_n < float(p.get("srep_shadow_frac", 0.85)))
+           | (above_n > float(p.get("srep_bright_frac", 1.25)))
+           | (np.nan_to_num(dev, nan=0.0) > float(p.get("srep_jump_px", 6.0))))
+
+    out = e.copy()
+    max_frac = float(p.get("srep_max_frac", 0.45))
+    min_trusted = int(p.get("srep_min_trusted", 120))
+    for f in range(F):
+        m = bad[:, f]
+        good = ~m & np.isfinite(e[:, f])
+        if int(good.sum()) < min_trusted or int(m.sum()) == 0:
+            continue
+        if m.mean() > max_frac:
+            continue                      # too little left to fit — leave the frame exactly as detected
+        c0 = np.polyfit(lat[good], e[good, f], 2)
+        r0 = e[good, f] - np.polyval(c0, lat[good])
+        k = np.abs(r0) <= np.percentile(np.abs(r0), 90)
+        q = np.polyval(np.polyfit(lat[good][k], e[good, f][k], 2), lat)
+        out[m, f] = q[m]
+    return out.astype(edges.dtype, copy=False)
 
 
 def _parabola_edge_constrain(edges: np.ndarray, p: dict) -> np.ndarray:
