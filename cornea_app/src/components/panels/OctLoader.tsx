@@ -815,10 +815,21 @@ export function OctLoader() {
   useEffect(() => {
     const groupOrder = new Map(groups.map((g, i) => [g.id, i]));
     const q = scans
-      .filter((s) => s.caseId && visibleIds.has(s.id) && needsApproval(s) && !s.life?.difficult_scan)
+      // NOT filtered on difficult_scan. That exclusion silently emptied the queue: every one of the 138 scans
+      // awaiting approval also carries the flag, so "N left" read 0 and the 10-scan checkpoint never counted.
+      // The flag is set by Reject and by bulk preprocessing — it marks a scan as WANTING attention, which is
+      // the opposite of a reason to drop it from the review queue (its own button was removed from the UI).
+      .filter((s) => s.caseId && visibleIds.has(s.id) && needsApproval(s))
       .sort((a, b) => (groupOrder.get(a.groupId) ?? 0) - (groupOrder.get(b.groupId) ?? 0))
       .map((s) => s.caseId as string);
-    publishQueue(q, openRef.current);
+    // PROGRESS over every scan in the store, NOT just the visible ones: "how far through the job am I" must
+    // not jump around when the reviewer narrows the sidebar to a subset. A scan is vettable once it has been
+    // preprocessed — those are exactly the scans an approval can be given to, so vetted/vettable is a real
+    // fraction rather than a count against an unrelated total.
+    const vettable = scans.filter((s) => s.status !== "error"
+      && (Boolean(s.life?.oct_preprocessed) || s.status === "done"));
+    publishQueue(q, openRef.current, vettable.filter((s) => s.life?.preproc_vetted).length, vettable.length,
+                 vettable.filter((s) => s.life?.reviewer_rejected).length);
     // `visibleIds` is a fresh Set every render, so this effect runs every render by design — publishQueue
     // dedupes by content, and the queue must track the filter/search the reviewer is working through.
   });

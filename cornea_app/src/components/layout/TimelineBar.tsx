@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Select } from "@mui/material";
 import { useWorkflowStore } from "../../store/workflowStore";
-import { useCaseStore } from "../../store/caseStore";
+import { useCaseStore, type DefectMark } from "../../store/caseStore";
+import { api } from "../../api/client";
 import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, type LifecycleStep } from "../../api/lifecycle";
 import { useReviewQueueStore, nextAfter } from "../../store/reviewQueueStore";
+import { usePendingEditStore } from "../../store/pendingEditStore";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
@@ -62,7 +64,27 @@ export function TimelineBar() {
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
   const setDifficult = useCaseStore((s) => s.setDifficult);
-  const setSurfaceCrop = useCaseStore((s) => s.setSurfaceCrop);
+  // Border corrections drawn but not Confirmed — committed by the reject handler so a correction costs one
+  // click, not three. See pendingEditStore.
+  const pendingEdit = usePendingEditStore((s) => s.pending);
+  const takePendingEdit = usePendingEditStore((s) => s.takePending);
+  // What the reject button is about to save. Counting only border POINTS read "(0)" whenever the pending work
+  // was crop or defect marks — telling the reviewer their marks would be discarded, which was the opposite of
+  // the truth.
+  const pendingSummary = pendingEdit ? [
+    pendingEdit.nPoints > 0 ? `${pendingEdit.nPoints} border pt` : null,
+    pendingEdit.cropFrames?.length ? `${pendingEdit.cropFrames.length} crop frame` : null,
+    pendingEdit.cropRegion?.frames.length ? `${pendingEdit.cropRegion.frames.length} region col` : null,
+    pendingEdit.defectCols?.cols.length ? `${pendingEdit.defectCols.cols.length} marked col` : null,
+    pendingEdit.postAnchors
+      ? `${Object.values(pendingEdit.postAnchors).reduce((a, m) => a + Object.keys(m).length, 0)} bottom pt` : null,
+  ].filter(Boolean).join(" + ") || "cleared marks" : "";
+  const commitBorderAnchors = useCaseStore((s) => s.commitBorderAnchors);
+  const commitOctMarks = useCaseStore((s) => s.commitOctMarks);
+  const startReprocessBatch = useCaseStore((s) => s.startReprocessBatch);
+  const startDetectorTune = useCaseStore((s) => s.startDetectorTune);
+  const rerunWithCorrections = useCaseStore((s) => s.rerunWithCorrections);
+  const setDefectMarks = useCaseStore((s) => s.setDefectMarks);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
   // Ground-truth capture: this scan carries a manual border correction (Fix-columns anchors) → Approving records
@@ -116,9 +138,44 @@ export function TimelineBar() {
   const openCaseInSidebar = useReviewQueueStore((s) => s.open);
   const queueSettled = useReviewQueueStore((s) => s.settled);
   const markSettled = useReviewQueueStore((s) => s.markSettled);
-  const [rejecting, setRejecting] = useState(false);      // the reason box is open
-  const [rejectReason, setRejectReason] = useState("");
+  const rejectsSinceCheckpoint = useReviewQueueStore((s) => s.rejectsSinceCheckpoint);
+  const clearCheckpoint = useReviewQueueStore((s) => s.clearCheckpoint);
+  const nVetted = useReviewQueueStore((s) => s.vetted);
+  const nVettable = useReviewQueueStore((s) => s.vettable);
+  const nRejected = useReviewQueueStore((s) => s.rejected);
+  // How many corrections to bank before offering to learn from them. Persisted so it survives a reload.
+  const [checkpointEvery, setCheckpointEvery] = useState<number>(() => {
+    const v = Number(localStorage.getItem("cornea.checkpointEvery"));
+    return Number.isFinite(v) && v >= 1 ? Math.min(200, Math.round(v)) : 10;
+  });
+  useEffect(() => { localStorage.setItem("cornea.checkpointEvery", String(checkpointEvery)); }, [checkpointEvery]);
+  const [rejecting, setRejecting] = useState(false);      // legacy: kept so existing guards read false
+  const [rejectReason, setRejectReason] = useState("");   // OPTIONAL note; empty is fine
   const [queueNote, setQueueNote] = useState<string | null>(null);   // "backlog is empty" / advance errors
+  // Detector-tuning progress. Polled while a run is live so an hours-long background search is VISIBLE —
+  // a button that appears to do nothing for an hour is indistinguishable from a broken one. Kept after it
+  // finishes so the verdict ("adopted X" / "nothing beat the current detector") is readable.
+  const [tuneBusy, setTuneBusy] = useState(false);
+  const [tune, setTune] = useState<null | { running?: boolean; phase?: string; done?: number; total?: number;
+    note?: string; adopted?: Record<string, number> | null; baseline?: { within?: number } | null;
+    best?: { within?: number } | null }>(null);
+  useEffect(() => {
+    let stop = false;
+    const poll = async () => {
+      try {
+        const r = await api.json<{ running?: boolean; phase?: string }>("/api/review/tune-status");
+        if (stop) return;
+        setTune(r as never);
+        if (!r?.running) setTuneBusy(false);
+      } catch { /* transient — the next tick retries */ }
+    };
+    void poll();
+    // Only while something is live: idle polling of a machine that is otherwise busy preprocessing is waste.
+    if (!tuneBusy && !tune?.running) return;
+    const t = setInterval(() => void poll(), 4000);
+    return () => { stop = true; clearInterval(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tuneBusy, tune?.running]);
   // Opening the NEXT scan is tracked separately from the approve/reject WRITE. They were one flag, so the
   // button sat on "Rejecting…" while the next volume loaded — and a first-time surface-crop detection can take
   // 25 s or more, which reads as a hang even though the rejection had already reached disk.
@@ -379,7 +436,28 @@ export function TimelineBar() {
   const advance = async () => {
     // The FULL queue, so nextAfter can find the current scan's position and step forward from it. Passing a
     // pre-filtered queue made indexOf return -1 and every advance jumped back to the top of the list.
-    const next = nextAfter(reviewQueue, activeCaseId, queueSettled);
+    let next = nextAfter(reviewQueue, activeCaseId, queueSettled);
+    // FALLBACK: ask the SERVER which scans await approval. The published queue is derived from OctLoader's
+    // in-memory list, and when that is empty or stale — a reload, a filter change, a lifecycle re-hydrate that
+    // has not landed — the loop reported "no scans left" while 138 genuinely awaited review, stranding the
+    // reviewer on the scan they had just judged. The queue is an optimisation; the backlog is a fact, so fall
+    // back to the fact rather than stopping.
+    if (!next) {
+      try {
+        const r = await api.json<{ cases: Array<{ case_id: string; life?: Record<string, unknown> }> }>(
+          "/api/cases/list");
+        const awaiting = (r.cases || []).filter((c) => {
+          const l = (c.life ?? {}) as Record<string, unknown>;
+          // NOT filtered on difficult_scan: a rejected scan is still awaiting approval — the reviewer's own
+          // backlog is 138 scans of which all 138 are flagged difficult, so excluding them matched nothing and
+          // the loop reported an empty queue. Only an APPROVED scan leaves the backlog.
+          return Boolean(l.oct_preprocessed) && !l.preproc_vetted;
+        }).map((c) => c.case_id);
+        next = awaiting.find((id) => id !== activeCaseId && !queueSettled.has(id)) ?? null;
+      } catch {
+        /* fall through to the note below */
+      }
+    }
     if (!next || !openCaseInSidebar) {
       setQueueNote(next ? "Cannot open the next scan — the scan list is still loading." : "No scans left awaiting approval.");
       return;
@@ -423,8 +501,45 @@ export function TimelineBar() {
   const approveAndNext = async () => {
     setBusyAction("approve");
     try {
-      if (activeCaseId) markSettled(activeCaseId);
+      if (activeCaseId) markSettled(activeCaseId, false);
       await settleWrite(approvePreprocessing(corpusEligible), "Approval");
+    } catch (e) {
+      setQueueNote(`Approval may not have saved (${e instanceof Error ? e.message : String(e)}) — moving on anyway; re-check this scan.`);
+    } finally { setBusyAction(null); }
+    await advance();
+  };
+
+  // ITERATE ON THIS SCAN. Commit whatever is drawn, re-run the scan against it, and STAY — so the reviewer
+  // can look at the result and correct again. This is the loop that actually converges per scan: unlike the
+  // detector-parameter search, an anchor is not a hint the detector may decline, it defines the surface.
+  const correctAndRerun = async () => {
+    setBusyAction("rerun");
+    try {
+      const edit = activeCaseId ? takePendingEdit(activeCaseId) : null;
+      if (edit) {
+        // Same commit path the verdict buttons use, so a correction recorded here is byte-identical to one
+        // recorded by a rejection — there is no second, weaker kind of correction.
+        if (edit.nPoints > 0) await commitBorderAnchors(edit.anchors, edit.parabola, edit.parabolaSlices);
+        if (edit.cropFrames !== null || edit.cropRegion !== null || edit.postAnchors) {
+          await commitOctMarks(edit.cropFrames, edit.cropRegion, edit.postAnchors);
+        }
+      }
+      const ok = await rerunWithCorrections();
+      if (!ok) setQueueNote("Re-run failed — your correction is saved; try again or Skip.");
+      else setQueueNote(null);
+    } catch (e) {
+      setQueueNote(`Re-run problem (${e instanceof Error ? e.message : String(e)}) — the correction is saved.`);
+    } finally { setBusyAction(null); }
+  };
+
+  // MOVE ON WITHOUT A VERDICT. Not every scan can be fixed, and forcing a reviewer to either approve
+  // something they do not believe or reject something they may come back to is a false choice. Skipping
+  // settles it for THIS session only — nothing is written, so the scan is still awaiting approval tomorrow.
+  const skipToNext = async () => {
+    setBusyAction("skip");
+    try {
+      if (activeCaseId) markSettled(activeCaseId, false);
+      setQueueNote(null);
     } finally { setBusyAction(null); }
     await advance();
   };
@@ -432,18 +547,149 @@ export function TimelineBar() {
   const rejectAndNext = async () => {
     setBusyAction("reject");
     try {
-      // The reason rides along with the flag in one write, so a rejection can never land without its why.
-      if (activeCaseId) markSettled(activeCaseId);
-      await settleWrite(setDifficult(true, rejectReason), "Rejection");
+      if (activeCaseId) markSettled(activeCaseId, true);
+      // COMMIT THE CORRECTION FIRST. A border the reviewer drew is ground truth about where the cornea is,
+      // and rejecting is how they say "this scan is wrong — here is what it should have been". Requiring a
+      // separate "Confirm border" click before that counted meant a correction drawn and then rejected was
+      // silently discarded, which is the reverse of what the gesture means. The write must land BEFORE the
+      // difficult flag, because the backend harvests border_gt from the persisted anchors at that moment.
+      const edit = activeCaseId ? takePendingEdit(activeCaseId) : null;
+      let note = "";
+      if (edit) {
+        const parts: string[] = [];
+        try {
+          if (edit.nPoints > 0) {
+            await commitBorderAnchors(edit.anchors, edit.parabola, edit.parabolaSlices);
+            parts.push(`border corrected: ${edit.nPoints} point(s) on ${edit.nSlices} slice(s)`);
+          }
+          if (edit.cropFrames !== null || edit.cropRegion !== null || edit.postAnchors) {
+            await commitOctMarks(edit.cropFrames, edit.cropRegion, edit.postAnchors);
+            if (edit.cropFrames !== null) parts.push(`${edit.cropFrames.length} surface-crop frame(s)`);
+            if (edit.cropRegion !== null) parts.push(`crop region ${edit.cropRegion.frames.length} col(s)`);
+            if (edit.postAnchors) {
+              const n = Object.values(edit.postAnchors).reduce((a, m) => a + Object.keys(m).length, 0);
+              parts.push(`${n} bottom-edge point(s)`);
+            }
+          }
+          if (edit.defectCols) {
+            // Replace this slice's marks with what is currently drawn, leaving every OTHER slice alone —
+            // the store takes the whole list, so a naive write would wipe marks made on other slices.
+            const existing = (((caseInfo?.manifest as Record<string, unknown> | undefined)?.defect_marks) ?? []) as
+              DefectMark[];
+            const others = existing.filter((k) => !(k.orient === "sagittal" && k.slice === edit.defectCols!.slice));
+            const next = edit.defectCols.cols.length
+              ? [...others, { orient: "sagittal" as const, slice: edit.defectCols.slice,
+                              cols: edit.defectCols.cols, tag: "reviewer" }]
+              : others;
+            await setDefectMarks(next);
+            parts.push(`${edit.defectCols.cols.length} marked column(s)`);
+          }
+          note = parts.join("; ");
+        } catch {
+          note = "correction FAILED to save — re-open the scan and retry";
+        }
+      }
+      // The reason is DERIVED, not typed: with a correction on screen the correction is the signal, and a
+      // sentence of prose adds nothing the anchors do not already say. A free-text note is still accepted by
+      // the endpoint for callers that want one.
+      // A TYPED note always wins; the derived summary is only the fallback so a rejection is never recorded
+      // blank. Typing stays optional — the box does not gate the button.
+      await settleWrite(setDifficult(true, rejectReason.trim() || note), "Rejection");
       setRejecting(false);
       setRejectReason("");
+    } catch (e) {
+      // A failed write must not strand the reviewer on the scan they just judged. settleWrite re-throws if
+      // the request rejects inside its 6 s race, and that propagated past the advance below — so one slow or
+      // failed save silently stopped the loop dead, which is indistinguishable from the button not working.
+      setQueueNote(`Rejection may not have saved (${e instanceof Error ? e.message : String(e)}) — moving on anyway; re-check this scan.`);
     } finally { setBusyAction(null); }
     await advance();
   };
 
+  // CHECKPOINT after N REJECTIONS — N chosen by the reviewer, not baked in. The whole point of the loop is
+  // that corrections accumulate until there are enough of them to be worth learning from, and only the
+  // reviewer knows when that is: a handful of corrections on one bad eye says less than the same number
+  // spread across five. Counted on rejections alone (see markSettled) — an approval carries no correction.
+  const atCheckpoint = rejectsSinceCheckpoint >= checkpointEvery;
+  const Checkpoint = atCheckpoint ? (
+    <span className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text)" }}>
+      <span style={{ color: "var(--c-amber, #d9a441)" }}>
+        {rejectsSinceCheckpoint} correction{rejectsSinceCheckpoint === 1 ? "" : "s"} banked
+      </span>
+      <Button size="small" variant="contained" color="warning" disabled={busy}
+        onClick={() => { clearCheckpoint(); void startReprocessBatch(); }}
+        title={"Re-run preprocessing on the scans you corrected, using those corrections.\n"
+          + "Runs in the background (~2 min per scan). Approved scans are protected: a scan is only re-written\n"
+          + "if it measures BETTER on both roughness and per-frame undulation, otherwise it keeps what it has.\n"
+          + "Whatever changes comes back flagged for a second look.\n\n"
+          + "This applies each scan's OWN corrections to that scan. It does not change the detector."}>
+        ⟳ Re-run corrected scans
+      </Button>
+      {/* THE CONVERGENCE STEP. The other button fixes the scans you corrected; this one changes the detector
+          so the scans nobody has looked at get better too — which is the only way the queue can empty. */}
+      <Button size="small" variant="contained" color="primary" disabled={busy || tuneBusy}
+        onClick={() => { clearCheckpoint(); void startDetectorTune(); setTuneBusy(true); }}
+        title={"Use every correction you have drawn to improve the DETECTOR ITSELF, globally.\n\n"
+          + "Searches the detector's parameters for a setting that reproduces your corrections better, scored\n"
+          + "with a tolerance band (your corrections are approximate by design, so it is not fitted to the pixel).\n"
+          + "Adopts it ONLY if it also leaves the scans you already approved undisturbed — otherwise nothing\n"
+          + "changes and it says so.\n\n"
+          + "Runs in the background for a while; approved scans keep the exact settings they were approved under."}>
+        ⟲ Improve detector
+      </Button>
+      <Button size="small" variant="outlined" disabled={busy}
+        onClick={() => clearCheckpoint()}
+        title={`Keep reviewing; you will be asked again after another ${checkpointEvery} corrections.`}>
+        Keep reviewing
+      </Button>
+    </span>
+  ) : null;
+
+  // HOW FAR THROUGH THE JOB. The queue count on the Approve button answers "what is left in front of me",
+  // which is not the same question — it moves with the sidebar filter and says nothing about the 300-odd
+  // scans behind. This is the standing total, so a session's work is visible as it accumulates.
+  // A REJECTION IS NOT PROGRESS HERE, and the tooltip says so: rejecting leaves a scan unvetted by design
+  // (it needs reprocessing before it can be approved), so it stays outstanding and will come back. Counting
+  // it as done would make the ticker overstate how much of the corpus is actually settled.
+  const vettedPct = nVettable > 0 ? Math.round((nVetted / nVettable) * 100) : 0;
+  const nThisSession = queueSettled.size;
+  const VettedTicker = nVettable > 0 ? (
+    <span className="flex items-center gap-1.5 text-[11px]" style={{ color: "var(--c-text-dim)" }}
+      title={`${nVetted} of ${nVettable} preprocessed scans approved (${vettedPct}%). ${nRejected} rejected.`
+        + (nThisSession ? ` ${nThisSession} settled in this session.` : "")
+        + " Rejecting does not vet a scan — it stays outstanding until it has been reprocessed, so the two"
+        + " counts do not add up to the total."}>
+      {/* The bar shows APPROVED only. Rejections are not progress along it — a rejected scan comes back. */}
+      <span style={{ width: 54, height: 5, borderRadius: 3, background: "var(--c-surface2)",
+                     border: "1px solid var(--c-border)", overflow: "hidden", display: "inline-block" }}>
+        <span style={{ display: "block", height: "100%", width: `${vettedPct}%`,
+                       background: "var(--c-green)", transition: "width .3s ease" }} />
+      </span>
+      <span style={{ whiteSpace: "nowrap" }}>
+        <b style={{ color: "var(--c-green)" }}>{nVetted}</b>
+        <span style={{ opacity: 0.75 }}>/{nVettable} vetted</span>
+        {nRejected > 0 && <b style={{ color: "var(--c-red, #e5534b)", marginLeft: 5 }}>✗{nRejected}</b>}
+        {nThisSession > 0 && <b style={{ color: "var(--c-accent)", marginLeft: 5 }}>+{nThisSession} now</b>}
+      </span>
+      {/* Corrections banked toward the next tuning offer, and the threshold that triggers it. Editable here
+          rather than buried in settings: it is the one number that paces the whole loop. */}
+      <span style={{ whiteSpace: "nowrap", opacity: 0.85 }} title="Corrections banked / how many to bank before offering to learn from them.">
+        <b style={{ color: rejectsSinceCheckpoint >= checkpointEvery ? "var(--c-amber, #d9a441)" : "var(--c-text)" }}>
+          {rejectsSinceCheckpoint}
+        </b>
+        <span style={{ opacity: 0.6 }}>/</span>
+        <input type="number" min={1} max={200} value={checkpointEvery}
+          onChange={(e) => { const v = Math.round(Number(e.target.value)); if (Number.isFinite(v) && v >= 1) setCheckpointEvery(Math.min(200, v)); }}
+          style={{ width: 34, fontSize: 11, marginLeft: 1, padding: "0 2px", color: "var(--c-text)",
+                   background: "var(--c-surface2)", border: "1px solid var(--c-border)", borderRadius: 3 }} />
+      </span>
+    </span>
+  ) : null;
+
   // The two review-loop buttons + the reason box, shared by every step that offers approval.
   const ReviewLoop = (
     <span className="flex items-center gap-1">
+      {VettedTicker}
       <Button size="small" variant="contained" color="success" disabled={busy || rejecting || navigating}
         onClick={() => void approveAndNext()}
         startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
@@ -452,35 +698,61 @@ export function TimelineBar() {
           : navigating ? "Opening next…"
           : `✓ Approve → next${nLeft ? ` (${nLeft})` : ""}`}
       </Button>
-      {!rejecting ? (
-        <Button size="small" variant="outlined" color="error" disabled={busy || navigating}
-          onClick={() => setRejecting(true)}
-          title="Reject this scan (flags it Difficult, excluding it from training), record why, and open the next scan awaiting approval.">
-          ✗ Reject…
-        </Button>
-      ) : (
-        <>
-          <input
-            autoFocus
-            value={rejectReason}
-            onChange={(e) => setRejectReason(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") { e.preventDefault(); void rejectAndNext(); }
-              if (e.key === "Escape") { setRejecting(false); setRejectReason(""); }
-            }}
-            placeholder="why? e.g. the places I marked are where the surface is too wavy"
-            style={{ fontSize: 11, width: 380, color: "var(--c-text)", background: "var(--c-surface2)",
-                     border: "1px solid var(--c-border)", borderRadius: 4, padding: "3px 6px" }}
-          />
-          <Button size="small" variant="contained" color="error" disabled={busy || navigating}
-            onClick={() => void rejectAndNext()}
-            startIcon={busyAction === "reject" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-            title="Record the rejection with this reason and open the next scan. Enter also works; Escape cancels.">
-            {busyAction === "reject" ? "Rejecting…" : "✗ Reject → next"}
-          </Button>
-          <Button size="small" variant="text" disabled={busy}
-            onClick={() => { setRejecting(false); setRejectReason(""); }}>cancel</Button>
-        </>
+      {/* ONE CLICK, with an OPTIONAL note. The box is always visible rather than a mode you have to enter:
+          typing is never required (a drawn correction already says more than a sentence could), but when the
+          problem is something the anchors cannot express — "wrong curvature", "eyelash across the apex" — it
+          is right there without an extra click. Enter submits, so a typed rejection is still one gesture. */}
+      <input
+        value={rejectReason}
+        onChange={(e) => setRejectReason(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void rejectAndNext(); } }}
+        placeholder="optional note…"
+        disabled={busy || navigating}
+        style={{ fontSize: 11, width: 210, color: "var(--c-text)", background: "var(--c-surface2)",
+                 border: "1px solid var(--c-border)", borderRadius: 4, padding: "3px 6px" }}
+      />
+      {/* ITERATE — the scan stays on screen. Primary action whenever something is drawn: a correction is
+          worth more applied to this scan than filed against it. */}
+      <Button size="small" variant="contained" color="warning" disabled={busy || navigating}
+        onClick={() => void correctAndRerun()}
+        startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title={"Apply what you drew to THIS scan and re-run it (~2 min), then stay here so you can look at the\n"
+          + "result and correct again. Repeat until you are happy, then Approve.\n\n"
+          + "The correction defines the surface — it is not a hint the detector can decline — so this converges\n"
+          + "on the scan in front of you, with no dependence on the detector being well-tuned."}>
+        {busyAction === "rerun" ? "Re-running…"
+          : pendingEdit ? `↻ Correct & re-run (${pendingSummary})`
+          : "↻ Re-run with corrections"}
+      </Button>
+      {/* MOVE ON without judging. Session-only: nothing is written, so it returns to the queue next time. */}
+      <Button size="small" variant="outlined" disabled={busy || navigating}
+        onClick={() => void skipToNext()}
+        title={"Leave this scan unjudged and open the next one. Nothing is written — it stays in the queue\n"
+          + "and will come back. Use it when a scan needs thought, or cannot be fixed right now."}>
+        {busyAction === "skip" ? "Skipping…" : "⤼ Skip → next"}
+      </Button>
+      {/* Flag as difficult + advance. Now the LAST resort rather than the way to record a correction — the
+          correction path is the re-run above, which acts on the scan instead of filing a complaint. */}
+      <Button size="small" variant="outlined" color="error" disabled={busy || navigating}
+        onClick={() => void rejectAndNext()}
+        startIcon={busyAction === "reject" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title={pendingEdit
+          ? `Save what you drew, flag this scan as difficult, and open the next one: ${pendingSummary}.`
+          : "Flag this scan as difficult (excluded from training) and open the next one. The note is optional."}>
+        {busyAction === "reject" ? "Rejecting…" : "✗ Difficult → next"}
+      </Button>
+      {Checkpoint}
+      {tune && (tune.running || tune.note) && (
+        <span className="text-[11px] flex items-center gap-1"
+              style={{ color: tune.running ? "var(--c-accent)" : (tune.adopted ? "var(--c-green)" : "var(--c-text-dim)") }}
+              title={tune.note || ""}>
+          {tune.running && <CircularProgress size={11} color="inherit" />}
+          {tune.running
+            ? `detector: ${tune.phase ?? "working"}${tune.total ? ` ${tune.done ?? 0}/${tune.total}` : ""}`
+            : (tune.adopted
+                ? `detector improved — ${Object.keys(tune.adopted).length} setting(s) adopted`
+                : `detector: ${tune.note}`)}
+        </span>
       )}
       {queueNote && <span className="text-[11px]" style={{ color: "var(--c-amber, #d9a441)" }}>{queueNote}</span>}
     </span>
@@ -503,27 +775,15 @@ export function TimelineBar() {
   // Marking is now CONSOLIDATED into Fix-columns: the user corrects the border there (the correction IS the
   // "mark", and on Approve it becomes ground truth), so the separate ⚑ Mark-defect toggle is retired. Only the
   // "⚠ Difficult" flag (this scan needs manual help / can't be fixed) remains.
-  const difficult = Boolean(manifest?.difficult_scan);
   // Surface-crop (clipped cornea): AUTO = the pipeline took the surface-crop path; MANUAL = human review override
   // (true/false). The effective state = manual if the human set it, else the auto detection.
-  const scAuto = ((manifest?.oct_iter as Record<string, unknown> | undefined)?.stopped) === "surface_crop";
-  const scManual = (manifest as Record<string, unknown> | undefined)?.surface_crop_manual;
-  const surfaceCrop = scManual != null ? Boolean(scManual) : scAuto;
-  const scReviewed = scManual != null;
-  const FlagButtons = (
-    <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}>
-      <Button size="small" variant={surfaceCrop ? "contained" : "outlined"} color="info" disabled={busy}
-        onClick={() => void setSurfaceCrop(!surfaceCrop)}
-        title={`Mark this scan as SURFACE-CROPPED (clipped cornea) → manifest.surface_crop_manual. ${scAuto ? "Auto-detected by the pipeline; " : ""}${scReviewed ? "you reviewed it. " : "not yet reviewed. "}Toggle to confirm, add one the detector missed, or clear a false positive.`}>
-        {surfaceCrop ? "⬚ Surface-crop✓" : "⬚ Surface-crop"}{scAuto && !scReviewed ? " (auto)" : ""}
-      </Button>
-      <Button size="small" variant={difficult ? "contained" : "outlined"} color="error" disabled={busy}
-        onClick={() => void setDifficult(!difficult)}
-        title="Mark this scan as a DIFFICULT SCAN needing manual help / too damaged to correct — persisted to manifest.difficult_scan. Difficult scans are EXCLUDED from nnU-Net training.">
-        ⚠ Difficult
-      </Button>
-    </span>
-  );
+  // FlagButtons (⬚ Surface-crop / ⚠ Difficult) REMOVED.
+  //   ⚠ Difficult set exactly the flag "✗ Reject → next" now sets — but without saving the corrections,
+  //     recording a note, or advancing the queue. Two buttons for one verdict, one of them worse.
+  //   ⬚ Surface-crop was a BOOLEAN classification living next to the editor's ✛ Surface crop mode, which owns
+  //     the actual frame set. Same words, different data, two sources of truth. It is now an INDICATOR on
+  //     that mode button (a ✓ when the pipeline surface-cropped this scan), and the frames are cleared in the
+  //     editor where they are drawn.
   // GT toggle shown next to Approve when the scan has a manual border correction (Fix-columns anchors).
   const CorpusToggle = hasBorderCorrection ? (
     <label className="flex items-center gap-1 text-[11px]" style={{ color: "var(--c-text-dim)", cursor: "pointer" }}
@@ -575,12 +835,12 @@ export function TimelineBar() {
         <Button size="small" variant="outlined" color="warning" disabled={busy}
           onClick={() => {
             if (hasBorderCorrection && !window.confirm(
-              "Re-run AUTO preprocessing from the raw .OCT?\n\nThis DISCARDS the Fix-columns border corrections on this scan (surface-crop / crop marks and classification are kept). Continue?")) return;
+              "Re-preprocess from the raw .OCT?\n\nThis DISCARDS your manual border corrections on this scan — the edge drags and the shaped curve. Surface-crop frames, crop region and classification are kept. Continue?")) return;
             setBusyAction("rerun"); void rerunPreprocess();
           }}
           startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title="Re-run the full AUTO preprocessing from the raw .OCT — fresh corneal-surface detection, surface-crop detection and warp. Keeps sticky manual surface-crop / crop params; DISCARDS Fix-columns border corrections (asks first if any exist). Resets to Auto — re-inspect, then Approve.">
-          {busyAction === "rerun" && caseBusy ? "Re-running…" : "↻ Re-run auto"}
+          title="Re-preprocess from the raw .OCT — fresh corneal-surface detection, surface-crop detection and warp. DISCARDS your manual border corrections (edge drags / shaped curve; asks first if any exist); KEEPS surface-crop frames, crop region and classification. Resets to Preprocessed — re-inspect, then Approve.">
+          {busyAction === "rerun" && caseBusy ? "Re-preprocessing…" : "↻ Re-preprocess"}
         </Button>
         {proposals.hasProposal && (
           <Button size="small" variant="outlined" color="secondary" disabled={busy}
@@ -595,11 +855,10 @@ export function TimelineBar() {
             here. Re-run via Fix-columns → Run (which keeps corrections), or "Use original (raw)" below. */}
         <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={() => { setBusyAction("useraw"); approveRaw(); }}
           startIcon={busyAction === "useraw" ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title="Use the ORIGINAL (raw) scan as the working volume instead of the correction. Drops any segmentation; also marks it vetted.">
+          title="Use the ORIGINAL (raw) scan as the working volume instead of the correction — for when the correction is worse than doing nothing. Drops any segmentation. Does NOT approve the scan: it returns to Preprocessed and still needs your Approve.">
           {busyAction === "useraw" ? "Loading…" : "↩ Use original (raw)"}
         </Button>
-        {sep}{FlagButtons}
-      </>
+              </>
     );
   } else if (step === 3) {
     // vetted (pink) → segment the CORNEA (SAM2). Classification (scar/control) is a LATER step now — it comes
@@ -620,14 +879,13 @@ export function TimelineBar() {
         {correctionMp4Url && !mp4Busy && (
           <a href={correctionMp4Url} download style={{ color: "var(--c-accent)", fontSize: 12 }} title={correctionMp4Info}>⤓ Download MP4</a>
         )}
-        {sep}{FlagButtons}
-      </div>
+              </div>
     );
   } else if (step === 4) {
     // cornea segmented (fuchsia) → VET the cornea/background (paint, scar pen hidden), then confirm → unlocks
     // classification. Scar detection is NOT shown here until cornea/background is confirmed AND the scan is classified.
     // Auto-populated scans also get a non-destructive "Approve preprocessing" here (their Vetted step was skipped).
-    actions = <>{ApprovePreproc && <>{ApprovePreproc}{sep}</>}{CorneaVet}{sep}{FlagButtons}</>;
+    actions = <>{ApprovePreproc && <>{ApprovePreproc}{sep}</>}{CorneaVet}</>;
   } else if (step === 5) {
     // cornea/background vetted (purple) → CLASSIFY scar/control. Moved here from before SAM2 (it only gates the
     // scar branch): a control schedules next; a scar scan proceeds to subgroup.
@@ -642,8 +900,7 @@ export function TimelineBar() {
           <Button size="small" variant={classification === "control" ? "contained" : "outlined"} color="inherit"
             disabled={busy} onClick={() => setClassification(classification === "control" ? null : "control")}>No scar (control)</Button>
         </span>
-        {sep}{FlagButtons}
-      </div>
+              </div>
     );
   } else if (step === 6) {
     // classified (violet) → SUBGROUP step (assigned BEFORE scar so the strategy comparison at the Scar step is

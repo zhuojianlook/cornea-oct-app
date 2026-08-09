@@ -16,6 +16,7 @@ unused `corr_factor` now scales the column displacement (default 1.0 = unchanged
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -468,6 +469,65 @@ DEFAULT_PARAMS: dict = {
     # (measured CS003 OD1: right-flank step 9.5px ON → 2.2px OFF; visually a clean smooth descent OFF). The raw
     # detection already tracks the limbus flattening smoothly, so the correct behaviour is to leave it alone.
     # Kept as an opt-in param (default False) — no approved scan uses it (added v145, CS002 OS approved at v132).
+    # ── EDGE-TO-CURVATURE constraints ── (reviewer-directed, 2026-08). Over half the scans the reviewer called
+    # "near acceptable" were rejected for one thing: the edges do not continue the overall corneal curvature —
+    # "the edge columns need to be better fitted to the overall curvature", "corners of frames dont always
+    # follow", "left and right cornea edge seem to change their slope signs". Measured against the frame's own
+    # quadratic, near-acceptable scans sit 13.73 px off at the FRAME ends and 6.64 px off at the LATERAL ends,
+    # against 2.68 and 1.66 px on approved scans.
+    #
+    # parabola_edge (already present, default False) fixes the frame axis; at parabola_edge_nb=14 it takes the
+    # near-acceptable set from 11.83 to 1.35 px — better than the approved scans' current 2.65. The 4-frame
+    # default was too narrow, which matches the reviewer's wording ("early/late frames", "near the start of the
+    # sagittal slices"). It saturates by 14, so this is a plateau rather than a knob to keep turning.
+    #
+    # lat_edge_parabola is its twin in the lateral direction: 6.64 -> 2.30 px at a 12% edge width.
+    #
+    # BOTH are gated on the interior actually BEING a parabola, because snapping onto a bad fit is worse than
+    # leaving the edge alone. The three scans where the frame-axis version misbehaved say so exactly:
+    # cs029_os_v5 interior residual 1.65 px (20.24 -> 0.39), cs025_os_v2 4.82 px (8.15 -> 14.91, WORSE),
+    # cs011_od_v2 17.77 px (52.56 -> 38.42, no help).
+    # ── SURFACE-CROP PATH: padding fill + the final rigid passes (both DEFAULT OFF, pending the A/B) ──
+    # warp_surface_crop_extend builds the taller canvas with zeros, so the padded rows sit at ~33 against an OCT
+    # background floor of ~511 just below. The DP detector prefers that cliff to the epithelium (row 27 vs the
+    # true ~199), which is why the surface-crop branch returns early and skips the three rigid smoothing passes.
+    # crop_pad_fill="background" tiles the scan's own background into those rows (no value fabricated) and
+    # restores detection; surface_crop_finish then runs the passes, and is HARD-GATED on the fill because
+    # running them on a zero-padded volume applies real shifts computed from the artifact.
+    #
+    # BOTH DEFAULT ON as of the A/B over all 39 canvas-extended scans. The decisive evidence was not the
+    # roughness gain (+8.3% median per scan, 28/36 improved, sign-test p=0.0006, 4/4 unpadded controls
+    # byte-identical) but WHERE THE SURFACE LANDS on the delivered file: with zeros padding, 89-93% of columns
+    # detect on the padding cliff instead of the cornea (case_cs024_os_v2 median surface row 17.6 against a
+    # corneal band at ~163; case_cs008_od_v3 144.2 with 92.9% of columns on the cliff). With the fill it is
+    # 0-3%. Everything downstream that re-detects — SAM2 seeding, delivered-QA, the review metrics — was
+    # reading a cliff on those scans. NOTE the trap this also explains: undulation CANNOT diagnose it, because
+    # a detector tracking a cliff flatly across every lateral scores an excellent undulation (cs008_od_v3 read
+    # 1.34 px while 92.9% wrong).
+    # The change is uneven (8 of 39 regress on roughness, one by 54%), so the store rollout goes through
+    # .work/guarded_rerun.py --only-if-better, which keeps the old output per scan wherever it measures worse.
+    # POSTERIOR (bottom) edge for the surface-crop reconstruction. It sits a near-constant distance below the
+    # anterior, so the detection is re-run with prior = anterior + robust median thickness, which rejects
+    # mis-locks onto the iris / specular bands. crop_post_anchors is the reviewer's manual override, keyed
+    # {slice: {frame: depth}} exactly like border_anchors, and WINS over any detection.
+    "crop_post_prior": True,
+    "crop_post_prior_win": 40.0,   # px: search window around anterior+thickness in the second pass
+    "crop_post_anchors": None,
+    "crop_pad_fill": "background",  # "zeros" (pre-A/B behaviour) | "background"
+    "crop_pad_fill_src": 24,      # rows below the pad used as the background source block
+    "surface_crop_finish": True,  # run the final rigid passes on the surface-crop path
+    # ...but NOT derotate, which the ablation identified as the pass that degrades per-frame shape on these
+    # volumes (undul 13.06 -> 3.74 when dropped, with roughness still improving 1.461 -> 1.127). See the call
+    # site in preprocess_oct_to_nifti. Untouched on the main path.
+    "surface_crop_derotate": False,
+    # Same three passes on the FIX-COLUMNS (provided_edges) path, per the reviewer's directive that correcting
+    # the detected edge must "still allow the axial transforms to occur". Costs the exact scrub-preview match
+    # that branch used to guarantee; False restores it.
+    "redetect_finish": True,
+    "edge_fit_max_resid": 2.5,    # px: interior quadratic residual above this = do not snap anything to it
+    "lat_edge_parabola": False,   # DEFAULT OFF pending review
+    "lat_edge_frac": 0.12,        # fraction of laterals at EACH end treated as edge
+    "lat_edge_max_move": 40.0,    # px: never move a column further than this
     "parabola_edge": False,
     "parabola_edge_nb": 4,        # frames at EACH end snapped to the interior parabola
     "parabola_edge_deg": 2,       # 2 = parabola (the corneal cross-section model)
@@ -788,7 +848,99 @@ DEFAULT_PARAMS: dict = {
     "detilt_clip_row": 30.0,    # a frame surface within this many px of the top counts as clipped (tilt ran off-top)
     "detilt_clip_min_frames": 3,  # need >= this many clipped frames for de-tilt to apply (else the slope is dome geometry)
     "detilt_max_pad": 400,      # safety cap on the canvas extension (px) added top+bottom by the de-tilt shift
+    # GUIDED RE-DETECTION: half-width (px) of the window the detector may search around the prior. Wide on
+    # purpose — ±5 px reproduced the prior's own errors, ±40 px found the true boundary (69% vs 31% of the
+    # reviewer's points within 5 px). Narrow it and this stops being detection and becomes interpolation.
+    "guided_window": 40.0,
+    # Extra rows kept above the highest drawn point when the canvas is extended for a corrected above-window
+    # apex, so the epithelium does not sit flush against the new top edge.
+    "crop_pad_margin": 8,
+    # Hand rigid_height_refine a guided re-detection of the corrected volume rather than letting it re-detect
+    # with detect_surface_all.
+    # DEFAULT OFF, on evidence. The theory was sound — the stage shifts every frame onto a dome fitted through
+    # whatever surface it reads, so a surface that is wrong on the corrected frames should misplace exactly
+    # those frames. Measured on the reviewer's own anchors it changed nothing: median shape error 7.94 px
+    # self-detected vs 7.95 px guided, while leaving the surface rougher (1.656 -> 1.722). The stage fits a
+    # DEGREE-5 2-D dome and then keeps only the HIGH-FREQUENCY residual, so local accuracy in its input is
+    # low-passed away before it reaches the applied shift. Kept as a switch, not a default: it costs a full
+    # detection pass per run and bought nothing.
+    "redetect_guided_finish": False,
+    # Run axial_motion_correct on the CORRECTIONS path too. Off: it regressed the scan it was meant to fix
+    # (dev 3.95 -> 10.86) and the cause is not yet understood. See the gate for the reasoning.
+    "redetect_amc": False,
+    # RIGID SAGITTAL MOTION CORRECTION on the corrections path: remove inter-frame drift the flatten keeps, by
+    # a per-frame rigid depth shift, GATED on the sphere-excess ratio so it fires only on genuine drift.
+    # Validated: complaint scan 166->34 px (undulation improved), two approved scans untouched (below gate).
+    "rigid_sagittal_mc": True,
+    "smc_sag_ratio": 0.444,       # across-frame sag / lateral sag for a sphere over the Avanti 4.04 vs 6.00 mm axes
+    "smc_excess_gate": 2.0,       # fire only when measured across-frame sag exceeds this x the sphere prediction
+    "smc_max_shift": 140.0,       # cap on the per-frame depth shift (px)
+    "smc_tilt_gate": 40.0,        # min edge-swing (px) of MONOTONIC tilt drift before the rotation fires.
+                                  #   40 sits in the gap between the approved-scan range (measured 0.2-31 px of
+                                  #   natural tilt drift) and clear motion (cs042 59 px), so it fires only on
+                                  #   genuine drift and leaves approved scans frozen — same philosophy as the
+                                  #   depth gate. Lower it toward 20 to also remove mild residual torsion on
+                                  #   borderline scans (benign in testing, but it then changes approved output).
+    "smc_tilt_smooth": 1.5,       # gaussian smoothing (frames) of the per-frame tilt estimate
+    "smc_tilt_deg": 1,            # degree of the tilt-DRIFT GATE fit. 1 = the MONOTONIC (early-vs-late) drift
+                                  #   that is the reviewer's rotation signature. deg>=2 also fits a mid-scan BOW,
+                                  #   which on a clean scan is low-freq detection noise (cs028: 0.2px monotonic
+                                  #   drift but a ~25px deg-3 bow) — firing on it sheared and harmed the scan.
+    # Guided POSTERIOR detection: half-width of the window the bottom-edge detector may search around the
+    # reviewer-informed prior, and how much the interpolated residual is smoothed across frames.
+    # 60, MEASURED — not a guess, and not the 30 first tried. Held out the reviewer's slice-214 posterior
+    # points and built the prior from slice 195 alone: auto scored median 14.6 px, +/-15 gave 30.0 and +/-30
+    # gave 41.0 (both WORSE than auto), +/-60 gave 11.5 with 31.9% of points within 5 px against auto's 25.5%.
+    # A tight window pins the search beside a prior that is itself wrong, so it cannot recover; a wide one
+    # lets the detector find the real bright->dark gradient. Same shape as the anterior, where +/-5 lost to +/-40.
+    "post_guided_window": 60.0,
+    "post_prior_smooth": 3.0,
+    # How far beyond the outermost corrected slice a posterior correction is still allowed to guide detection,
+    # fading linearly to nothing. Beyond it, guidance is withheld entirely rather than weakened to a no-op.
+    "post_taper_slices": 20,
+    # Master switch for guided posterior detection in the surface-crop preview. False = the old behaviour
+    # (detect the bottom edge with no knowledge of the reviewer's posterior corrections).
+    "post_guided": True,
 }
+
+
+def load_param_overrides(path: str | None = None) -> dict:
+    """Fold GLOBALLY TUNED detector parameters into DEFAULT_PARAMS, in place.
+
+    WHY A FILE AND NOT AN IN-MEMORY UPDATE. Preprocessing runs two ways — in-process from the sidecar, and as
+    THIS module invoked as a CLI in a subprocess (_run_oct_worker, which keeps fork-based parallelism away
+    from the sidecar's CUDA state). A tuned value held only in the sidecar's memory would apply to the first
+    and be silently absent from the second, so the same scan would preprocess differently depending on which
+    path ran it. Reading the file at import means every process that touches the pipeline sees the same
+    detector, including subprocesses that inherit only the environment.
+
+    The path comes from CORNEA_PARAM_OVERRIDES so the DATA DIRECTORY IS RESOLVED IN EXACTLY ONE PLACE (the
+    sidecar's settings), rather than re-derived here from XDG/CORNEA_DATA_DIR — that duplication is precisely
+    what once pointed a relaunched app at the wrong case store.
+
+    Only keys that already exist in DEFAULT_PARAMS are accepted, and only scalars: the file is written by the
+    tuner, but it is still on disk, and an unknown key silently doing nothing is a worse failure than a
+    rejected one. Returns what was applied."""
+    src = path or os.environ.get("CORNEA_PARAM_OVERRIDES") or ""
+    if not src:
+        return {}
+    try:
+        with open(src, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    applied: dict = {}
+    for k, v in (data.get("params") or data).items():
+        if k not in DEFAULT_PARAMS or not isinstance(v, (int, float, bool, str)):
+            continue
+        applied[k] = v
+    DEFAULT_PARAMS.update(applied)
+    return applied
+
+
+_PARAM_OVERRIDES_APPLIED = load_param_overrides()
 # Optovue Angiovue XR Avanti "3D Cornea" geometry (corrected from the companion .txt;
 # the conversion script's hardcoded 0.00625/0.0078 implied a 4x4x4mm cube — wrong, the
 # real volume is 6.00mm lateral x 4.04mm x 2.006mm depth). Array is (frames,rows,cols)
@@ -2067,6 +2219,115 @@ def _reject_specular_spike(edge: np.ndarray, p: dict) -> np.ndarray:
     return out.astype(np.float32) if changed else edge
 
 
+def guided_posterior_row(sag: np.ndarray, si: int, anchors: dict, params: dict | None = None,
+                         window: float | None = None) -> np.ndarray | None:
+    """The POSTERIOR (bottom) edge of slice `si`, DETECTED but guided by the reviewer's posterior corrections.
+
+    THE GAP THIS CLOSES. crop_post_anchors had exactly one reader in the pipeline — a per-frame override inside
+    the surface-crop reconstruction — so a posterior correction changed the line on the slice it was drawn on
+    and nowhere else. Re-running could not improve the bottom edge anywhere, by construction, which is the
+    reviewer's "bottom edge detection does not seem to improve after iterations".
+
+    THE MECHANISM is the reviewer's own: the correction says WHERE TO LOOK, the detector still decides where
+    the edge IS. Their residual (drawn depth − auto depth) is measured on the anchored slices, interpolated
+    across slices to `si`, added to si's own auto posterior to form a prior, and _detect_bottom_edge then
+    searches for the real bright→dark gradient within a window of it. Interpolating the DRAWN DEPTHS instead
+    would just spread a hand-drawn line — measured on the anterior, that reproduced auto exactly on a held-out
+    slice while guided detection cut the median error from 11.1 px to 3.0 px.
+
+    Cheap by design: it detects only the anchored slices plus `si`, not the volume, so it is affordable inside
+    a per-slice preview. Returns None when there is nothing to guide with."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    n, _D, F = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
+    if not (0 <= si < n) or not isinstance(anchors, dict) or not anchors:
+        return None
+    # anchored slices → {slice: {frame: depth}}, skipping the absent sentinel (no posterior on that frame)
+    anc: dict[int, dict[int, float]] = {}
+    for s_key, frames in anchors.items():
+        try:
+            sa = int(s_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= sa < n) or not isinstance(frames, dict):
+            continue
+        fm = {}
+        for f_key, d in frames.items():
+            try:
+                fi = int(f_key); dv = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= fi < F and np.isfinite(dv) and 0.0 <= dv < _D - 1:
+                fm[fi] = dv
+        if fm:
+            anc[sa] = fm
+    if not anc:
+        return None
+    # residual per anchored slice, on its OWN auto posterior — the residual is what generalises, not the depth
+    res: dict[int, np.ndarray] = {}
+    for sa, fm in anc.items():
+        b = _detect_bottom_edge(np.ascontiguousarray(sag[sa]).astype(np.float32), p)
+        r = np.full(F, np.nan)
+        for fi, dv in fm.items():
+            if np.isfinite(b[fi]):
+                r[fi] = dv - float(b[fi])
+        if np.isfinite(r).any():
+            res[sa] = r
+    if not res:
+        return None
+    # interpolate each frame's residual across the anchored slices (edge-hold beyond the anchored span, the
+    # same shape generalize_surface uses); with one anchored slice this is a constant carry, which is the most
+    # a single slice can honestly support
+    keys = sorted(res)
+    R = np.full(F, np.nan)
+    for f in range(F):
+        vals = [(sa, res[sa][f]) for sa in keys if np.isfinite(res[sa][f])]
+        if not vals:
+            continue
+        if len(vals) == 1:
+            R[f] = vals[0][1]
+        else:
+            xs = np.array([v[0] for v in vals], dtype=np.float64)
+            ys = np.array([v[1] for v in vals], dtype=np.float64)
+            R[f] = float(np.interp(float(si), xs, ys))             # edge-hold outside the span
+    if not np.isfinite(R).any():
+        return None
+    # TAPER BEYOND THE ANCHORED SPAN. Without it the residual is edge-held forever, so a correction on slice
+    # 195 was carried unchanged to slice 300 and moved the detected posterior by 166 px on average — not a
+    # refinement, a relocation. generalize_surface tapers for exactly this reason; a correction is evidence
+    # about the cornea NEAR where it was drawn, and claiming it 100 slices away is not supported by anything.
+    # Outside the taper the function returns None rather than a zero residual: with no correction in reach
+    # there is nothing to guide with, and the caller should use its ordinary detection rather than a windowed
+    # search around a prior that is merely auto by another name.
+    _lo, _hi = min(keys), max(keys)
+    _tap = float(p.get("post_taper_slices", p.get("gen_taper_slices", 20)) or 0.0)
+    if si < _lo:
+        _d = float(_lo - si)
+    elif si > _hi:
+        _d = float(si - _hi)
+    else:
+        _d = 0.0
+    if _tap <= 0 and _d > 0:
+        return None
+    _w = 1.0 if _d <= 0 else max(0.0, 1.0 - _d / _tap)
+    if _w <= 1e-3:
+        return None
+    R = R * _w
+    # smooth across frames so a couple of corrected frames do not produce a step in the prior
+    Rf = R.copy()
+    ok = np.isfinite(Rf)
+    if ok.sum() >= 2:
+        Rf = np.interp(np.arange(F), np.where(ok)[0], Rf[ok])
+    else:
+        Rf = np.where(ok, Rf, float(np.nanmean(Rf)))
+    sig = float(p.get("post_prior_smooth", 3.0) or 0.0)
+    if sig > 0:
+        Rf = ndimage.gaussian_filter1d(Rf, sigma=sig, mode="nearest")
+    sl = np.ascontiguousarray(sag[si]).astype(np.float32)
+    prior = _detect_bottom_edge(sl, p).astype(np.float64) + Rf
+    win = float(window if window is not None else p.get("post_guided_window", 30.0))
+    return _detect_bottom_edge(sl, {**p, "detect_window": win}, prior=prior.astype(np.float32))
+
+
 def _merged_side_edge(slice_img: np.ndarray, p: dict, prior: np.ndarray | None = None) -> np.ndarray:
     """The per-slice corrected anterior boundary. Default detector = the native DP path (_detect_surface_dp,
     matches a manual trace so AUTO preprocessing needs minimal correction); set params['detector']='legacy'
@@ -2266,6 +2527,19 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # FIX apexspec: LATERAL specular-spike reject on the assembled (lateral, frame) surface. Auto detection only;
     # a supplied per-slice prior means fix-columns re-detection, which carries its own user-seeded surface and must
     # not be laterally re-smoothed here (the per-worker _edge_worker never receives a prior, so this is the auto path).
+    out = _surface_post_passes(out, sag, p)
+    return out
+
+
+def _surface_post_passes(out: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarray:
+    """The whole-volume tail every detected surface gets: specular reject, despike, dip suppression, robust
+    dome smoothing, lateral confidence smoothing, faint-onset snap, the two edge-dome passes, untrusted-column
+    repair and edge regularization.
+
+    EXTRACTED so that a surface produced by any other route gets IDENTICAL treatment. Comparing a raw per-slice
+    detection against this polished one is not a comparison of detectors, it is a comparison of one detector
+    with and without smoothing — measured on real scans, that alone accounted for most of an apparent +13%
+    roughness penalty against guided re-detection (+13% -> +2.5% once both were passed through here)."""
     if bool(p.get("spec_spike_reject", True)):
         out = _reject_apex_lateral_spike(out, p)
     if bool(p.get("despike_lateral", True)):
@@ -2309,6 +2583,88 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # artifact correction is applied ONLY to the final WARP surface (smooth_volume), so the OUTPUT edges follow
     # the parabola while the detectors still see the real tissue.
     return out
+
+
+def guided_redetect_all(sag: np.ndarray, prior: np.ndarray, params: dict | None = None,
+                        window: float | None = None) -> np.ndarray:
+    """Re-detect EVERY slice inside ±window of `prior`, then apply the standard surface tail.
+
+    THE REVIEWER'S IDEA, and it measures better than the alternatives. Interpolating a drawn correction across
+    the volume only spreads a hand-drawn line — on a held-out corrected slice it produced a surface identical
+    to auto, because it never looked at the image there. This instead uses the correction to say WHERE TO LOOK
+    and lets the detector decide WHERE THE EDGE IS, so the other 512 slices are detected rather than guessed.
+
+    Measured against the reviewer's own corrections (prior = plain auto, so no correction even fed in), the
+    median error on three corrected slices went 27.4→19.2, 11.1→3.0 and 14.9→12.0 px, and the surface sat on
+    14-20% stronger gradients on every scan tried. Wider windows beat tight ones (±5px reproduced the prior's
+    mistakes; ±40px found the real boundary), which is the signature of detection rather than interpolation.
+
+    NOT SAFE UNCONDITIONALLY — at the delivered-volume level it helped two approved scans and hurt two others.
+    Callers must guard it; see the api layer, which keeps this surface only when it measures better."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    win = float(window if window is not None else p.get("guided_window", 40.0))
+    pr = np.asarray(prior, dtype=np.float32)
+    out = np.empty_like(pr)
+    for s in range(int(sag.shape[0])):
+        out[s] = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32),
+                                     pr[s], win, p, light=True)
+    return _surface_post_passes(out, sag, p)
+
+
+def surface_gradient_score(sag: np.ndarray, S: np.ndarray, stride: int = 8) -> float:
+    """Mean |d intensity / d depth| at the detected surface — how strong a boundary it is sitting on.
+
+    A LABEL-FREE quality signal, and the detector's own objective measured independently of how the answer was
+    reached, so it can judge a surface on the ~170 approved scans where no ground truth exists. Never used
+    alone: a search that wanders finds strong gradients on other structures, so it is always paired with a
+    roughness check (see shift_roughness)."""
+    L, D, F = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
+    tot, n = 0.0, 0
+    for s in range(0, L, max(1, int(stride))):
+        d = np.clip(np.rint(np.asarray(S[s], dtype=np.float64)), 1, D - 2).astype(int)
+        c = np.arange(F)
+        g = np.abs(sag[s][d + 1, c].astype(np.float64) - sag[s][d - 1, c].astype(np.float64))
+        tot += float(np.nansum(g)); n += int(np.isfinite(g).sum())
+    return tot / max(1, n)
+
+
+def shift_roughness(S: np.ndarray) -> float:
+    """Across-frame jitter of the PER-FRAME SHIFT the warp will actually apply.
+
+    Deliberately not the roughness of the surface itself. Each B-scan gets ONE rigid depth shift, taken as a
+    median across all 513 laterals, so per-lateral jitter that is uncorrelated between laterals never reaches
+    the volume. The reviewer approved the OUTPUT, so this — not the surface — is what a regression guard has
+    to protect. On real scans the two disagree sharply: one scan's surface roughened 10% while its delivered
+    shift series smoothed by 20%."""
+    m = np.median(np.asarray(S, dtype=np.float64), axis=0)
+    return float(np.mean(np.abs(np.diff(m, n=2))))
+
+
+def anchor_error(S: np.ndarray, anchors: dict, depth: int) -> tuple[float, int]:
+    """(median |surface − reviewer anchor|, n) over anchors that are actually detectable.
+
+    Anchors ABOVE the captured window are excluded: on a surface-cropped cornea the reviewer legitimately
+    draws the apex at negative depth, and no detector can return a row that does not exist. Scoring against
+    them adds a large constant no candidate can reduce, which drowns the differences that matter — on one
+    scan those 13 points alone moved the apparent error from 23 to 27 px."""
+    errs: list[float] = []
+    for s_key, frames in (anchors or {}).items():
+        try:
+            s = int(s_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= s < S.shape[0]) or not isinstance(frames, dict):
+            continue
+        for f_key, d in frames.items():
+            try:
+                f = int(f_key); dv = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < S.shape[1] and 0.0 <= dv < depth - 1 and np.isfinite(S[s, f]):
+                errs.append(abs(float(S[s, f]) - dv))
+    if not errs:
+        return float("nan"), 0
+    return float(np.median(errs)), len(errs)
 
 
 def _repair_untrusted_surface(edges: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarray:
@@ -2364,20 +2720,26 @@ def _repair_untrusted_surface(edges: np.ndarray, sag: np.ndarray, p: dict) -> np
         q = np.polyval(np.polyfit(lat[g][k], y[g][k], 2), lat)
         exp[:, f] = q
         dev[:, f] = np.abs(y - q)
-    below = np.full((L, F), np.nan)
-    above = np.full((L, F), np.nan)
-    for i in range(L):
-        for f in range(F):
-            b = exp[i, f]
-            if not np.isfinite(b):
-                continue
-            bi = int(round(b))
-            l1, h1 = max(0, bi + 5), min(D, bi + 60)
-            l2, h2 = max(0, bi - 70), max(1, bi - 10)
-            if h1 > l1:
-                below[i, f] = v[i, l1:h1, f].mean()
-            if h2 > l2:
-                above[i, f] = v[i, l2:h2, f].mean()
+    # Gather both brightness windows with fancy indexing rather than a per-column loop: 513x101 columns is
+    # 51,813 Python iterations per scan, which cost about two minutes a scan when this first ran over the corpus.
+    base = np.where(np.isfinite(exp), np.nan_to_num(exp, nan=0.0), 0.0).astype(np.int64)
+    ok = np.isfinite(exp)
+    ii = np.arange(L)[:, None, None]
+    ff = np.arange(F)[None, None, :]
+
+    def _window(off_lo, off_hi):
+        # One behavioural difference from the loop this replaced: an offset falling outside the canvas is
+        # CLAMPED to the edge row rather than dropped from the average, so near the top and bottom of the volume
+        # the window repeats the edge instead of shrinking. That is the steadier of the two — a shrinking window
+        # changes its own noise level exactly where the surface is least reliable — and both are then normalised
+        # by the scan median, so the threshold moves with it either way.
+        offs = np.arange(off_lo, off_hi)[None, :, None]
+        zz = np.clip(base[:, None, :] + offs, 0, D - 1)
+        vals = v[ii, zz, ff].mean(axis=1)
+        return np.where(ok, vals, np.nan)
+
+    below = _window(5, 60)
+    above = _window(-70, -10)
     def _norm(X):
         med = float(np.nanmedian(X)) if np.isfinite(X).any() else 1.0
         return ndimage.uniform_filter(np.nan_to_num(X, nan=med), size=(6, 3), mode="nearest") / max(med, 1e-6)
@@ -2402,6 +2764,75 @@ def _repair_untrusted_surface(edges: np.ndarray, sag: np.ndarray, p: dict) -> np
         k = np.abs(r0) <= np.percentile(np.abs(r0), 90)
         q = np.polyval(np.polyfit(lat[good][k], e[good, f][k], 2), lat)
         out[m, f] = q[m]
+    return out.astype(edges.dtype, copy=False)
+
+
+def _interior_parabola_ok(edges: np.ndarray, p: dict, axis: str = "frame") -> bool:
+    """Is this scan's interior actually a parabola? If not, nothing should be snapped onto it.
+
+    Both edge constraints work by pulling the edges onto a quadratic fitted to the reliable interior. That is
+    only meaningful when the interior IS quadratic — on cs011_od_v2 the interior fit leaves a 17.77 px residual,
+    and snapping its edges to that made the surface no better (52.56 -> 38.42 px). Measured per scan, so a
+    difficult volume opts itself out instead of being detected by a constant."""
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2:
+        return False
+    L, F = e.shape
+    prof = np.nanmedian(e[int(0.2 * L):int(0.8 * L)], axis=0) if axis == "frame" else \
+        np.nanmedian(e[:, int(0.2 * F):int(0.8 * F)], axis=1)
+    n = prof.size
+    x = np.arange(n, dtype=np.float64)
+    g = np.isfinite(prof)
+    g[:max(4, n // 12)] = False
+    g[-max(4, n // 12):] = False
+    if int(g.sum()) < 20:
+        return False
+    c = np.polyfit(x[g], prof[g], 2)
+    r = prof[g] - np.polyval(c, x[g])
+    return float(np.sqrt(np.mean(r ** 2))) <= float(p.get("edge_fit_max_resid", 2.5))
+
+
+def _lat_edge_parabola(edges: np.ndarray, p: dict) -> np.ndarray:
+    """Pull each frame's OUTER LATERALS onto the quadratic fitted to that frame's trusted middle.
+
+    The frame-axis twin of _parabola_edge_constrain, and necessary because half the reviewer's edge complaints
+    are about the lateral ends WITHIN a B-scan — "the left edge marked is a very different curvature from the
+    general corneal curvature", "corners of frames dont always follow overall curvature" — which no correction
+    along the frame axis can reach.
+
+    The correction is TAPERED to zero where it meets the untouched interior, so the repaired edge joins it
+    without a step, and bounded by lat_edge_max_move so a wild column cannot drag the edge somewhere absurd.
+    edges=(n_lateral, n_frames)."""
+    if not bool(p.get("lat_edge_parabola", False)):
+        return edges
+    e = np.asarray(edges, dtype=np.float64)
+    if e.ndim != 2 or not _interior_parabola_ok(e, p, axis="lateral"):
+        return edges
+    L, F = e.shape
+    nb = int(float(p.get("lat_edge_frac", 0.12)) * L)
+    if nb < 4 or L < 8 * nb:
+        return edges
+    lat = np.arange(L, dtype=np.float64)
+    lo_f, hi_f = int(0.15 * L), int(0.85 * L)
+    max_move = float(p.get("lat_edge_max_move", 40.0))
+    out = e.copy()
+    for f in range(F):
+        y = out[:, f]
+        g = np.isfinite(y)
+        mid = g.copy()
+        mid[:lo_f] = False
+        mid[hi_f:] = False
+        if int(mid.sum()) < 200:
+            continue
+        c0 = np.polyfit(lat[mid], y[mid], 2)
+        r = y[mid] - np.polyval(c0, lat[mid])
+        k = np.abs(r) <= np.percentile(np.abs(r), 90)
+        q = np.polyval(np.polyfit(lat[mid][k], y[mid][k], 2), lat)
+        for sl, w in ((slice(0, nb), np.linspace(1.0, 0.0, nb)),
+                      (slice(L - nb, L), np.linspace(0.0, 1.0, nb))):
+            seg = out[sl, f]
+            mv = np.clip(q[sl] - seg, -max_move, max_move)
+            out[sl, f] = seg + mv * w
     return out.astype(edges.dtype, copy=False)
 
 
@@ -2839,7 +3270,60 @@ def _crop_reconstruct_slice(slice_img: np.ndarray, anterior: np.ndarray, crop_fr
     final surface (the result is taller and parabola-flattened)."""
     a = np.asarray(anterior, dtype=np.float64)
     F = a.size
-    b = _detect_bottom_edge(np.ascontiguousarray(slice_img).astype(np.float32), p).astype(np.float64)
+    sl = np.ascontiguousarray(slice_img).astype(np.float32)
+    # A caller that has already computed a BETTER posterior for this slice (guided_posterior_row — the
+    # reviewer's corrections used as a search prior) passes it in rather than having it re-detected here with
+    # no knowledge of those corrections. The manual per-frame override below still applies on top, so a point
+    # the reviewer drew on THIS slice continues to win outright over any detection, guided or not.
+    _pre = p.get("_post_row_detected")
+    if _pre is not None and np.asarray(_pre).shape == (sl.shape[1],):
+        b = np.asarray(_pre, dtype=np.float64).copy()
+    else:
+        b = _detect_bottom_edge(sl, p).astype(np.float64)
+    # ── THICKNESS-PRIOR SECOND PASS ──────────────────────────────────────────────────────────────────────
+    # The posterior edge sits a NEAR-CONSTANT distance below the anterior — corneal thickness varies slowly
+    # across a slice — so a detection far from that offset is a mis-lock, not anatomy. The first pass above is
+    # unconstrained and does mis-lock (onto the iris, a specular band, or the anterior itself), and because the
+    # reconstruction is `posterior − thickness`, a mis-locked posterior moves the reconstructed apex by the
+    # same amount. _detect_bottom_edge already accepts a PRIOR that restricts its search — it was simply never
+    # given one here. So: measure the robust thickness from the frames where the anterior is trustworthy, then
+    # re-detect with prior = anterior + that thickness.
+    # Self-limiting by construction: with no trustworthy anterior frames there is no prior and the first pass
+    # stands. crop_post_prior=False disables.
+    if bool(p.get("crop_post_prior", True)) and np.isfinite(a).any():
+        _floor0 = float(p.get("clip_edge_floor", 8.0))
+        _cf0 = set(int(f) for f in (crop_frames if crop_frames is not None else []))
+        _ok = np.array([np.isfinite(a[f]) and a[f] >= _floor0 and f not in _cf0 for f in range(F)])
+        if int(_ok.sum()) >= 3:
+            _t0 = (b - a)[_ok]
+            _t0 = _t0[np.isfinite(_t0) & (_t0 > 0)]
+            if _t0.size >= 3:
+                _med_t = float(np.median(_t0))
+                _prior = np.where(np.isfinite(a), a + _med_t, np.nan)
+                _prior = _fill_nan_1d(_prior)
+                _win = float(p.get("crop_post_prior_win", 40.0))
+                b2 = _detect_bottom_edge(sl, {**p, "detect_window": _win}, prior=_prior).astype(np.float64)
+                # keep the constrained result only where it is finite and inside the canvas
+                _good = np.isfinite(b2) & (b2 > 0) & (b2 < sl.shape[0] - 1)
+                b = np.where(_good, b2, b)
+    # ── MANUAL OVERRIDE ──────────────────────────────────────────────────────────────────────────────────
+    # The reviewer's dragged posterior points WIN over any detection, on the same principle as border anchors:
+    # where a human has said where the edge is, that is ground truth and the detector's opinion is irrelevant.
+    # Applied per frame, so a couple of corrections fix a slice without redrawing all of it.
+    _pa = p.get("_post_anchor_row")
+    if isinstance(_pa, dict) and _pa:
+        for _f, _d in _pa.items():
+            try:
+                _fi = int(_f); _dv = float(_d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= _fi < F and np.isfinite(_dv):
+                # ABSENT SENTINEL: a value at or below the canvas floor means the reviewer said there is NO
+                # posterior edge on this frame — the bottom edge genuinely leaves the image there. Clamping it
+                # back to depth-1 (as this did) manufactured a flat edge pinned along the floor, and since the
+                # reconstruction is posterior - thickness, that phantom edge dragged the rebuilt apex with it.
+                # NaN instead, so every downstream mask treats the frame as having no measurement.
+                b[_fi] = float("nan") if _dv >= sl.shape[0] - 1 else float(np.clip(_dv, 0.0, sl.shape[0] - 1))
     out = a.copy()
     adopted = np.zeros(F, dtype=bool)
     cfin = [] if crop_frames is None else list(crop_frames)
@@ -2853,6 +3337,9 @@ def _crop_reconstruct_slice(slice_img: np.ndarray, anterior: np.ndarray, crop_fr
     if int(valid.sum()) < 3:
         return out, b, adopted
     t = b - a                                                     # corneal thickness (posterior - anterior)
+    valid = valid & np.isfinite(b)                                # frames with no posterior contribute nothing
+    if int(valid.sum()) < 3:
+        return out, b, adopted
     tv = t[valid]
     med = float(np.median(tv)); mad = float(np.median(np.abs(tv - med))) + 1e-6
     keep = valid.copy(); keep[valid] = np.abs(tv - med) <= 4.0 * 1.4826 * mad   # drop posterior mis-locks
@@ -2861,7 +3348,10 @@ def _crop_reconstruct_slice(slice_img: np.ndarray, anterior: np.ndarray, crop_fr
     fk = np.where(keep)[0].astype(np.float64)
     t_interp = np.interp(cf.astype(np.float64), fk, t[keep])      # thickness from non-marked flanks (held at ends)
     recon = b[cf] - t_interp
-    clipped_here = recon < (a[cf] - margin)                       # reconstruct only where it sits ABOVE the detected anterior
+    # a cropped frame whose posterior is absent has nothing to be rebuilt FROM — leave its detected anterior
+    # alone rather than propagating a NaN into the surface
+    _has_post = np.isfinite(b[cf])
+    clipped_here = _has_post & (recon < (a[cf] - margin))         # reconstruct only where it sits ABOVE the detected anterior
     idx = cf[clipped_here]
     out[idx] = recon[clipped_here]
     adopted[idx] = True
@@ -2892,9 +3382,13 @@ def build_surface_crop_edges(sag: np.ndarray, crop_frames, params: dict | None =
     edges = detect_surface_all(sag, p, workers=workers)            # (n_slices, n_frames) anterior
     F = int(sag.shape[2])
     posterior = np.zeros_like(edges)                               # detected bottom edge (warp target for the crop path)
-    cf = np.array(sorted({int(f) for f in (crop_frames or []) if 0 <= int(f) < F}), dtype=int)
+    cf = np.array(sorted({int(f) for f in (crop_frames if crop_frames is not None else []) if 0 <= int(f) < F}), dtype=int)
+    # per-slice manual posterior anchors ({slice: {frame: depth}}), normalised once
+    _panch = p.get("crop_post_anchors") or {}
+    _panch = _panch if isinstance(_panch, dict) else {}
     for i in range(int(sag.shape[0])):
-        out, b, _adopted = _crop_reconstruct_slice(sag[i], edges[i], cf, p)
+        _row = _panch.get(str(i)) or _panch.get(i) or None
+        out, b, _adopted = _crop_reconstruct_slice(sag[i], edges[i], cf, {**p, "_post_anchor_row": _row})
         edges[i] = out.astype(np.float32)
         posterior[i] = b.astype(np.float32)
     return edges, posterior
@@ -2936,7 +3430,7 @@ def warp_surface_crop_extend(sag: np.ndarray, posterior: np.ndarray, crop_frames
     in the SAME per-voxel spacing (the window just spans more depth). SAM2 cornea verified on the taller volume."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     n, depth, F = sag.shape
-    cf = set(int(f) for f in (crop_frames or []))
+    cf = set(int(f) for f in (crop_frames if crop_frames is not None else []))
     md = float(p.get("max_displacement", 40.0)) or 40.0
     res = float(p.get("residual_threshold", 5.0))
     det = detect if detect is not None else detect_surface_all(sag, p, workers=workers)
@@ -3001,7 +3495,69 @@ def warp_surface_crop_extend(sag: np.ndarray, posterior: np.ndarray, crop_frames
             lo = max(0, off); hi = min(H2, off + depth)
             if hi > lo:
                 out[i, lo:hi, f] = sag[i, lo - off:lo - off + (hi - lo), f]
+    # The vacated rows above the tissue are HARD ZEROS, and an OCT background floor is not zero — measured on
+    # case_cs005_od_v2 the padding sits at 33 against 511 just below it. That step is a far stronger edge than
+    # the epithelium, so the DP detector locks onto it: detection lands at row 27 instead of ~199 (verified with
+    # the scan's own tuned dp_*, and with auto_tune re-run on the padded volume). Every later stage that
+    # re-detects is then reading an artifact, which is why the surface-crop branch has to return early and skip
+    # the three rigid smoothing passes — see preprocess_oct_to_nifti.
+    # Filling those rows by TILING this scan's own background (real noise from just below the pad; no tissue
+    # invented, no distribution synthesised) removes the cliff: detection returns to row 199 with 0% of columns
+    # left in the padding, and rigid_frame_derotate — a strict no-op on the zero-padded volume — then adjusts
+    # 100 frames for roughness 1.073 -> 0.859.
+    # DEFAULT OFF: this changes DELIVERED voxels on the 39 canvas-extended scans, so it stays opt-in until the
+    # A/B is reviewed. crop_pad_fill="background" enables it.
+    if str(p.get("crop_pad_fill", "zeros")).lower() == "background" and pad > 0:
+        out = _fill_pad_background(out, int(pad), int(p.get("crop_pad_fill_src", 24)))
     return out, int(pad), Pb, Pa, bool(clamped)
+
+
+def _fill_pad_background(out: np.ndarray, pad: int, src: int = 24, first_valid: np.ndarray | None = None
+                         ) -> np.ndarray:
+    """Replace each column's empty leading rows with a mirrored tiling of ITS OWN background just below them.
+
+    out is (n_slices, depth, n_frames).
+
+    PER-COLUMN, not per-volume, and that distinction is the whole correctness of this function. Every frame is
+    copied in at its own offset (`off = pad + round(disp[f])` in warp_surface_crop_extend), so a downward-
+    displaced frame has MORE empty rows than `pad`. A version of this that sampled a single global block at
+    rows [pad : pad+src] read those still-empty rows as if they were background and copied zeros over zeros —
+    silently doing nothing for exactly the frames that needed it (measured: 48 of 101 frames left with a zero
+    band up to 20 rows, and detection then follows the residual cliff on some of them).
+
+    `first_valid` is the per-(slice, frame) index of the first real row; when omitted it is measured from the
+    data. The source block is taken from just BELOW that boundary, so it is always real signal.
+    """
+    if out.ndim != 3:
+        return out
+    n, H, F = out.shape
+    src = max(2, int(src))
+    if first_valid is None:
+        # a column's leading run of near-zero rows; threshold off the volume's own level so it is scale-free
+        lvl = float(np.median(out[out > 0])) if np.any(out > 0) else 0.0
+        thr = 0.05 * lvl
+        nz = out > thr
+        any_nz = nz.any(axis=1)
+        first_valid = np.where(any_nz, nz.argmax(axis=1), 0).astype(np.int64)   # (n, F)
+    fv = np.clip(np.asarray(first_valid, dtype=np.int64), 0, H - 1)
+    hi = int(fv.max())
+    if hi <= 0:
+        return out
+    hi = min(hi, H - 2)
+    rows = np.arange(hi)[None, :]                                    # (1, hi)
+    for f in range(F):
+        lo = fv[:, f][:, None]                                       # (n, 1) first real row of this column
+        if int(lo.max()) <= 0:
+            continue
+        avail = np.maximum(np.minimum(src, H - lo), 1)                # rows of real signal below the boundary
+        # mirrored tiling: row r takes lo + ((lo-1-r) mod avail), so the join at the boundary is continuous
+        idx = lo + ((lo - 1 - rows) % avail)
+        idx = np.clip(idx, 0, H - 1)
+        block = np.take_along_axis(out[:, :, f], idx, axis=1)         # (n, hi)
+        mask = rows < lo
+        cur = out[:, :hi, f]
+        out[:, :hi, f] = np.where(mask, block, cur)
+    return out
 
 
 def _surface_confidence(sl_smooth: np.ndarray, edge: np.ndarray):
@@ -3091,6 +3647,17 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
     p = {**DEFAULT_PARAMS, **(params or {})}
     n, depth, W = int(sag.shape[0]), int(sag.shape[1]), int(sag.shape[2])
     seed_win = float(p.get("redetect_seed_window", 2.0))     # snap tight to the user's drawn line (±1-2 px)
+    # PER-SLICE seed windows. The two kinds of correction mean different things: a shaped quadratic IS the
+    # surface (window 0 — follow it exactly), while hand-drawn edge anchors only say roughly where the surface
+    # is, so they are seeds the detector snaps to within a couple of px. One global window forced every
+    # anchored slice to be read the same way, so a scan carrying both had to pick one — and the app resolved
+    # that by DISCARDING the other slices' anchors on commit. Keyed by slice; anything absent uses the global.
+    seed_win_by_slice: dict[int, float] = {}
+    for _k, _v in (p.get("redetect_seed_window_slices") or {}).items():
+        try:
+            seed_win_by_slice[int(_k)] = float(_v)
+        except (TypeError, ValueError):
+            continue
     march_win = float(p.get("detect_window", 10.0))
     fmargin = max(0, int(p.get("redetect_frame_margin", 8)))
     slice_band = max(0, int(p.get("redetect_slice_band", 30)))
@@ -3116,8 +3683,19 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
                 f = int(f_key); dv = float(d)
             except (TypeError, ValueError):
                 continue
-            if 0 <= f < W and np.isfinite(dv):
-                fm[f] = float(np.clip(dv, 0, depth - 1))
+            # ABSENT SENTINEL: an anchor at or below the canvas floor means the reviewer said there is NO
+            # top surface on that frame (it happens — some frames have none at all). Skipped entirely rather
+            # than clamped to depth-1, which would assert a real surface lying along the bottom and drag the
+            # flatten's per-frame alignment onto it.
+            if 0 <= f < W and np.isfinite(dv) and dv < depth - 1:
+                # ABOVE-CANVAS anchors are legal and necessary. A surface-cropped cornea has its apex above
+                # the captured window by definition, so the curve through it can only be specified at
+                # NEGATIVE depth. Clamping those to 0 (as this did) silently flattened the drawn apex onto
+                # the top row: the correction was accepted and then did the opposite of what was drawn.
+                # The floor is crop_max_pad, the same cap that bounds how far warp_surface_crop_extend will
+                # extend the canvas, so nothing can be asked for that the reconstruction cannot deliver — and
+                # a negative surface then DRIVES that extension (raw_pad is computed from exactly this).
+                fm[f] = float(np.clip(dv, -float(p.get("crop_max_pad", 120)), depth - 1))
         if fm:
             anc[s] = fm
     if not anc:
@@ -3193,12 +3771,13 @@ def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
         wf_s = _frame_weight(runs)
         rmask = wf_s > 0
         prior = _run_prior(fm, base[s], runs)
-        # light=True + tight seed_win: snap to the nearest gradient within ±1-2 px of the user's drawn line
+        # light=True + tight seed window: snap to the nearest gradient within ±1-2 px of the user's drawn line
         # (no robust side-correction/RANSAC that would pull the corrected edge away from where they drew it).
-        redet = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), prior, seed_win, p,
+        sw = float(seed_win_by_slice.get(s, seed_win))        # 0 on a slice whose curve was shaped exactly
+        redet = _redetect_one_slice(np.ascontiguousarray(sag[s]).astype(np.float32), prior, sw, p,
                                     light=True).astype(np.float32)
-        # HARD-clamp the re-detected region to within ±seed_win of the prior so a low-signal frame can't drift.
-        redet[rmask] = np.clip(redet[rmask], prior[rmask] - seed_win, prior[rmask] + seed_win)
+        # HARD-clamp the re-detected region to within ±sw of the prior so a low-signal frame can't drift.
+        redet[rmask] = np.clip(redet[rmask], prior[rmask] - sw, prior[rmask] + sw)
         redet_region[s] = redet; region_wf[s] = wf_s; _splice(s, redet, wf_s)
 
     # 2) INTERPOLATE the correction across slices — fills the gaps BETWEEN anchored slices, and tapers to auto
@@ -3317,8 +3896,19 @@ def generalize_surface(sag: np.ndarray, anchors: dict, params: dict | None = Non
                 f = int(f_key); dv = float(d)
             except (TypeError, ValueError):
                 continue
-            if 0 <= f < W and np.isfinite(dv):
-                fm[f] = float(np.clip(dv, 0, depth - 1))
+            # ABSENT SENTINEL: an anchor at or below the canvas floor means the reviewer said there is NO
+            # top surface on that frame (it happens — some frames have none at all). Skipped entirely rather
+            # than clamped to depth-1, which would assert a real surface lying along the bottom and drag the
+            # flatten's per-frame alignment onto it.
+            if 0 <= f < W and np.isfinite(dv) and dv < depth - 1:
+                # ABOVE-CANVAS anchors are legal and necessary. A surface-cropped cornea has its apex above
+                # the captured window by definition, so the curve through it can only be specified at
+                # NEGATIVE depth. Clamping those to 0 (as this did) silently flattened the drawn apex onto
+                # the top row: the correction was accepted and then did the opposite of what was drawn.
+                # The floor is crop_max_pad, the same cap that bounds how far warp_surface_crop_extend will
+                # extend the canvas, so nothing can be asked for that the reconstruction cannot deliver — and
+                # a negative surface then DRIVES that extension (raw_pad is computed from exactly this).
+                fm[f] = float(np.clip(dv, -float(p.get("crop_max_pad", 120)), depth - 1))
         if fm:
             anc[s] = fm
     if not anc:
@@ -3790,7 +4380,12 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # downward step/V-notch at the margin boundary (~frame 87) — the exact steep edge it meant to remove. The
         # raw detection already tracks the limbus flattening smoothly. Opt-in only (default False). See DEFAULT_PARAMS.
         if not use_provided and bool(p.get("parabola_edge", False)):
-            edges = _parabola_edge_constrain(edges, p)
+            # Gate the frame-axis snap on the interior actually being a parabola — see
+            # _interior_parabola_ok. Then apply the lateral-direction twin, which reaches the edge the
+            # frame-axis version cannot (the reviewer's "left edge"/"corners of frames").
+            if _interior_parabola_ok(edges, p, axis="frame"):
+                edges = _parabola_edge_constrain(edges, p)
+            edges = _lat_edge_parabola(edges, p)
         # FAINT→ONSET SNAP (laterally coherent) on the WARP edges — same correction as detect_surface_all, so the
         # flattened OUTPUT surface lands on the epithelium AND stays laterally smooth (no axial fuzziness from the
         # snap). Auto path only; the fix-columns provided_edges path carries the user's own surface and is skipped.
@@ -4036,8 +4631,20 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     #     3-6px ≫ the ~0 rigid part). Replace each frame's per-lateral displacement with ONE robust rigid shift
     #     (median over the reliable laterals, excluding clipped/user-cut columns whose disp is a clamp not a motion
     #     sample), then re-assert the tissue-preservation clamps. Interior barely changes (≤ noise); the boundary
-    #     deformation is removed at the source. Auto path only. rigid_frame_warp=False → off (legacy per-column).
-    if not use_provided and bool(p.get("rigid_frame_warp", False)):
+    #     deformation is removed at the source. rigid_frame_warp=False → off (legacy per-column).
+    #
+    #     APPLIES ON THE CORRECTIONS PATH TOO (was: auto path only). The rule is a statement about the DATA, not
+    #     about which code path produced the surface: a B-scan is captured near-instantaneously, so its internal
+    #     geometry is real on a corrected scan exactly as it is on an auto one. Excluding use_provided meant that
+    #     correcting a scan silently opted it out of the constraint and warped it per-column — the reviewer's
+    #     corrections were the one case guaranteed to deform the B-scans.
+    #
+    #     CONSEQUENCE, deliberately accepted: the delivered volume no longer sits exactly on the drawn line at
+    #     every column, because honouring a drawn line per-column IS the deformation. The drawn surface now
+    #     determines ONE shift per frame (the median over reliable laterals), which is the most a rigid
+    #     transform can take from it. Preview and result therefore differ per-column by design; the alternative
+    #     is bending instantaneously-captured tissue to match a hand-drawn curve.
+    if bool(p.get("rigid_frame_warp", False)):
         clamped = np.zeros(disp_field.shape, dtype=bool)          # (lateral, frame) clip/user-cut columns
         for i in range(n):
             cc = clip_cols_list[i]; zc = zero_cols_list[i]
@@ -4071,6 +4678,14 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
             zc = zero_cols_list[i]
             if len(zc):
                 disp_field[i][zc] = 0.0
+        # ...and re-assert the ABOVE-WINDOW clamp on the corrections path. It was applied to disp_field further
+        # up, but the rigid replacement above overwrites every column with the frame's median — which can be
+        # negative and would shift a column whose apex is already above row 0 further up, truncating real
+        # epithelium off the top. This clamp is the reason that assignment cannot simply stand.
+        if use_provided:
+            neg = edges < 0.0
+            if neg.any():
+                disp_field = np.where(neg, np.maximum(disp_field, 0.0), disp_field)
     # 4) warp each slice by its guarded+smoothed displacement, then revert. sub-pixel (subpixel_warp) removes the
     #    int-truncate lateral staircase in the flattened anterior boundary (the "ripples" seen at zoom).
     _subpx = bool(p.get("subpixel_warp", False))
@@ -5529,6 +6144,148 @@ def axial_consistency_volume(volume: np.ndarray, params: dict | None = None, wor
                  "n_frames": n_frames, "cols_adjusted": int(n_moved_cols)}
 
 
+def rigid_sagittal_motion_correct(volume: np.ndarray, params: dict | None = None,
+                                  workers: int | None = None):
+    """Remove inter-frame axial DRIFT that survives the flatten, by a per-frame rigid DEPTH shift — GATED so
+    it only fires on genuine drift and never touches a normal scan.
+
+    THE PROBLEM (measured). The corrections-path flatten lands each B-scan on its own across-frame quadratic
+    and keeps it, so a slow drift that accumulated into a smooth across-frame bow is preserved as if it were
+    corneal curvature. On the complaint scan the across-frame sag was 166 px against an anatomical ~34 —
+    ~130 px of drift, shaped like anatomy, which no dome/quadratic fit can tell apart from real shape.
+
+    THE DRIFT-PROOF REFERENCE. Each B-scan is captured instantaneously, so its LATERAL arc is untouched by
+    inter-frame motion. A near-spherical cornea has across-frame sag ≈ SAG_RATIO × lateral sag (constant in
+    radius). So the lateral sag — which drift cannot corrupt — predicts what the across-frame sag SHOULD be.
+    Excess over that prediction is drift.
+
+    THE CORRECTION is exactly the reviewer's spec: one rigid depth shift per B-scan (nothing deformed), moving
+    each frame so the per-frame surface trajectory follows a smooth curve scaled to the sphere-predicted sag.
+    Because drift is common across laterals (the whole B-scan moved), a single per-frame shift corrects every
+    lateral at once, and the lateral arc — hence lateral sag — is invariant under it.
+
+    THE GATE. Fires only when (measured across-frame sag) / (SAG_RATIO × lateral sag) exceeds
+    `smc_excess_gate`. Validated: complaint scan 4.9× (fires → 166→34 px, undulation IMPROVED 4.2→0.6, lateral
+    held); two approved scans 1.28× and 0.92× (do NOT fire — left byte-identical). A normal cornea's
+    variation sits ~0.9–1.3×, so the 2.0 gate has wide margin. Under-correcting a mildly-drifted scan (leaving
+    acquired geometry) is the safe failure; distorting a good scan toward a sphere model is not, which is why
+    the gate is deliberately conservative. Returns (volume, info); info.applied is False when the gate holds.
+    """
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("rigid_sagittal_mc", True)):
+        return volume, {"applied": False, "reason": "disabled"}
+    if workers is None:
+        workers = auto_workers()
+    ratio = float(p.get("smc_sag_ratio", 0.444))
+    gate = float(p.get("smc_excess_gate", 2.0))
+    max_shift = float(p.get("smc_max_shift", 140.0))
+    try:
+        sag = reformat_to_sagittal(volume)                      # (lateral, depth, frames)
+        S = detect_surface_all(sag, p, workers=workers).astype(np.float64)   # (lateral, frames)
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False, "reason": "detect failed"}
+    L, F = S.shape
+    if F < 12 or L < 32:
+        return volume, {"applied": False, "reason": "too small"}
+    lo, hi = int(0.25 * L), int(0.75 * L)
+    r = np.array([np.nanmedian(S[lo:hi, f]) for f in range(F)], dtype=np.float64)   # per-frame ref depth
+    if not np.isfinite(r).all():
+        r = np.interp(np.arange(F), np.where(np.isfinite(r))[0], r[np.isfinite(r)]) \
+            if np.isfinite(r).any() else None
+        if r is None:
+            return volume, {"applied": False, "reason": "no reference"}
+    # LATERAL sag — drift-proof, measured within B-scans, median over central frames
+    xL = np.arange(L, dtype=np.float64)
+    lat = []
+    for f in range(F // 3, 2 * F // 3):
+        col = S[:, f]
+        ok = np.isfinite(col) & (col > 1)
+        if ok.sum() >= L * 0.5:
+            lat.append(float(np.ptp(ndimage.gaussian_filter1d(np.interp(xL, xL[ok], col[ok]), 10.0, mode="nearest"))))
+    lat_sag = float(np.median(lat)) if lat else float("nan")
+    if not np.isfinite(lat_sag) or lat_sag < 8:
+        return volume, {"applied": False, "reason": "lateral sag unmeasurable"}
+    xs = np.arange(F, dtype=np.float64)
+    trend = np.poly1d(np.polyfit(xs, r, min(4, F - 1)))(xs)      # smooth across-frame trajectory
+    cur_sag = float(np.ptp(trend))
+    target_sag = ratio * lat_sag
+    excess = cur_sag / max(target_sag, 1e-6)
+
+    # ── DEPTH component (y): sphere de-bow, gated on the across-frame excess ratio ──────────────────────
+    depth_shift = np.zeros(F)
+    if excess > gate:
+        scaled = (trend - trend.mean()) * (target_sag / cur_sag) + trend.mean()
+        depth_shift = scaled - r
+
+    # ── TILT component (r): remove the VARIATION of the per-frame lateral tilt ──────────────────────────
+    # Each B-scan's arc has a linear-in-lateral tilt m_f. A rigid eye in a fixed pose has a CONSTANT tilt
+    # across frames (its static torsion/decentration); any VARIATION is the eye rotating during the scan —
+    # motion. The reviewer's "trough on early slices, bump on later slices at the same column" is exactly a
+    # tilt that flips sign across frames, which a static cornea cannot produce. So keep the mean tilt (real,
+    # small) and remove the variation, as a per-frame rotation (a depth shear linear in lateral; the lateral
+    # component is sub-pixel at these angles, so the arc SHAPE — the anatomy — is preserved).
+    xc = (L - 1) / 2.0
+    xn = np.arange(L, dtype=np.float64) - xc
+    tlo, thi = int(0.2 * L), int(0.8 * L)
+    tilt = np.full(F, np.nan)
+    for f in range(F):
+        col = S[:, f]
+        ok = np.isfinite(col) & (col > 1)
+        ok[:tlo] = False; ok[thi:] = False
+        if int(ok.sum()) > 20:
+            A = np.vstack([np.ones(int(ok.sum())), xn[ok], xn[ok] ** 2]).T
+            try:
+                coef = np.linalg.lstsq(A, col[ok], rcond=None)[0]
+                tilt[f] = coef[1]                               # depth-px per lateral-px (the tilt slope)
+            except Exception:  # noqa: BLE001
+                pass
+    tilt_gate_px = float(p.get("smc_tilt_gate", 20.0))          # min edge-swing DRIFT (px) to act on
+    rot_slope = np.zeros(F)
+    tilt_drift_px = 0.0
+    if np.isfinite(tilt).sum() >= max(8, F // 3):
+        tf = np.interp(xs, xs[np.isfinite(tilt)], tilt[np.isfinite(tilt)])
+        # TWO metrics, two jobs — conflating them broke both directions.
+        #   GATE on a LOW-ORDER fit: the reviewer's rotation is a SMOOTH monotonic drift, while the per-frame
+        #   tilt estimate also carries high-freq WIGGLE from detection noise. Keying the DECISION on total
+        #   variation fired on a clean scan (cs028: 0.2 px real drift, ~21 px wiggle) and sheared it by noise
+        #   (lateral 218->188). A degree-`smc_tilt_deg` fit sees only the real drift, so cs028 no longer fires.
+        #   APPLY a lightly-smoothed tilt: a low-order fit is too rigid to REMOVE the real drift fully (it left
+        #   cs042 at 13.8 px residual and dev 1.63 vs 0.62), because genuine motion has a steeper transition
+        #   than deg-3 can follow. Only scans that PASS the gate reach this, and those have real drift, so
+        #   removing their lightly-smoothed tilt (incl. any micro-wiggle, which is also motion) is correct.
+        deg = int(p.get("smc_tilt_deg", 3))
+        gate_curve = np.poly1d(np.polyfit(xs, tf, min(deg, F - 1)))(xs)
+        tilt_drift_px = float(np.ptp(gate_curve - np.median(gate_curve)) * L)   # GATE metric (noise-robust)
+        apply_curve = ndimage.gaussian_filter1d(tf, float(p.get("smc_tilt_smooth", 1.5)), mode="nearest")
+        if tilt_drift_px > tilt_gate_px:
+            rot_slope = -(apply_curve - np.median(apply_curve))  # remove the full smoothed drift (rigid rot)
+
+    info = {"applied": False, "excess": round(excess, 2), "gate": gate,
+            "across_frame_sag": round(cur_sag, 1), "lateral_sag": round(lat_sag, 1),
+            "target_sag": round(target_sag, 1),
+            "tilt_drift_px": round(tilt_drift_px, 1), "tilt_gate_px": tilt_gate_px}
+    depth_on = excess > gate
+    tilt_on = tilt_drift_px > tilt_gate_px
+    if not depth_on and not tilt_on:
+        info["reason"] = "within normal range (no drift, no tilt)"
+        return volume, info
+
+    # zero-centre the depth shift (minimal canvas use); clip. Rotation is already zero-mean (drift - mean).
+    depth_shift = np.clip(depth_shift - (np.median(depth_shift) if depth_on else 0.0), -max_shift, max_shift)
+    out = volume.copy(); nadj = 0
+    for f in range(F):
+        disp = np.full(L, depth_shift[f]) + rot_slope[f] * xn   # per-lateral: translation + rotation(shear)
+        if float(np.max(np.abs(disp))) > 0.05:
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), disp, subpixel=True)
+            nadj += 1
+    info.update({"applied": bool(nadj), "frames_adjusted": int(nadj),
+                 "depth_applied": bool(depth_on), "tilt_applied": bool(tilt_on),
+                 "max_shift": round(float(np.max(np.abs(depth_shift))), 1) if depth_on else 0.0,
+                 "max_tilt_swing": round(float(np.max(np.abs(rot_slope)) * L), 1) if tilt_on else 0.0,
+                 "sag_after_expected": round(float(target_sag), 1)})
+    return out, info
+
+
 def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
                          detect: np.ndarray | None = None):
     """Correct slow-scan (frame-axis) inter-frame AXIAL EYE MOTION (v0.0.159).
@@ -5606,7 +6363,8 @@ def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers
                  "shift": [round(float(x), 3) for x in M]}
 
 
-def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
+                        detect: np.ndarray | None = None):
     """RIGID per-frame HEIGHT refinement for a smoother sagittal (v0.0.191).
 
     After the rigid flatten each B-scan sits at ONE depth (a single per-frame height). Any residual ESTIMATION
@@ -5627,8 +6385,17 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
     F, depth = int(volume.shape[0]), int(volume.shape[1])
     if F < 12:
         return volume, {"applied": False}
+    # `detect` = a surface of THIS volume the caller already has, same reuse idiom as axial_motion_correct.
+    # It matters most on the CORRECTIONS path: this stage aligns every frame to a smooth dome fitted through
+    # the detected surface, so wherever the detector is wrong the frame is moved to the wrong height — and the
+    # frames the reviewer corrected are, by definition, the ones the detector got wrong. Re-detecting here
+    # discarded the correction and re-introduced the error it was drawn to fix, which is the "better on some
+    # slices, worse on others" the reviewer reported. A caller that has a better surface passes it in.
+    _shape_ok = (detect is not None and np.asarray(detect).ndim == 2
+                 and int(np.asarray(detect).shape[1]) == F)
     try:
-        S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
+        S = (np.asarray(detect, dtype=np.float32) if _shape_ok
+             else detect_surface_all(reformat_to_sagittal(volume), p, workers=workers))  # (lat, frames)
     except Exception:  # noqa: BLE001
         return volume, {"applied": False}
     L = int(S.shape[0])
@@ -6638,6 +7405,21 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             _S_raw = detect_surface_all(reformat_to_sagittal(vol), params, workers=workers)
         except Exception:  # noqa: BLE001 — hoisting this pass out of AMC must not remove AMC's own guard:
             _S_raw = None  # on failure do NOT pass detect= to AMC (it re-detects and degrades to a no-op)
+    # AXIAL MOTION CORRECTION — now on the CORRECTIONS path too.
+    #
+    # This is the stage whose whole job is removing inter-frame axial drift, and `provided_edges is None`
+    # excluded it from every "Correct & re-run". Measured consequence on a corrected scan: across-frame sag
+    # 162 px against an anatomical ~85, i.e. ~75 px of drift left in, while two approved scans that took the
+    # AUTO path (AMC ran: 98 and 100 frames adjusted) sat at 93 and 86 px — right on anatomy. That residue is
+    # exactly the "corrected pane still isn't smooth" the reviewer reported. Correcting the border must not
+    # cost the scan its motion correction.
+    #
+    # AUTO PATH ONLY here (provided_edges is None). Running AMC BEFORE the flatten on the corrections path was
+    # tried and regressed the scan (dev 3.95 -> 10.86): provided_edges is in RAW coordinates and AMC moves the
+    # volume beneath it, so re-basing the surface through AMC's shift — though the sign was right — still fed
+    # the flatten and the downstream detectors a surface in a shifted basis they did not expect. The
+    # corrections path instead removes drift AFTER the flatten (see the provided_edges branch below), where
+    # AMC operates on a finished volume exactly as it does on any other, with no basis to reconcile.
     if provided_edges is None and bool(_pcr.get("axial_motion_correct", False)):
         vol, _amc_info = axial_motion_correct(vol, params, workers=workers, detect=_S_raw)
     # INTRA-frame saccade de-distortion (v0.0.159): re-warp only the genuinely saccade-distorted B-scans onto
@@ -6878,6 +7660,55 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if _crop_tune:
                 info["auto_tune"] = _crop_tune
             p_all = {**DEFAULT_PARAMS, **(params or {})}
+            # ── FINAL RIGID SMOOTHING on the surface-crop path (opt-in) ──────────────────────────────────────
+            # This branch returns before the main path's three rigid passes, so every canvas-extended scan ships
+            # WITHOUT them. Measured cost: on an unpadded control those passes take roughness 0.750 -> 0.601,
+            # and 0 of the 39 canvas-extended scans in the store are approved against 170/269 elsewhere, 64% of
+            # their rejections citing smoothness. (Confounded — extension only fires on clipped-apex scans,
+            # which are harder to begin with — but they are also the only scans denied the smoothing.)
+            #
+            # It CANNOT simply be enabled: these passes re-detect, and on a zero-padded volume the detector
+            # locks onto the padding cliff (row 27 instead of ~199). Run there, rigid_height_refine happily
+            # "improves" 95 frames against that artifact — real shifts computed from a false surface, which is
+            # worse than skipping it. So this is gated on the padding actually having been filled
+            # (crop_pad_fill="background"), which is what restores detection to the true epithelium.
+            # Order matches the main path: rigid passes first, then the user's GT (axial anchors, manual
+            # shifts, reviewer patches) so GT still wins.
+            if (bool(p_all.get("surface_crop_finish", False))
+                    and str(p_all.get("crop_pad_fill", "zeros")).lower() == "background"
+                    and bool(p_all.get("rigid_frame_warp", True))):
+                if p_all.get("rigid_height_refine", True):
+                    corrected, _rhr = rigid_height_refine(corrected, params, workers=workers)
+                    info["rigid_height_refine"] = _rhr
+                # DEROTATE IS OFF ON THIS PATH BY DEFAULT — measured, not assumed. A five-arm ablation over
+                # the scans where surface_crop_finish degraded per-frame shape (.work/stage_ablate.py) put the
+                # damage squarely on this pass, and showed that dropping it keeps the whole roughness gain:
+                #   case_cs005_od_v2  all three: undul 13.06 rough 1.178 | minus derotate: undul  3.74 rough 1.127
+                #   case_cs014_os_v1  all three: undul  4.57 rough 0.876 | minus derotate: undul  1.12 rough 0.825
+                # i.e. undulation returns to its no-op baseline (3.72 / 1.04) while roughness still improves
+                # 1.461->1.127 and 1.231->0.825. Strictly better than running it.
+                # Edge-loss was 0.0% in every arm, so this is NOT rotation pushing tissue off the canvas (the
+                # obvious hypothesis, and it is refuted); the pass resamples each column by a different
+                # fractional offset and the detector's sub-pixel response follows, though the size of the
+                # effect is not fully explained. Scoped to THIS path only: derotate is untouched on the main
+                # path, where the 269 unpadded scans it serves are 63% approved.
+                if p_all.get("surface_crop_derotate", False):
+                    corrected, _rfd = rigid_frame_derotate(corrected, params, workers=workers)
+                    info["rigid_frame_derotate"] = _rfd
+                if p_all.get("rigid_frame_refine", True):
+                    corrected, _rfr = rigid_frame_refine(corrected, params, workers=workers)
+                    info["rigid_frame_refine"] = _rfr
+                # RE-FILL after the passes. Each of them warps frames, and _warp_by_displacement fills the rows
+                # a shift vacates with ZEROS (see ~line 1531) — so the cliff this whole path exists to remove is
+                # cut afresh, per frame, after the extension-time fill has already run. Measured on the
+                # delivered file: re-detecting case_cs024_os_v2 gave undulation 1.56 px before this branch and
+                # 22.94 px after it, and case_cs008_od_v3 1.34 -> 41.77 px — i.e. the output was left HARDER to
+                # detect on than the zero-padded volume it replaced, which would silently damage every
+                # downstream consumer that re-detects (SAM2 seeding, QA, the review metrics).
+                # Per-column off each column's own first-valid row, so a frame displaced further than the
+                # original pad is covered too.
+                corrected = revert_sagittal(_fill_pad_background(reformat_to_sagittal(corrected), 0,
+                                                                 int(p_all.get("crop_pad_fill_src", 24))))
             _axa = p_all.get("axial_anchors")   # AXIAL fix-tool GT (see main path) — applies on the surface-crop path too
             if _axa:
                 corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
@@ -6916,13 +7747,187 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if _crop_guard_removed:
                 info["crop_guard_removed_frames"] = list(_crop_guard_removed)
             return info
+    _crop_recon_info = None
+    # ── POSTERIOR-DERIVED CURVATURE ON THE CORRECTIONS PATH ─────────────────────────────────────────────
+    # THE REVIEWER'S MODEL, in their words: the bottom line "allows for curvature correction even when the top
+    # edge (red) is not present". On a surface-cropped frame there IS no anterior to detect or to draw, so the
+    # posterior is the only observation of the cornea's shape there, and the anterior is recoverable from it as
+    # posterior − thickness (thickness interpolated from the un-cropped flanks).
+    #
+    # build_surface_crop_edges does exactly that, and already reads crop_post_anchors per slice — so the
+    # reviewer's own orange line feeds it. It was simply unreachable from here: its only call site sat inside
+    # the `provided_edges is None` branch, which is why marking amber columns and correcting the bottom line
+    # both appeared to do nothing on a re-run. One gate, both symptoms.
+    #
+    # PRECEDENCE: the reviewer's RED edge wins wherever they drew one, including above the window — there it is
+    # their hypothesis for the clipped apex, which is a statement about this cornea and outranks a
+    # reconstruction inferred from thickness. The reconstruction fills the remaining cropped frames only.
+    if provided_edges is not None:
+        _cf_src = (params or {}).get("surface_crop_frames") if params else None
+        if _cf_src:
+            try:
+                _pe = np.asarray(provided_edges, dtype=np.float32).copy()
+                _Lp, _Fp = int(_pe.shape[0]), int(_pe.shape[1])
+                _cf = np.array(sorted({int(f) for f in _cf_src if 0 <= int(f) < _Fp}), dtype=int)
+                if _cf.size:
+                    _rec, _ = build_surface_crop_edges(reformat_to_sagittal(vol), _cf.tolist(),
+                                                       params, workers=workers)
+                    _rec = np.asarray(_rec, dtype=np.float32)
+                    if _rec.shape == _pe.shape:
+                        # where the reviewer drew a red anchor — those (slice, frame) keep their own value
+                        _drawn = np.zeros(_pe.shape, dtype=bool)
+                        for _sk, _fm in ((params or {}).get("border_anchors") or {}).items():
+                            try:
+                                _si2 = int(_sk)
+                            except (TypeError, ValueError):
+                                continue
+                            if not (0 <= _si2 < _Lp) or not isinstance(_fm, dict):
+                                continue
+                            for _fk in _fm:
+                                try:
+                                    _fi2 = int(_fk)
+                                except (TypeError, ValueError):
+                                    continue
+                                if 0 <= _fi2 < _Fp:
+                                    _drawn[_si2, _fi2] = True
+                        _take = np.isfinite(_rec[:, _cf]) & (~_drawn[:, _cf])
+                        _pe[:, _cf] = np.where(_take, _rec[:, _cf], _pe[:, _cf])
+                        provided_edges = _pe
+                        _crop_recon_info = {"n_frames": int(_cf.size),
+                                            "n_columns_rebuilt": int(_take.sum()),
+                                            "from": "posterior continuity (bottom line)"}
+            except Exception:  # noqa: BLE001 — best-effort: fall back to the anterior as supplied
+                _crop_recon_info = None
+
+    # ── CANVAS EXTENSION ON THE CORRECTIONS PATH ────────────────────────────────────────────────────────
+    # When the reviewer draws the anterior ABOVE the captured window (negative depth — the definition of a
+    # surface-cropped apex), the volume has to grow upward or there is nowhere for that tissue to go. The
+    # auto path does this at :7241, but that branch is gated `provided_edges is None`, so correcting a scan
+    # skipped it entirely: the drawn line was understood well enough to be protected by the disp>=0 clamp
+    # (:4336) and then nothing was done with it, which is exactly the reviewer's report — "the corrected
+    # result never shifts those columns outside the image area".
+    #
+    # A CANVAS OPERATION ONLY, deliberately. The auto branch extends AND warps (flattening to its own
+    # posterior parabola) and then returns; running it here would mean two warps composed, or the extension
+    # deciding the alignment instead of the correction. Growing the canvas and re-basing the surface leaves
+    # the moving to the rigid flatten below — which is the reviewer's own rule: corrections fix the detected
+    # edge, the rigid transforms do the moving.
+    _ext_pad = 0
+    if provided_edges is not None:
+        _pe = np.asarray(provided_edges, dtype=np.float32)
+        _above = float(np.nanmin(_pe)) if np.isfinite(_pe).any() else 0.0
+        if _above < 0.0:
+            _pex = {**DEFAULT_PARAMS, **(params or {})}
+            # headroom for the deepest drawn point plus a margin, capped exactly where the reconstruction is
+            # capped — asking for more than warp_surface_crop_extend could ever deliver would be incoherent.
+            _ext_pad = int(min(float(_pex.get("crop_max_pad", 120)),
+                               np.ceil(-_above) + float(_pex.get("crop_pad_margin", 8))))
+            if _ext_pad > 0:
+                _F, _D, _L = int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2])
+                _tall = np.zeros((_F, _D + _ext_pad, _L), dtype=vol.dtype)
+                _tall[:, _ext_pad:, :] = vol
+                # Fill the new rows with real background rather than zeros: a zero block against ~33-valued
+                # OCT background is a cliff the detector locks onto (it mistook row 27 for the epithelium on
+                # padded volumes), and every later stage would then measure that cliff instead of the cornea.
+                if str(_pex.get("crop_pad_fill", "zeros")).lower() == "background":
+                    # (out, pad, src) — src is how many rows of real background to sample, NOT the depth.
+                    # first_valid is left to default: the pad here is uniform (no per-frame displacement has
+                    # been applied yet), so every column's first real row is exactly _ext_pad.
+                    _tall = revert_sagittal(_fill_pad_background(
+                        reformat_to_sagittal(_tall), _ext_pad, int(_pex.get("crop_pad_fill_src", 24))))
+                vol = _tall
+                # The surface is in OLD-canvas rows; every row moved down by _ext_pad, so the drawn apex that
+                # was at a negative depth is now a real row inside the volume. This is what makes the flatten
+                # able to act on it at all.
+                provided_edges = _pe + float(_ext_pad)
     if provided_edges is not None:
         # fix-columns marched re-detection: a SINGLE same-canvas warp that flattens to the user-validated
         # surface, NO iteration and NO axial-refine — so the corrected volume matches the scrub preview exactly.
         corrected = smooth_volume(vol, params, progress=progress, provided_edges=provided_edges, workers=workers)
         info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "redetect",
                 "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0}}
+        # Record AMC here too. It is reported on the auto and surface-crop branches but was never recorded on
+        # this one, so "did motion correction run?" was unanswerable from the manifest for every corrected
+        # scan — which is how a missing stage stayed hidden until the anatomy said so.
+        if _amc_info:
+            info["axial_motion_correct"] = _amc_info
+        if _crop_recon_info:
+            info["crop_reconstruction"] = _crop_recon_info
+        if _ext_pad:
+            # Recorded, because a taller output is the most visible thing a run can do and a silent change of
+            # canvas height is indistinguishable from a bug. The reviewer asked for exactly this and needs to
+            # be able to confirm it happened.
+            info["canvas_extend"] = {"pad": int(_ext_pad), "reason": "corrected apex above the window",
+                                     "depth_before": int(vol.shape[1] - _ext_pad),
+                                     "depth_after": int(vol.shape[1])}
         p_all = {**DEFAULT_PARAMS, **(params or {})}
+        # ── FINAL RIGID PASSES on the fix-columns path ───────────────────────────────────────────────────────
+        # REVIEWER DIRECTIVE: "not to manipulate the columns directly in sagittal view but to correct the
+        # detected edge / corneal curvature. This will inform detector and still allow the axial transforms to
+        # occur." Until now the second half did not happen: this branch returned before the main path's rigid
+        # passes, so a corrected edge bought a single warp onto the user's surface and nothing else — the same
+        # early-return shape as the surface-crop branch.
+        #
+        # Why running them here is coherent rather than double-correcting: the user's surface enters as
+        # provided_edges and fixes WHERE THE CORNEA IS; the rigid passes then place each frame's pose
+        # (translation + rotation) against the smooth dome implied by that surface. Those are different
+        # quantities. And each pass is self-gated on its own roughness measure, so where the corrected surface
+        # already leaves nothing to remove they are strict no-ops.
+        #
+        # TRADE-OFF, stated because it is real: the branch's original comment justified skipping them as "NO
+        # iteration and NO axial-refine — so the corrected volume matches the scrub preview exactly". That
+        # exactness is now traded away — the delivered volume may differ from the scrub preview by the rigid
+        # pose correction. redetect_finish=False restores the old behaviour.
+        # Runs BEFORE the user's GT (axial anchors, manual shifts, reviewer patches) so GT still wins last.
+        #
+        # ── AXIAL MOTION CORRECTION, on the CORRECTED volume ─────────────────────────────────────────────
+        # The flatten above lands each frame on fit(provided_edges) — its OWN per-slice lateral quadratic —
+        # independently per frame. That removes within-frame deviation but NOT frame-to-frame drift, because
+        # provided_edges encodes the surface where it actually sits in the drifted acquisition. So a corrected
+        # scan keeps its inter-frame drift: measured, across-frame sag 162 px vs an anatomical ~85 (sag ratio
+        # 2.10 vs 0.44), which is the "corrected pane still isn't smooth" the reviewer reported.
+        #
+        # Two candidates were tried here. Plain AMC (redetect_amc) removes only ~6%: its degree-5 dome fit
+        # absorbs a smooth drift as if it were anatomy, and it cannot use the drift-proof lateral geometry.
+        # rigid_sagittal_motion_correct does — it predicts the true across-frame sag from the lateral arc
+        # (which inter-frame motion cannot touch) and shifts each frame to it, GATED so it fires only when the
+        # measured sag exceeds the sphere prediction by smc_excess_gate. Validated: complaint scan 166->34 px
+        # (undulation improved 4.2->0.6, lateral held), two approved scans below the gate and left untouched.
+        # Rigid (one depth shift per frame), so the B-scan is never deformed — the reviewer's exact spec.
+        if provided_edges is not None and bool(p_all.get("rigid_sagittal_mc", True)):
+            corrected, _smc = rigid_sagittal_motion_correct(corrected, params, workers=workers)
+            info["rigid_sagittal_mc"] = _smc
+        if provided_edges is not None and bool(p_all.get("redetect_amc", False)) \
+                and bool(p_all.get("axial_motion_correct", True)):
+            corrected, _amc2 = axial_motion_correct(corrected, params, workers=workers)
+            info["axial_motion_correct_post"] = _amc2
+        if bool(p_all.get("rigid_frame_warp", True)) and bool(p_all.get("redetect_finish", True)):
+            if p_all.get("rigid_height_refine", True):
+                # GIVE IT AN ACCURATE SURFACE instead of letting it re-detect. This stage fits a smooth dome
+                # through the detected surface and shifts every frame onto it, so the surface it reads decides
+                # where each frame lands — and detect_surface_all is wrong precisely on the frames the reviewer
+                # corrected. Guided re-detection (windowed light search around the auto prior, then the same
+                # post-passes) measured markedly closer to the reviewer's own anchors on the corrected volume:
+                # median error 11.1 -> 3.0 px on a held-out corrected slice, 31% -> 69% of points within 5 px.
+                # Best-effort: any failure falls back to the stage's own detection, i.e. the old behaviour.
+                _rhr_det = None
+                if bool(p_all.get("redetect_guided_finish", True)):
+                    try:
+                        _cs = reformat_to_sagittal(corrected).astype(np.float32)
+                        _rhr_det = guided_redetect_all(_cs, detect_surface_all(_cs, p_all, workers=workers),
+                                                       p_all)
+                        del _cs
+                    except Exception:  # noqa: BLE001
+                        _rhr_det = None
+                corrected, _rhr = rigid_height_refine(corrected, params, workers=workers, detect=_rhr_det)
+                _rhr["surface"] = "guided" if _rhr_det is not None else "self-detected"
+                info["rigid_height_refine"] = _rhr
+            if p_all.get("rigid_frame_derotate", True):
+                corrected, _rfd = rigid_frame_derotate(corrected, params, workers=workers)
+                info["rigid_frame_derotate"] = _rfd
+            if p_all.get("rigid_frame_refine", True):
+                corrected, _rfr = rigid_frame_refine(corrected, params, workers=workers)
+                info["rigid_frame_refine"] = _rfr
         _axa = p_all.get("axial_anchors")   # AXIAL fix-tool GT (see main path) — applies on the fix-columns path too
         if _axa:
             corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)

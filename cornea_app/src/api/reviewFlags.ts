@@ -23,6 +23,12 @@ export const REVIEW_FLAGS: ReviewFlagMeta[] = [
   // colour. Filtering to it makes "✓ Approve → next" walk exactly this set instead of the whole backlog.
   { slug: "to-review", label: "◆ To review (queued)", short: "Queue", color: "#39d353",
     description: "Queued for this review pass. Filter to this, then Approve → next walks the queue in order." },
+  // Set by a guarded re-run: this scan's OUTPUT actually moved, so it needs re-inspection. Scans the re-run
+  // left byte-identical are deliberately NOT flagged — the point is to surface only what changed, so a
+  // re-run over the whole store produces a short worklist instead of 308 scans to look at again.
+  { slug: "changed", label: "⟳ Changed by re-run", short: "Changed", color: "#38bdf8",
+    description: "A preprocessing re-run changed this scan's output. Approved scans are only re-written when "
+      + "they measured BETTER — a regression keeps the old output and is never flagged." },
   { slug: "zeroed-frames", label: "Zeroed frames", short: "Zeroed", color: "#ef4444",       // red (worst)
     description: "The automatic off-cornea noise-crop blanked a contiguous block of B-scans." },
   { slug: "still-clipped", label: "Still clipped", short: "Clipped", color: "#fb923c",      // orange

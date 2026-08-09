@@ -26,6 +26,10 @@ import { BeforeAfterViewer } from "./BeforeAfterViewer";
 import { StepsViewer } from "./StepsViewer";
 import { MotionPanel } from "./MotionPanel";
 
+// One size for every toolbar toggle, so the view group and the Slices/Segmentation group line up instead of
+// sitting at two different heights.
+const viewBtnSx = { py: 0.25, px: 1.1, fontSize: 12, textTransform: "none" as const };
+
 export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);   // #paint — WebGL-independent 2-D drawing overlay
@@ -116,6 +120,8 @@ export function VolumeCanvas() {
   // on a FIXED FRAME — reaching apex/limbus notches on the low-signal first/last frames that the SAGITTAL
   // Fix-columns tool (which corrects along the frame axis) structurally cannot. Its own 2-D overlay (AxialGallery).
   const [fixAxialView, setFixAxialView] = useState(false);
+  const autoFixOpenedRef = useRef<string | null>(null);   // once-per-case guard for the editor auto-open
+
   // The niivue view active BEFORE entering an overlay (before/after or fix-columns). Those modes force
   // SAGITTAL on entry (their 2-D panels are sagittal); we restore this on exit so the user lands back on the
   // view they were inspecting (e.g. axial) instead of being stranded on sagittal — the "the view changed and
@@ -129,11 +135,14 @@ export function VolumeCanvas() {
   const [contrast, setContrast] = useState(100);   // %
   const [brightness, setBrightness] = useState(100); // %
   const [blur, setBlur] = useState(0);              // px
-  // CRISP ⇄ SMOOTH display toggle. Default SMOOTH: the corneal surface is smooth (the warp is sub-pixel), so the
-  // smooth/linear render is the FAITHFUL one — the nearest/crisp render ADDS voxel-quantization "steps" that are
-  // not in the anatomy (steps are always wrong on a smooth cornea). Crisp stays available (opt-in) for pixel-
-  // precise border marking. Display-only — the data (and what's trained) is identical in both modes.
-  const [crisp, setCrisp] = useState(false);
+  // CRISP ⇄ SMOOTH display toggle. DEFAULT CRISP (reviewer request). The earlier default was smooth, on the
+  // argument that the warp is sub-pixel so a linear render is the more faithful one and a nearest render adds
+  // voxel steps that are not in the anatomy. True as far as it goes — but this viewer's job is JUDGING the
+  // surface and marking it, and interpolation is exactly what hides the small-amplitude roughness being looked
+  // for: a smoothed render makes a jagged border look acceptable. Showing the true voxels means what you accept
+  // is what is in the training volume. Smooth stays one click away. Display-only either way — the data is
+  // identical in both modes.
+  const [crisp, setCrisp] = useState(true);
   const viewerFilter = `contrast(${contrast}%) brightness(${brightness}%)` + (blur > 0 && !fixColsView ? ` blur(${blur}px)` : "");
   // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
   // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
@@ -272,9 +281,30 @@ export function VolumeCanvas() {
   useEffect(() => {
     setCompareView(false); setFixColsView(false); setFixAxialView(false); setStepsView(false);
     autoCropOpenedRef.current = null;   // clear the once-per-case guard so the surface-crop auto-open can fire
+    autoFixOpenedRef.current = null;    // ...and the border-editor auto-open below
     wfSet("showSegmentation", hasSegmentation(manifest));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseInfo?.case_id]);
+
+  // OPEN THE BORDER EDITOR BY DEFAULT at the preprocessing-review step. Declared AFTER the case-change reset
+  // above ON PURPOSE: effects run in declaration order, so with this first the reset closed the editor a
+  // moment after it opened, and — the once-per-case guard having already been claimed — it never re-opened.
+  // That is why rejecting a scan landed on the next one with no editing tools showing.
+  // hasRaw is deliberately NOT required: it gates the before/after COMPARISON, while the editor only needs
+  // the pass input, so demanding it kept the tools hidden on any scan without a raw snapshot.
+  // Keyed on caseInfo.case_id — the SAME id the case-change reset above uses. Keying this on caseStore's
+  // `caseId` instead meant the two ran in different commits: the editor opened, then the reset (firing later,
+  // on the other id) closed it, and the guard was already claimed so it never reopened. That is why advancing
+  // to the next scan landed with no editing tools even though opening the same scan from the sidebar worked.
+  useEffect(() => {
+    const cid = caseInfo?.case_id;
+    if (!cid || !preprocStep || inspecting) return;
+    if (autoFixOpenedRef.current === cid) return;
+    autoFixOpenedRef.current = cid;
+    setFixColsView(true);
+    if (view !== "sagittal" && view !== "coronal") onView(null, "sagittal");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseInfo?.case_id, preprocStep, inspecting]);
 
   // #2 — keep the slice scrollbar in sync with niivue while a single-plane view is active (also catches the
   // user scrubbing by mouse-wheel/click). Polls niivue's crosshair position + per-axis slice count.
@@ -399,6 +429,12 @@ export function VolumeCanvas() {
 
   const onView = (_: unknown, v: ViewName | null) => {
     if (!v) return;
+    // The border editor can only host SAGITTAL and CORONAL (it marks along depth). Those views used to be the
+    // only ones OFFERED while it was open — fine when opening it was a deliberate choice, wrong now that it
+    // opens by default, because the reviewer was left with a single view button and no way to look at the
+    // scan any other way. Every view is offered again; choosing one the editor cannot host simply closes it.
+    if (fixColsView && v !== "sagittal" && v !== "coronal") setFixColsView(false);
+    if (compareView && (v === "multi" || v === "render")) setCompareView(false);
     setViewState(v);
     setView(v);
   };
@@ -482,11 +518,13 @@ export function VolumeCanvas() {
         </ToggleButtonGroup>
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         <ToggleButtonGroup size="small" exclusive value={overlay2d ? orient2d : view} onChange={onView}>
-          {!overlay2d && <ToggleButton value="multi">Multi</ToggleButton>}
-          {!fixColsView && <ToggleButton value="axial">Axial</ToggleButton>}
-          {!cropRegionMode && !fixColsView && <ToggleButton value="coronal">Coronal</ToggleButton>}
-          <ToggleButton value="sagittal">Sagittal</ToggleButton>
-          {!overlay2d && <ToggleButton value="render">3D</ToggleButton>}
+          {/* sized to match the Slices/Segmentation group beside them — they had no sx, so they rendered at
+              MUI's default height and made the toolbar look like two different bars stitched together */}
+          <ToggleButton value="multi" sx={viewBtnSx} title="All three planes at once">Multi</ToggleButton>
+          <ToggleButton value="axial" sx={viewBtnSx} title="Axial — the B-scan plane, as acquired">Axial</ToggleButton>
+          {!cropRegionMode && <ToggleButton value="coronal" sx={viewBtnSx} title="Coronal — en-face">Coronal</ToggleButton>}
+          <ToggleButton value="sagittal" sx={viewBtnSx} title="Sagittal — across frames. The plane the border editor works in.">Sagittal</ToggleButton>
+          <ToggleButton value="render" sx={viewBtnSx} title="3-D volume render">3D</ToggleButton>
         </ToggleButtonGroup>
         {/* Display-only contrast / brightness / blur sliders (CSS filter on the viewer; does not change the
             data). Blur is disabled while Fix-columns is active. */}
@@ -540,60 +578,11 @@ export function VolumeCanvas() {
             ⇆ Before/after
           </ToggleButton>
         )}
-        {hasRaw && preprocStep && (
-          <ToggleButton
-            size="small"
-            value="fix"
-            selected={fixColsView}
-            // GLOW pink when an auto de-tilt/crop was proposed but not applied — draws the user in to review it.
-            className={proposals.hasProposal ? "crop-proposal-glow" : undefined}
-            onChange={() => {
-              // Fix-columns is COMBINABLE with Before/after (it doesn't clear it). Surface-crop is now a
-              // mode WITHIN this menu (the SliceGallery toolbar's "✛ Surface crop" tab), not a sibling button.
-              const on = !fixColsView;
-              if (on && !compareView && !fixColsView) preOverlayViewRef.current = view; // entering from normal → remember view
-              setFixColsView(on); setStepsView(false); setFixAxialView(false);
-              if (on && view !== "coronal" && view !== "sagittal") onView(null, "sagittal");
-              else if (!on) {
-                void openCase(); // leaving fix-cols: reload the 3D volume in case a re-run changed it
-                if (!compareView) { // back to normal → restore the pre-overlay view
-                  const prev = preOverlayViewRef.current; preOverlayViewRef.current = null;
-                  if (prev && prev !== view) onView(null, prev);
-                }
-              }
-            }}
-            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-            title={proposals.hasProposal
-              ? "An automatic correction was DETECTED (de-tilt / crop) but not applied — open to review the pink crop region, then Approve to bake it in"
-              : "Manually fix mis-aligned B-scan frames (edge/parabola drag, cut clipped surfaces, or detect surface-cropped frames), then re-run preprocessing"}
-          >
-            ▥ Fix columns
-          </ToggleButton>
-        )}
-        {hasRaw && preprocStep && (
-          <ToggleButton
-            size="small"
-            value="fixaxial"
-            selected={fixAxialView}
-            onChange={() => {
-              // Fix-axial is a full 2-D overlay (mutually exclusive with the sagittal panels): drag the anterior
-              // surface across laterals on a fixed FRAME. Force the AXIAL view on entry; restore on exit.
-              const on = !fixAxialView;
-              if (on && !compareView && !fixColsView && !fixAxialView) preOverlayViewRef.current = view;
-              setFixAxialView(on); setStepsView(false); setFixColsView(false); setCompareView(false);
-              if (on && view !== "axial") onView(null, "axial");
-              else if (!on) {
-                void openCase(); // leaving: reload the 3D volume in case a Run changed it
-                const prev = preOverlayViewRef.current; preOverlayViewRef.current = null;
-                if (prev && prev !== view) onView(null, prev);
-              }
-            }}
-            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-            title="Correct the corneal surface in the AXIAL (B-scan) plane — drag it across laterals onto the true band where the auto-detector notched at the apex/limbus of the first/last frames (reaches what Fix columns can't)"
-          >
-            ▤ Fix axial
-          </ToggleButton>
-        )}
+        {/* Fix columns and Fix axial were retired here: the border editor IS the review surface now and
+            opens automatically at the preprocessing step (autoFixOpenedRef above), so a button to reach it
+            just sat between the reviewer and the thing they came to look at. Fix axial went with it; the
+            sagittal editor plus the rigid per-frame passes cover that plane. fixAxialView state is kept so
+            AxialGallery still renders if something sets it, only the entry point is gone. */}
         {hasRaw && preprocStep && (
           <ToggleButton
             size="small"
@@ -606,26 +595,11 @@ export function VolumeCanvas() {
             ⚙ Steps
           </ToggleButton>
         )}
-        {hasRaw && preprocStep && (
-          <ToggleButton
-            size="small"
-            value="mark"
-            selected={markDefectMode}
-            onChange={() => {
-              // Reinstated defect-marking: drag over the WRONG columns of an axial/sagittal slice, tag the type,
-              // and commit (this frame or a slice range) → manifest.defect_marks, so the assistant sees exactly
-              // where the border is off instead of a described slice number. Needs a single axial/sagittal plane
-              // (defectOrient), so force sagittal if we're in multi/3D/coronal when turning it on.
-              const on = !markDefectMode;
-              setWf("markDefectMode", on);
-              if (on && view !== "axial" && view !== "sagittal") onView(null, "sagittal");
-            }}
-            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-            title="Mark the WRONG columns of the current axial/sagittal slice — drag over the bad region, pick a defect type, then commit to this frame or a slice range. Saved to the scan so I can see exactly which columns/frames are off. Right-click a band to remove it."
-          >
-            ⚑ Mark columns
-          </ToggleButton>
-        )}
+        {/* ⚑ Mark columns MOVED into the border editor's mode group (SliceGallery: "⚑ Mark"). It could not
+            simply be relocated — the marking was a niivue overlay (setDefectBands + handlers on the niivue
+            container, gated on singlePlane), so it went inert exactly when the border editor was open, which
+            is now always. The ported version paints on the editor's own SVG and commits with Reject alongside
+            the border and crop marks. markDefectMode state is left in place for the niivue path. */}
         <div className="flex-1" />
         {loading && <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Loading volume…</span>}
         {error && <span className="text-xs" style={{ color: "var(--c-red)" }}>{error}</span>}
@@ -755,7 +729,8 @@ export function VolumeCanvas() {
         )}
         {fixColsView && volumeUrl && (
           <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
-            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting} />
+            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting}
+              onToggleRaw={() => setCompareView((v) => !v)} />
           </div>
         )}
         {/* AXIAL fix-tool — a 2-D overlay over the (still-mounted) niivue canvas. Mutually exclusive with the

@@ -226,7 +226,7 @@ export function BeforeAfterViewer({ orient, filter }: {
     transform: orient === "sagittal" ? "scaleX(-1)" : undefined,
   };
   const panelCol: React.CSSProperties = {
-    flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+    flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 1,
   };
   const imgArea: React.CSSProperties = {
     flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center",
@@ -337,7 +337,11 @@ export function BeforeAfterViewer({ orient, filter }: {
         </div>
       ) : null}
 
-      <div className="flex-1 min-h-0 flex items-center justify-center p-3">
+      {/* MAXIMISE the slice area: the outer padding was p-3 (12px all round) and the panels carried a 10px
+          gutter plus a caption line each — on a 1500px-wide window that is ~40px of chrome taken off the only
+          thing being judged. Trimmed to a 2px inset and a 4px gutter; the captions stay (you have to know
+          which panel is which) but no longer reserve space above a shrunken image. */}
+      <div className="flex-1 min-h-0 flex items-center justify-center" style={{ padding: 2 }}>
         {!cur ? (
           <div className="text-center" style={{ color: "var(--c-text-dim)" }}>
             <div style={{ fontSize: 13 }}>{loading ? "Loading…" : "No preprocessed slices yet."}</div>
@@ -349,7 +353,7 @@ export function BeforeAfterViewer({ orient, filter }: {
           <div
             style={{
               display: "flex",
-              gap: 10,
+              gap: 4,
               width: "100%",
               height: "100%",
               alignItems: "stretch",

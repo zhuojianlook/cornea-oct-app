@@ -80,6 +80,22 @@ interface CaseState {
   // `reason` is the reviewer's own words for WHY, persisted as manifest.difficult_reason and cleared with the
   // flag; omitting it leaves any existing reason alone so a plain toggle-on does not wipe one.
   setDifficult: (difficult: boolean, reason?: string) => Promise<void>;
+  /** Persist drawn border anchors WITHOUT the user pressing "Confirm border". Used by the review loop so
+   *  a correction + Reject is one click; the backend then harvests them as border_gt when the difficult
+   *  flag is written, which is why this must complete BEFORE setDifficult. */
+  commitBorderAnchors: (anchors: Record<string, Record<string, number>>, parabola: boolean,
+                        parabolaSlices?: string[]) => Promise<void>;
+  /** Persist crop marks (surface-crop frames / crop region) WITHOUT re-running the pipeline — the cheap
+   *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
+  commitOctMarks: (cropFrames: number[] | null, cropRegion: { lateral: [number, number]; frames: number[] } | null,
+                   postAnchors?: Record<string, Record<string, number>> | null) => Promise<void>;
+  /** Kick off the guarded re-run over the scans corrected so far. Returns immediately; the pass runs
+   *  in the background on the sidecar and only re-writes a scan that measures better. */
+  startReprocessBatch: () => Promise<{ started: number } | null>;
+  /** Search + adopt better DETECTOR parameters from every correction drawn so far (guarded). */
+  startDetectorTune: () => Promise<{ started: number; n_points?: number; note?: string } | null>;
+  /** Re-run THIS scan against the corrections drawn on it, and stay on it. The per-scan iteration step. */
+  rerunWithCorrections: () => Promise<boolean>;
   // "Surface-crop" manual mark → manifest.surface_crop_manual (human review of the auto-detected clipped-cornea set).
   setSurfaceCrop: (surfaceCrop: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
@@ -240,6 +256,129 @@ export const useCaseStore = create<CaseState>()(
       _defectMarkChain.set(id, next);
       void next.finally(() => { if (_defectMarkChain.get(id) === next) _defectMarkChain.delete(id); });   // see setReviewFlags
       await next;
+    },
+
+    startReprocessBatch: async () => {
+      try {
+        const r = await api.json<{ started: number }>("/api/review/reprocess-batch", "POST", "{}");
+        useWorkflowStore.getState().set("status", { kind: "working", title: "Reprocessing with your corrections",
+          detail: `${r.started} scan(s) queued. Only scans that measure better are re-written; the rest keep what they have.` });
+        return r;
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+        return null;
+      }
+    },
+
+    // PER-SCAN ITERATION — correct a slice, re-run THIS scan against it, look again, repeat.
+    //
+    // WHY THIS AND NOT PARAMETER TUNING. Measured across six eyes, the detector's whole parameter space moves
+    // the surface by 1.5 px on a typical slice and 2.6 px on the most responsive one — while the detector sat
+    // ~23 px from the reviewer's corrections on the scan they had actually corrected. Tuning cannot close a
+    // gap an order of magnitude wider than its own authority. Anchors can: redetect_surface is seeded by the
+    // drag and, for a shaped curve, follows it exactly (seed window 0), so the correction IS the surface
+    // rather than a hint the detector may decline. There is no leverage ceiling.
+    //
+    // Stays on the scan deliberately. The verdict buttons advance; this one is the iteration, and a loop you
+    // cannot go round twice without losing your place is not a loop.
+    rerunWithCorrections: async () => {
+      const id = get().caseId;
+      if (!id) return false;
+      set((s) => { s.busy = true; s.apiError = null; });
+      useWorkflowStore.getState().set("status", { kind: "working", title: "Re-running with your corrections",
+        detail: "Flattening this scan to the surface you drew — about two minutes." });
+      try {
+        // GENERALIZE FIRST, then warp. This is the difference between a correction reaching the output and
+        // being outvoted by it.
+        //
+        // The flatten shifts each frame by the MEDIAN of the surface across all 513 laterals — one rigid
+        // shift per B-scan, because a B-scan is captured instantaneously and may only be translated. A
+        // correction confined to a few laterals is therefore 1-in-513 per frame and the median ignores it:
+        // measured on a real scan, corrections of 14-24 px moved the applied shift by 0.89 px.
+        // generalize_surface learns the residual (correction − auto) and interpolates it across laterals, so
+        // the correction reaches enough of them to move the median. Measured on the same scan: anchors
+        // spanning the volume reached 84-100% of laterals and shifted by 3.4 px, against 16% and 0.9 px for
+        // the local ±20-slice band that use_redetect alone applies.
+        //
+        // It has to run AFTER committing the anchors: oct-border-redetect deliberately clears the generalize
+        // flag (a fresh local Confirm exits generalize mode), so setting it first would simply be undone.
+        // Non-fatal — if generalizing fails the warp still runs off the local band, which is the old behaviour
+        // rather than no behaviour.
+        try {
+          await api.json(`/api/case/${id}/oct-border-generalize`, "POST", "{}");
+        } catch { /* fall through to the local-band redetect */ }
+        // GUIDED RE-DETECTION, GUARDED. The generalized surface above is only a PRIOR — it says where to
+        // look. This re-detects every slice from the image inside a window around it, so the 512 slices you
+        // did not draw on are DETECTED rather than interpolated. Measured against the reviewer's own
+        // corrections it cut the median error on a held-out slice from 11.1 px to 3.0 px.
+        // It is kept only if it measures better than auto (by the anchors where they exist, otherwise by
+        // gradient + delivered shift-roughness) — unguarded it improved two approved scans and regressed two.
+        // If it loses, the endpoint reverts the scan and the warp below uses the surface it would have used.
+        let guided: { accepted?: boolean; why?: string } | null = null;
+        try {
+          guided = await api.json(`/api/case/${id}/oct-border-guided`, "POST", "{}");
+        } catch { /* guard unavailable → warp to the generalized/local surface, i.e. the old behaviour */ }
+        // use_redetect: flatten to the CONFIRMED surface — which _redetect_surface_cached now serves from
+        // generalize.npz because the flag above is set. The editor previews the same surface, so what you
+        // judged is what you get.
+        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ use_redetect: true }));
+        await get().openCase();                  // reload the re-corrected volume (cache-busted URL)
+        const wf = useWorkflowStore.getState();
+        wf.set("segVersion", wf.segVersion + 1);  // re-render previews
+        wf.set("status", { kind: "done", title: "Re-run complete",
+          detail: (guided?.accepted
+                    ? `Detection improved and kept — ${guided.why}. `
+                    : (guided ? `Guided detection did NOT beat auto (${guided.why}), so the scan keeps the better surface. ` : ""))
+                 + "Inspect it — correct again, Approve, or Skip." });
+        return true;
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        set((s) => { s.apiError = m; });
+        useWorkflowStore.getState().set("status", { kind: "error", title: "Re-run failed", detail: m });
+        return false;
+      } finally {
+        set((s) => { s.busy = false; });
+      }
+    },
+
+    // GLOBAL DETECTOR TUNING — the step that makes the review loop converge. Unlike startReprocessBatch,
+    // which re-applies each scan's own corrections to that scan, this searches the DETECTOR's parameters for
+    // a setting that reproduces the accumulated corrections better and adopts it for every scan, guarded so
+    // approved scans are not disturbed. Long-running; poll /api/review/tune-status.
+    startDetectorTune: async () => {
+      try {
+        const r = await api.json<{ started: number; n_points?: number; note?: string }>(
+          "/api/review/tune-detector", "POST", "{}");
+        useWorkflowStore.getState().set("status", r.started
+          ? { kind: "working", title: "Improving the detector from your corrections",
+              detail: `Searching detector settings against ${r.n_points ?? 0} corrected point(s). `
+                + "Nothing changes unless it beats the current detector AND leaves approved scans alone." }
+          : { kind: "done", title: "Nothing to learn from yet", detail: r.note || "No corrections recorded." });
+        return r;
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+        return null;
+      }
+    },
+
+    commitOctMarks: async (cropFrames, cropRegion, postAnchors) => {
+      const id = get().caseId;
+      if (!id || (cropFrames === null && cropRegion === null && !postAnchors)) return;
+      const body: Record<string, unknown> = {};
+      if (cropFrames !== null) body.surface_crop_frames = cropFrames;
+      if (cropRegion !== null) body.crop_region = cropRegion;
+      if (postAnchors) body.crop_post_anchors = postAnchors;
+      await api.json(`/api/case/${id}/oct-marks`, "POST", JSON.stringify(body));
+    },
+
+    commitBorderAnchors: async (anchors, parabola, parabolaSlices) => {
+      const id = get().caseId;
+      if (!id || !anchors || Object.keys(anchors).length === 0) return;
+      // Same endpoint "Confirm border" uses, so a correction committed this way is byte-identical to a
+      // confirmed one — there is no second, weaker kind of ground truth.
+      await api.json(`/api/case/${id}/oct-border-redetect`, "POST",
+        JSON.stringify({ border_pass: 1, border_anchors: anchors, parabola,
+                         parabola_slices: parabolaSlices ?? null }));
     },
 
     setDifficult: async (difficult, reason) => {

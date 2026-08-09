@@ -91,6 +91,20 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def manifest_lock():
+    """The manifest write lock, exposed so a caller doing a READ-MODIFY-WRITE on a NESTED key can hold it
+    across both halves.
+
+    write_manifest_value merges only TOP-LEVEL keys, so a caller that reads manifest["oct_params"], edits it
+    and writes the whole dict back will silently discard any concurrent change to a DIFFERENT sub-key. The
+    lock inside write_manifest_value does not help: it protects the write, not the gap between the read and
+    the write. That gap is where a background sweep rewriting detector settings can land on top of a border
+    correction the reviewer committed a moment earlier — the correction is simply gone, with no error.
+
+    Reentrant, so write_manifest_value can still be called while holding it."""
+    return _MANIFEST_LOCK
+
+
 def write_manifest_value(case_id: str, updates: dict) -> dict:
     path = manifest_path(case_id)
     with _MANIFEST_LOCK:

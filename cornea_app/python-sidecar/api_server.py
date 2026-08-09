@@ -52,6 +52,7 @@ import metrics_export
 import consensus as consensus_mod
 import normal_baseline
 import oct_preprocess as oct_mod
+import detector_tune
 import oct_motion as oct_motion_mod
 import cohort as cohort_mod
 import debug_align
@@ -2091,6 +2092,10 @@ class OctPreprocessRequest(BaseModel):
     force_columns: List[int] | None = None  # BAD frame indices to re-correct ("re-run preprocessing")
     good_columns: List[int] | None = None    # GOOD/anchor frame indices guiding the re-correction
                                              # (all reuse the scan's persisted settings)
+    # Reviewer's manual POSTERIOR (bottom) edge points, {slice: {frame: depth}} — the same shape as
+    # border_anchors. Supplied live while dragging so the preview reflects the line being drawn; persisted via
+    # oct-marks and thereafter read from oct_params.
+    crop_post_anchors: dict | None = None
     surface_crop_frames: List[int] | None = None  # "Detect surface crop" Confirm: B-scan columns whose apex is
                                              # cropped (no top surface). A STICKY oct_param; on re-run those
                                              # frames are reconstructed by posterior continuity (bottom-edge
@@ -2129,6 +2134,10 @@ class OctPreprocessRequest(BaseModel):
                                               # post-hoc additive per-frame warp (apply_axial_surface_gt); {} clears.
     use_redetect: bool | None = None          # oct-preprocess: flatten to the confirmed re-detected surface
                                               # (provided_edges) instead of auto-detecting — the fix-columns "Run".
+    # WHICH slices are an exact fitted curve, when the payload mixes both kinds. `parabola` alone could only
+    # say "all or nothing", so a reviewer who shaped a curve on one slice and dragged edge points on another
+    # had to lose one of the two — the client resolved that by sending only whatever tool was selected.
+    parabola_slices: list | None = None
     parabola: bool | None = None              # fix-columns "Confirm" parabola mode: the anchors are a DENSE fitted
                                               # quadratic → use it EXACTLY (seed window 0), don't re-snap per frame.
     concurrency: int | None = None            # batch preprocess: how many scans the caller runs AT ONCE → each
@@ -2773,9 +2782,13 @@ def keep_raw_case(case_id: str) -> dict:
              # 0 passes / best_pass 0 = raw kept (BeforeAfterViewer reads this; passCount is Math.max(1,…)-guarded).
              "oct_iter": {"passes": 0, "best_pass": 0, "metrics": [], "stopped": "kept_raw"},
              "oct_kept_raw": True,
-             # the user explicitly approved the raw as the final preprocessing → vet it (timeline → orange);
-             # a later auto re-preprocess clears these as usual.
-             "preproc_vetted": True, "training_scheduled": False,
+             # NO LONGER AUTO-VETTED (reviewer: "Use original still requires a manual approval"). Choosing to
+             # keep the raw volume says the CORRECTION was wrong, which is not the same as saying the raw one
+             # is good — and this silently marked the scan approved, so a scan could reach the training set
+             # without anyone judging it. It now lands at Preprocessed and waits for Approve like everything
+             # else. preproc_vetted is explicitly cleared rather than left alone, so a previously-vetted scan
+             # does not keep an approval that referred to the discarded correction.
+             "preproc_vetted": False, "training_scheduled": False,
              # seg files were deleted above → clear their flags so the timeline drops to Vetted (not SAM2).
              "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None, "cornea_vetted": None,
              "qa_json": None, "segmentation_preview_dir": None}
@@ -2938,12 +2951,45 @@ def set_difficult_scan(case_id: str, req: DifficultRequest) -> dict:
     Difficult scans are EXCLUDED from nnU-Net training candidate selection (per_scan_segmented_cases).
 
     An optional free-text `reason` is persisted alongside as manifest.difficult_reason (with the time it was
-    given), and is cleared when the flag is cleared."""
+    given), and is cleared when the flag is cleared.
+
+    GT CAPTURE ON REJECT (mirrors vet_preprocessing). A border correction is ground truth about WHERE THE
+    CORNEA IS, and that is true whether or not the resulting volume was good enough to accept. Capturing it
+    only on Approve — as this used to — dropped exactly the most informative corrections, because a scan you
+    are rejecting is one the detector got wrong, and you would not approve it. The reviewer's own framing for
+    this workflow is "correct the detected edge ... this will inform detector", which cannot happen if the
+    correction dies with the rejection.
+    Recorded with confirmed=False, so the corpus can tell a signed-off scan from one that was corrected and
+    still rejected. corpus_eligible is False as well: the anchor POINTS are real geometry, but a scan whose
+    output the reviewer refused should not silently become a global-tuning target — /api/gt-corpus can opt
+    them in deliberately. An existing CONFIRMED border_gt is never downgraded."""
     difficult = bool(req.difficult)
     values: dict = {"difficult_scan": difficult}
     if not difficult:
         values["difficult_reason"] = None
+        values["reviewer_rejected"] = None
+        # …and the rejection RECORD with it. border_gt written by a rejection carries rejected=True; leaving it
+        # behind means a scan that has been un-rejected (typically because it was reprocessed with its
+        # corrections and is going back for a fresh look) still counts in the rejected-GT pool and still reads
+        # as judged. A CONFIRMED record is never touched: that one came from an approval, not a rejection, and
+        # is the corpus's own provenance.
+        _prev_gt = orch.read_manifest(_require_case(case_id)).get("border_gt")
+        if isinstance(_prev_gt, dict) and _prev_gt.get("rejected") and not _prev_gt.get("confirmed"):
+            values["border_gt"] = None
     else:
+        # A REVIEWER REJECTION, stamped explicitly. difficult_scan cannot answer "how many have I rejected":
+        # bulk preprocessing sets it too, so every scan awaiting approval already carries it. border_gt only
+        # appears when the rejection came with anchors, and difficult_reason only when a note was typed or
+        # derived — so a bare "this one is wrong, next" left no trace at all. This is the one marker every
+        # rejection writes, which is what a counter has to be built on.
+        values["reviewer_rejected"] = {"ts": round(time.time(), 1)}
+        _m0 = orch.read_manifest(_require_case(case_id))
+        _ns, _npts, _sig = _border_anchor_stats(_m0)
+        _prev = _m0.get("border_gt") or {}
+        if _npts > 0 and not (isinstance(_prev, dict) and _prev.get("confirmed")):
+            values["border_gt"] = {"confirmed": False, "corpus_eligible": False,
+                                   "n_slices": _ns, "n_points": _npts, "anchors_sig": _sig,
+                                   "rejected": True, "ts": round(time.time(), 1)}
         text = (req.reason or "").strip()
         if text:
             # `ts` as an epoch float, matching the defect-marks record just above — the module has no
@@ -2951,7 +2997,8 @@ def set_difficult_scan(case_id: str, req: DifficultRequest) -> dict:
             values["difficult_reason"] = {"text": text[:2000], "ts": round(time.time(), 1)}
     m = orch.write_manifest_value(_require_case(case_id), values)
     return {"ok": True, "difficult_scan": bool(m.get("difficult_scan")),
-            "difficult_reason": m.get("difficult_reason")}
+            "difficult_reason": m.get("difficult_reason"),
+            "border_gt": m.get("border_gt")}
 
 
 def apply_surface_crop_mode(eff_params: dict, mode: str | None) -> dict:
@@ -3004,6 +3051,430 @@ def set_surface_crop_manual(case_id: str, req: SurfaceCropRequest) -> dict:
     return {"ok": True, "surface_crop_manual": m.get("surface_crop_manual")}
 
 
+# ── GUARDED REVIEW RE-RUN ────────────────────────────────────────────────────────────────────────────────
+# The reviewer works in batches: correct ~10 scans, then re-run preprocessing with those corrections. The
+# re-run must be SAFE to fire repeatedly, which means it can only ever improve the store — a scan is
+# re-written solely when it measures better, otherwise it keeps exactly the bytes it has. That guard is what
+# lets the loop run many times without anyone auditing every pass.
+#
+# TWO criteria, because one is not enough: across-frame ROUGHNESS is what the rigid passes target and what
+# "the surface is not smooth" refers to, while per-frame UNDULATION cannot change under translation+rotation
+# at all — so if it moves, something is wrong regardless of how good the roughness looks. A change that
+# improves roughness while worsening undulation is refused (that combination is exactly what the
+# surface_crop_derotate investigation turned up).
+_REPROC_JOB: dict = {"running": False, "done": 0, "total": 0, "written": 0, "kept": 0, "failed": 0,
+                     "started": None, "cases": []}
+_REPROC_LOCK = threading.Lock()
+
+# ── GLOBAL DETECTOR TUNING ────────────────────────────────────────────────────────────────────────────────
+# The step that makes the review loop converge. Re-running corrected scans fixes those scans; this changes the
+# DETECTOR, so the 300-odd scans nobody has corrected get better too — which is the only way the queue can
+# ever empty. See detector_tune for the objective (hinge on a tolerance band) and the no-regression guard.
+_TUNE_LOCK = threading.Lock()
+# The tuning pass runs as a SUBPROCESS, never a thread here. detect_surface_all forks a worker pool per
+# detection, and _map_slices states the rule plainly: that is safe only outside this process. Run in a sidecar
+# thread it deadlocked — children inherit locks held by threads that do not exist in the fork, so they wedge,
+# the parent waits forever, and cancellation cannot land because nothing raises. Files carry state across the
+# boundary: a status file for progress, a sentinel file for cancel, and the process group for a hard stop.
+_TUNE_PROC: "subprocess.Popen | None" = None
+_TUNE_PATHS: dict = {}          # {dir, job, status, cancel}
+_TUNE_LAST: dict = {"running": False, "phase": "idle", "note": "", "adopted": None}
+# Detector settings live PER SCAN in oct_params as well as globally, and the per-scan copy wins. 306 of 308
+# scans carry these four, so adopting a global change without clearing them would be a no-op everywhere —
+# the tuner would report success and nothing would behave differently.
+_TUNED_KEYS = tuple(k for k, _v in detector_tune.SEARCH_SPACE)
+
+
+def _param_overrides_path() -> Path:
+    """Where the globally tuned detector lives. Beside the case store, not in the app bundle, so an app
+    update cannot silently revert the detector the reviewer tuned."""
+    return Path(settings.CASES_ROOT).parent / "detector_overrides.json"
+
+
+def _apply_param_overrides_at_startup() -> dict:
+    """Publish the override path into the environment and fold the file into DEFAULT_PARAMS.
+
+    The environment part is what reaches the CLI SUBPROCESS path (_run_oct_worker inherits os.environ), so
+    both ways of running the pipeline read the same detector. Without it, an in-process re-run and a
+    subprocess re-run of the same scan would use different parameters."""
+    os.environ["CORNEA_PARAM_OVERRIDES"] = str(_param_overrides_path())
+    return oct_mod.load_param_overrides()
+
+
+def _tune_corpus_and_guard(guard_limit: int = 8) -> tuple[list[dict], list[dict]]:
+    """Split the store into what the tuner LEARNS from and what it is FORBIDDEN to disturb.
+
+    corpus = every scan carrying corrections, approved or rejected. Pressing the button is the reviewer's
+    deliberate opt-in, which is exactly the consent that kept rejected corrections out of the passive corpus.
+    guard  = approved scans, sampled evenly across the store so the check is not all one patient."""
+    corpus: list[dict] = []
+    approved: list[dict] = []
+    root = settings.CASES_ROOT
+    for child in sorted(root.iterdir()) if root.exists() else []:
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        try:
+            m = orch.read_manifest(child.name)
+        except Exception:  # noqa: BLE001
+            continue
+        src = m.get("oct_source")
+        if not src or not Path(str(src)).exists():
+            continue
+        # EYE identity, so the held-out split can keep every replicate of one eye on the SAME side. A scan
+        # is not "unseen" if four other scans of the same eye were trained on — the search would have fitted
+        # that cornea already, and the held-out number would report generalisation it has not demonstrated.
+        # patient_id/eye are USUALLY ABSENT from the manifest — the sidebar fills them by parsing the source
+        # filename — so reading them directly gave every scan the same key "none|none", collapsing the corpus
+        # to a single eye and silently disabling the split for good. Parse first, then fall back to the case
+        # id with its replicate suffix stripped (case_cs002_os_v3 -> case_cs002_os), which encodes the same
+        # identity and cannot be missing.
+        _pid, _eye = m.get("patient_id"), m.get("eye")
+        if not (_pid and _eye):
+            try:
+                _meta = metrics_export.parse_case_meta(str(src))
+                _pid = _pid or _meta.get("patient_id"); _eye = _eye or _meta.get("eye")
+            except Exception:  # noqa: BLE001
+                pass
+        _grp = (f"{_pid}|{_eye}".lower() if (_pid and _eye)
+                else re.sub(r"_v\d+(?:_\d+)*$", "", child.name).lower())
+        entry = {"case_id": child.name, "src": str(src), "group": _grp,
+                 "volume_index": int(m.get("oct_volume_index", 0) or 0),
+                 "params": dict(m.get("oct_params") or {})}
+        pts = detector_tune._anchor_points(m)
+        if pts:
+            corpus.append({**entry, "pts": pts})
+        elif m.get("preproc_vetted"):
+            approved.append(entry)
+    if len(approved) > guard_limit:                      # even spread, not the first N alphabetically
+        step = len(approved) / float(guard_limit)
+        approved = [approved[int(i * step)] for i in range(guard_limit)]
+    return corpus, approved
+
+
+def _tune_adopt(params: dict) -> dict:
+    """Persist the winning detector and make it actually take effect.
+
+    Three writes, and all three are needed: the file (so subprocesses and restarts see it), the in-memory
+    DEFAULT_PARAMS (so the running sidecar does), and the removal of the per-scan copies that would otherwise
+    shadow it. UNAPPROVED scans only — an approved scan keeps the exact settings its signed-off output was
+    produced under, so re-running it still reproduces what the reviewer accepted."""
+    path = _param_overrides_path()
+    prev = {}
+    try:
+        prev = (json.loads(path.read_text(encoding="utf-8")) or {}).get("params") or {}
+    except (OSError, ValueError):
+        pass
+    merged = {**prev, **params}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"params": merged, "ts": round(time.time(), 1)}, indent=2), encoding="utf-8")
+    oct_mod.DEFAULT_PARAMS.update(merged)
+    cleared = 0
+    root = settings.CASES_ROOT
+    for child in sorted(root.iterdir()) if root.exists() else []:
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        # READ-MODIFY-WRITE UNDER THE LOCK. oct_params is written back whole, so without this the reviewer
+        # committing a border correction in the gap between this read and this write would have it discarded
+        # — silently, and on the one scan they are actively working on. This sweep touches every unapproved
+        # scan, so it is exactly the background writer that gap exists for.
+        with orch.manifest_lock():
+            try:
+                m = orch.read_manifest(child.name)
+            except Exception:  # noqa: BLE001
+                continue
+            if m.get("preproc_vetted"):
+                continue
+            op = dict(m.get("oct_params") or {})
+            if not any(k in op for k in _TUNED_KEYS):
+                continue
+            for k in _TUNED_KEYS:
+                op.pop(k, None)
+            orch.write_manifest_value(child.name, {"oct_params": op})
+        cleared += 1
+    return {"params": merged, "cleared_scans": cleared}
+
+
+def _tune_read_status() -> dict:
+    """Whatever the child last published. Missing/half-written reads as 'no news', never as failure."""
+    path = _TUNE_PATHS.get("status")
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _tune_watch(proc: "subprocess.Popen") -> None:
+    """Wait for the child, then ADOPT IN THIS PROCESS. The adopt writes manifests, and doing that here rather
+    than in the child keeps every manifest write behind the sidecar's own lock — the child has no access to
+    it, so a child-side write could land on top of a correction the reviewer committed meanwhile."""
+    global _TUNE_LAST
+    try:
+        proc.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    st = _tune_read_status()
+    st["running"] = False
+    if proc.returncode not in (0, None) and st.get("phase") not in ("done", "cancelled"):
+        st.setdefault("phase", "failed")
+        st.setdefault("note", f"Tuning process exited with code {proc.returncode}.")
+    if st.get("adopted"):
+        try:
+            st["adopt"] = _tune_adopt(st["adopted"])
+        except Exception as exc:  # noqa: BLE001
+            st["note"] = f"Tuned, but adopting failed: {exc}"[:300]
+            st["adopted"] = None
+    _TUNE_LAST = dict(st)
+    with _TUNE_LOCK:
+        globals()["_TUNE_PROC"] = None
+
+
+def _reproc_measure(path: str) -> dict:
+    """Roughness of the across-frame profile + per-frame undulation, both from the delivered volume."""
+    import numpy as np
+    import nibabel as nib          # module-local, matching the rest of this file (nibabel is not a top-level import)
+    sag = np.ascontiguousarray(np.asanyarray(nib.load(path).dataobj)).astype(np.float32)
+    sag = oct_mod._fill_pad_background(sag, 0, 24)     # measurement only; padding must not be scored
+    L, _D, F = sag.shape
+    S = np.asarray(oct_mod.detect_surface_all(sag, {}, workers=2), float)
+    lat = np.arange(L, dtype=float)
+    und = []
+    for f in range(F):
+        y = S[:, f]; g = np.isfinite(y)
+        if int(g.sum()) < 200:
+            continue
+        c0 = np.polyfit(lat[g], y[g], 2); r0 = y[g] - np.polyval(c0, lat[g])
+        k = np.abs(r0) <= np.percentile(np.abs(r0), 90)
+        und.append(float(np.sqrt(np.mean((y[g] - np.polyval(np.polyfit(lat[g][k], y[g][k], 2), lat[g])) ** 2))))
+    prof = np.nanmedian(S[int(0.2 * L):int(0.8 * L)], axis=0)
+    gp = np.isfinite(prof)
+    return {"rough": float(np.mean(np.abs(np.diff(prof[gp], 2)))) if gp.sum() > 3 else float("nan"),
+            "undul": float(np.median(und)) if und else float("nan")}
+
+
+def _reproc_worker(case_ids: list[str]) -> None:
+    import numpy as np
+    import shutil as _sh2
+    import tempfile
+    for cid in case_ids:
+        tmp = tempfile.mkdtemp(prefix=f"reproc_{cid}_")
+        try:
+            m = orch.read_manifest(cid)
+            src = m.get("oct_source"); cur = m.get("input_volume")
+            if not (src and Path(src).exists() and cur and Path(cur).exists()):
+                with _REPROC_LOCK:
+                    _REPROC_JOB["failed"] += 1; _REPROC_JOB["done"] += 1
+                continue
+            params = dict(m.get("oct_params") or {})
+            params.pop("apply_proposals", None)
+            dst = str(Path(tmp) / "new.nii.gz")
+            oct_mod.preprocess_oct_to_nifti(src, dst, params=params,
+                                            volume_index=int(m.get("oct_volume_index", 0) or 0),
+                                            companion_txt=m.get("companion_txt"), workers=2)
+            old, new = _reproc_measure(cur), _reproc_measure(dst)
+            rel = (old["rough"] - new["rough"]) / old["rough"] if old["rough"] > 0 else 0.0
+            d_und = new["undul"] - old["undul"]
+            better = rel >= 0.02 and d_und <= 1.0        # must gain roughness AND not lose per-frame shape
+            if better:
+                os.replace(dst, cur)                      # same filesystem → atomic
+                orch.write_manifest_value(cid, {"review_flags": ["changed"]})
+                with _REPROC_LOCK:
+                    _REPROC_JOB["written"] += 1
+            else:
+                with _REPROC_LOCK:
+                    _REPROC_JOB["kept"] += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[reprocess-batch] {cid}: {exc}", file=sys.stderr)
+            with _REPROC_LOCK:
+                _REPROC_JOB["failed"] += 1
+        finally:
+            _sh2.rmtree(tmp, ignore_errors=True)
+            with _REPROC_LOCK:
+                _REPROC_JOB["done"] += 1
+    with _REPROC_LOCK:
+        _REPROC_JOB["running"] = False
+
+
+@app.post("/api/review/reprocess-batch")
+def start_reprocess_batch() -> dict:
+    """Re-run preprocessing on the scans the reviewer has CORRECTED but not yet approved, guarded so the
+    store can only improve. Returns immediately; poll /api/review/reprocess-status."""
+    with _REPROC_LOCK:
+        if _REPROC_JOB["running"]:
+            return {"ok": True, "already_running": True, **_REPROC_JOB}
+    # Candidates: carrying a border correction or crop marks, and NOT already approved. An approved scan is
+    # left alone entirely — the reviewer signed off on the bytes it has, and re-running it would put a scan
+    # they already judged back into the queue for no reason.
+    cands: list[str] = []
+    for child in sorted(settings.CASES_ROOT.iterdir()) if settings.CASES_ROOT.exists() else []:
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        try:
+            m = orch.read_manifest(child.name)
+        except Exception:  # noqa: BLE001
+            continue
+        if m.get("preproc_vetted"):
+            continue
+        op = m.get("oct_params") or {}
+        if (op.get("border_anchors") or op.get("crop_post_anchors")
+                or op.get("surface_crop_frames") or op.get("crop_region") or m.get("border_gt")):
+            cands.append(child.name)
+    with _REPROC_LOCK:
+        _REPROC_JOB.update({"running": bool(cands), "done": 0, "total": len(cands), "written": 0,
+                            "kept": 0, "failed": 0, "started": round(time.time(), 1), "cases": cands})
+    if cands:
+        threading.Thread(target=_reproc_worker, args=(cands,), daemon=True).start()
+    return {"ok": True, "started": len(cands), "cases": cands}
+
+
+@app.post("/api/review/tune-detector")
+def start_tune_detector() -> dict:
+    """Search the detector's parameters for a setting that reproduces the reviewer's corrections better, and
+    adopt it globally if it does — without disturbing the scans they have already approved. Returns at once;
+    poll /api/review/tune-status. This is the step that makes the queue converge: it changes the ALGORITHM,
+    not just the scans that were corrected."""
+    global _TUNE_PROC, _TUNE_PATHS
+    with _TUNE_LOCK:
+        if _TUNE_PROC is not None and _TUNE_PROC.poll() is None:
+            return {"ok": True, "already_running": True, **_tune_read_status()}
+        corpus, guard = _tune_corpus_and_guard()
+        if not corpus:
+            return {"ok": True, "started": 0, "note": "No corrections to learn from yet."}
+        d = Path(tempfile.mkdtemp(prefix="cornea_tune_"))
+        paths = {"dir": str(d), "job": str(d / "job.json"), "status": str(d / "status.json"),
+                 "cancel": str(d / "cancel")}
+        Path(paths["job"]).write_text(json.dumps({
+            "corpus": corpus, "guard": guard, "workers": max(2, oct_mod.auto_workers() // 2)}), encoding="utf-8")
+        Path(paths["status"]).write_text(json.dumps(
+            {"running": True, "phase": "starting", "done": 0, "total": 0,
+             "n_corpus": len(corpus), "n_guard": len(guard)}), encoding="utf-8")
+        # start_new_session so a cancel can reap the whole fork pool, exactly as _run_oct_worker does.
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(detector_tune.__file__)),
+             "--job", paths["job"], "--status", paths["status"], "--cancel", paths["cancel"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        _TUNE_PROC, _TUNE_PATHS = proc, paths
+    threading.Thread(target=_tune_watch, args=(proc,), daemon=True).start()
+    return {"ok": True, "started": len(corpus), "n_corpus": len(corpus), "n_guard": len(guard),
+            "n_points": sum(len(c["pts"]) for c in corpus)}
+
+
+@app.get("/api/review/tune-status")
+def tune_status() -> dict:
+    with _TUNE_LOCK:
+        live = _TUNE_PROC is not None and _TUNE_PROC.poll() is None
+    if live:
+        st = _tune_read_status()
+        st["running"] = True                 # the file may predate the child's first publish
+        return {"ok": True, **st}
+    return {"ok": True, **_TUNE_LAST}
+
+
+@app.post("/api/review/tune-cancel")
+def tune_cancel(hard: bool = False) -> dict:
+    """Sentinel first, then the process group if it does not take.
+
+    The graceful path only lands at a checkpoint, and a checkpoint can be a whole volume detection away — so
+    `hard` exists to kill the group outright. Nothing is written until the very end of a successful run, so a
+    hard stop cannot leave the store half-updated."""
+    import signal
+    with _TUNE_LOCK:
+        proc, paths = _TUNE_PROC, dict(_TUNE_PATHS)
+    if proc is None or proc.poll() is not None:
+        return {"ok": True, "cancelling": False}
+    try:
+        Path(paths["cancel"]).write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+    if hard:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return {"ok": True, "cancelling": True, "hard": bool(hard)}
+
+
+@app.get("/api/review/detector-overrides")
+def detector_overrides() -> dict:
+    """What the detector has been tuned to, if anything — so the UI can show that the algorithm has moved."""
+    path = _param_overrides_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    return {"ok": True, "path": str(path), "params": (data or {}).get("params") or {}, "ts": (data or {}).get("ts")}
+
+
+@app.get("/api/review/reprocess-status")
+def reprocess_status() -> dict:
+    with _REPROC_LOCK:
+        return {"ok": True, **_REPROC_JOB}
+
+
+class OctMarksRequest(BaseModel):
+    surface_crop_frames: list[int] | None = None      # frames whose apex is above the window
+    crop_region: dict | None = None                   # {"lateral":[lo,hi], "frames":[...]}
+    crop_post_anchors: dict | None = None             # {slice: {frame: depth}} manual posterior edge
+
+
+@app.post("/api/case/{case_id}/oct-marks")
+def set_oct_marks(case_id: str, req: OctMarksRequest) -> dict:
+    """Persist the reviewer's CROP MARKS to oct_params WITHOUT re-running the pipeline.
+
+    WHY THIS EXISTS. Marking surface-cropped frames or a crop region used to reach disk only via
+    "Confirm & re-run", which re-processes the whole scan (~2 min). That is the right cost when the reviewer
+    wants the corrected volume NOW, and entirely the wrong one during a review pass, where the marks are being
+    recorded as ground truth and the volume is regenerated later in bulk. Without a cheap path the marks would
+    simply be lost when the reviewer moves on, which is worse than the extra click it replaced.
+
+    Manifest-only, and sticky exactly like the same keys set by oct-preprocess: the next re-run picks them up.
+    An explicit empty list CLEARS a set (matching apply_surface_crop_mode's "off" semantics, where an empty
+    list both suppresses auto-detection and applies no repair); None leaves that key untouched."""
+    cid = _require_case(case_id)
+    m = orch.read_manifest(cid)
+    op = dict(m.get("oct_params") or {})
+    changed: dict = {}
+    if req.surface_crop_frames is not None:
+        scf = sorted({int(f) for f in req.surface_crop_frames})
+        if scf:
+            op["surface_crop_frames"] = scf
+            op["surface_crop_mode"] = "manual"        # the user's set wins over the detector's
+        else:
+            op.pop("surface_crop_frames", None)
+            op["surface_crop_mode"] = "off"
+        changed["surface_crop_frames"] = scf
+    if req.crop_region is not None:
+        cr = req.crop_region or {}
+        lat = cr.get("lateral") or []
+        frames = sorted({int(f) for f in (cr.get("frames") or [])})
+        if len(lat) == 2 and frames:
+            op["crop_region"] = {"lateral": [int(lat[0]), int(lat[1])], "frames": frames}
+            op.pop("crop_lateral", None)             # a valid box supersedes the legacy full-slice crop
+        else:
+            op.pop("crop_region", None)
+        changed["crop_region"] = op.get("crop_region")
+    if req.crop_post_anchors is not None:
+        # MERGED per slice, not replaced: the reviewer corrects one slice at a time and a whole-object write
+        # would silently drop every other slice's posterior corrections. An empty row clears that slice.
+        cur = dict(op.get("crop_post_anchors") or {})
+        for sk, row in (req.crop_post_anchors or {}).items():
+            if isinstance(row, dict) and row:
+                cur[str(sk)] = {str(f): float(d) for f, d in row.items()}
+            else:
+                cur.pop(str(sk), None)
+        if cur:
+            op["crop_post_anchors"] = cur
+        else:
+            op.pop("crop_post_anchors", None)
+        changed["crop_post_anchors"] = {k: len(v) for k, v in cur.items()}
+    if not changed:
+        return {"ok": True, "changed": {}}
+    orch.write_manifest_value(cid, {"oct_params": op})
+    return {"ok": True, "changed": changed}
+
+
 class SubgroupRequest(BaseModel):
     subgroup: str | None = None   # e.g. "1" (default), "posterior", "inferior"
 
@@ -3046,16 +3517,54 @@ def _gt_corpus_cases() -> list[tuple[str, dict]]:
     return out
 
 
+def _rejected_gt_cases() -> list[tuple[str, dict]]:
+    """(case_id, manifest) for cases CORRECTED but then REJECTED — border_gt present with confirmed=False.
+
+    These are captured by set_difficult_scan and are deliberately NOT corpus-eligible, but they must still be
+    VISIBLE: a correction that is recorded and then never surfaced is write-only, and the reviewer has no way
+    to know it accumulated or to opt it in. They are also the corrections most likely to matter — a rejected
+    scan is one the auto-detector got wrong."""
+    out: list[tuple[str, dict]] = []
+    root = settings.CASES_ROOT
+    if not root.exists():
+        return out
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        try:
+            m = orch.read_manifest(child.name)
+        except Exception:  # noqa: BLE001
+            continue
+        gt = m.get("border_gt") if isinstance(m, dict) else None
+        if not (isinstance(gt, dict) and not gt.get("confirmed") and gt.get("n_points")):
+            continue
+        _ns, npts, sig = _border_anchor_stats(m)
+        if npts <= 0 or sig != gt.get("anchors_sig"):     # re-corrected since → stale, same rule as confirmed
+            continue
+        out.append((child.name, m))
+    return out
+
+
 @app.get("/api/gt-corpus")
 def gt_corpus() -> dict:
     """Cheap summary of the confirmed, corpus-eligible corrected-border cases (the ground-truth corpus) — no
-    detector run. Used by the UI badge + the assistant to see how much GT has accumulated."""
+    detector run. Used by the UI badge + the assistant to see how much GT has accumulated.
+
+    Also reports the CORRECTED-BUT-REJECTED pool separately: real anchor geometry the reviewer drew on scans
+    they then rejected. Not part of the tuning corpus (a scan whose output was refused should not silently
+    become a global target), but counted here so it is discoverable and can be opted in deliberately."""
     cases = _gt_corpus_cases()
     total = sum(_border_anchor_stats(m)[1] for _, m in cases)
+    rej = _rejected_gt_cases()
+    rej_pts = sum(_border_anchor_stats(m)[1] for _, m in rej)
     return {"ok": True, "n_cases": len(cases), "n_points": total,
             "cases": [{"case_id": cid,
                        "n_slices": (m.get("border_gt") or {}).get("n_slices"),
-                       "n_points": (m.get("border_gt") or {}).get("n_points")} for cid, m in cases]}
+                       "n_points": (m.get("border_gt") or {}).get("n_points")} for cid, m in cases],
+            "n_rejected_cases": len(rej), "n_rejected_points": rej_pts,
+            "rejected_cases": [{"case_id": cid,
+                                "n_slices": (m.get("border_gt") or {}).get("n_slices"),
+                                "n_points": (m.get("border_gt") or {}).get("n_points")} for cid, m in rej]}
 
 
 class GtCorpusEvalRequest(BaseModel):
@@ -3559,7 +4068,28 @@ def oct_surface_crop_preview(case_id: str, req: OctPreprocessRequest) -> dict:
             frames = (m.get("oct_params") or {}).get("surface_crop_frames") or []
         sl = np.ascontiguousarray(arr[si]).astype(np.float32)
         top = oct_mod._merged_side_edge(sl, p)                       # detected anterior (DP + scar-guard)
-        recon, bottom, adopted = oct_mod._crop_reconstruct_slice(sl, top, frames, p)
+        # The reviewer's manual posterior points for THIS slice, so the preview shows the line they dragged
+        # rather than the detector's version of it — preview == what the re-run will use. Request-supplied
+        # anchors take precedence over the persisted ones (live drag before it is committed).
+        _pa = req.crop_post_anchors if getattr(req, "crop_post_anchors", None) is not None \
+            else (m.get("oct_params") or {}).get("crop_post_anchors")
+        _row = None
+        if isinstance(_pa, dict):
+            _row = _pa.get(str(si)) or _pa.get(si) or None
+        # GUIDED POSTERIOR: the reviewer's bottom-edge corrections used as a search PRIOR, so the detected
+        # bottom edge improves on slices they did NOT draw on. Without this, crop_post_anchors was a per-frame
+        # override on its own slice and nothing else — re-running could never improve the bottom edge anywhere,
+        # which is the reviewer's "bottom edge detection does not seem to improve after iterations".
+        # Held-out measurement (prior from slice 195, scored on slice 214's own points): median error
+        # 14.6 -> 11.5 px, within-5px 25.5% -> 31.9%. Best-effort — any failure falls back to plain detection.
+        _post_row = None
+        if isinstance(_pa, dict) and _pa and bool(p.get("post_guided", True)):
+            try:
+                _post_row = oct_mod.guided_posterior_row(arr, si, _pa, p)
+            except Exception:  # noqa: BLE001
+                _post_row = None
+        recon, bottom, adopted = oct_mod._crop_reconstruct_slice(
+            sl, top, frames, {**p, "_post_anchor_row": _row, "_post_row_detected": _post_row})
         r1 = lambda a: [round(float(v), 1) for v in np.asarray(a)]
         return {"slice_index": si, "n_frames": n_frames, "depth_vox": depth_vox,
                 "top": r1(top), "bottom": r1(bottom), "recon": r1(recon),
@@ -3711,7 +4241,7 @@ def _border_anchors_sig(anchors: dict) -> str:
 _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColor", "sigmaSpace",
                       "side_window", "side_threshold_factor", "residual_threshold", "active_threshold",
                       "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band",
-                      "redetect_seed_window", "redetect_interp_window",
+                      "redetect_seed_window", "redetect_seed_window_slices", "redetect_interp_window",
                       # native DP detector selection + tuning — a change must invalidate the surface caches
                       "detector", "dp_sigma_depth", "dp_sigma_frame", "dp_below", "dp_max_jump",
                       # DP scar-guard (cross-checks DP vs legacy, pulls DP off a bright internal scar) — its
@@ -3943,6 +4473,20 @@ def _redetect_surface_cached(case_id: str, m: dict, anchors: dict):
 
     If oct_params['border_generalize'] is set, returns the WHOLE-VOLUME generalized surface (generalize.npz)
     instead of the local-band redetect — rerouting scrub + Run to the generalization in one place."""
+    # GUIDED first, when it won its guard. It is a detection of every slice from the image (seeded by the
+    # corrections), rather than the corrections interpolated across slices, and it is only ever written when
+    # it measured better than auto — so wherever the flag is set, this is the best surface the scan has.
+    # Falls through if the cache is missing or stale, rather than serving a surface that no longer matches
+    # the anchors it was judged on.
+    if (m.get("oct_params") or {}).get("border_guided"):
+        gp = _guided_cache_path(case_id)
+        try:
+            if gp.exists():
+                z = np.load(gp, allow_pickle=False)
+                if str(z["anchors_sig"]) == _border_anchors_sig(anchors or {}):
+                    return np.asarray(z["surface"], dtype=np.float32)
+        except Exception:  # noqa: BLE001
+            pass
     if not anchors:
         return None
     if (m.get("oct_params") or {}).get("border_generalize"):
@@ -3977,11 +4521,45 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         op = dict(m.get("oct_params") or {})
         op.pop("detect_lo", None); op.pop("detect_hi", None)   # legacy global band — removed
         op.pop("border_generalize", None)   # a fresh local Confirm exits whole-volume-generalize mode
-        op["border_anchors"] = anchors
-        # Parabola mode: the anchors are a DENSE fitted quadratic → use it EXACTLY (seed window 0). Edge mode:
-        # the default tight window. Persisted so the cache write/read/run all derive the SAME seed window (and
-        # so params_sig matches — _redetect_surface_fresh reads this back).
-        op["redetect_seed_window"] = 0.0 if req.parabola else float(oct_mod.DEFAULT_PARAMS.get("redetect_seed_window", 2.0))
+        op.pop("border_guided", None)       # ...and guided mode: its cache was judged against the OLD anchors
+        # MERGE OR REPLACE, decided by how complete the payload is — not by taste.
+        #   edge mode      the client sends EVERY anchored slice (its editable set is seeded from what is
+        #                  persisted), so the payload is authoritative: replace. This is also the only way to
+        #                  clear a slice, since a slice emptied by dragging back onto the detected edge simply
+        #                  drops out of the payload.
+        #   quadratic mode the client sends ONLY the slices whose curve was shaped. Replacing on that payload
+        #                  DELETED every edge correction on every other slice — a reviewer who fixed the border
+        #                  on one slice and later shaped a curve on another silently lost the first.
+        prev_anc = dict(op.get("border_anchors") or {})
+        prev_win = dict(op.get("redetect_seed_window_slices") or {})
+        # Which slices in THIS payload are an exact fitted curve. Explicit list when the client sends one;
+        # otherwise fall back to the old all-or-nothing flag so an older client still behaves as before.
+        _exact = ({str(x) for x in (req.parabola_slices or [])} if req.parabola_slices is not None
+                  else (set(anchors) if req.parabola else set()))
+        if req.parabola_slices is not None or req.parabola:
+            # MERGE, because a payload that names exact slices is describing part of the picture, not all of
+            # it — replacing on it would drop edge corrections made on slices this commit does not mention.
+            merged = {**prev_anc, **anchors} if anchors else {}
+            # A shaped quadratic IS the surface → follow it exactly (window 0) on ITS slices only. Slices
+            # carrying hand-drawn edge anchors keep the default window: those are approximate by the
+            # reviewer's own account, so honouring them to the pixel would be reading in more than they said.
+            # A slice carrying BOTH is NOT exact: it contains approximate points, and treating the whole
+            # slice as exact would pin those to the pixel.
+            win = {k: v for k, v in prev_win.items() if k in merged}
+            win = {k: v for k, v in win.items() if k in _exact}
+            win.update({s: 0.0 for s in _exact})
+        else:
+            merged = anchors
+            win = {k: v for k, v in prev_win.items() if k in merged}
+        op["border_anchors"] = merged
+        # sorted: this dict is stringified into the detector cache signature, so a stable key order keeps an
+        # unchanged set from reading as a change and needlessly discarding the cached surface
+        op["redetect_seed_window_slices"] = {k: win[k] for k in sorted(win, key=lambda x: int(x))}
+        # The GLOBAL window stays at the default and is what any slice not named above is read with. It used to
+        # be flipped to 0 for the whole scan by a single quadratic commit, which re-interpreted every other
+        # slice's approximate anchors as exact.
+        op["redetect_seed_window"] = float(oct_mod.DEFAULT_PARAMS.get("redetect_seed_window", 2.0))
+        anchors = merged
         orch.write_manifest_value(case_id, {"oct_params": op})
         if anchors:
             _compute_redetect_cache(case_id, {**m, "oct_params": op}, anchors)
@@ -4140,6 +4718,91 @@ def oct_border_generalize(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT generalize failed: {exc}")
+
+
+def _guided_cache_path(case_id: str) -> Path:
+    return orch.case_root(case_id) / "border_cache" / "guided.npz"
+
+
+@app.post("/api/case/{case_id}/oct-border-guided")
+def oct_border_guided(case_id: str) -> dict:
+    """GUARDED GUIDED RE-DETECTION — use the reviewer's corrections to improve DETECTION on this scan.
+
+    The correction supplies a PRIOR (where to look); the detector still decides where the edge is, on every
+    slice, from the image. That is the difference between improving detection and spreading a drawn line: on a
+    held-out corrected slice, interpolation returned a surface identical to auto, while this cut the median
+    error from 11.1 px to 3.0 px.
+
+    GUARDED, because unconditionally it is a coin flip. Across four approved scans it improved the delivered
+    volume on two (-20.4%, -1.8% shift-roughness) and worsened it on two (+21.1%, +11.0%) — a +2.5% mean that
+    hides both. So both surfaces are measured and the better one is kept:
+
+      * WITH corrections, the reviewer's anchors decide it. That is real ground truth and beats any proxy.
+      * WITHOUT, gradient@surface must improve AND the delivered per-frame shift must not get rougher. Two
+        signals, because a wandering search raises the first on its own by finding other structures.
+
+    Losing leaves the scan exactly as it was, and says so."""
+    m = orch.read_manifest(_require_case(case_id))
+    work = m.get("input_volume") or m.get("corrected_volume")
+    if not work or not Path(str(work)).exists():
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    src = m.get("oct_source")
+    if not src or not Path(str(src)).exists():
+        raise HTTPException(400, "Raw .OCT not available — guided re-detection reads the raw volume.")
+    p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+    anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
+    try:
+        sag = oct_mod.reformat_to_sagittal(
+            oct_mod.read_oct_zstack(str(src), int(m.get("oct_volume_index", 0) or 0))).astype("float32")
+        depth = int(sag.shape[1])
+        auto = oct_mod.detect_surface_all(sag, p, workers=max(2, oct_mod.auto_workers() // 2))
+        # The PRIOR: the corrections carried across the volume where they exist, else plain auto. Even a weak
+        # prior is useful — the gain above was measured with the prior equal to auto.
+        prior = auto
+        if anchors:
+            try:
+                prior = oct_mod.generalize_surface(sag, anchors, p, baseline=auto)
+            except Exception:  # noqa: BLE001 — a failed generalize just means a weaker prior, not a failure
+                prior = auto
+        guided = oct_mod.guided_redetect_all(sag, prior, p)
+
+        ga, gg = (oct_mod.surface_gradient_score(sag, auto), oct_mod.surface_gradient_score(sag, guided))
+        sa, sg = (oct_mod.shift_roughness(auto), oct_mod.shift_roughness(guided))
+        ea, na = oct_mod.anchor_error(auto, anchors, depth)
+        eg, _n = oct_mod.anchor_error(guided, anchors, depth)
+
+        if na >= 8 and math.isfinite(ea) and math.isfinite(eg):
+            accept = eg < ea
+            why = (f"reviewer's anchors: median error {ea:.1f} -> {eg:.1f} px on {na} point(s)")
+        else:
+            accept = (gg > ga) and (sg <= sa * 1.02)
+            why = (f"gradient {ga:.0f} -> {gg:.0f} ({100*(gg/ga-1):+.1f}%), "
+                   f"delivered shift-roughness {sa:.3f} -> {sg:.3f} ({100*(sg/sa-1):+.1f}%)")
+
+        op = dict(m.get("oct_params") or {})
+        if accept:
+            cp = _guided_cache_path(case_id)
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cp.with_name("guided.tmp.npz")
+            np.savez_compressed(tmp, surface=guided.astype(np.float32),
+                                anchors_sig=_border_anchors_sig(anchors),
+                                raw_mtime=str(Path(str(work)).stat().st_mtime),
+                                params_sig=_detect_params_sig(p))
+            os.replace(tmp, cp)
+            op["border_guided"] = True
+        else:
+            op.pop("border_guided", None)
+            _guided_cache_path(case_id).unlink(missing_ok=True)
+        orch.write_manifest_value(case_id, {"oct_params": op})
+        return {"ok": True, "accepted": bool(accept), "why": why, "judged_on": ("anchors" if na >= 8 else "proxies"),
+                "gradient": {"auto": round(ga, 1), "guided": round(gg, 1)},
+                "shift_roughness": {"auto": round(sa, 4), "guided": round(sg, 4)},
+                "anchor_error": {"auto": (round(ea, 2) if math.isfinite(ea) else None),
+                                 "guided": (round(eg, 2) if math.isfinite(eg) else None), "n": na}}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Guided re-detection failed: {exc}")
 
 
 @app.post("/api/case/{case_id}/oct-border-generalize/discard")
@@ -4359,6 +5022,9 @@ def cases_list() -> dict:
                 # both the sidebar and the assistant can see them (count only for the marks, to keep the list light).
                 "defect_marks": (len(m.get("defect_marks")) if isinstance(m.get("defect_marks"), list) else 0),
                 "difficult_scan": bool(m.get("difficult_scan")),
+                # Rejected BY THE REVIEWER, as distinct from difficult_scan (which bulk preprocessing also
+                # sets). This is what the review counter is built on.
+                "reviewer_rejected": bool(m.get("reviewer_rejected")),
                 # The rejection reason travels with the flag so the sidebar can show WHY a scan was rejected
                 # on hover, without opening it. Text only — the timestamp stays in the manifest.
                 "difficult_reason": (((m.get("difficult_reason") or {}).get("text"))
@@ -4872,6 +5538,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
+
+    # Fold any globally tuned detector settings in BEFORE serving, and publish their path so the CLI
+    # subprocess path picks up the same ones. Done here rather than at import so it also covers --reload.
+    _tuned = _apply_param_overrides_at_startup()
+    if _tuned:
+        print(f"detector overrides applied: {_tuned}", flush=True)
 
     # Signal readiness for dev-launch.sh (greps for "READY:{port}").
     print(f"READY:{args.port}", flush=True)
