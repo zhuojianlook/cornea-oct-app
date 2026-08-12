@@ -68,6 +68,15 @@ export function TimelineBar() {
   // click, not three. See pendingEditStore.
   const pendingEdit = usePendingEditStore((s) => s.pending);
   const takePendingEdit = usePendingEditStore((s) => s.takePending);
+  // CORRECTED-result edge edits (before/after right pane), committed alongside raw edits by the SAME re-run.
+  const correctedEdge = usePendingEditStore((s) => s.correctedEdge);
+  const takeCorrectedEdge = usePendingEditStore((s) => s.takeCorrectedEdge);
+  const commitCorrectedEdgeAnchors = useCaseStore((s) => s.commitCorrectedEdgeAnchors);
+  const correctedPts = correctedEdge?.dirty ? correctedEdge.nPoints : 0;
+  // Did the reviewer actually CHANGE the raw line/marks (vs just re-loading a scan that already carries them)?
+  // Only a real change reshapes the volume → full re-run; a corrected-edge-only pin stays instant.
+  const rawDirty = !!pendingEdit && (pendingEdit.bordersDirty || pendingEdit.cropFrames !== null
+    || pendingEdit.cropRegion !== null || pendingEdit.defectCols !== null || pendingEdit.postAnchors !== null);
   // What the reject button is about to save. Counting only border POINTS read "(0)" whenever the pending work
   // was crop or defect marks — telling the reviewer their marks would be discarded, which was the opposite of
   // the truth.
@@ -78,7 +87,9 @@ export function TimelineBar() {
     pendingEdit.defectCols?.cols.length ? `${pendingEdit.defectCols.cols.length} marked col` : null,
     pendingEdit.postAnchors
       ? `${Object.values(pendingEdit.postAnchors).reduce((a, m) => a + Object.keys(m).length, 0)} bottom pt` : null,
-  ].filter(Boolean).join(" + ") || "cleared marks" : "";
+    correctedPts > 0 ? `${correctedPts} corrected-edge pt` : null,
+  ].filter(Boolean).join(" + ") || "cleared marks"
+    : (correctedPts > 0 ? `${correctedPts} corrected-edge pt` : "");
   const commitBorderAnchors = useCaseStore((s) => s.commitBorderAnchors);
   const commitOctMarks = useCaseStore((s) => s.commitOctMarks);
   const startReprocessBatch = useCaseStore((s) => s.startReprocessBatch);
@@ -516,14 +527,24 @@ export function TimelineBar() {
     setBusyAction("rerun");
     try {
       const edit = activeCaseId ? takePendingEdit(activeCaseId) : null;
-      if (edit) {
+      // Did the reviewer actually CHANGE the raw line/marks this session? nPoints alone counts the re-seeded
+      // persisted set, so it can't tell "changed" from "just loaded". Only a real raw change reshapes the
+      // volume and needs the full re-run.
+      const rawChanged = !!edit && (edit.bordersDirty || edit.cropFrames !== null || edit.cropRegion !== null
+        || edit.defectCols !== null || edit.postAnchors !== null);
+      if (rawChanged) {
         // Same commit path the verdict buttons use, so a correction recorded here is byte-identical to one
         // recorded by a rejection — there is no second, weaker kind of correction.
-        if (edit.nPoints > 0) await commitBorderAnchors(edit.anchors, edit.parabola, edit.parabolaSlices);
-        if (edit.cropFrames !== null || edit.cropRegion !== null || edit.postAnchors) {
-          await commitOctMarks(edit.cropFrames, edit.cropRegion, edit.postAnchors);
+        if (edit!.bordersDirty && edit!.nPoints > 0) await commitBorderAnchors(edit!.anchors, edit!.parabola, edit!.parabolaSlices);
+        if (edit!.cropFrames !== null || edit!.cropRegion !== null || edit!.postAnchors) {
+          await commitOctMarks(edit!.cropFrames, edit!.cropRegion, edit!.postAnchors);
         }
       }
+      // CORRECTED-result edge edits are a GUARDED rigid axial move (the tissue moves when a rigid shift/tilt
+      // genuinely aligns the frame; it's declined when it can't) — so, like a raw change, they need the full
+      // re-run to re-apply the pipeline + apply_sagittal_surface_gt. Persist them here first.
+      const ce = activeCaseId ? takeCorrectedEdge(activeCaseId) : null;
+      if (ce) await commitCorrectedEdgeAnchors(ce);
       const ok = await rerunWithCorrections();
       if (!ok) setQueueNote("Re-run failed — your correction is saved; try again or Skip.");
       else setQueueNote(null);
@@ -554,15 +575,21 @@ export function TimelineBar() {
       // silently discarded, which is the reverse of what the gesture means. The write must land BEFORE the
       // difficult flag, because the backend harvests border_gt from the persisted anchors at that moment.
       const edit = activeCaseId ? takePendingEdit(activeCaseId) : null;
+      const ce = activeCaseId ? takeCorrectedEdge(activeCaseId) : null;
       let note = "";
-      if (edit) {
+      if (edit || ce) {
         const parts: string[] = [];
         try {
-          if (edit.nPoints > 0) {
+          if (ce) {
+            await commitCorrectedEdgeAnchors(ce);
+            const n = Object.values(ce).reduce((a, m) => a + Object.keys(m).length, 0);
+            if (n) parts.push(`corrected-edge: ${n} point(s)`);
+          }
+          if (edit && edit.nPoints > 0) {
             await commitBorderAnchors(edit.anchors, edit.parabola, edit.parabolaSlices);
             parts.push(`border corrected: ${edit.nPoints} point(s) on ${edit.nSlices} slice(s)`);
           }
-          if (edit.cropFrames !== null || edit.cropRegion !== null || edit.postAnchors) {
+          if (edit && (edit.cropFrames !== null || edit.cropRegion !== null || edit.postAnchors)) {
             await commitOctMarks(edit.cropFrames, edit.cropRegion, edit.postAnchors);
             if (edit.cropFrames !== null) parts.push(`${edit.cropFrames.length} surface-crop frame(s)`);
             if (edit.cropRegion !== null) parts.push(`crop region ${edit.cropRegion.frames.length} col(s)`);
@@ -571,7 +598,7 @@ export function TimelineBar() {
               parts.push(`${n} bottom-edge point(s)`);
             }
           }
-          if (edit.defectCols) {
+          if (edit && edit.defectCols) {
             // Replace this slice's marks with what is currently drawn, leaving every OTHER slice alone —
             // the store takes the whole list, so a naive write would wipe marks made on other slices.
             const existing = (((caseInfo?.manifest as Record<string, unknown> | undefined)?.defect_marks) ?? []) as
@@ -721,7 +748,8 @@ export function TimelineBar() {
           + "The correction defines the surface — it is not a hint the detector can decline — so this converges\n"
           + "on the scan in front of you, with no dependence on the detector being well-tuned."}>
         {busyAction === "rerun" ? "Re-running…"
-          : pendingEdit ? `↻ Correct & re-run (${pendingSummary})`
+          : rawDirty ? `↻ Correct & re-run (${pendingSummary})`
+          : correctedPts > 0 ? `↻ Correct & re-run (${correctedPts} corrected-edge pt)`
           : "↻ Re-run with corrections"}
       </Button>
       {/* MOVE ON without judging. Session-only: nothing is written, so it returns to the queue next time. */}

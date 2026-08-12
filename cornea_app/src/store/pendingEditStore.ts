@@ -23,6 +23,10 @@ export interface PendingBorderEdit {
   /** counts, for the human-readable summary recorded with a rejection */
   nSlices: number;
   nPoints: number;
+  /** true when the border anchors DIFFER from what is persisted (the reviewer actually changed the raw line
+   *  this session). nPoints alone counts the re-seeded persisted set too, so it can't tell "changed" from
+   *  "just loaded" — which a corrected-edge-only pin needs, to skip the full re-run. */
+  bordersDirty: boolean;
   /** surface-crop frame marks drawn but not yet committed (null = untouched, [] = explicitly cleared) */
   cropFrames: number[] | null;
   /** crop-region box drawn but not yet committed (null = untouched) */
@@ -33,12 +37,39 @@ export interface PendingBorderEdit {
   postAnchors: Record<string, Record<string, number>> | null;
 }
 
+/** WHICH red line the before/after view is editing right now. The two corrections COMPOSE (raw = detection +
+ *  base warp; corrected = a post-hoc rigid per-frame shift for residual drift), but the reviewer edits ONE at a
+ *  time so a single "Correct & re-run" is unambiguous and no drawn edit is ever silently dropped. */
+export type EditTarget = "original" | "corrected";
+
+/** Corrected-result edge edits drawn on the RIGHT pane but not yet committed. Keyed by case like the border
+ *  pending, so a stale edit can never land on the next scan. `dirty` = differs from what is persisted, so
+ *  clearing (emptying the anchors) still commits (to remove the persisted set). */
+export interface PendingCorrectedEdge {
+  caseId: string;
+  /** lateral -> frame -> depth, in CORRECTED-output depth space (0 = TOP). */
+  anchors: Record<string, Record<string, number>>;
+  nPoints: number;
+  dirty: boolean;
+}
+
 interface PendingEditState {
   pending: PendingBorderEdit | null;
   setPending: (p: PendingBorderEdit | null) => void;
   /** Returns the edit only if it belongs to `caseId`; clears it either way, so a flush can never be
    *  double-committed and a stale edit cannot leak onto the next scan. */
   takePending: (caseId: string) => PendingBorderEdit | null;
+
+  /** which line the before/after view is editing (default: the original/raw line). */
+  editTarget: EditTarget;
+  setEditTarget: (t: EditTarget) => void;
+
+  /** corrected-pane edits, published by CorrectedEdgePanel, flushed by the same handlers that flush `pending`. */
+  correctedEdge: PendingCorrectedEdge | null;
+  setCorrectedEdge: (c: PendingCorrectedEdge | null) => void;
+  /** Returns the corrected-edge anchors to commit (only when it belongs to `caseId` AND is dirty); clears it
+   *  either way. Empty-but-dirty returns `{}` so a cleared correction is committed as a removal. */
+  takeCorrectedEdge: (caseId: string) => Record<string, Record<string, number>> | null;
 }
 
 export const usePendingEditStore = create<PendingEditState>((set, get) => ({
@@ -53,5 +84,17 @@ export const usePendingEditStore = create<PendingEditState>((set, get) => ({
     const hasWork = p.nPoints > 0 || p.cropFrames !== null || p.cropRegion !== null
       || p.defectCols !== null || p.postAnchors !== null;
     return hasWork ? p : null;
+  },
+
+  editTarget: "original",
+  setEditTarget: (t) => set({ editTarget: t }),
+
+  correctedEdge: null,
+  setCorrectedEdge: (c) => set({ correctedEdge: c }),
+  takeCorrectedEdge: (caseId) => {
+    const c = get().correctedEdge;
+    set({ correctedEdge: null });
+    if (!c || c.caseId !== caseId || !c.dirty) return null;
+    return c.anchors;   // may be {} → commit as a removal of the persisted corrected-edge set
   },
 }));

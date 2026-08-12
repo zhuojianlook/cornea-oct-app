@@ -2129,6 +2129,7 @@ class OctPreprocessRequest(BaseModel):
                                               # corrected ABSOLUTE surface depths (depth 0 = TOP). The server MARCHES
                                               # a tilt-aware re-detection of the whole RAW volume seeded by these.
     axial_anchors: dict | None = None         # AXIAL fix-tool "Confirm": {str(frame): {str(lateral): true_depth}}
+    corrected_edge_anchors: dict | None = None  # CORRECTED-result sagittal fix-tool: {str(lateral): {str(frame): corrected_depth}}
                                               # anterior-surface depths (CORRECTED-output depth space, 0 = TOP) drawn on
                                               # an axial B-scan across laterals. STICKY like manual_shifts: applied as a
                                               # post-hoc additive per-frame warp (apply_axial_surface_gt); {} clears.
@@ -2554,6 +2555,11 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # normal-auto supersede / use_redetect blocks below → it composes with (survives) a sagittal fix-columns Run.
     if req.axial_anchors is not None:
         eff_params["axial_anchors"] = req.axial_anchors
+    # CORRECTED-result sagittal fix-tool GT (sticky, same rules as axial_anchors): a post-hoc per-frame rigid
+    # warp applied to the finished corrected volume, so it survives use_redetect (composes with the sagittal
+    # raw-GT Run rather than being superseded). Request set REPLACES; omitted carries the persisted set through.
+    if req.corrected_edge_anchors is not None:
+        eff_params["corrected_edge_anchors"] = req.corrected_edge_anchors
     # Sanitize the EFFECTIVE set (request-provided OR carried-through from persisted oct_params): drop any
     # zero / NaN / Infinity / malformed entry so the manifest never accumulates no-op garbage and always
     # matches the frontend's zero-free view (a zero shift is a no-op the frontend already removes).
@@ -2577,8 +2583,19 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
         # ensure a FRESH cache for the persisted anchors (recompute if missing/stale incl. an algorithm
         # upgrade), then feed it to the worker — same surface the scrub display uses (preview == result).
-        _redetect_surface_cached(case_id, m, anchors)
-        redetect_npz = _redetect_cache_path(case_id)
+        # _redetect_surface_cached returns WHICHEVER surface the scan carries (guided > generalize > local
+        # redetect) — the exact one the scrub display draws. The warp must flatten to THAT, not always to
+        # redetect.npz: on a border_guided scan those differ, so the old code showed one edge and warped to
+        # another. Persist the returned surface to its own npz so the worker flattens to what the reviewer saw.
+        surf_for_warp = _redetect_surface_cached(case_id, m, anchors)
+        if surf_for_warp is None:
+            raise HTTPException(400, "No re-detected surface to apply — drag the border and Confirm first.")
+        pe_path = orch.case_root(case_id) / "border_cache" / "provided_edges.npz"
+        pe_path.parent.mkdir(parents=True, exist_ok=True)
+        _pe_tmp = pe_path.with_name("provided_edges.tmp.npz")   # MUST end .npz (savez appends it otherwise)
+        np.savez_compressed(_pe_tmp, surface=np.asarray(surf_for_warp, dtype=np.float32))
+        os.replace(_pe_tmp, pe_path)
+        redetect_npz = pe_path
         eff_params["border_anchors"] = anchors        # keep them persisted on the case
         # the re-detect warp flattens to EXACTLY the previewed surface — legacy per-frame manual_shifts (which
         # the scrub preview does NOT show) would break preview==result, so they're superseded here.
@@ -4389,6 +4406,10 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
     baseline = _baseline_surface(case_id, arr, p)           # cached auto surface (the satisfactory rest)
     surface = oct_mod.redetect_surface(arr, anchors, p, baseline=baseline)   # local-band correction (lateral, frames)
+    # PIN the reviewer's drawn frames to their exact value: the local-band march snaps to within a couple of
+    # px of the drawn line (redetect_seed_window), which drifts a correction off where it was drawn. Ground
+    # truth wins at the frames the reviewer actually touched; the march still governs the propagated band.
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)))
     cp = _redetect_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     # tmp MUST end in .npz — np.savez_compressed appends '.npz' to any path that doesn't, which would make
@@ -4442,6 +4463,9 @@ def _compute_generalize_cache(case_id: str, m: dict, anchors: dict):
     p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
     baseline = _baseline_surface(case_id, arr, p)           # cached auto surface
     surface = oct_mod.generalize_surface(arr, anchors, p, baseline=baseline)
+    # PIN drawn frames exact: the residual field is interpolated across the volume, so at the drawn frames it
+    # should reproduce the drawn line exactly, not a smoothed approximation of it.
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)))
     cp = _generalize_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     tmp = cp.with_name("generalize.tmp.npz")
@@ -4545,9 +4569,21 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
             # reviewer's own account, so honouring them to the pixel would be reading in more than they said.
             # A slice carrying BOTH is NOT exact: it contains approximate points, and treating the whole
             # slice as exact would pin those to the pixel.
-            win = {k: v for k, v in prev_win.items() if k in merged}
-            win = {k: v for k, v in win.items() if k in _exact}
-            win.update({s: 0.0 for s in _exact})
+            # Per-slice seed window. A slice this commit RE-SENDS is redefined by this payload: exact (0.0)
+            # if named in _exact, else approximate (dropped → read with the global default). A slice this
+            # commit does NOT mention keeps its PRIOR window — so an exact quadratic shaped on an earlier
+            # commit stays exact instead of silently reverting to the approximate global window (the bug that
+            # made a multi-slice correction lose the first slice's exactness on the next commit). A slice
+            # carrying BOTH shaped and hand-drawn anchors is approximate: _exact lists only purely-shaped slices.
+            _this = {str(k) for k in (anchors or {})}
+            win = {}
+            for _k in merged:
+                _ks = str(_k)
+                if _ks in _this:
+                    if _ks in _exact:
+                        win[_ks] = 0.0
+                elif _ks in prev_win:
+                    win[_ks] = prev_win[_ks]
         else:
             merged = anchors
             win = {k: v for k, v in prev_win.items() if k in merged}
@@ -4694,6 +4730,102 @@ def oct_axial_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         raise HTTPException(500, f"OCT axial re-detect failed: {exc}")
 
 
+# ── CORRECTED-RESULT sagittal fix-tool: edit the anterior surface on the CORRECTED output in the SAGITTAL plane
+#    (fixed LATERAL, across FRAMES) — the before/after "corrected" pane. Edge detection is cleaner on the flattened
+#    result, and this reaches residual inter-frame drift that editing the raw GT cannot (measured gain 0.055). Confirm
+#    persists sticky corrected_edge_anchors; Run re-applies them via the post-hoc apply_sagittal_surface_gt warp. The
+#    trio mirrors the axial fix-tool but reslices sagittally (surf[idx,:] across frames vs surf[:,f] across laterals).
+@app.get("/api/case/{case_id}/oct-corrected-slice")
+def oct_corrected_slice_png(case_id: str, slice_index: int = 0) -> Response:
+    """The corrected-result B-scan for ONE sagittal slice (a FIXED LATERAL) at NATIVE voxel resolution
+    (depth rows × frame cols, depth 0 = TOP) as a grayscale PNG, from the CORRECTED preprocessed-output volume.
+    Mirrors oct-border-slice (same 1-99 stretch, no-store) but sourced from the corrected output, not the raw
+    input — so the editable line drawn over it lands on the SAME grid the corrected surface was detected on."""
+    import io
+    import numpy as np
+    import nibabel as nib
+    from PIL import Image
+    m = orch.read_manifest(case_id)
+    work = _oct_corrected_vol_path(case_id, m)
+    if not work.exists():
+        raise HTTPException(400, f"Case {case_id} is not preprocessed yet.")
+    try:
+        vol = np.asarray(nib.load(str(work)).dataobj)            # (lateral, depth, frame)
+        n = int(vol.shape[0])
+        idx = max(0, min(n - 1, int(slice_index)))
+        sl = np.ascontiguousarray(vol[idx]).astype(np.float32)   # (depth, frames), depth 0 = TOP
+        finite = sl[np.isfinite(sl)]
+        if finite.size:
+            lo = float(np.percentile(finite, 1)); hi = float(np.percentile(finite, 99))
+            if hi <= lo:
+                hi = lo + 1.0
+            gray = (np.clip((sl - lo) / (hi - lo), 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            gray = np.zeros(sl.shape, dtype=np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(gray, mode="L").save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT corrected slice failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-corrected-curve")
+def oct_corrected_curve(case_id: str, req: OctPreprocessRequest) -> dict:
+    """The detected anterior surface across FRAMES for ONE sagittal slice (a FIXED LATERAL) of the CORRECTED
+    volume (+ a robust quadratic fit) so the before/after corrected pane draws + drags the border. req.slice_index
+    = the LATERAL index (central if None). Coordinates: edge[frame] = depth (0 = TOP), aligning with the
+    oct-corrected-slice (depth, frames) image and the fix-columns sagittal editor. Reuses the SAME cached corrected
+    surface (surf(lateral,frames)) the warp's apply_sagittal_surface_gt re-diffs against, so preview ≈ result."""
+    import nibabel as nib  # noqa: F401 — used by _axial_surface_cached
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    work = _oct_corrected_vol_path(case_id, m)
+    if not work.exists():
+        raise HTTPException(400, f"Case {case_id} is not preprocessed yet.")
+    try:
+        p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        surf, (L, D, nF) = _axial_surface_cached(case_id, work, p)   # (lateral, frames)
+        idx = L // 2 if req.slice_index is None else max(0, min(L - 1, int(req.slice_index)))
+        edge = np.asarray(surf[idx, :], dtype=np.float32)            # across FRAMES for this lateral slice
+        fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
+        # NOTE: no pin. The corrected surface shown is the REAL re-detected surface of the (guarded) rigid axial
+        # correction applied inside preprocess (apply_sagittal_surface_gt). The reviewer sees the true result —
+        # fixed where a rigid move helped, honestly unchanged where it was declined — never a painted line.
+        return {"slices": int(L), "index": int(idx), "depth_vox": int(D), "n_frames": int(nF),
+                "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT corrected curve failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-corrected-redetect")
+def oct_corrected_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
+    """CORRECTED-result sagittal fix-tool "Confirm": persist the user's corrected-surface anchors as STICKY GT
+    (oct_params.corrected_edge_anchors) so a later Run re-applies them. NO warp + NO cache here — the warp is the
+    post-hoc apply_sagittal_surface_gt pass inside preprocess_oct_to_nifti. Empty anchors clear it (revert to
+    auto). {str(lateral): {str(frame): true_depth}} in CORRECTED-output depth space (0 = TOP)."""
+    m = orch.read_manifest(case_id)
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        raise HTTPException(400, f"Case {case_id} has no working volume.")
+    anchors = req.corrected_edge_anchors if isinstance(req.corrected_edge_anchors, dict) else {}
+    try:
+        op = dict(m.get("oct_params") or {})
+        if anchors:
+            op["corrected_edge_anchors"] = anchors
+        else:
+            op.pop("corrected_edge_anchors", None)
+        orch.write_manifest_value(case_id, {"oct_params": op})
+        n_anchors = sum(len(v) for v in anchors.values() if isinstance(v, dict))
+        return {"ok": True, "n_anchors": int(n_anchors)}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT corrected re-detect failed: {exc}")
+
+
 @app.post("/api/case/{case_id}/oct-border-generalize")
 def oct_border_generalize(case_id: str, req: OctPreprocessRequest) -> dict:
     """GENERALIZE the confirmed fix-columns corrections to the WHOLE volume: learn the systematic per-frame
@@ -4781,6 +4913,11 @@ def oct_border_guided(case_id: str) -> dict:
 
         op = dict(m.get("oct_params") or {})
         if accept:
+            # PIN drawn frames to the reviewer's exact line BEFORE caching. The guard judged the UN-pinned
+            # guided (a fair test of whether the detector's own search found the drawn edge); but what gets
+            # delivered must honor the anchors exactly at the frames drawn — guided's 40 px search otherwise
+            # lands well off a manifestly-correct line. Non-drawn frames keep guided's from-image detection.
+            oct_mod.pin_anchors(guided, anchors, depth, float(p.get("crop_max_pad", 120)))
             cp = _guided_cache_path(case_id)
             cp.parent.mkdir(parents=True, exist_ok=True)
             tmp = cp.with_name("guided.tmp.npz")

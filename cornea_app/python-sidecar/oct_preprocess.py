@@ -3629,6 +3629,44 @@ def auto_tune_detector(sag: np.ndarray, params: dict | None = None, n_sample: in
     return {k: (float(v) if isinstance(v, float) else int(v)) for k, v in best.items()}, float(best_s)
 
 
+def pin_anchors(surface: np.ndarray, anchors: dict, depth: int,
+                crop_max_pad: float = 120.0) -> np.ndarray:
+    """Force `surface` to the reviewer's DRAWN depth at every anchored (slice, frame), IN PLACE.
+
+    Ground truth: the reviewer's fix-columns line is what the surface IS at the frames they drew. A detector
+    (any window: local redetect, generalize, guided) may refine the surface AROUND those frames, but must
+    never override one — otherwise the strongest-nearby gradient wins and the correction is silently ignored
+    (guided's 40 px search did exactly this: it landed 7-17 px off a manifestly-correct line). Pinning makes a
+    correction STICK where it was drawn, so iterating corrections converges instead of re-detecting each time.
+
+    Applies the SAME anchor normalization as redetect_surface, so pinned == what the reviewer meant:
+      * ABSENT sentinel (depth >= depth-1) → skipped (the reviewer said no surface there; do not assert one).
+      * ABOVE-canvas (negative) anchors → clamped to [-crop_max_pad, depth-1] and honored (a surface-cropped
+        apex lives above the window and can only be given at negative depth).
+    Non-drawn frames are left untouched. Returns the same array."""
+    if surface is None or not anchors:
+        return surface
+    S = np.asarray(surface)
+    if S.ndim != 2:
+        return surface
+    L, F = int(S.shape[0]), int(S.shape[1])
+    for s_key, frames in anchors.items():
+        try:
+            s = int(s_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= s < L) or not isinstance(frames, dict):
+            continue
+        for f_key, d in frames.items():
+            try:
+                f = int(f_key); dv = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < F and np.isfinite(dv) and dv < depth - 1:
+                S[s, f] = float(np.clip(dv, -float(crop_max_pad), depth - 1))
+    return S
+
+
 def redetect_surface(sag: np.ndarray, anchors: dict, params: dict | None = None,
                      baseline: np.ndarray | None = None, progress=None) -> np.ndarray:
     """LOCAL-BAND re-detection seeded by the user's fix-columns anchors.
@@ -7134,6 +7172,141 @@ def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | Non
     return out, {"applied": nadj > 0, "frames_adjusted": int(nadj)}
 
 
+def apply_sagittal_surface_gt(volume: np.ndarray, sag_anchors, params: dict | None = None,
+                              workers: int | None = None) -> tuple[np.ndarray, dict]:
+    """CORRECTED-RESULT sagittal fix-tool GT. The annotator opened the before/after view and dragged the
+    anterior surface on the CORRECTED result along the FRAME axis (a fixed lateral, across frames) — the axis
+    where residual INTER-FRAME drift lives (a trough on the early frames, a bump on the later ones = a
+    per-frame depth offset the auto rigid alignment left behind, and the very thing the reviewer sees).
+
+    Why this is a POST-HOC warp and not a change to the original GT: editing the raw provided_edges CANNOT fix
+    this. Measured end-to-end, a +12 px nudge to the raw surface moved the corrected surface by 0.66 px
+    (gain 0.055) — the rigid inter-frame alignment re-detects the real surface and re-smooths it, absorbing
+    the nudge. So the correction is applied where it lands: a per-frame RIGID depth shift (+ a tilt when
+    several laterals are drawn on one frame) on the FINISHED corrected volume. It is the SAGITTAL sibling of
+    apply_axial_surface_gt: IDEMPOTENT + STICKY — it stores the absolute TARGET depth and each run re-detects
+    the current surface with the same detector and re-diffs, so re-runs land on the target every time; the
+    per-frame shift is interpolated across gaps between drawn frames and raised-cosine feathered back to zero
+    beyond the drawn span so no step forms at the edges. sag_anchors = {str(lateral): {str(frame): depth}} in
+    the corrected-output depth space (0 = TOP). volume = (frames, depth, lateral). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not isinstance(sag_anchors, dict) or not sag_anchors:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    if workers is None:
+        workers = auto_workers()
+    nF, depth, L = volume.shape
+    # NO feather by default. The correction ALIGNS drifted frames to their (un-drawn, smooth) neighbours, so a
+    # hard band edge forms NO step — the drawn frames land ON the boundary trend. Feathering instead spreads the
+    # shift onto those correct neighbours, diluting the fix (a single-frame drift only half-corrected). The
+    # cross-lateral guard already guarantees an applied correction is a genuine alignment, so no smoothing is due.
+    fm = int(p.get("sag_gt_feather", 0) or 0)
+    try:
+        surf = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lat, frames)
+    except Exception:  # noqa: BLE001 — without a current surface we cannot diff → no-op
+        return volume, {"applied": False, "frames_adjusted": 0}
+    # gather the drawn anchors PER FRAME (across the drawn laterals): f -> {lateral: absolute target depth}
+    per_frame: dict[int, dict[int, float]] = {}
+    for l_key, frame_map in sag_anchors.items():
+        try:
+            li = int(l_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= li < L) or not isinstance(frame_map, dict):
+            continue
+        for f_key, d in frame_map.items():
+            try:
+                f = int(f_key); dd = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < nF and math.isfinite(dd):
+                per_frame.setdefault(f, {})[li] = dd
+    if not per_frame:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    xc = (L - 1) / 2.0
+    shift = np.zeros(nF, dtype=np.float64)          # per-frame rigid depth shift (+ = deeper)
+    tilt = np.zeros(nF, dtype=np.float64)           # per-frame tilt slope (depth px per lateral px)
+    has = np.zeros(nF, dtype=bool)
+    for f, lat_map in per_frame.items():
+        ll = np.array(sorted(lat_map), dtype=np.int64)
+        tt = np.array([lat_map[int(l)] for l in ll], dtype=np.float64)
+        cur = surf[ll, f].astype(np.float64)                     # current corrected surface at those laterals
+        good = np.isfinite(cur) & (cur > 1.0) & (cur < depth - 1)  # never diff against an off-cornea column
+        if good.sum() < 1:
+            continue
+        llg = ll[good].astype(np.float64); resid = tt[good] - cur[good]   # move each drawn point by resid
+        if llg.size >= 3 and (llg.max() - llg.min()) >= 8:       # enough lateral spread → fit shift + tilt
+            A = np.vstack([np.ones(llg.size), llg - xc]).T
+            a, b = np.linalg.lstsq(A, resid, rcond=None)[0]
+            shift[f] = float(a); tilt[f] = float(b)
+        else:                                                    # one lateral (or clustered) → pure per-frame shift
+            shift[f] = float(np.median(resid)); tilt[f] = 0.0
+        has[f] = True
+    fs = np.nonzero(has)[0]
+    if fs.size == 0:
+        return volume, {"applied": False, "frames_adjusted": 0}
+    # interpolate the per-frame shift/tilt across gaps between drawn frames, then feather to 0 beyond the span
+    allf = np.arange(nF, dtype=np.float64)
+    shift_i = np.interp(allf, fs.astype(np.float64), shift[fs])
+    tilt_i = np.interp(allf, fs.astype(np.float64), tilt[fs])
+    lo_f, hi_f = int(fs.min()), int(fs.max())
+    wf = np.zeros(nF, dtype=np.float64); wf[lo_f:hi_f + 1] = 1.0
+    for k in range(1, fm + 1):
+        ww = 0.5 * (1.0 + math.cos(math.pi * k / max(1, fm)))
+        if lo_f - k >= 0:
+            wf[lo_f - k] = max(wf[lo_f - k], ww)
+        if hi_f + k < nF:
+            wf[hi_f + k] = max(wf[hi_f + k], ww)
+    shift_i *= wf; tilt_i *= wf
+    xs = np.arange(L, dtype=np.float64)
+    # ── CROSS-LATERAL GUARD (rigid-or-accept) ────────────────────────────────────────────────────────────────
+    # A per-frame shift/tilt moves the WHOLE B-scan across all 513 laterals. It is only a LEGAL, useful rigid
+    # correction if it makes the drawn frames MORE consistent with the smooth surface implied by the un-corrected
+    # frames just outside the drawn band — measured over ALL good laterals, not just the one the reviewer drew on.
+    #   * A real inter-frame DRIFT (or a genuinely TILTED frame) is off across the whole B-scan, so the move
+    #     reduces that deviation → APPLY (the tissue moves, rigidly).
+    #   * An EDGE-SPECIFIC defect (surface wrong only at the periphery while the centre is already right) cannot
+    #     be fixed by any whole-frame move: shifting to fix the edge corrupts the centre, so the deviation RISES
+    #     → DECLINE and leave it. Per the standing rule (corrections are rigid axial shifts/rotations only), a
+    #     periphery no rigid move can reach is accepted as-is, never patched by a non-rigid deformation.
+    # Whole-correction decision (one coherent defect per draw), so the feather rides the core consistently.
+    band = np.nonzero(wf > 1e-6)[0]
+    ref_lo = int(max(0, (int(band.min()) if band.size else 0) - 1))
+    ref_hi = int(min(nF - 1, (int(band.max()) if band.size else nF - 1) + 1))
+    span = max(1, ref_hi - ref_lo)
+    db = da = 0.0; nn = 0
+    for f in fs:                                                  # the ANCHORED frames = the core of the correction
+        disp = shift_i[f] + tilt_i[f] * (xs - xc)
+        w = (f - ref_lo) / span
+        expected = (1.0 - w) * surf[:, ref_lo] + w * surf[:, ref_hi]   # smooth surface from the band boundaries
+        cur_f = surf[:, f]
+        gx = (np.isfinite(cur_f) & (cur_f > 1.0) & (cur_f < depth - 1)
+              & np.isfinite(expected) & (expected > 1.0) & (expected < depth - 1))
+        if gx.sum() < max(8, int(0.1 * L)):
+            continue
+        db += float(np.sum(np.abs(cur_f[gx] - expected[gx])))
+        da += float(np.sum(np.abs(cur_f[gx] + disp[gx] - expected[gx])))
+        nn += int(gx.sum())
+    dev_before = (db / nn) if nn else 0.0
+    dev_after = (da / nn) if nn else 0.0
+    # meaningful improvement required: a periphery-only defect makes dev_after >= dev_before → decline
+    apply_ok = nn > 0 and (dev_after < dev_before - 0.4) and (dev_after < 0.92 * dev_before)
+    out = volume.copy(); nadj = 0
+    if apply_ok:
+        for f in range(nF):
+            if abs(shift_i[f]) < 1e-6 and abs(tilt_i[f]) < 1e-9:
+                continue
+            disp = shift_i[f] + tilt_i[f] * (xs - xc)
+            disp = np.clip(disp, -(depth - 2), depth - 2)
+            out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), disp, subpixel=True)
+            nadj += 1
+    return out, {"applied": nadj > 0, "frames_adjusted": int(nadj),
+                 "declined": bool(not apply_ok and nn > 0),
+                 "dev_before": round(dev_before, 2), "dev_after": round(dev_after, 2),
+                 "n_drawn_frames": int(fs.size),
+                 "max_shift": float(np.max(np.abs(shift_i))) if nadj else 0.0,
+                 "max_tilt_swing": float(np.max(np.abs(tilt_i)) * L) if nadj else 0.0}
+
+
 # ── NIfTI output (correct Avanti geometry, matching the app's existing volumes) ──
 def write_volume_nifti(vol_zyx: np.ndarray, out_path: str | Path,
                        spacing_xyz=NIFTI_SPACING, direction=NIFTI_DIRECTION,
@@ -7713,6 +7886,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if _axa:
                 corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
                 info["axial_anchors"] = _axinfo
+            _cea = p_all.get("corrected_edge_anchors")   # CORRECTED-RESULT sagittal fix-tool GT (guarded rigid axial move)
+            if _cea:
+                corrected, _ceinfo = apply_sagittal_surface_gt(corrected, _cea, params, workers=workers)
+                info["corrected_edge_anchors"] = _ceinfo
             ms = p_all.get("manual_shifts")
             if ms:
                 corrected, n_ms = apply_manual_shifts(corrected, ms)
@@ -7932,6 +8109,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         if _axa:
             corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
             info["axial_anchors"] = _axinfo
+        _cea = p_all.get("corrected_edge_anchors")   # CORRECTED-RESULT sagittal fix-tool GT (guarded rigid axial move)
+        if _cea:
+            corrected, _ceinfo = apply_sagittal_surface_gt(corrected, _cea, params, workers=workers)
+            info["corrected_edge_anchors"] = _ceinfo
         ms = p_all.get("manual_shifts")
         if ms:
             corrected, n_ms = apply_manual_shifts(corrected, ms)
@@ -8079,6 +8260,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
     if _axa:
         corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
         info["axial_anchors"] = _axinfo
+    # CORRECTED-RESULT sagittal fix-tool GT: the reviewer dragged the anterior surface on the CORRECTED result
+    # along the FRAME axis (fixed lateral). A per-frame RIGID axial shift (+ tilt), GUARDED by a cross-lateral
+    # check: applied only when the rigid move makes the frame more consistent across all laterals (a real drift /
+    # tilt); declined when it can't (an edge-specific defect no rigid move can reach). Sticky + idempotent.
+    _cea = p_all.get("corrected_edge_anchors")
+    if _cea:
+        corrected, _ceinfo = apply_sagittal_surface_gt(corrected, _cea, params, workers=workers)
+        info["corrected_edge_anchors"] = _ceinfo
     # #2 fix-columns drag-to-correct: apply the annotator's explicit per-frame manual depth nudges LAST,
     # so they override whatever the auto-correction left for those frames (manual ground truth wins).
     ms = p_all.get("manual_shifts")

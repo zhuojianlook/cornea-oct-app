@@ -85,6 +85,14 @@ interface CaseState {
    *  flag is written, which is why this must complete BEFORE setDifficult. */
   commitBorderAnchors: (anchors: Record<string, Record<string, number>>, parabola: boolean,
                         parabolaSlices?: string[]) => Promise<void>;
+  /** Persist the CORRECTED-result sagittal edits (drawn on the before/after right pane) as sticky
+   *  corrected_edge_anchors — a pure SURFACE PIN (WYSIWYG), NOT a tissue warp: the drawn depth becomes the
+   *  served corrected surface at those frames (oct-corrected-curve pins them), so narrow corrections the DP
+   *  detector would smooth away actually stick. No preprocess needed. Empty {} clears. */
+  commitCorrectedEdgeAnchors: (anchors: Record<string, Record<string, number>>) => Promise<void>;
+  /** Reload the manifest + bump segVersion so the corrected pane re-fetches its (now-pinned) surface. The cheap
+   *  refresh a pin-only corrected-edge commit needs — no ~2min preprocess, because no tissue moved. */
+  refreshCorrectedView: () => Promise<void>;
   /** Persist crop marks (surface-crop frames / crop region) WITHOUT re-running the pipeline — the cheap
    *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
   commitOctMarks: (cropFrames: number[] | null, cropRegion: { lateral: [number, number]; frames: number[] } | null,
@@ -321,12 +329,20 @@ export const useCaseStore = create<CaseState>()(
         // use_redetect: flatten to the CONFIRMED surface — which _redetect_surface_cached now serves from
         // generalize.npz because the flag above is set. The editor previews the same surface, so what you
         // judged is what you get.
-        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ use_redetect: true }));
+        const pre = await api.json<{ case_info?: { manifest?: { oct_iter?: { corrected_edge_anchors?: {
+          applied?: boolean; declined?: boolean; frames_adjusted?: number; dev_before?: number; dev_after?: number } } } } }>(
+          `/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ use_redetect: true }));
         await get().openCase();                  // reload the re-corrected volume (cache-busted URL)
         const wf = useWorkflowStore.getState();
         wf.set("segVersion", wf.segVersion + 1);  // re-render previews
+        // Corrected-edge outcome (guarded rigid axial move): tell the reviewer whether it took or was declined,
+        // so a legitimately-declined periphery correction reads as "can't be rigidly fixed", not "nothing happened".
+        const ce = pre?.case_info?.manifest?.oct_iter?.corrected_edge_anchors;
+        const ceNote = ce?.declined
+          ? `Corrected-edge correction DECLINED — no rigid axial shift fixes it without corrupting the good laterals (cross-lateral deviation ${ce.dev_before}→${ce.dev_after}px). Left as-is (a periphery a rigid move can't reach). `
+          : (ce?.applied ? `Corrected-edge correction applied as a rigid axial shift to ${ce.frames_adjusted} frame(s). ` : "");
         wf.set("status", { kind: "done", title: "Re-run complete",
-          detail: (guided?.accepted
+          detail: ceNote + (guided?.accepted
                     ? `Detection improved and kept — ${guided.why}. `
                     : (guided ? `Guided detection did NOT beat auto (${guided.why}), so the scan keeps the better surface. ` : ""))
                  + "Inspect it — correct again, Approve, or Skip." });
@@ -379,6 +395,24 @@ export const useCaseStore = create<CaseState>()(
       await api.json(`/api/case/${id}/oct-border-redetect`, "POST",
         JSON.stringify({ border_pass: 1, border_anchors: anchors, parabola,
                          parabola_slices: parabolaSlices ?? null }));
+    },
+
+    commitCorrectedEdgeAnchors: async (anchors) => {
+      const id = get().caseId;
+      if (!id) return;
+      // Persist the drawn corrected-edge anchors. They are a pure SURFACE PIN: oct-corrected-curve overrides the
+      // detected surface with these values at the drawn frames (WYSIWYG). No tissue is moved, so no preprocess
+      // is needed — the caller refreshes the view so the pane re-fetches the pinned curve. Empty {} clears.
+      await api.json(`/api/case/${id}/oct-corrected-redetect`, "POST",
+        JSON.stringify({ corrected_edge_anchors: anchors ?? {} }));
+    },
+
+    refreshCorrectedView: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      await get().openCase();                       // reload manifest (persisted anchors) + volumes
+      const wf = useWorkflowStore.getState();
+      wf.set("segVersion", wf.segVersion + 1);       // corrected pane re-fetches oct-corrected-curve (now pinned)
     },
 
     setDifficult: async (difficult, reason) => {

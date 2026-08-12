@@ -11,6 +11,7 @@ import { useWorkflowStore } from "../../store/workflowStore";
 import { pxToIjk, brushVoxels } from "../../api/coords";
 import { octProposals } from "../../api/lifecycle";
 import { usePendingEditStore } from "../../store/pendingEditStore";
+import { CorrectedEdgePanel } from "./CorrectedEdgePanel";
 import type { PreviewImage } from "../../api/types";
 
 // A preview either carries an inline base64 data_url (segmentation/consensus) or a lazy `src`
@@ -224,8 +225,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // are inline base64 PNGs that loadSteps only clears when it is next opened — so a filmstrip viewed on
   // one scan would sit in state, tens of MB, across every following case in a triage run.
   useEffect(() => { setSteps([]); setStepsOpen(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [caseId]);
-  const zoomBorderAt = (clientX: number, clientY: number, factor: number) => {
-    const host = borderHostRef.current?.getBoundingClientRect();
+  // Zoom around the cursor, keeping the point under it fixed. `host` is the container whose CENTRE is the
+  // transform origin — the LEFT editor's for a left-pane scroll, the CORRECTED pane's for a right-pane scroll —
+  // so scrolling over EITHER pane zooms and anchors to what you're pointing at (both panes share bZoom/bPan).
+  const zoomBorderAtRect = (clientX: number, clientY: number, factor: number, host: DOMRect | undefined) => {
     setBZoom((z) => {
       const nz = Math.max(1, Math.min(10, z * factor));
       if (nz === z) return z;
@@ -238,6 +241,11 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
       return nz;
     });
   };
+  const zoomBorderAt = (clientX: number, clientY: number, factor: number) =>
+    zoomBorderAtRect(clientX, clientY, factor, borderHostRef.current?.getBoundingClientRect());
+  // Scroll-to-zoom for the CORRECTED (right) pane — same zoom state, but anchored to the RIGHT pane's own centre.
+  const onCorrectedWheel = (clientX: number, clientY: number, deltaY: number, rect: DOMRect | undefined) =>
+    zoomBorderAtRect(clientX, clientY, deltaY < 0 ? 1.2 : 1 / 1.2, rect);
   const zoomBorderCentered = (factor: number) => {
     const h = borderHostRef.current?.getBoundingClientRect();
     if (h) zoomBorderAt(h.left + h.width / 2, h.top + h.height / 2, factor);
@@ -259,6 +267,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const anchorsDirty = anchorsSig(borderAnchors) !== anchorsSig(persistedAnchors);
   const anchorCount = useMemo(() => { let n = 0; borderAnchors.forEach((fm) => { n += fm.size; }); return n; }, [borderAnchors]);
   const setPendingEdit = usePendingEditStore((s) => s.setPending);
+  // Before/after: which red line is being edited (original/raw left vs corrected-result right). Shared with the
+  // CorrectedEdgePanel + TimelineBar so ONE "Correct & re-run" commits whichever line was drawn.
+  const editTarget = usePendingEditStore((s) => s.editTarget);
+  const setEditTarget = usePendingEditStore((s) => s.setEditTarget);
   // Border edit MODE (2c): drag the noisy per-frame EDGE (red) or the smooth PARABOLA (blue). In parabola mode
   // a drag adds a point the quadratic must pass through; the curve re-fits live and Confirm uses it EXACTLY.
   const [borderMode, setBorderMode] = useState<"edge" | "parabola">("edge");
@@ -737,6 +749,28 @@ const PROP_SLICE_BAND = 20;
   const inputSrc = fixCols
     ? (caseId && cur ? resourceUrl(`/api/case/${caseId}/oct-border-slice?slice_index=${cur.slice_index}&border_pass=${borderPass}`) : null)
     : (borderPass > 1 ? passInputImg : (rawCur ? imgSrc(rawCur) : null));
+  // Self-heal a transient B-scan load failure. On scan-advance (Approve → next) the sidecar can be momentarily
+  // busy (committing the just-approved scan / warming the next scan's caches), so this one <img> can fail to
+  // load while the JSON curve for the same frame succeeds — leaving the fix-columns pane showing the red/cyan
+  // lines floating over a BLANK B-scan, with no recovery because <img> never retries itself. So on error we
+  // re-request a few times with a cache-busting suffix (fix-columns http URL only — blob srcs can't take a
+  // query param). The counter resets whenever the underlying src changes, so each B-scan gets a fresh budget.
+  const [imgRetry, setImgRetry] = useState(0);
+  useEffect(() => { setImgRetry(0); }, [inputSrc]);
+  const inputSrcR = (fixCols && inputSrc && imgRetry > 0)
+    ? `${inputSrc}${inputSrc.includes("?") ? "&" : "?"}_r=${imgRetry}`
+    : inputSrc;
+  // Tracks whether THIS src's B-scan has painted yet. First-open of a scan computes its surface / surface-crop
+  // caches on the sidecar (25 s+ uncached), so the PNG can be in flight for a while — during which the panel
+  // would otherwise show the red/cyan lines floating over black, which reads as "broken". Gate a "loading"
+  // affordance on this instead. onLoad is the fast path; the ref-check covers a cached image that finished
+  // loading before React bound the handler (onLoad would never fire, stranding the overlay over a good image).
+  const bImgRef = useRef<HTMLImageElement | null>(null);
+  const [bImgLoaded, setBImgLoaded] = useState(false);
+  useEffect(() => {
+    const el = bImgRef.current;
+    setBImgLoaded(!!(el && el.complete && el.naturalWidth > 0));
+  }, [inputSrcR]);
 
   const borderSliceIdx = cur?.slice_index ?? null;
   // Seed from the marks already stored for THIS slice, so an existing mark can be seen and amended rather
@@ -1213,6 +1247,12 @@ const PROP_SLICE_BAND = 20;
     // A new gesture starts fresh — never bridge from where the last one ended. Must be here, ABOVE the
     // crop/cut branches: they return early, so clearing it further down missed every posterior-line drag.
     borderPaintRef.current = null;
+    // Before/after: when editing the CORRECTED (right) line, the raw (left) line is view-only — pan/zoom still
+    // work, but no edit — so the reviewer edits ONE line at a time and the single "Correct & re-run" is
+    // unambiguous. (The two corrections still compose; this only gates which one you're drawing right now.)
+    if (showRaw && editTarget !== "original") {
+      borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode: "pan" }; return;
+    }
     if (cropMode && cropSub === "line" && e.shiftKey && !readOnly && e.button !== 1) {
       // SHIFT moves the WHOLE bottom line. Only in the line sub-mode: column painting is already a plain
       // click-and-hold drag and needed no modifier — adding one there just made an ordinary action feel
@@ -1521,11 +1561,11 @@ const PROP_SLICE_BAND = 20;
     const hasWork = nPoints > 0 || cropFrames !== null || cropRegion !== null || defectCols !== null
       || postApi !== null;
     setPendingEdit(hasWork
-      ? { caseId, anchors, parabola, parabolaSlices, nSlices, nPoints, cropFrames, cropRegion,
-          defectCols, postAnchors: postApi }
+      ? { caseId, anchors, parabola, parabolaSlices, nSlices, nPoints, bordersDirty: anchorsDirty,
+          cropFrames, cropRegion, defectCols, postAnchors: postApi }
       : null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [caseId, fixCols, orient, borderMode, anchorCount, paraCount, paraAnchors, borderAnchors,
+  }, [caseId, fixCols, orient, borderMode, anchorCount, paraCount, paraAnchors, borderAnchors, anchorsDirty,
       cropDirty, cropColsSig, latCropDirty, latCropFrames, latCropLo, latCropHi,
       markDirty, markCols, borderSliceIdx, postCount, postAnchors]);
 
@@ -2033,7 +2073,9 @@ const PROP_SLICE_BAND = 20;
                   // (frame0 on the RIGHT). Image + SVG overlay are children, so they flip together and stay
                   // aligned; the four screen-x→frame conversions invert the fraction (1 - fx) to compensate.
                   transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom}) scaleX(-1)`, transformOrigin: "center center" }}>
-      <img src={inputSrc} alt="pass input" draggable={false}
+      <img ref={bImgRef} src={inputSrcR ?? undefined} alt="pass input" draggable={false}
+        onLoad={() => setBImgLoaded(true)}
+        onError={() => { if (fixCols && imgRetry < 5) window.setTimeout(() => setImgRetry((n) => n + 1), 300); }}
         style={bSized
           ? { display: "block", width: "100%", height: "100%", objectFit: "fill", imageRendering: "pixelated", filter: enhanceFilter }
           : { display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: enhanceFilter }} />
@@ -2300,6 +2342,15 @@ const PROP_SLICE_BAND = 20;
               pointerEvents="none" />
           ))}
       </svg>
+      {/* First-open of a scan can leave this PNG in flight while the sidecar computes its caches; without this
+          the pane shows the red/cyan lines over black, which reads as "broken". Cover it with a plain "loading"
+          state until the image paints. transform: scaleX(-1) counters the parent flip so the text is readable. */}
+      {fixCols && !bImgLoaded && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                      background: "rgba(15,18,24,0.82)", pointerEvents: "none", zIndex: 6, transform: "scaleX(-1)" }}>
+          <span style={{ color: "#cbd5e1", fontSize: 13, letterSpacing: 0.3 }}>loading B-scan…</span>
+        </div>
+      )}
     </div>
   ) : null;
 
@@ -2438,6 +2489,26 @@ const PROP_SLICE_BAND = 20;
                              fontSize: 11, padding: "2px 7px", whiteSpace: "nowrap" }}>
                     {showRaw ? "⇆ corrected: on" : "⇆ corrected: off"}
                   </button>
+                )}
+                {/* WHICH red line the before/after view edits. Lives in the toolbar (not floating over a pane) so
+                    it never overlaps the zoom / Clear-slice controls. Only shown once the corrected panel is on.
+                    The two corrections COMPOSE (original = detection + base warp; corrected = post-hoc rigid drift
+                    fix); you edit ONE at a time so the single "Correct & re-run" is unambiguous. */}
+                {onToggleRaw && showRaw && (
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 2, whiteSpace: "nowrap" }}>
+                    <span style={{ fontSize: 10, opacity: 0.6, marginLeft: 2 }}>edit line:</span>
+                    {(["original", "corrected"] as const).map((t) => (
+                      <button key={t} onClick={() => setEditTarget(t)}
+                        title={t === "original"
+                          ? "Edit the ORIGINAL (left) red line — fixes detection + reshapes the base surface."
+                          : "Edit the CORRECTED-result (right) red line — fixes residual inter-frame drift via a post-hoc rigid per-frame warp."}
+                        style={{ background: editTarget === t ? (t === "corrected" ? "rgba(34,211,238,0.18)" : "var(--c-surface2)") : "none",
+                                 border: "1px solid", borderColor: editTarget === t ? (t === "corrected" ? "#22d3ee" : "var(--c-accent)") : "var(--c-border)",
+                                 borderRadius: 4, color: editTarget === t ? (t === "corrected" ? "#22d3ee" : "var(--c-text)") : "var(--c-text-dim)",
+                                 cursor: "pointer", fontSize: 11, padding: "2px 7px", whiteSpace: "nowrap" }}>
+                        {t === "original" ? "Original" : "Corrected"}</button>
+                    ))}
+                  </span>
                 )}
                 {cropMode && (
                   <ToggleButtonGroup size="small" exclusive value={cropSub}
@@ -2737,11 +2808,11 @@ const PROP_SLICE_BAND = 20;
           // FIFTH of the image size — the picture renders 505x251 instead of 606x301 to save 10 px of
           // whitespace. Trimmed to 2, and the captions are absolutely positioned so they cost no height
           // either (17 px + 4 gap each, which binds whenever the window is short).
-          <div style={{ display: "flex", gap: 2, width: "100%", height: "100%", alignItems: "stretch", justifyContent: "center" }}>
+          <div style={{ display: "flex", gap: 2, width: "100%", height: "100%", alignItems: "stretch", justifyContent: "center", position: "relative" }}>
             <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 0, position: "relative" }}>
-              <span className="text-[11px]" style={{ color: "var(--c-text-dim)", position: "absolute", top: 0, left: 0,
+              <span className="text-[11px]" style={{ color: editTarget === "original" || !showRaw ? "var(--c-accent)" : "var(--c-text-dim)", position: "absolute", top: 0, left: 0,
                                                      zIndex: 4, pointerEvents: "none", background: "var(--c-bg)", padding: "0 4px" }}>
-                {passInputLabel} — drag the red border{bZoom > 1 ? " · shift/middle-drag to pan" : " · scroll to zoom"}
+                {passInputLabel}{editTarget === "original" || !showRaw ? " — drag the red border" : " (view)"}{bZoom > 1 ? " · shift/middle-drag to pan" : " · scroll to zoom"}
               </span>
               <div ref={setBorderHost} onWheel={borderPanel ? onBorderWheel : undefined}
                 style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", position: "relative",
@@ -2779,25 +2850,14 @@ const PROP_SLICE_BAND = 20;
                 )}
             </div>
             {showRaw && cur && (
-              <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 0, position: "relative" }}>
-                <span className="text-[11px]" style={{ color: "var(--c-green)", position: "absolute", top: 0, right: 0,
-                                                       zIndex: 4, pointerEvents: "none", background: "var(--c-bg)", padding: "0 4px" }}>corrected (result)</span>
-                <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
-                  {/* Display-only mirror of the CORRECTED slice, matching the LEFT editor panel EXACTLY: same
-                      physical-aspect pixel box (bDispW×bDispH), same scaleX(-1) frame flip, and same zoom/pan —
-                      so before (left) and after (right) render same-size + same-orientation for a fair
-                      comparison. Previously the right panel reused the un-flipped, maxWidth-sized interactive
-                      correctedPanel, so it looked LR-mirrored AND a different size than the editor. */}
-                  <div style={{ position: "relative",
-                                ...(bSized ? { width: bDispW, height: bDispH } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
-                                transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom}) scaleX(-1)`, transformOrigin: "center center" }}>
-                    <img src={imgSrc(cur)} alt="corrected" draggable={false}
-                      style={bSized
-                        ? { display: "block", width: "100%", height: "100%", objectFit: "fill", imageRendering: "pixelated", filter: effectiveGroup === "context" ? enhanceFilter : undefined }
-                        : { display: "block", maxHeight: "100%", maxWidth: "100%", imageRendering: "pixelated", filter: effectiveGroup === "context" ? enhanceFilter : undefined }} />
-                  </div>
-                </div>
-              </div>
+              // The CORRECTED (result) pane. Now EDITABLE: the reviewer can drag the anterior surface here (along
+              // the frame axis) to correct residual inter-frame drift the raw edit can't reach — it applies as a
+              // post-hoc per-frame RIGID warp (apply_sagittal_surface_gt) on Correct & re-run. Same physical-aspect
+              // box (bDispW×bDispH), scaleX(-1) frame flip, and zoom/pan as the LEFT editor, so before/after render
+              // same-size + same-orientation. Backdrop is the NATIVE corrected B-scan so the line lands on-grid.
+              <CorrectedEdgePanel sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
+                                  bZoom={bZoom} bPan={bPan} filterCss={enhanceFilter} readOnly={readOnly}
+                                  onZoomWheel={onCorrectedWheel} />
             )}
           </div>
         ) : correctedPanel}
@@ -2836,6 +2896,23 @@ const PROP_SLICE_BAND = 20;
           >
             {PROP_SLICE_BAND}⏭
           </button>
+          {/* Two SPREAD-OUT slices (~1/3 and ~2/3 across the volume). Correcting the SAME defect on 2+ spread
+              slices is what lets Generalize propagate it across the whole scan — a single slice is a no-op
+              (gen_min_slices=2), so one edit never reaches its neighbours. These give the reviewer a fast way to
+              seed that: correct here, correct the other, then Re-run and the whole volume follows. */}
+          {fixCols && orient === "sagittal" && (allCurves?.edges?.length ?? 0) > 6 &&
+            [Math.round((allCurves!.edges.length) / 3), Math.round((2 * allCurves!.edges.length) / 3)].map((s, i) => (
+              <button
+                key={`spread${i}`}
+                type="button"
+                onClick={() => jumpToSlice(s)}
+                title={`Jump to spread-out slice ${dispSlice(s)} (one of two spread ~evenly across the volume). Correct the SAME defect on BOTH spread slices, then Re-run, so Generalize propagates it volume-wide — a single-slice correction cannot.`}
+                className="text-xs px-1.5 py-0.5 rounded border whitespace-nowrap"
+                style={{ borderColor: "var(--c-border)", color: "var(--c-text-dim)" }}
+              >
+                ⤢ slice {dispSlice(s)}
+              </button>
+            ))}
           {/* Step through the slices ranked most-questionable first (raw detected edge vs its own fit), so an
               edit lands where it carries the most information instead of wherever scrubbing stopped. The
               editor already opens on rank 1; this walks to the next one. */}
