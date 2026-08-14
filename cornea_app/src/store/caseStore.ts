@@ -9,6 +9,33 @@ import { useWorkflowStore } from "./workflowStore";
 // workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
 let _lastOpenedCase: string | null = null;
 
+// Audible "process done" chime — the reviewer asked to be alerted when a ~2-min re-run finishes so they don't
+// have to sit watching it. Web Audio (no asset); best-effort resume() past autoplay-suspension (a prior click
+// gesture usually clears it), silently no-ops if audio is unavailable. ok=true → rising three-tone; else low buzz.
+function playDoneChime(ok = true): void {
+  try {
+    const AC: typeof AudioContext | undefined =
+      window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const go = () => {
+      const t0 = ctx.currentTime;
+      const tones: Array<[number, number]> = ok ? [[784, 0], [1175, 0.16], [1568, 0.32]] : [[220, 0], [175, 0.28]];
+      for (const [freq, at] of tones) {
+        const o = ctx.createOscillator(); const g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = freq;
+        g.gain.setValueAtTime(0.0001, t0 + at);
+        g.gain.exponentialRampToValueAtTime(0.7, t0 + at + 0.02);   // loud
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + 0.42);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(t0 + at); o.stop(t0 + at + 0.42);
+      }
+      window.setTimeout(() => { try { void ctx.close(); } catch { /* ignore */ } }, 2000);
+    };
+    if (ctx.state === "suspended") void ctx.resume().then(go).catch(go); else go();
+  } catch { /* audio unavailable */ }
+}
+
 // Per-case serialization of review-flag writes: each toggle POSTs the FULL flag set, so rapid toggles must
 // land on disk IN CLICK ORDER (out-of-order arrival on the sidecar threadpool would let an older/smaller set
 // win and silently drop a flag on reload). Mirrors OctLoader's persistClassification chain.
@@ -86,13 +113,11 @@ interface CaseState {
   commitBorderAnchors: (anchors: Record<string, Record<string, number>>, parabola: boolean,
                         parabolaSlices?: string[]) => Promise<void>;
   /** Persist the CORRECTED-result sagittal edits (drawn on the before/after right pane) as sticky
-   *  corrected_edge_anchors — a pure SURFACE PIN (WYSIWYG), NOT a tissue warp: the drawn depth becomes the
-   *  served corrected surface at those frames (oct-corrected-curve pins them), so narrow corrections the DP
-   *  detector would smooth away actually stick. No preprocess needed. Empty {} clears. */
+   *  corrected_edge_anchors. These are GROUND TRUTH for a RIGID per-frame axial move on the next re-run: the
+   *  edited slices feed align_corrected_to_smooth (the "Smooth to trusted slices" action) or, on their own,
+   *  apply_sagittal_surface_gt — a guarded per-frame depth shift (+ tilt) that moves the tissue onto the drawn
+   *  curve. So a correction the DP detector would smooth away actually sticks. Empty {} clears. */
   commitCorrectedEdgeAnchors: (anchors: Record<string, Record<string, number>>) => Promise<void>;
-  /** Reload the manifest + bump segVersion so the corrected pane re-fetches its (now-pinned) surface. The cheap
-   *  refresh a pin-only corrected-edge commit needs — no ~2min preprocess, because no tissue moved. */
-  refreshCorrectedView: () => Promise<void>;
   /** Persist crop marks (surface-crop frames / crop region) WITHOUT re-running the pipeline — the cheap
    *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
   commitOctMarks: (cropFrames: number[] | null, cropRegion: { lateral: [number, number]; frames: number[] } | null,
@@ -103,7 +128,7 @@ interface CaseState {
   /** Search + adopt better DETECTOR parameters from every correction drawn so far (guarded). */
   startDetectorTune: () => Promise<{ started: number; n_points?: number; note?: string } | null>;
   /** Re-run THIS scan against the corrections drawn on it, and stay on it. The per-scan iteration step. */
-  rerunWithCorrections: () => Promise<boolean>;
+  rerunWithCorrections: (opts?: { smoothAlign?: boolean; trustedLaterals?: number[] }) => Promise<boolean>;
   // "Surface-crop" manual mark → manifest.surface_crop_manual (human review of the auto-detected clipped-cornea set).
   setSurfaceCrop: (surfaceCrop: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
@@ -289,7 +314,7 @@ export const useCaseStore = create<CaseState>()(
     //
     // Stays on the scan deliberately. The verdict buttons advance; this one is the iteration, and a loop you
     // cannot go round twice without losing your place is not a loop.
-    rerunWithCorrections: async () => {
+    rerunWithCorrections: async (opts) => {
       const id = get().caseId;
       if (!id) return false;
       set((s) => { s.busy = true; s.apiError = null; });
@@ -329,9 +354,12 @@ export const useCaseStore = create<CaseState>()(
         // use_redetect: flatten to the CONFIRMED surface — which _redetect_surface_cached now serves from
         // generalize.npz because the flag above is set. The editor previews the same surface, so what you
         // judged is what you get.
-        const pre = await api.json<{ case_info?: { manifest?: { oct_iter?: { corrected_edge_anchors?: {
-          applied?: boolean; declined?: boolean; frames_adjusted?: number; dev_before?: number; dev_after?: number } } } } }>(
-          `/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ use_redetect: true }));
+        const pre = await api.json<{ case_info?: { manifest?: { oct_iter?: {
+          corrected_edge_anchors?: { applied?: boolean; declined?: boolean; frames_adjusted?: number; dev_before?: number; dev_after?: number };
+          corrected_smooth_align?: { applied?: boolean; frames_adjusted?: number; reason?: string; trusted_slices?: number; edited_slices?: number; approved_slices?: number; max_shift?: number } } } } }>(
+          `/api/case/${id}/oct-preprocess`, "POST",
+          JSON.stringify({ use_redetect: true, corrected_smooth_align: opts?.smoothAlign ?? false,
+                           corrected_trusted_laterals: opts?.smoothAlign ? (opts?.trustedLaterals ?? null) : null }));
         await get().openCase();                  // reload the re-corrected volume (cache-busted URL)
         const wf = useWorkflowStore.getState();
         wf.set("segVersion", wf.segVersion + 1);  // re-render previews
@@ -341,16 +369,30 @@ export const useCaseStore = create<CaseState>()(
         const ceNote = ce?.declined
           ? `Corrected-edge correction DECLINED — no rigid axial shift fixes it without corrupting the good laterals (cross-lateral deviation ${ce.dev_before}→${ce.dev_after}px). Left as-is (a periphery a rigid move can't reach). `
           : (ce?.applied ? `Corrected-edge correction applied as a rigid axial shift to ${ce.frames_adjusted} frame(s). ` : "");
+        // Smooth-align outcome: propagated the reviewer's edited (drawn) + approved trusted curves across the volume.
+        const csa = pre?.case_info?.manifest?.oct_iter?.corrected_smooth_align;
+        const csaNote = opts?.smoothAlign
+          ? (csa?.applied
+              ? `Propagated your trusted curves (${csa.edited_slices ?? 0} edited + ${csa.approved_slices ?? 0} approved slice${(csa.trusted_slices ?? 0) === 1 ? "" : "s"}) across the volume — each B-scan rigidly moved to follow them, ${csa.frames_adjusted} frame(s) adjusted (max ${csa.max_shift ?? 0}px). `
+              : (csa?.reason && csa.reason.includes("no trusted")
+                  ? `No trusted slices yet — draw the good curve on a slice or approve one, then run "Smooth to trusted slices". `
+                  : `Smooth-align made no change (${csa?.reason ?? "nothing to propagate"}). `))
+          : "";
         wf.set("status", { kind: "done", title: "Re-run complete",
-          detail: ceNote + (guided?.accepted
+          detail: csaNote + ceNote + (guided?.accepted
                     ? `Detection improved and kept — ${guided.why}. `
                     : (guided ? `Guided detection did NOT beat auto (${guided.why}), so the scan keeps the better surface. ` : ""))
                  + "Inspect it — correct again, Approve, or Skip." });
+        // Warm the corrected-surface cache BEFORE the chime, so the chime means "ready to inspect" rather than
+        // just "flatten finished" — the surface detection is the heavy trailing compute the reviewer was hearing.
+        try { await api.json(`/api/case/${id}/oct-corrected-curve`, "POST", "{}"); } catch { /* best-effort warm-up */ }
+        playDoneChime(true);                      // audible "re-run done" alert (reviewer request)
         return true;
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         set((s) => { s.apiError = m; });
         useWorkflowStore.getState().set("status", { kind: "error", title: "Re-run failed", detail: m });
+        playDoneChime(false);                     // low buzz on failure
         return false;
       } finally {
         set((s) => { s.busy = false; });
@@ -400,19 +442,12 @@ export const useCaseStore = create<CaseState>()(
     commitCorrectedEdgeAnchors: async (anchors) => {
       const id = get().caseId;
       if (!id) return;
-      // Persist the drawn corrected-edge anchors. They are a pure SURFACE PIN: oct-corrected-curve overrides the
-      // detected surface with these values at the drawn frames (WYSIWYG). No tissue is moved, so no preprocess
-      // is needed — the caller refreshes the view so the pane re-fetches the pinned curve. Empty {} clears.
+      // Persist the drawn corrected-edge anchors as sticky GT (oct_params.corrected_edge_anchors). The next re-run
+      // consumes them as a RIGID per-frame axial move (the "Smooth to trusted slices" align, or
+      // apply_sagittal_surface_gt on their own), so a correction the DP detector would smooth away actually sticks.
+      // No warp happens here — only on the following preprocess Run. Empty {} clears.
       await api.json(`/api/case/${id}/oct-corrected-redetect`, "POST",
         JSON.stringify({ corrected_edge_anchors: anchors ?? {} }));
-    },
-
-    refreshCorrectedView: async () => {
-      const id = get().caseId;
-      if (!id) return;
-      await get().openCase();                       // reload manifest (persisted anchors) + volumes
-      const wf = useWorkflowStore.getState();
-      wf.set("segVersion", wf.segVersion + 1);       // corrected pane re-fetches oct-corrected-curve (now pinned)
     },
 
     setDifficult: async (difficult, reason) => {

@@ -271,6 +271,11 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // CorrectedEdgePanel + TimelineBar so ONE "Correct & re-run" commits whichever line was drawn.
   const editTarget = usePendingEditStore((s) => s.editTarget);
   const setEditTarget = usePendingEditStore((s) => s.setEditTarget);
+  // TRUSTED SLICES for smooth-align: mark the sagittal slices whose corrected border is good; smooth-align builds
+  // its curvature from only these (see align_corrected_to_smooth). Cleared automatically on scan switch (keyed by case).
+  const trustedSlices = usePendingEditStore((s) => s.trustedSlices);
+  const toggleTrustedSlice = usePendingEditStore((s) => s.toggleTrustedSlice);
+  const clearTrustedSlices = usePendingEditStore((s) => s.clearTrustedSlices);
   // Border edit MODE (2c): drag the noisy per-frame EDGE (red) or the smooth PARABOLA (blue). In parabola mode
   // a drag adds a point the quadratic must pass through; the curve re-fits live and Confirm uses it EXACTLY.
   const [borderMode, setBorderMode] = useState<"edge" | "parabola">("edge");
@@ -2510,6 +2515,33 @@ const PROP_SLICE_BAND = 20;
                     ))}
                   </span>
                 )}
+                {/* APPROVE-SLICE marking — in the Corrected smooth-align workflow. Approve a slice whose corrected
+                    border is already good (its detection becomes a trusted GOOD curve); slices you EDIT are trusted
+                    automatically via their drawn line. "↻ Smooth to trusted slices" propagates edited + approved
+                    curves across the whole volume. Scroll to a good slice, click, repeat. */}
+                {onToggleRaw && showRaw && editTarget === "corrected" && cur && cur.slice_index != null && (() => {
+                  const tl = (trustedSlices && trustedSlices.caseId === caseId) ? trustedSlices.slices : [];
+                  const isT = tl.includes(cur.slice_index);
+                  return (
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 3, whiteSpace: "nowrap", marginLeft: 4 }}>
+                      <button onClick={() => caseId && toggleTrustedSlice(caseId, cur.slice_index as number)}
+                        title="APPROVE this sagittal slice — its corrected border is already good, so its detection becomes a trusted GOOD curve. Slices you EDIT (draw on) are trusted automatically. Smooth-align propagates all trusted curves across the volume. Toggles off if already approved."
+                        style={{ background: isT ? "rgba(52,211,153,0.18)" : "none",
+                                 border: "1px solid", borderColor: isT ? "#34d399" : "var(--c-border)",
+                                 borderRadius: 4, color: isT ? "#34d399" : "var(--c-text-dim)",
+                                 cursor: "pointer", fontSize: 11, padding: "2px 7px", whiteSpace: "nowrap" }}>
+                        {isT ? "✓ slice approved" : "✓ approve slice"}</button>
+                      {tl.length > 0 && (
+                        <span style={{ fontSize: 10, opacity: 0.7 }}>
+                          {tl.length} approved
+                          <button onClick={() => caseId && clearTrustedSlices(caseId)} title="Clear all approved-slice marks"
+                            style={{ marginLeft: 3, border: "none", background: "none", color: "var(--c-text-dim)",
+                                     cursor: "pointer", fontSize: 10, textDecoration: "underline" }}>clear</button>
+                        </span>
+                      )}
+                    </span>
+                  );
+                })()}
                 {cropMode && (
                   <ToggleButtonGroup size="small" exclusive value={cropSub}
                     onChange={(_, v) => { if (v) setCropSub(v); }}>

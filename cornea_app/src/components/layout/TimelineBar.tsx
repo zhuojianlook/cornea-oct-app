@@ -71,12 +71,24 @@ export function TimelineBar() {
   // CORRECTED-result edge edits (before/after right pane), committed alongside raw edits by the SAME re-run.
   const correctedEdge = usePendingEditStore((s) => s.correctedEdge);
   const takeCorrectedEdge = usePendingEditStore((s) => s.takeCorrectedEdge);
+  const editTarget = usePendingEditStore((s) => s.editTarget);
+  const trustedSlices = usePendingEditStore((s) => s.trustedSlices);
   const commitCorrectedEdgeAnchors = useCaseStore((s) => s.commitCorrectedEdgeAnchors);
   const correctedPts = correctedEdge?.dirty ? correctedEdge.nPoints : 0;
   // Did the reviewer actually CHANGE the raw line/marks (vs just re-loading a scan that already carries them)?
   // Only a real change reshapes the volume → full re-run; a corrected-edge-only pin stays instant.
   const rawDirty = !!pendingEdit && (pendingEdit.bordersDirty || pendingEdit.cropFrames !== null
     || pendingEdit.cropRegion !== null || pendingEdit.defectCols !== null || pendingEdit.postAnchors !== null);
+  // In Corrected mode, "Smooth to trusted slices" propagates the reviewer's EDITED (drawn) + APPROVED slices
+  // across the whole volume. It works WITH edits (the drawn line IS a trusted good curve), so — unlike the old
+  // "use the detected edge" — there is no correctedPts===0 requirement; only a raw change diverts to a raw re-run.
+  const smoothAlignReady = editTarget === "corrected" && !rawDirty;
+  // Trusted slices = APPROVED laterals (their detection is a good curve, sent as trustedLaterals) + slices EDITED
+  // this session (their drawn curve is a trusted curve, carried by the persisted corrected_edge_anchors).
+  const trustedForCase = (trustedSlices && trustedSlices.caseId === activeCaseId) ? trustedSlices.slices : [];
+  const editedLaterals = (correctedEdge?.dirty && correctedEdge.anchors)
+    ? Object.keys(correctedEdge.anchors).filter((k) => Object.keys(correctedEdge.anchors[k] ?? {}).length > 0).length : 0;
+  const trustedCount = trustedForCase.length + editedLaterals;
   // What the reject button is about to save. Counting only border POINTS read "(0)" whenever the pending work
   // was crop or defect marks — telling the reviewer their marks would be discarded, which was the opposite of
   // the truth.
@@ -540,12 +552,17 @@ export function TimelineBar() {
           await commitOctMarks(edit!.cropFrames, edit!.cropRegion, edit!.postAnchors);
         }
       }
-      // CORRECTED-result edge edits are a GUARDED rigid axial move (the tissue moves when a rigid shift/tilt
-      // genuinely aligns the frame; it's declined when it can't) — so, like a raw change, they need the full
-      // re-run to re-apply the pipeline + apply_sagittal_surface_gt. Persist them here first.
+      // CORRECTED-result edge edits: persist the reviewer's drawn curves as corrected_edge_anchors. In the
+      // smooth-align workflow the pipeline CONSUMES them as EDITED trusted curves (propagated across the volume),
+      // so committing them here is what feeds the smooth-align its ground truth.
       const ce = activeCaseId ? takeCorrectedEdge(activeCaseId) : null;
       if (ce) await commitCorrectedEdgeAnchors(ce);
-      const ok = await rerunWithCorrections();
+      // In Corrected mode, the re-run is "Smooth to trusted slices": propagate the edited (drawn, just committed)
+      // + approved slices across the volume. Only a raw change diverts to a plain raw re-run.
+      const ok = await rerunWithCorrections(
+        editTarget === "corrected" && !rawChanged
+          ? { smoothAlign: true, trustedLaterals: trustedForCase.length ? trustedForCase : undefined }
+          : undefined);
       if (!ok) setQueueNote("Re-run failed — your correction is saved; try again or Skip.");
       else setQueueNote(null);
     } catch (e) {
@@ -743,13 +760,19 @@ export function TimelineBar() {
       <Button size="small" variant="contained" color="warning" disabled={busy || navigating}
         onClick={() => void correctAndRerun()}
         startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-        title={"Apply what you drew to THIS scan and re-run it (~2 min), then stay here so you can look at the\n"
+        title={smoothAlignReady
+          ? "Smooth to trusted slices (~2 min). Takes the corrected-surface curves you EDITED (drew) plus the\n"
+            + "slices you APPROVED as trusted ground truth, and propagates them across the whole volume — each\n"
+            + "B-scan rigidly shifts/rotates so the result follows the curvature YOU defined. Rigid only: the\n"
+            + "within-frame arc is untouched. Mark a few good slices / draw a few, then run."
+          : "Apply what you drew to THIS scan and re-run it (~2 min), then stay here so you can look at the\n"
           + "result and correct again. Repeat until you are happy, then Approve.\n\n"
           + "The correction defines the surface — it is not a hint the detector can decline — so this converges\n"
           + "on the scan in front of you, with no dependence on the detector being well-tuned."}>
         {busyAction === "rerun" ? "Re-running…"
           : rawDirty ? `↻ Correct & re-run (${pendingSummary})`
-          : correctedPts > 0 ? `↻ Correct & re-run (${correctedPts} corrected-edge pt)`
+          : editTarget === "corrected"
+              ? `↻ Smooth to ${trustedCount} trusted slice${trustedCount === 1 ? "" : "s"} & re-run`
           : "↻ Re-run with corrections"}
       </Button>
       {/* MOVE ON without judging. Session-only: nothing is written, so it returns to the queue next time. */}

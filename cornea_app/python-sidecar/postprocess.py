@@ -21,6 +21,45 @@ import scar as scar_mod  # absolute density-tier helper (shared with the 3D disp
 BG, CORNEA, SCAR = 0, 1, 2
 
 
+def clip_labelmap_anterior_to_surface(label: np.ndarray, surface: np.ndarray,
+                                      cornea_val: int = CORNEA) -> np.ndarray:
+    """Force the cornea labelmap's ANTERIOR boundary onto the reviewer-accurate corneal SURFACE.
+
+    SAM2 auto-prompts on the bright corneal BAND — it never sees the detected surface, so its anterior boundary
+    is a rough band-top, not the epithelium. The corrected-result reconstruction (drawn edges + across-lateral
+    interpolation, DP fallback) IS the pixel-accurate anterior. For every column that already contains cornea,
+    this removes any label ABOVE the surface (air/background) and FILLS cornea from the surface down to the
+    segmentation's own top where SAM2 started BELOW the surface — so the label starts exactly at the surface.
+    Empty columns are never given cornea (the surface only relocates a boundary, it never invents tissue) and the
+    POSTERIOR boundary is left to SAM2. label = (lateral, depth, frames); surface[lateral, frame] = anterior depth
+    (0 = TOP), NaN where undetected → that column is left untouched. Returns a new array."""
+    lab = np.asarray(label)
+    if lab.ndim != 3:
+        return lab
+    L, D, F = lab.shape
+    surf = np.asarray(surface, dtype=np.float64)
+    if surf.shape != (L, F):
+        return lab
+    out = np.ascontiguousarray(lab.copy())
+    si = np.where(np.isfinite(surf), np.clip(np.rint(surf), 0, D - 1), -1).astype(np.int64)   # (L, F); -1 = skip
+    for l in range(L):
+        sl = out[l]                                   # (depth, F) view
+        sr = si[l]
+        for f in range(F):
+            s = int(sr[f])
+            if s < 0:
+                continue                              # no surface here → leave the column as SAM2 gave it
+            col = sl[:, f]
+            if not col.any():
+                continue                              # empty column → never invent cornea
+            col[:s] = BG                              # remove any label above the surface (that is air)
+            nz = np.nonzero(col)[0]
+            top = int(nz[0]) if nz.size else D        # the segmentation's own top after clipping
+            if top > s:
+                col[s:top] = cornea_val               # fill cornea from the surface down to it
+    return out
+
+
 def _spacing(affine: np.ndarray) -> list[float]:
     return [float(np.linalg.norm(affine[:3, i])) for i in range(3)]
 

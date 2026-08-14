@@ -799,6 +799,23 @@ def segment_sam2(case_id: str, req: Sam2Request) -> dict:
         # specular/saturation streak past the true posterior surface (the user shouldn't have to paint these
         # away slice-by-slice). Conservative + scar-safe; no-op on an already-smooth cornea.
         label = scar_mod.regularize_cornea(label)
+        # ANTERIOR-SURFACE CLIP: SAM2 auto-prompts on the bright band, so its anterior is a rough band-top, not the
+        # epithelium. Force the cornea's ANTERIOR onto the reviewer-accurate CORRECTED-RESULT reconstruction (drawn
+        # edges + across-lateral interpolation, DP fallback) — the same surface the corrected pane serves. So the
+        # reviewer's pixel-accurate edge flows straight into the training label, especially on steep limbus
+        # descents where the raw DP fails. base == the corrected volume (byte-identical), so label/surface align.
+        _m_seg = orch.read_manifest(case_id)
+        if bool((_m_seg.get("oct_params") or {}).get("seg_clip_anterior", oct_mod.DEFAULT_PARAMS.get("seg_clip_anterior", True))):
+            try:
+                _pp = {**oct_mod.DEFAULT_PARAMS, **(_m_seg.get("oct_params") or {})}
+                _bvol = np.asarray(nib.load(str(base)).dataobj).astype(np.float32)   # (lateral, depth, frame)
+                _surf = oct_mod.detect_surface_all(_bvol, _pp)                        # (lateral, frames)
+                _cea = _pp.get("corrected_edge_anchors")
+                if _cea:
+                    _surf = oct_mod.generalize_corrected_surface(_surf, _cea, _pp)
+                label = postprocess.clip_labelmap_anterior_to_surface(label, _surf)
+            except Exception as _clip_exc:  # noqa: BLE001 — best-effort; never fail segmentation over the clip
+                print(f"[segment] anterior-surface clip skipped: {_clip_exc}", file=sys.stderr)
     except Exception:
         _sam2_progress_set(case_id, "error", "SAM2 failed", n_planes, n_planes)
         raise
@@ -2133,6 +2150,13 @@ class OctPreprocessRequest(BaseModel):
                                               # anterior-surface depths (CORRECTED-output depth space, 0 = TOP) drawn on
                                               # an axial B-scan across laterals. STICKY like manual_shifts: applied as a
                                               # post-hoc additive per-frame warp (apply_axial_surface_gt); {} clears.
+    corrected_smooth_align: bool = False      # corrected pane "use the detected edge": smooth-fit the trusted detected
+                                              # surface across frames and rigidly align each B-scan onto it. ONE-SHOT
+                                              # (never persisted to oct_params), like apply_proposals — the reviewer
+                                              # re-invokes it per re-run; not a sticky GT (they chose align, not lock).
+    corrected_trusted_laterals: list | None = None  # smooth-align: ARRAY laterals (== oct-corrected-curve slice_index)
+                                              # whose detected border the reviewer marked GOOD; the smooth-fit reference
+                                              # is built from ONLY these. Empty/None → central-lateral fit. One-shot.
     use_redetect: bool | None = None          # oct-preprocess: flatten to the confirmed re-detected surface
                                               # (provided_edges) instead of auto-detecting — the fix-columns "Run".
     # WHICH slices are an exact fitted curve, when the payload mixes both kinds. `parabola` alone could only
@@ -2577,10 +2601,14 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # (the cached marched result) instead of auto-detecting — the same surface the scrub preview drew, so
     # preview == result. A SINGLE warp pass (no iteration / no axial-refine, see preprocess_oct_to_nifti).
     redetect_npz: Path | None = None
-    if req.use_redetect:
+    # Smooth-align ("use the detected edge") re-runs to reproduce the corrected result and iron out its
+    # undulation. It does NOT depend on a re-detected surface: on an AUTO-only scan there are no border anchors
+    # to flatten to, so fall back to a normal auto preprocess (+ the align at the end) instead of erroring.
+    _want_redetect = bool(req.use_redetect) and bool((m.get("oct_params") or {}).get("border_anchors"))
+    if req.use_redetect and not _want_redetect and not req.corrected_smooth_align:
+        raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
+    if _want_redetect:
         anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
-        if not anchors:
-            raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
         # ensure a FRESH cache for the persisted anchors (recompute if missing/stale incl. an algorithm
         # upgrade), then feed it to the worker — same surface the scrub display uses (preview == result).
         # _redetect_surface_cached returns WHICHEVER surface the scan carries (guided > generalize > local
@@ -2635,8 +2663,18 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         extra += ["--inject-pass", str(int(inject_pass)),
                   "--inject-force", json.dumps(_int_list(req.force_columns)),
                   "--inject-good", json.dumps(_int_list(req.good_columns))]
-    worker_out = _run_oct_worker("preprocess", src, work,
-                                 ({**eff_params, "apply_proposals": True} if _apply_prop else eff_params), vi,
+    # ONE-SHOT worker flags — passed to THIS run only, never merged into eff_params (which is what gets
+    # persisted to oct_params), so they don't stick like a sticky correction. apply_proposals bakes the auto
+    # crop; corrected_smooth_align is the corrected pane's "use the detected edge" smooth-fit rigid align.
+    _wparams = dict(eff_params)
+    if _apply_prop:
+        _wparams["apply_proposals"] = True
+    if req.corrected_smooth_align:
+        _wparams["corrected_smooth_align"] = True
+        if req.corrected_trusted_laterals:
+            _wparams["corrected_trusted_laterals"] = [int(v) for v in req.corrected_trusted_laterals
+                                                      if isinstance(v, (int, float))]
+    worker_out = _run_oct_worker("preprocess", src, work, _wparams, vi,
                                  companion=m.get("companion_txt"), extra=extra)
     iter_info = _parse_iter_info(worker_out)
     # NATIVE AUTO-TUNE: the worker tuned the DP detector to this scan; persist the chosen dp_* into the case's
@@ -4630,15 +4668,23 @@ def _axial_surface_cached(case_id: str, work: Path, p: dict):
     output file mtime + a detection-params signature so scrubbing frames is instant (first call detects the whole
     volume, ~seconds). This is the SAME detector apply_axial_surface_gt diffs against, so the drawn line the user
     corrects is the one the warp re-diffs (preview ≈ result)."""
+    import json as _json
     import numpy as np
     import nibabel as nib
     mt = work.stat().st_mtime
-    sig = ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS if k in p)
+    # CORRECTED-GENERALIZE: the reviewer's drawn edges reconstruct the served surface where the DP fails, so they
+    # must be part of the cache key (drawing a slice must re-serve). Full anchors dict → any change invalidates.
+    _cea = p.get("corrected_edge_anchors") or {}
+    sig = ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS if k in p) + ";cea=" + _json.dumps(_cea, sort_keys=True)
     c = _AXIAL_SURF_CACHE.get(case_id)
     if c and c[0] == mt and c[1] == sig:
         return c[2], c[3]
     vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)   # (lateral, depth, frame) = sagittal layout
     surf = oct_mod.detect_surface_all(vol, p)                          # (lateral, frames)
+    if _cea:
+        # Bypass the DP where it fails on steep limbus descents: reconstruct from the drawn edges + across-lateral
+        # interpolation (pixel-exact where drawn). See oct_preprocess.generalize_corrected_surface.
+        surf = oct_mod.generalize_corrected_surface(surf, _cea, p)
     shape = (int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2]))
     _AXIAL_SURF_CACHE[case_id] = (mt, sig, surf, shape)
     return surf, shape

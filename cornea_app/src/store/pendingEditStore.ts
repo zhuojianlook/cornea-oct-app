@@ -70,6 +70,13 @@ interface PendingEditState {
   /** Returns the corrected-edge anchors to commit (only when it belongs to `caseId` AND is dirty); clears it
    *  either way. Empty-but-dirty returns `{}` so a cleared correction is committed as a removal. */
   takeCorrectedEdge: (caseId: string) => Record<string, Record<string, number>> | null;
+
+  /** TRUSTED SLICES for smooth-align: the sagittal slices (ARRAY laterals == slice_index) whose detected border
+   *  the reviewer marked GOOD. smooth-align builds its per-frame curvature from ONLY these. Keyed by case so a
+   *  stale set can't leak onto the next scan; persists across scrolling until re-run or cleared. */
+  trustedSlices: { caseId: string; slices: number[] } | null;
+  toggleTrustedSlice: (caseId: string, slice: number) => void;
+  clearTrustedSlices: (caseId: string) => void;
 }
 
 export const usePendingEditStore = create<PendingEditState>((set, get) => ({
@@ -97,4 +104,15 @@ export const usePendingEditStore = create<PendingEditState>((set, get) => ({
     if (!c || c.caseId !== caseId || !c.dirty) return null;
     return c.anchors;   // may be {} → commit as a removal of the persisted corrected-edge set
   },
+
+  trustedSlices: null,
+  toggleTrustedSlice: (caseId, slice) => set((s) => {
+    // a scan switch resets the set (belongs to a different case)
+    const cur = s.trustedSlices && s.trustedSlices.caseId === caseId ? s.trustedSlices.slices : [];
+    const has = cur.includes(slice);
+    const slices = has ? cur.filter((x) => x !== slice) : [...cur, slice].sort((a, b) => a - b);
+    return { trustedSlices: { caseId, slices } };
+  }),
+  clearTrustedSlices: (caseId) => set((s) => (
+    s.trustedSlices && s.trustedSlices.caseId !== caseId ? {} : { trustedSlices: null })),
 }));
