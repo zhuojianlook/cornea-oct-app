@@ -4220,6 +4220,24 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         surf = _redetect_surface_cached(case_id, m, anc) if (pass_n <= 1 and anc) else None
         if surf is not None and 0 <= idx < surf.shape[0] and surf.shape[1] == sl.shape[1]:
             edge = np.asarray(surf[idx], dtype=np.float32)
+        elif pass_n <= 1:
+            # No confirmed anchors: the scrub preview (oct-border-curves-all) ALREADY serves the robust
+            # whole-volume baseline (detect_surface_all, cached in baseline.npz) for every slice, and
+            # Confirm/Run flatten to THAT surface. Re-running the single-slice _merged_side_edge here (~360ms)
+            # only recomputes a near-identical edge (measured median ~0.4px vs the baseline) but WITHOUT the
+            # cross-slice cascade — so the "settle refine" cost the reviewer ~450ms per slice while sometimes
+            # nudging the line OFF the surface the warp actually uses. Serve the SAME cached baseline slice
+            # instead (a warm .npz read): scrubbing settles instantly AND the displayed edge == the flatten's
+            # edge (no on-settle line jump). Fall back to the live detector only if the baseline is absent.
+            edge = None
+            try:
+                _bs = _baseline_surface(case_id, arr, p)
+                if _bs is not None and 0 <= idx < _bs.shape[0] and _bs.shape[1] == sl.shape[1]:
+                    edge = np.asarray(_bs[idx], dtype=np.float32)
+            except Exception:  # noqa: BLE001 — no/stale baseline → live detect below
+                edge = None
+            if edge is None:
+                edge = oct_mod._merged_side_edge(sl, p)
         else:
             edge = oct_mod._merged_side_edge(sl, p)
         fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
