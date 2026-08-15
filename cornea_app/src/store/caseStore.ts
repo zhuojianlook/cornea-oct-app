@@ -4,6 +4,7 @@ import { api, checkHealth, resourceUrl } from "../api/client";
 import type { AppConfig, CaseInfo } from "../api/types";
 import { octProposals } from "../api/lifecycle";
 import { useWorkflowStore } from "./workflowStore";
+import { describeSmoothAlign, type SmoothAlignInfo } from "./smoothAlign";
 
 // The last case openCase() actually switched to — so we only reset the per-case
 // workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
@@ -356,7 +357,7 @@ export const useCaseStore = create<CaseState>()(
         // judged is what you get.
         const pre = await api.json<{ case_info?: { manifest?: { oct_iter?: {
           corrected_edge_anchors?: { applied?: boolean; declined?: boolean; frames_adjusted?: number; dev_before?: number; dev_after?: number };
-          corrected_smooth_align?: { applied?: boolean; frames_adjusted?: number; reason?: string; trusted_slices?: number; edited_slices?: number; approved_slices?: number; max_shift?: number } } } } }>(
+          corrected_smooth_align?: SmoothAlignInfo } } } }>(
           `/api/case/${id}/oct-preprocess`, "POST",
           JSON.stringify({ use_redetect: true, corrected_smooth_align: opts?.smoothAlign ?? false,
                            corrected_trusted_laterals: opts?.smoothAlign ? (opts?.trustedLaterals ?? null) : null }));
@@ -370,14 +371,11 @@ export const useCaseStore = create<CaseState>()(
           ? `Corrected-edge correction DECLINED — no rigid axial shift fixes it without corrupting the good laterals (cross-lateral deviation ${ce.dev_before}→${ce.dev_after}px). Left as-is (a periphery a rigid move can't reach). `
           : (ce?.applied ? `Corrected-edge correction applied as a rigid axial shift to ${ce.frames_adjusted} frame(s). ` : "");
         // Smooth-align outcome: propagated the reviewer's edited (drawn) + approved trusted curves across the volume.
+        // Same formatter the corrected-mode toolbar uses (store/smoothAlign), so the toast and the persistent toolbar
+        // line explain a decline identically (which guard fired + the numbers) rather than "made no change".
         const csa = pre?.case_info?.manifest?.oct_iter?.corrected_smooth_align;
-        const csaNote = opts?.smoothAlign
-          ? (csa?.applied
-              ? `Propagated your trusted curves (${csa.edited_slices ?? 0} edited + ${csa.approved_slices ?? 0} approved slice${(csa.trusted_slices ?? 0) === 1 ? "" : "s"}) across the volume — each B-scan rigidly moved to follow them, ${csa.frames_adjusted} frame(s) adjusted (max ${csa.max_shift ?? 0}px). `
-              : (csa?.reason && csa.reason.includes("no trusted")
-                  ? `No trusted slices yet — draw the good curve on a slice or approve one, then run "Smooth to trusted slices". `
-                  : `Smooth-align made no change (${csa?.reason ?? "nothing to propagate"}). `))
-          : "";
+        const csaDesc = opts?.smoothAlign ? describeSmoothAlign(csa) : null;
+        const csaNote = csaDesc ? `${csaDesc.detail} ` : "";
         wf.set("status", { kind: "done", title: "Re-run complete",
           detail: csaNote + ceNote + (guided?.accepted
                     ? `Detection improved and kept — ${guided.why}. `

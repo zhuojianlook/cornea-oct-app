@@ -6,6 +6,7 @@ import { api } from "../../api/client";
 import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, type LifecycleStep } from "../../api/lifecycle";
 import { useReviewQueueStore, nextAfter } from "../../store/reviewQueueStore";
 import { usePendingEditStore } from "../../store/pendingEditStore";
+import { describeSmoothAlign, type SmoothAlignInfo } from "../../store/smoothAlign";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
@@ -89,6 +90,13 @@ export function TimelineBar() {
   const editedLaterals = (correctedEdge?.dirty && correctedEdge.anchors)
     ? Object.keys(correctedEdge.anchors).filter((k) => Object.keys(correctedEdge.anchors[k] ?? {}).length > 0).length : 0;
   const trustedCount = trustedForCase.length + editedLaterals;
+  // Outcome of the LAST "Smooth to trusted slices & re-run" (align_corrected_to_smooth), persisted by the backend
+  // to manifest.oct_iter.corrected_smooth_align. Surfaced in the corrected-mode toolbar so a DECLINE is explained
+  // (which guard fired + the numbers) instead of the reviewer seeing a good edge but no volume change and no reason.
+  const lastSmoothAlign = describeSmoothAlign(
+    ((manifest?.oct_iter as Record<string, unknown> | undefined)?.corrected_smooth_align as SmoothAlignInfo | undefined) ?? null);
+  const smoothAlignTone = (t: "ok" | "info" | "muted") =>
+    t === "ok" ? "var(--c-green)" : t === "info" ? "var(--c-amber, #d9a441)" : "var(--c-text-dim)";
   // What the reject button is about to save. Counting only border POINTS read "(0)" whenever the pending work
   // was crop or defect marks — telling the reviewer their marks would be discarded, which was the opposite of
   // the truth.
@@ -775,6 +783,16 @@ export function TimelineBar() {
               ? `↻ Smooth to ${trustedCount} trusted slice${trustedCount === 1 ? "" : "s"} & re-run`
           : "↻ Re-run with corrections"}
       </Button>
+      {/* WHY the last "Smooth to trusted slices" did (or, more often, did NOT) change the volume. Shown only in
+          Corrected mode, and hidden while a re-run is in flight (the result is about to change). A rigid move that
+          would worsen the already-quadratic surface, or drag the drawn edges off, is DECLINED by design — this makes
+          that verdict visible with the numbers instead of leaving the reviewer with a good edge and no explanation. */}
+      {editTarget === "corrected" && lastSmoothAlign && busyAction !== "rerun" && (
+        <span className="text-[11px]" style={{ maxWidth: 340, lineHeight: 1.2, color: smoothAlignTone(lastSmoothAlign.tone) }}
+              title={lastSmoothAlign.detail}>
+          {lastSmoothAlign.headline}
+        </span>
+      )}
       {/* MOVE ON without judging. Session-only: nothing is written, so it returns to the queue next time. */}
       <Button size="small" variant="outlined" disabled={busy || navigating}
         onClick={() => void skipToNext()}
