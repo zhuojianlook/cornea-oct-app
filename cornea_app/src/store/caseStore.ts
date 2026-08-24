@@ -5,6 +5,7 @@ import type { AppConfig, CaseInfo } from "../api/types";
 import { octProposals } from "../api/lifecycle";
 import { useWorkflowStore } from "./workflowStore";
 import { describeSmoothAlign, type SmoothAlignInfo } from "./smoothAlign";
+import { usePendingEditStore } from "./pendingEditStore";
 
 // The last case openCase() actually switched to — so we only reset the per-case
 // workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
@@ -123,6 +124,9 @@ interface CaseState {
    *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
   commitOctMarks: (cropFrames: number[] | null, cropRegion: { lateral: [number, number]; frames: number[] } | null,
                    postAnchors?: Record<string, Record<string, number>> | null) => Promise<void>;
+  /** Persist the per-lateral ARTIFACT bands (crop_bands = {lateral:[lo,hi]}) as sticky GT (oct-marks, no re-run).
+   *  Interpolated across laterals + excluded from the cornea fit on the next Run. Empty {} clears. */
+  commitCropBands: (bands: Record<number, [number, number]>) => Promise<void>;
   /** Kick off the guarded re-run over the scans corrected so far. Returns immediately; the pass runs
    *  in the background on the sidecar and only re-writes a scan that measures better. */
   startReprocessBatch: () => Promise<{ started: number } | null>;
@@ -139,6 +143,14 @@ interface CaseState {
   // #3 Auto step: re-run the full auto preprocessing on the raw .OCT again (fresh auto detect/warp,
   // keeping the scan's persisted params + classification). Drops any segmentation; reloads the volume.
   rerunPreprocess: () => Promise<void>;
+  // "Clear all corrections & re-preprocess": discard EVERY sticky manual correction on this scan (border /
+  // corrected-edge / axial anchors, crop bands, surface crop, marks, force/good columns, manual patch/shifts)
+  // and re-run pure AUTO detection — a true fresh start. Superset of rerunPreprocess (which keeps crop/surface
+  // corrections sticky). Also clears the frontend pending edits + bumps editorResetNonce to remount the editor.
+  clearAllCorrections: () => Promise<void>;
+  // Bumped by clearAllCorrections so the fix-columns editor (SliceGallery) REMOUNTS and drops all its local
+  // marks — a same-case reload alone doesn't reset the openCaseKey-gated seed effects.
+  editorResetNonce: number;
   // Step regression: roll the scan back to `step`, clearing every later step's manifest flag so the
   // user can redo from there (flag-only on the backend; files remain and are overwritten on re-run).
   resetStep: (step: number) => Promise<void>;
@@ -167,6 +179,7 @@ export const useCaseStore = create<CaseState>()(
     caseInfo: null,
     volumeUrl: null,
     busy: false,
+    editorResetNonce: 0,
     exportInfo: null,
     preprocessed: false,
 
@@ -427,6 +440,20 @@ export const useCaseStore = create<CaseState>()(
       await api.json(`/api/case/${id}/oct-marks`, "POST", JSON.stringify(body));
     },
 
+    commitCropBands: async (bands) => {
+      const id = get().caseId;
+      if (!id) return;
+      // Sticky per-lateral artifact bands. REPLACE semantics — the caller holds the full {lateral:[lo,hi]} map;
+      // {} clears. Persisted to oct_params.crop_bands (no re-run here); the next Run interpolates + excludes them.
+      await api.json(`/api/case/${id}/oct-marks`, "POST",
+        JSON.stringify({ crop_bands: bands ?? {} }));
+      set((s) => { if (s.caseInfo) {
+        const op = ((s.caseInfo.manifest as Record<string, unknown>).oct_params ?? {}) as Record<string, unknown>;
+        if (bands && Object.keys(bands).length) op.crop_bands = bands; else delete op.crop_bands;
+        (s.caseInfo.manifest as Record<string, unknown>).oct_params = op;
+      } });
+    },
+
     commitBorderAnchors: async (anchors, parabola, parabolaSlices) => {
       const id = get().caseId;
       if (!id || !anchors || Object.keys(anchors).length === 0) return;
@@ -585,6 +612,35 @@ export const useCaseStore = create<CaseState>()(
         const m = e instanceof Error ? e.message : String(e);
         set((s) => { s.apiError = m; });
         useWorkflowStore.getState().set("status", { kind: "error", title: "Re-run failed", detail: m });
+      } finally {
+        set((s) => { s.busy = false; });
+      }
+    },
+
+    clearAllCorrections: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      // Discard uncommitted pending edits FIRST so a stale drag can't be re-committed against the now-fresh scan.
+      const pe = usePendingEditStore.getState();
+      pe.setPending(null); pe.setCorrectedEdge(null); pe.clearTrustedSlices(id); pe.setEditTarget("original");
+      set((s) => { s.busy = true; s.apiError = null; });
+      useWorkflowStore.getState().set("status", { kind: "working", title: "Clearing all corrections",
+        detail: "Dropping every manual correction and re-detecting from the raw .OCT — this can take a minute." });
+      try {
+        // clear_all_corrections pops every sticky correction from oct_params, then runs a pure AUTO preprocess.
+        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ params: {}, clear_all_corrections: true }));
+        await get().openCase();                 // reload the fresh working volume + clean manifest (cache-busted)
+        const wf = useWorkflowStore.getState();
+        wf.set("segVersion", wf.segVersion + 1);  // refresh previews + reflect the dropped segmentation
+        // Remount the fix-columns editor so its local marks (cropBands, marks, para/posterior, cut, shifts) reset —
+        // a same-case reload doesn't change openCaseKey, so the seed effects gated on it wouldn't otherwise re-fire.
+        set((s) => { s.editorResetNonce = s.editorResetNonce + 1; });
+        wf.set("status", { kind: "done", title: "All corrections cleared",
+          detail: "Fresh auto detection applied — review (Before/after · Fix-columns), then Approve." });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        set((s) => { s.apiError = m; });
+        useWorkflowStore.getState().set("status", { kind: "error", title: "Clear corrections failed", detail: m });
       } finally {
         set((s) => { s.busy = false; });
       }

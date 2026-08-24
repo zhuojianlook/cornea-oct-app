@@ -12,6 +12,7 @@ import { pxToIjk, brushVoxels } from "../../api/coords";
 import { octProposals } from "../../api/lifecycle";
 import { usePendingEditStore } from "../../store/pendingEditStore";
 import { CorrectedEdgePanel } from "./CorrectedEdgePanel";
+import { interpBand as interpBandOf } from "../../store/cropBands";
 import type { PreviewImage } from "../../api/types";
 
 // A preview either carries an inline base64 data_url (segmentation/consensus) or a lazy `src`
@@ -26,22 +27,37 @@ const GROUP_LABEL: Record<Group, string> = {
 };
 const ORIENTS = ["axial", "coronal", "sagittal"] as const;
 
+// Correction-coverage prompt tuning (mirror the backend so the UI's "reachable" matches the warp's reach):
+const COV_SLICE_BAND = 20;   // == DEFAULT_PARAMS.redetect_slice_band (per-mark propagation reach, in slices)
+const COV_EDGE_BAND = 12;    // == DEFAULT_PARAMS.frame_edge_band (first/last N frames = low-signal edge band)
+// Confidence-driven marking prompt: the backend returns a per-(slice,frame) confidence over the SERVED edge
+// (surface_confidence_map); a slice's edge band is "low confidence" when its mean confidence < CONF_LO. We
+// prompt only where the edge is BOTH low-confidence AND not already covered by a nearby mark — so the reviewer
+// is steered to the genuinely-uncertain gaps (the faint limbus corner), and high-confidence edges never nag
+// (the old pure-sparsity rule false-fired on cs046's fine right edge). CONF_ASSIST asks the backend for the map.
+const CONF_LO = 0.35;        // mirrors backend calibration: interior≈1.0, faint floating corner→0 (1.1% interior false-flag)
+const CONF_ASSIST = true;    // request + use the confidence map (kill-switch: set false to fall back to auto-only edges)
+
 // When embedded as the de-nested "Fix columns" panel (driven by the single top toolbar in
 // VolumeCanvas), `fixCols` auto-enters column-marking and hides this panel's own duplicate toggles
 // (group/orient/before-after/contrast/blur/scar) — orientation + display filter come from props so the
 // ONE top toolbar drives them. Called with NO props on the no-WebGL fallback path (unchanged behaviour).
-export function SliceGallery({ fixCols = false, cropStart = false, orientProp, filterCss, showRaw = false, readOnly = false, onToggleRaw }: {
+export function SliceGallery({ fixCols = false, cropStart = false, orientProp, filterCss, showRaw = false, showOriginal = true, viewMode = "both", readOnly = false, onToggleRaw, onNeedOriginalPane }: {
   fixCols?: boolean;
   cropStart?: boolean; // open fix-columns directly in surface-crop mode (auto-detect the apex-cropped frames)
   orientProp?: "axial" | "coronal" | "sagittal";
   filterCss?: string;
-  showRaw?: boolean; // fix-cols: show the raw "before" beside the markable corrected "after"
-  onToggleRaw?: () => void;  // hide/show that corrected panel from inside the editor toolbar
+  showRaw?: boolean; // fix-cols: the corrected pane is present ("both" or "corrected") — true unless view is original-only
+  showOriginal?: boolean; // fix-cols: the original (left, editable) pane is present — true unless view is corrected-only
+  viewMode?: "original" | "both" | "corrected"; // 3-state view toggle: which of the original / corrected panes are shown
+  onToggleRaw?: () => void;  // cycle that 3-state view toggle from inside the editor toolbar
+  onNeedOriginalPane?: () => void; // reveal the original pane (leave corrected-only view) when an original-scan tool is picked
   readOnly?: boolean; // inspecting an earlier (completed) step → view only; no border edits until rollback
 } = {}) {
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const openCase = useCaseStore((s) => s.openCase); // refetch caseInfo after a fix-cols re-run (fresh persisted nudges)
+  const commitCropBands = useCaseStore((s) => s.commitCropBands);  // persist per-lateral artifact bands (sticky)
   // Iterative-refinement pass count (for the "fix at pass" selector) — from the manifest.
   const octIter = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as { passes?: number } | undefined;
   const passCount = Math.max(1, Number(octIter?.passes ?? 1));
@@ -169,7 +185,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // on in fix-columns; no column selection. x=frame/n_frames, y=depth/depth_vox (depth 0 = top).
   // ALL per-slice border curves (FAST detector), fetched ONCE per pass → scrubbing is an instant client-side
   // lookup instead of a ~258ms per-slice round-trip (the user's "can't wait for the red line" complaint).
-  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][] } | null>(null);
+  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][]; conf?: number[][] } | null>(null);
   // The slice the user SETTLES on is refined to the slower, more ACCURATE (robust) detector + cached here,
   // so the border you actually inspect/drag is the precise one while scrubbing stays smooth.
   const [accurate, setAccurate] = useState<Map<number, { edge: number[]; fit: number[] }>>(new Map());
@@ -271,6 +287,12 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // CorrectedEdgePanel + TimelineBar so ONE "Correct & re-run" commits whichever line was drawn.
   const editTarget = usePendingEditStore((s) => s.editTarget);
   const setEditTarget = usePendingEditStore((s) => s.setEditTarget);
+  // Keep the edited line in sync with the visible pane: corrected-only view edits the corrected line, original-only
+  // edits the original line — so a drag never lands on a hidden pane. "Both" leaves the reviewer's choice alone.
+  useEffect(() => {
+    if (viewMode === "corrected") setEditTarget("corrected");
+    else if (viewMode === "original") setEditTarget("original");
+  }, [viewMode, setEditTarget]);
   // TRUSTED SLICES for smooth-align: mark the sagittal slices whose corrected border is good; smooth-align builds
   // its curvature from only these (see align_corrected_to_smooth). Cleared automatically on scan switch (keyed by case).
   const trustedSlices = usePendingEditStore((s) => s.trustedSlices);
@@ -365,6 +387,15 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const [latCropLo, setLatCropLo] = useState<number | null>(null);             // lateral range start (slice index)
   const [latCropHi, setLatCropHi] = useState<number | null>(null);             // lateral range end (slice index)
   const [latCropBusy] = useState(false);    // retained: still gates disabled states
+  // #9 v3 ARTIFACT BANDS — the per-lateral [lo,hi] band, marked on several slices + interpolated across laterals.
+  // cropBands is the MARKED source-of-truth map {lateral:[lo,hi]}; bandDraft is the frames being painted on the
+  // CURRENT slice (the "＋ Mark band" button snapshots bandDraft → cropBands[slice], then clears it). Kept fully
+  // separate from the legacy uniform-box latCropFrames/crop_region path so that stays intact for old cases.
+  const [cropBands, setCropBands] = useState<Record<number, [number, number]>>({});
+  const [bandDraft, setBandDraft] = useState<Set<number>>(new Set());
+  const persistedCropBandsSig = JSON.stringify(
+    (((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.crop_bands) ?? null);
   useEffect(() => {
     // Seed from the persisted crop, but NOT while the user is actively editing (latCropMode) — a concurrent
     // manifest change must not wipe their unsaved marks. On confirm, local already matches persisted.
@@ -398,13 +429,22 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
     const framesDiff = latCropFrames.size !== pf.size || [...latCropFrames].some((f) => !pf.has(f));
     return framesDiff || latCropLo !== (persistedCropRegion?.lo ?? null) || latCropHi !== (persistedCropRegion?.hi ?? null);
   }, [latCropFrames, latCropLo, latCropHi, persistedCropRegion]);
-  const latCropFrameRanges = useMemo(() => {
-    const xs = [...latCropFrames].sort((a, b) => a - b);
-    const runs: string[] = []; let s0: number | null = null, prev = -2;
-    for (const c of xs) { if (c !== prev + 1) { if (s0 != null) runs.push(prev > s0 ? `${s0}–${prev}` : `${s0}`); s0 = c; } prev = c; }
-    if (s0 != null) runs.push(prev > s0 ? `${s0}–${prev}` : `${s0}`);
-    return runs;
-  }, [latCropFrames]);
+  // Seed the marked artifact bands from persisted oct_params.crop_bands (not while editing — don't wipe unsaved).
+  useEffect(() => {
+    if (latCropMode) return;
+    try {
+      const raw = JSON.parse(persistedCropBandsSig) as Record<string, [number, number]> | null;
+      const next: Record<number, [number, number]> = {};
+      if (raw) for (const [k, v] of Object.entries(raw))
+        if (Array.isArray(v) && v.length === 2) next[Number(k)] = [Number(v[0]), Number(v[1])];
+      setCropBands(next);
+    } catch { setCropBands({}); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [persistedCropBandsSig, openCaseKey]);
+  // Interpolate the artifact band for a lateral from the MARKED cropBands — mirrors backend _artifact_bands:
+  // linear between the two nearest marked laterals, confined to the [min,max] marked span (null outside),
+  // single mark → that lateral only. Returns [lo,hi] | null.
+  const interpBand = useMemo(() => (lat: number) => interpBandOf(cropBands, lat), [cropBands]);
   // #9 — tell the viewer (VolumeCanvas) that Crop mode is active so it forces SAGITTAL and disables coronal.
   useEffect(() => { wfSet("cropRegionMode", fixCols && latCropMode); return () => wfSet("cropRegionMode", false); }, [fixCols, latCropMode]);
   // Bumped after we render context previews on demand, to force the fetch effect to
@@ -711,6 +751,89 @@ const PROP_SLICE_BAND = 20;
   const depthVox = rawImages.find((i) => i.orientation === "sagittal")?.source_width ?? 0;
   const canMarkColumns = !previewGroup && rawImages.length > 0 && nFrames > 1 && !showBeforeAfter;
 
+  // ── CONFIDENCE-DRIVEN MARKING PROMPT ─────────────────────────────────────────────────────────────────
+  // The backend returns a per-(slice,frame) confidence over the SERVED edge (surface_confidence_map: bright
+  // tissue below the edge − dark above, scan-normalised). A slice's edge band is LOW-CONFIDENCE when its mean
+  // confidence < CONF_LO — exactly where the auto/interpolated edge floats above the faint epithelium (the
+  // limbus corner). We prompt the reviewer to add corrections only where the edge is BOTH low-confidence AND
+  // not already within COV_SLICE_BAND of a mark (a drawn mark propagates ±COV_SLICE_BAND). That AND is the
+  // whole point: it steers marking to the genuinely-uncertain gaps, and — unlike the old pure-sparsity rule —
+  // it never nags on a HIGH-confidence edge (which false-fired on e.g. cs046's fine right edge). It self-clears
+  // as the reviewer draws (deps on borderAnchors) and needs no ground truth. `lowConfBands` is the shared
+  // per-edge state; `coverageAdvice` (banner summary) and `markQueue` (guided walk) both derive from it.
+  const lowConfBands = useMemo(() => {
+    type Band = { side: "left" | "right"; lo: number; hi: number; marks: number[];
+                  confBand: number[]; needs: boolean[]; nNeed: number };
+    const out: Band[] = [];
+    const nSlices = allCurves?.edges?.length ?? 0;
+    if (!fixCols || orient !== "sagittal" || nFrames <= 2 || nSlices < 3 * COV_SLICE_BAND) return out;
+    const conf = allCurves?.conf;
+    if (!conf || conf.length !== nSlices) return out;   // no confidence map → no prompts (confidence-driven only)
+    const eb = Math.min(COV_EDGE_BAND, Math.floor(nFrames / 3));
+    // The border panel applies scaleX(-1) (frame 0 renders on the RIGHT), so display-LEFT = HIGH frame indices.
+    const bands: Array<{ side: "left" | "right"; lo: number; hi: number }> = [
+      { side: "left",  lo: nFrames - eb, hi: nFrames },
+      { side: "right", lo: 0,            hi: eb },
+    ];
+    for (const b of bands) {
+      const marks: number[] = [];
+      borderAnchors.forEach((fm, s) => {
+        for (const f of fm.keys()) { if (f >= b.lo && f < b.hi) { marks.push(s); break; } }
+      });
+      marks.sort((x, y) => x - y);
+      const confBand: number[] = new Array(nSlices).fill(1);
+      const needs: boolean[] = new Array(nSlices).fill(false);
+      let nNeed = 0;
+      for (let s = 0; s < nSlices; s++) {
+        const row = conf[s]; let sum = 0, cnt = 0;
+        for (let f = b.lo; f < b.hi; f++) { const v = row?.[f]; if (typeof v === "number") { sum += v; cnt++; } }
+        const mean = cnt ? sum / cnt : 1;
+        confBand[s] = mean;
+        if (mean < CONF_LO) {
+          let d = Infinity;
+          for (const m of marks) { const dd = m < s ? s - m : m - s; if (dd < d) d = dd; }
+          if (d > COV_SLICE_BAND) { needs[s] = true; nNeed++; }   // low-confidence AND uncovered
+        }
+      }
+      out.push({ ...b, marks, confBand, needs, nNeed });
+    }
+    return out;
+  }, [fixCols, orient, nFrames, allCurves, borderAnchors]);
+
+  // Banner summary: per edge, how many slices still need marking + the WORST-confidence one to jump to first.
+  const coverageAdvice = useMemo(() => {
+    type Adv = { side: "left" | "right"; loFrame: number; hiFrame: number;
+                 nMarks: number; uncovered: number; jump: number };
+    const out: Adv[] = [];
+    for (const b of lowConfBands) {
+      if (!b.nNeed) continue;
+      let jump = -1, worst = Infinity;
+      for (let s = 0; s < b.needs.length; s++)
+        if (b.needs[s] && b.confBand[s] < worst) { worst = b.confBand[s]; jump = s; }
+      if (jump < 0) continue;
+      out.push({ side: b.side, loFrame: b.lo, hiFrame: b.hi - 1, nMarks: b.marks.length,
+                 uncovered: b.nNeed, jump });
+    }
+    return out;
+  }, [lowConfBands]);
+
+  // GUIDED-MARKING QUEUE — the concrete slices to visit so every low-confidence gap gets a correction. Greedy:
+  // walk the band and suggest a slice whenever a still-needed one lies more than COV_SLICE_BAND beyond the last
+  // suggestion (one mark covers ±COV_SLICE_BAND). Robust to the sparse, interleaved way low-confidence slices
+  // appear along the faint limbus; RECOMPUTES as the reviewer draws, shrinking to empty once the edge is covered.
+  const markQueue = useMemo(() => {
+    type Q = { slice: number; side: "left" | "right"; conf: number };
+    const out: Q[] = [];
+    for (const b of lowConfBands) {
+      let last = -Infinity;
+      for (let s = 0; s < b.needs.length; s++) {
+        if (!b.needs[s]) continue;
+        if (s - last > COV_SLICE_BAND) { out.push({ slice: s, side: b.side, conf: b.confBand[s] }); last = s; }
+      }
+    }
+    return out;
+  }, [lowConfBands]);
+
   // Which pass to fix → its INPUT is what we detect + draw the border on (pass 1 = the RAW original; pass k
   // = pass k-1's output). Editing the detection on the INPUT improves that pass's result — editing the
   // border on the downstream/corrected result is meaningless.
@@ -778,6 +901,18 @@ const PROP_SLICE_BAND = 20;
   }, [inputSrcR]);
 
   const borderSliceIdx = cur?.slice_index ?? null;
+  // Step to the next queued mark slice in DISPLAY order (wrapping), relative to the slice on screen — so
+  // repeated clicks walk the reviewer through the edge sequentially. dispSlice/jumpToSlice map array↔panel.
+  const jumpNextMark = () => {
+    if (!markQueue.length) return;
+    const cur0 = borderSliceIdx != null ? dispSlice(borderSliceIdx) : -1;
+    const ordered = [...markQueue].sort((a, b) => dispSlice(a.slice) - dispSlice(b.slice));
+    const next = ordered.find((q) => dispSlice(q.slice) > cur0 + 0.5) ?? ordered[0];
+    jumpToSlice(next.slice);
+  };
+  // The artifact-band draft is PER SLICE: clear it whenever the current slice changes so painting on slice B
+  // never carries slice A's frames. (Marked bands live in cropBands and are unaffected.)
+  useEffect(() => { setBandDraft(new Set()); }, [borderSliceIdx]);
   // Seed from the marks already stored for THIS slice, so an existing mark can be seen and amended rather
   // than silently replaced by whatever is drawn next.
   const storedMarks = useMemo(() => {
@@ -803,9 +938,10 @@ const PROP_SLICE_BAND = 20;
     if (!fixCols || !caseId) { setAllCurves(null); setAccurate(new Map()); return; }
     let cancelled = false;
     setBorderBusy(true); setAllCurves(null); setAccurate(new Map());
-    api.json<{ edges: number[][]; fits: number[][] }>(
-      `/api/case/${caseId}/oct-border-curves-all`, "POST", JSON.stringify({ border_pass: borderPass }))
-      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [] }); })
+    api.json<{ edges: number[][]; fits: number[][]; conf?: number[][] }>(
+      `/api/case/${caseId}/oct-border-curves-all`, "POST",
+      JSON.stringify({ border_pass: borderPass, want_conf: CONF_ASSIST }))
+      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [], conf: r.conf }); })
       .catch(() => !cancelled && setAllCurves(null))
       .finally(() => !cancelled && setBorderBusy(false));
     return () => { cancelled = true; };
@@ -860,6 +996,11 @@ const PROP_SLICE_BAND = 20;
   // The border for the CURRENT slice: the accurate (settled) curve if we have it, else the instant fast one.
   const curEdge = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.edge ?? allCurves?.edges[borderSliceIdx]) : null) ?? null;
   const curFit = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.fit ?? allCurves?.fits[borderSliceIdx]) : null) ?? null;
+  // #9 v3: the marked/applied artifact band for THIS slice (interpolated across the marked laterals). The surface
+  // lines (red detected edge + cyan quadratic fit) are BROKEN over it — those frames are cropped/removed, so a
+  // surface drawn across them is misleading (the reviewer sees a line on an area that no longer exists).
+  const curBand = (borderSliceIdx != null && Object.keys(cropBands).length > 0) ? interpBand(borderSliceIdx) : null;
+  const inBand = (f: number) => curBand != null && f >= curBand[0] && f <= curBand[1];
 
   // ── "THERE IS NO ANTERIOR SURFACE ON THIS FRAME" ─────────────────────────────────────────────────────
   // The reviewer says so by dragging the red line to the image floor, which stores the absent sentinel
@@ -1241,7 +1382,8 @@ const PROP_SLICE_BAND = 20;
   const paintLatCrop = (clientX: number, svg: Element) => {
     const f = frameAtBorder(clientX, svg);
     if (f == null) return;
-    setLatCropFrames((prev) => {
+    // Paint into the PER-SLICE draft (bandDraft); "＋ Mark band" snapshots it into cropBands[slice].
+    setBandDraft((prev) => {
       const next = new Set(prev);
       if (cropPaintRef.current === "remove") next.delete(f); else next.add(f);
       return next;
@@ -1317,7 +1459,7 @@ const PROP_SLICE_BAND = 20;
     if (latCropMode) {     // #9 crop region: drag to add/remove FRAME columns (pan with shift/middle or readOnly)
       if (readOnly || e.button === 1 || e.shiftKey) { borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode: "pan" }; return; }
       const f = frameAtBorder(e.clientX, e.currentTarget);
-      cropPaintRef.current = (f != null && latCropFrames.has(f)) ? "remove" : "add";
+      cropPaintRef.current = (f != null && bandDraft.has(f)) ? "remove" : "add";
       paintLatCrop(e.clientX, e.currentTarget);
       return;
     }
@@ -2014,16 +2156,7 @@ const PROP_SLICE_BAND = 20;
     : orient !== "sagittal" ? null            // border editing is sagittal-only
     : borderMode === "parabola" ? (surfaceGone ? null : "parabola")   // no curve on this frame to pulse
     : "edge";
-  // Draw the curves spanning the FULL slice width: frame f is centred at x=f+0.5, so a plain map leaves a
-  // half-column gap at each end (frame 0 / last frame's outer half un-drawn). Anchor the ends at x=0 and
-  // x=nFrames (repeating the first/last value) so the edge reaches the very first/last pixel columns.
-  const spanPts = (yAt: (f: number) => number): string => {
-    const pts: string[] = [`0,${yAt(0)}`];
-    for (let f = 0; f < nFrames; f++) pts.push(`${f + 0.5},${yAt(f)}`);
-    pts.push(`${nFrames},${yAt(nFrames - 1)}`);
-    return pts.join(" ");
-  };
-  // …and the same thing BROKEN at the frames where y is not a number, for any curve derived from the anterior
+  // Curves are drawn BROKEN at the frames where y is not a number, for any curve derived from the anterior
   // edge: a frame marked "no surface" has no y, and a single point of NaN in a polyline's `points` aborts the
   // parse at that coordinate — so one absent frame silently truncated the rest of the line.
   const segPts = (yAt: (f: number) => number): string[] => {
@@ -2053,9 +2186,11 @@ const PROP_SLICE_BAND = 20;
   // 100% MEANS THE SAME SIZE either way. Hiding the corrected panel hands this host the full row width, which
   // doubled the image and made "100%" mean two different things depending on a panel toggle — so a scan
   // looked twice as rough with the comparison off. The scale is therefore always solved against the
-  // TWO-PANEL column width; hiding the corrected panel now buys blank space (and reach), and zoom is how you
+  // TWO-PANEL column width; hiding a panel now buys blank space (and reach), and zoom is how you
   // get bigger. bZoom still scales freely on top.
-  const kfHostW = showRaw ? (hostSize.w || 0) : (hostSize.w || 0) / 2;
+  // Only the BOTH view sizes against the full host; original-only AND corrected-only both size against the
+  // two-panel (half) width, so all three views render the image at the SAME size (the reviewer asked for this).
+  const kfHostW = (showRaw && showOriginal) ? (hostSize.w || 0) : (hostSize.w || 0) / 2;
   const bKf = Math.max(1, Math.floor(Math.min(
     kfHostW / Math.max(1, nFrames),
     ((hostSize.h || 0) * physAspect) / Math.max(1, nFrames),
@@ -2152,7 +2287,7 @@ const PROP_SLICE_BAND = 20;
               {(() => {
                 const segs: string[][] = []; let cur: string[] = [];
                 for (let f = 0; f < nFrames; f++) {
-                  const y = edgeY(f);
+                  const y = inBand(f) ? NaN : edgeY(f);          // gap over the cropped artifact band
                   if (Number.isFinite(y)) cur.push(`${f + 0.5},${y}`);
                   else if (cur.length) { segs.push(cur); cur = []; }
                 }
@@ -2175,11 +2310,19 @@ const PROP_SLICE_BAND = 20;
              A fit needs something to fit: leaving the cyan arc on screen there would show a confident smooth
              cornea top drawn straight through the region that was just declared empty. */
           const smoothLine = surfaceGone ? null : (
-            <polyline key="smooth" fill="none" stroke="#22d3ee" vectorEffect="non-scaling-stroke"
-              className={editPulse === "parabola" ? "bpulse" : undefined}
-              strokeWidth={curPara ? 1.5 : (anchorsDirty ? 0.8 : 1.3)}
-              opacity={cropMode ? 0.35 : (anchorsDirty ? 0.5 : 0.95)}
-              points={spanPts((f) => (curPara ? curPara[f] : curFit[f]))} />
+            // segmented (not spanPts) so it BREAKS over the cropped artifact band — no fit drawn on removed frames.
+            // Wrapped in a keyed <g> (mirroring edgeLine/cropLines): this layer is pushed into the z-order
+            // `ordered` array below and rendered as a direct <svg> child, so it needs a stable key both to
+            // silence React's list-key warning and so the activeKey === "smooth" lift can find it by .key.
+            <g key="smooth">
+              {segPts((f) => (inBand(f) ? NaN : (curPara ? curPara[f] : curFit[f]))).map((sg, i) => (
+                <polyline key={`smooth${i}`} fill="none" stroke="#22d3ee" vectorEffect="non-scaling-stroke"
+                  className={editPulse === "parabola" ? "bpulse" : undefined}
+                  strokeWidth={curPara ? 1.5 : (anchorsDirty ? 0.8 : 1.3)}
+                  opacity={cropMode ? 0.35 : (anchorsDirty ? 0.5 : 0.95)}
+                  points={sg} />
+              ))}
+            </g>
           );
           /* SURFACE-CROP preview: the detected BOTTOM (posterior) edge (orange = the guidance the
              reconstruction follows) and the RECONSTRUCTED anterior surface (green = what the re-run applies;
@@ -2342,10 +2485,30 @@ const PROP_SLICE_BAND = 20;
               || (borderSliceIdx != null && borderSliceIdx >= latCropLo && borderSliceIdx <= (latCropHi ?? latCropLo)))
           && [...latCropFrames].map((f) => (
             <rect key={`lc${f}`} x={f} y={0} width={1} height={depthVox}
-              className={editPulse === "latcrop" ? "bpulse" : undefined}
+              // NOT pulsed — same rationale as the amber crop bands above: a row of wide bands blinking together
+              // is distracting rather than informative while you paint, and latcrop mode is already obvious from
+              // the toolbar + the brighter fill below. (Reviewer: the marked crop-artifact columns must not flash.)
               fill={latCropMode ? "rgba(93,176,255,0.34)" : "rgba(93,176,255,0.16)"} stroke="none"
               pointerEvents="none" />
           ))}
+        {/* #9 v3 ARTIFACT BANDS — the INTERPOLATED band for THIS slice (from the marked cropBands): the light
+            preview of what will be cropped here. A slice you actually MARKED shows slightly stronger. Shown in
+            latcrop mode + also when the scan simply carries bands (so they stay visible from any mode). */}
+        {(latCropMode || Object.keys(cropBands).length > 0) && borderSliceIdx != null && (() => {
+          const band = interpBand(borderSliceIdx);
+          if (!band) return null;
+          const marked = cropBands[borderSliceIdx] != null;
+          const rects = [];
+          for (let f = band[0]; f <= band[1]; f++)
+            rects.push(<rect key={`ib${f}`} x={f} y={0} width={1} height={depthVox}
+              fill={marked ? "rgba(93,176,255,0.30)" : "rgba(93,176,255,0.15)"} stroke="none" pointerEvents="none" />);
+          return rects;
+        })()}
+        {/* the LIVE painted draft on this slice (bright) — what "＋ Mark band" will snapshot */}
+        {latCropMode && [...bandDraft].map((f) => (
+          <rect key={`bd${f}`} x={f} y={0} width={1} height={depthVox}
+            fill="rgba(93,176,255,0.55)" stroke="none" pointerEvents="none" />
+        ))}
       </svg>
       {/* First-open of a scan can leave this PNG in flight while the sidecar computes its caches; without this
           the pane shows the red/cyan lines over black, which reads as "broken". Cover it with a plain "loading"
@@ -2436,6 +2599,12 @@ const PROP_SLICE_BAND = 20;
                 <ToggleButtonGroup size="small" exclusive value={markMode ? "mark" : latCropMode ? "latcrop" : cropMode ? "crop" : cutMode ? "cut" : borderMode}
                   onChange={(_, v) => {
                     if (!v) return;
+                    // Every fix-cols tool (Edge/Quadratic/Surface crop/Mark/Crop artifact) paints on the ORIGINAL
+                    // (left) pane. In corrected-ONLY view that pane is hidden (visibility:hidden + pointer-events:none)
+                    // and edits are aimed at the corrected line (editTarget forced to "corrected"), so drags land on
+                    // pan-only (see onBorderDown) — the tool "does nothing". Reveal the original pane and aim edits at
+                    // it so the tool works. (Fixes "changing tools to Crop artifact does not work" in corrected-only.)
+                    if (!showOriginal) { setEditTarget("original"); onNeedOriginalPane?.(); }
                     // EDITS SURVIVE A MODE SWITCH. This used to wipe the inactive mode's un-confirmed edits,
                     // so leaving Parabola discarded the shaped curve and leaving Edge reset the drags to the
                     // persisted set — which is why every other view still showed the ORIGINAL parabola. The
@@ -2486,13 +2655,15 @@ const PROP_SLICE_BAND = 20;
                     gestures on the same picture, so they get their own switch rather than a hidden modifier. */}
                 {onToggleRaw && (
                   <button onClick={onToggleRaw}
-                    title={showRaw
-                      ? "Hide the corrected panel — the original then gets the full width, so the image is larger to judge and to draw on."
-                      : "Show the corrected result beside the original."}
+                    title={viewMode === "original"
+                      ? "View: ORIGINAL only — the raw image gets full width to judge and draw on. Click to cycle → both → corrected → original."
+                      : viewMode === "both"
+                      ? "View: BOTH — original (left, editable) beside the corrected result (right). Click to cycle → corrected → original → both."
+                      : "View: CORRECTED only — the corrected result gets full width. Click to cycle → original → both → corrected."}
                     style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4,
-                             color: showRaw ? "var(--c-green)" : "var(--c-text-dim)", cursor: "pointer",
+                             color: viewMode === "original" ? "var(--c-text-dim)" : "var(--c-green)", cursor: "pointer",
                              fontSize: 11, padding: "2px 7px", whiteSpace: "nowrap" }}>
-                    {showRaw ? "⇆ corrected: on" : "⇆ corrected: off"}
+                    {viewMode === "original" ? "⇆ view: original" : viewMode === "both" ? "⇆ view: both" : "⇆ view: corrected"}
                   </button>
                 )}
                 {/* WHICH red line the before/after view edits. Lives in the toolbar (not floating over a pane) so
@@ -2553,7 +2724,7 @@ const PROP_SLICE_BAND = 20;
                 )}
                 <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
-                    latCropMode ? (<>Drag to mark <b style={{ color: "#5db0ff" }}>frame-columns</b> to crop, set the lateral <b>slice range</b> (Mark start/end). current slice <b>{borderSliceIdx ?? "—"}</b>{latCropLo != null ? <> · range <b style={{ color: "#5db0ff" }}>{latCropLo}{latCropHi != null && latCropHi !== latCropLo ? `–${latCropHi}` : ""}</b></> : " · range not set (defaults to all slices)"} · {latCropFrames.size} col(s){latCropFrameRanges.length ? ` [${latCropFrameRanges.join(", ")}]` : ""}</>) :
+                    latCropMode ? (<>Paint the <b style={{ color: "#5db0ff" }}>artifact band</b> on this slice, then <b>＋ Mark band</b>. Mark it on a few slices — its extent is <b>interpolated across the laterals</b> between them, excluded from the cornea fit + zeroed. slice <b>{borderSliceIdx ?? "—"}</b>{bandDraft.size > 0 ? <> · draft <b style={{ color: "#5db0ff" }}>{Math.min(...bandDraft)}–{Math.max(...bandDraft)}</b></> : (() => { const b = borderSliceIdx != null ? interpBand(borderSliceIdx) : null; return b ? <> · band here <b style={{ color: "#5db0ff" }}>{b[0]}–{b[1]}</b>{cropBands[borderSliceIdx!] ? " (marked)" : " (interp)"}</> : " · no band here"; })()} · <b>{Object.keys(cropBands).length}</b> marked slice(s)</>) :
                     cropMode ? (cropBusy ? "Detecting surface-cropped frames…" : (<>The <b style={{ color: "#ffaa28" }}>amber</b> columns are surface-cropped — aligned by the <b style={{ color: "#ffaa28" }}>orange bottom edge</b> → <b style={{ color: "#39d98a" }}>green reconstructed surface</b> (it leaves the top where the apex is cropped). Click/drag columns to add/remove, then <b>Confirm &amp; re-run</b>. · {cropCols.size} frame(s)</>)) :
                     cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
                     borderMode === "parabola" ? (surfaceGone
@@ -2561,6 +2732,39 @@ const PROP_SLICE_BAND = 20;
                       : (<>Drag points to shape the <b style={{ color: "#22d3ee" }}>quadratic fit</b>, then <b>Confirm</b>; scrub, then <b>Run</b>.{paraCount ? ` · ${paraCount} pt(s)` : ""}</>)) :
                     (<>The <b style={{ color: "#22d3ee" }}>cyan line</b> is the surface the correction applies (the <b style={{ color: "#ff4d4d" }}>red</b> is the raw detection — its artifacts are smoothed out). Drag onto the true surface (local), then <b>Confirm</b>; scrub, then <b>Run preprocessing</b>.{anchorCount ? ` · ${anchorCount} anchor(s)` : ""}</>)}
                 </span>
+                {/* Confidence-driven marking prompt: where the SERVED edge is low-confidence (floats above the
+                    faint epithelium) AND not already covered by a nearby mark, steer the reviewer there. Draw the
+                    edge, click for the next; the count drops live as marks land, then the banner clears itself. */}
+                {coverageAdvice.length > 0 && (
+                  <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+                                marginTop: 3, padding: "3px 8px", borderRadius: 4,
+                                background: "rgba(255,170,40,0.10)", border: "1px solid rgba(255,170,40,0.5)" }}>
+                    <span style={{ fontSize: 11, color: "#ffcc66", whiteSpace: "nowrap" }}>⚠ Low-confidence edge — needs correction</span>
+                    {/* GUIDED MARKING: walk the reviewer through every low-confidence slice that still needs a mark.
+                        Draw the edge at each, click again for the next; the count drops live as marks land. */}
+                    {markQueue.length > 0 && (
+                      <button onClick={jumpNextMark}
+                        title={`Step to the next of ${markQueue.length} low-confidence slice(s) that still need an edge correction. Draw the edge there, then click again for the next — the count drops as you mark, and the banner clears once the low-confidence edges are corrected. Then Correct & re-run.`}
+                        style={{ border: "1px solid #ffcc66", background: "rgba(255,204,102,0.22)", color: "#ffe0a3",
+                                 borderRadius: 4, fontSize: 11, fontWeight: 600, padding: "2px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                        → Next slice to mark ({markQueue.length} left)
+                      </button>
+                    )}
+                    {coverageAdvice.map((a) => (
+                      <span key={a.side} style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                                                   fontSize: 11, color: "var(--c-text-dim)", whiteSpace: "nowrap" }}>
+                        <b style={{ color: "#ffcc66" }}>{a.side} edge</b>
+                        <span>· ~{a.uncovered} low-confidence slice(s){a.nMarks ? `, ${a.nMarks} marked` : ""}</span>
+                        <button onClick={() => jumpToSlice(a.jump)}
+                          title={`Jump to slice ${dispSlice(a.jump)} — the LOWEST-confidence un-marked slice of the ${a.side} edge — and draw the surface there. Each mark tightens ±${COV_SLICE_BAND} slices, so a few across the range fix the edge.`}
+                          style={{ border: "1px solid #ffaa28", background: "rgba(255,170,40,0.16)", color: "#ffcc66",
+                                   borderRadius: 4, fontSize: 11, padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          Jump to worst (slice {dispSlice(a.jump)})
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </>
             ) : (
               <>
@@ -2593,12 +2797,32 @@ const PROP_SLICE_BAND = 20;
             {fixCols ? (
               latCropMode ? (
                 <>
-                  {/* Mark start / Mark end retired: the marks are committed by the review loop and the range
-                      defaults to ALL slices, which is what a reviewer marking a bad column actually means. */}
+                  {/* ＋ Mark band: snapshot the painted draft on THIS slice into cropBands[slice] (as [min,max]) and
+                      persist. Mark a few slices; the band interpolates across the laterals between them. */}
+                  {bandDraft.size > 0 && borderSliceIdx != null && !readOnly && (
+                    <button
+                      onClick={() => {
+                        const fs = [...bandDraft].sort((a, b) => a - b);
+                        const next = { ...cropBands, [borderSliceIdx]: [fs[0], fs[fs.length - 1]] as [number, number] };
+                        setCropBands(next); setBandDraft(new Set()); void commitCropBands(next);
+                      }} disabled={latCropBusy}
+                      title="Record the artifact band you painted on this slice. Mark several slices; the band is interpolated across the laterals in between and excluded from the cornea fit on re-run."
+                      style={{ background: "none", border: "1px solid var(--c-accent, #5db0ff)", borderRadius: 4, color: "var(--c-accent, #5db0ff)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                      ＋ Mark band [{Math.min(...bandDraft)}–{Math.max(...bandDraft)}] on slice {borderSliceIdx}
+                    </button>
+                  )}
+                  {Object.keys(cropBands).length > 0 && !readOnly && (
+                    <button onClick={() => { setCropBands({}); setBandDraft(new Set()); void commitCropBands({}); }} disabled={latCropBusy}
+                      title={`Clear all ${Object.keys(cropBands).length} marked artifact band(s) on this scan.`}
+                      style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
+                      Clear bands ({Object.keys(cropBands).length})
+                    </button>
+                  )}
+                  {/* Legacy uniform-box clear (only if such a crop is still present on an old case). */}
                   {(latCropFrames.size > 0 || latCropLo != null) && !readOnly && (
                     <button onClick={() => { setLatCropFrames(new Set()); setLatCropLo(null); setLatCropHi(null); }} disabled={latCropBusy}
                       style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
-                      Clear
+                      Clear box
                     </button>
                   )}
                 </>
@@ -2841,7 +3065,13 @@ const PROP_SLICE_BAND = 20;
           // whitespace. Trimmed to 2, and the captions are absolutely positioned so they cost no height
           // either (17 px + 4 gap each, which binds whenever the window is short).
           <div style={{ display: "flex", gap: 2, width: "100%", height: "100%", alignItems: "stretch", justifyContent: "center", position: "relative" }}>
-            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 0, position: "relative" }}>
+            {/* Corrected-only view hides this pane. It stays in layout (visibility, not display:none) because the
+                border HOST inside it is what measures hostSize → the corrected pane's size; collapsing it to zero
+                shrank the corrected image to 1px/frame. Mirrors original-only: hiding a pane buys blank space, not a
+                bigger image (see the kfHostW note) — zoom to enlarge. pointerEvents off so the blank half is inert. */}
+            <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", visibility: showOriginal ? "visible" : "hidden",
+                          pointerEvents: showOriginal ? undefined : "none",
+                          flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 0, position: "relative" }}>
               <span className="text-[11px]" style={{ color: editTarget === "original" || !showRaw ? "var(--c-accent)" : "var(--c-text-dim)", position: "absolute", top: 0, left: 0,
                                                      zIndex: 4, pointerEvents: "none", background: "var(--c-bg)", padding: "0 4px" }}>
                 {passInputLabel}{editTarget === "original" || !showRaw ? " — drag the red border" : " (view)"}{bZoom > 1 ? " · shift/middle-drag to pan" : " · scroll to zoom"}
@@ -2887,9 +3117,16 @@ const PROP_SLICE_BAND = 20;
               // post-hoc per-frame RIGID warp (apply_sagittal_surface_gt) on Correct & re-run. Same physical-aspect
               // box (bDispW×bDispH), scaleX(-1) frame flip, and zoom/pan as the LEFT editor, so before/after render
               // same-size + same-orientation. Backdrop is the NATIVE corrected B-scan so the line lands on-grid.
-              <CorrectedEdgePanel sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
-                                  bZoom={bZoom} bPan={bPan} filterCss={enhanceFilter} readOnly={readOnly}
-                                  onZoomWheel={onCorrectedWheel} />
+              // In corrected-ONLY view the original pane is hidden (but still in flow to hold the size measurement),
+              // so this pane is taken OUT of flow and centred over the full row — the hidden pane then measures the
+              // full width, so bDispW grows and the corrected image renders large + centred rather than off to one side.
+              <div style={showOriginal
+                ? { display: "contents" }
+                : { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 5 }}>
+                <CorrectedEdgePanel sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
+                                    bZoom={bZoom} bPan={bPan} filterCss={enhanceFilter} readOnly={readOnly}
+                                    onZoomWheel={onCorrectedWheel} />
+              </div>
             )}
           </div>
         ) : correctedPanel}

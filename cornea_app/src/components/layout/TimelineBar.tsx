@@ -118,6 +118,7 @@ export function TimelineBar() {
   const setDefectMarks = useCaseStore((s) => s.setDefectMarks);
   const approvePreprocessing = useCaseStore((s) => s.approvePreprocessing);
   const rerunPreprocess = useCaseStore((s) => s.rerunPreprocess);
+  const clearAllCorrections = useCaseStore((s) => s.clearAllCorrections);
   // Ground-truth capture: this scan carries a manual border correction (Fix-columns anchors) → Approving records
   // it as CONFIRMED ground truth for the auto-detector training corpus. The toggle lets the user EXCLUDE an
   // idealised case (e.g. a motion-corrupted scan whose hand-drawn border is not real geometry) from the corpus.
@@ -910,6 +911,23 @@ export function TimelineBar() {
           startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Re-preprocess from the raw .OCT — fresh corneal-surface detection, surface-crop detection and warp. DISCARDS your manual border corrections (edge drags / shaped curve; asks first if any exist); KEEPS surface-crop frames, crop region and classification. Resets to Preprocessed — re-inspect, then Approve.">
           {busyAction === "rerun" && caseBusy ? "Re-preprocessing…" : "↻ Re-preprocess"}
+        </Button>
+        {/* FULL reset — the superset of Re-preprocess. Discards EVERY manual correction (border + corrected-edge +
+            axial anchors, artifact/surface crops, marks, force/good columns, manual patch/shifts) and re-runs pure
+            AUTO. For starting a scan over from scratch. Always confirms (it is destructive of all edits). */}
+        <Button size="small" variant="outlined" color="error" disabled={busy}
+          onClick={() => {
+            if (!window.confirm(
+              "Clear ALL corrections on this scan and start fresh?\n\n"
+              + "This DISCARDS every manual correction — edge drags, shaped curves, corrected-result edge edits, "
+              + "artifact + surface crops, axial fixes, marks and approved slices — then re-runs pure AUTO detection "
+              + "from the raw .OCT.\n\nDetection settings, scar classification and recorded training GT are kept. "
+              + "This cannot be undone. Continue?")) return;
+            setBusyAction("clearall"); void clearAllCorrections();
+          }}
+          startIcon={busyAction === "clearall" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title="Discard ALL manual corrections on this scan (border / corrected-edge / axial anchors, artifact + surface crops, marks, approved slices, force/good columns, manual patch + shifts) and re-run pure AUTO detection from the raw .OCT — a clean slate. KEEPS detection settings, classification and training GT. Resets to Preprocessed — re-inspect, then Approve.">
+          {busyAction === "clearall" && caseBusy ? "Clearing…" : "⟲ Clear all corrections"}
         </Button>
         {proposals.hasProposal && (
           <Button size="small" variant="outlined" color="secondary" disabled={busy}

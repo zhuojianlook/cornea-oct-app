@@ -34,6 +34,7 @@ export function VolumeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);   // #paint — WebGL-independent 2-D drawing overlay
   const volumeUrl = useCaseStore((s) => s.volumeUrl);
+  const editorResetNonce = useCaseStore((s) => s.editorResetNonce);
   const caseId = useCaseStore((s) => s.caseId);
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const setCaseId = useCaseStore((s) => s.setCaseId);
@@ -88,6 +89,9 @@ export function VolumeCanvas() {
   // been preprocessed — i.e. its raw snapshot (context_raw previews) was captured.
   const [hasRaw, setHasRaw] = useState(false);
   const [compareView, setCompareView] = useState(false);
+  // Fix-columns 3-state view toggle: show the original (raw, editable) pane only, the corrected result only, or both.
+  // Decoupled from compareView (which drives the non-fix-cols before/after viewer); the fix-cols "⇆ view" button cycles it.
+  const [fcViewMode, setFcViewMode] = useState<"original" | "both" | "corrected">("original");
   // AUTO-OPEN before/after when the pipeline surface-cropped this scan. The clip is only visible on the
   // ORIGINAL panel — the correction's whole purpose is that the output no longer shows it — so a scan that
   // was auto-cropped should land straight in the view where that decision can be seen and edited, rather
@@ -434,6 +438,14 @@ export function VolumeCanvas() {
     // opens by default, because the reviewer was left with a single view button and no way to look at the
     // scan any other way. Every view is offered again; choosing one the editor cannot host simply closes it.
     if (fixColsView && v !== "sagittal" && v !== "coronal") setFixColsView(false);
+    // SYMMETRIC RE-OPEN: the line above closes the border editor when leaving to a plane it can't host (Axial/
+    // Multi/3D), but nothing re-opened it on the way back — so sagittal→axial→sagittal left fixColsView stuck
+    // false and the cyan/red + band overlay never returned (only the bare niivue B-scan showed): the reviewer's
+    // "the edges/lines disappear after switching views". Returning to a hostable plane at a preprocessing step
+    // restores it. Mirrors the once-per-case auto-open conditions (preprocStep && !inspecting) and yields to the
+    // sibling 2-D overlays (before/after, steps, axial-fix) when the user deliberately has one of those open.
+    else if (!fixColsView && (v === "sagittal" || v === "coronal") && preprocStep && !inspecting
+             && !compareView && !stepsView && !fixAxialView) setFixColsView(true);
     if (compareView && (v === "multi" || v === "render")) setCompareView(false);
     setViewState(v);
     setView(v);
@@ -559,10 +571,19 @@ export function VolumeCanvas() {
           <ToggleButton
             size="small"
             value="ba"
-            selected={compareView}
+            // In fix-columns mode the raw-beside-corrected split is driven by fcViewMode (the panel reads it,
+            // NOT compareView), so reflect THAT here — otherwise the button looks unselected while the split is on.
+            selected={fixColsView ? fcViewMode !== "original" : compareView}
             onChange={() => {
               // Before/after is COMBINABLE with Fix-columns (it doesn't clear it): turning it on while
               // fix-columns is active makes the fix-columns panel show raw beside the markable corrected.
+              // The fix-cols panel is gated on fcViewMode (not compareView), so in that mode DRIVE fcViewMode
+              // (original <-> both) instead — else this button is a dead no-op there ("before/after doesn't work").
+              // "both" keeps the original pane shown+editable (showOriginal stays true), so no tool gesture breaks.
+              if (fixColsView) {
+                setFcViewMode((v) => (v === "original" ? "both" : "original"));
+                return;
+              }
               const on = !compareView;
               if (on && !compareView && !fixColsView) preOverlayViewRef.current = view; // entering from normal → remember view
               setCompareView(on); setStepsView(false); setFixAxialView(false);
@@ -729,8 +750,10 @@ export function VolumeCanvas() {
         )}
         {fixColsView && volumeUrl && (
           <div className={`absolute inset-0 z-20 flex flex-col${crisp ? "" : " oct-smooth-imgs"}`} style={{ backgroundColor: "var(--c-bg)" }}>
-            <SliceGallery fixCols showRaw={compareView} orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting}
-              onToggleRaw={() => setCompareView((v) => !v)} />
+            <SliceGallery key={`fixcols-${editorResetNonce}`} fixCols showRaw={fcViewMode !== "original"} showOriginal={fcViewMode !== "corrected"} viewMode={fcViewMode}
+              orientProp={orient2d} filterCss={viewerFilter} readOnly={inspecting}
+              onToggleRaw={() => setFcViewMode((v) => (v === "original" ? "both" : v === "both" ? "corrected" : "original"))}
+              onNeedOriginalPane={() => setFcViewMode((v) => (v === "corrected" ? "both" : v))} />
           </div>
         )}
         {/* AXIAL fix-tool — a 2-D overlay over the (still-mounted) niivue canvas. Mutually exclusive with the

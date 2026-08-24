@@ -3,6 +3,7 @@ import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { usePendingEditStore } from "../../store/pendingEditStore";
+import { parseCropBands, interpBand } from "../../store/cropBands";
 import type { CaseInfo } from "../../api/types";
 
 // CORRECTED-RESULT sagittal fix-tool — the RIGHT ("corrected") pane of the before/after fix-columns view.
@@ -110,11 +111,21 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     if (a != null) return a;                       // un-confirmed drag → WYSIWYG (the line you're moving is visible)
     return edge ? edge[f] : 0;
   };
-  const spanPts = (): string => {
-    if (!edge || nFrames < 2) return "";
-    const pts: string[] = [];
-    for (let f = 0; f < nFrames; f++) pts.push(`${f + 0.5},${edgeY(f)}`);
-    return pts.join(" ");
+  // #9 v3: the interpolated artifact band for THIS lateral — the corrected result has these frames ZEROED (black),
+  // so the red surface line is BROKEN over them (drawing a line across the removed/black region is misleading).
+  const cropBandsSig = JSON.stringify(ocParams(caseInfo).crop_bands ?? {});
+  const curBand = useMemo(() => interpBand(parseCropBands(JSON.parse(cropBandsSig)), sliceIndex), [cropBandsSig, sliceIndex]);
+  const inBand = (f: number) => curBand != null && f >= curBand[0] && f <= curBand[1];
+  const segPts = (): string[] => {
+    if (!edge || nFrames < 2) return [];
+    const segs: string[][] = []; let cur: string[] = [];
+    for (let f = 0; f < nFrames; f++) {
+      const y = inBand(f) ? NaN : edgeY(f);
+      if (Number.isFinite(y)) cur.push(`${f + 0.5},${y}`);
+      else if (cur.length) { segs.push(cur); cur = []; }
+    }
+    if (cur.length) segs.push(cur);
+    return segs.filter((s) => s.length > 1).map((s) => s.join(" "));
   };
 
   // drag: screen → (frame, depth). Parent is scaleX(-1)-flipped so frame 0 is on the VISUAL RIGHT; invert the
@@ -177,9 +188,11 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
                           cursor: edit ? "row-resize" : "default", touchAction: "none",
                           pointerEvents: edit ? "auto" : "none" }}>
-              {/* detected / dragged corrected surface (red) — the line you drag onto the true band */}
-              <polyline fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
-                        strokeWidth={dirty ? 1.3 : 0.9} opacity={edit ? (dirty ? 0.95 : 0.8) : 0.5} points={spanPts()} />
+              {/* detected / dragged corrected surface (red) — broken over the cropped (zeroed) artifact band */}
+              {segPts().map((sg, i) => (
+                <polyline key={`ce${i}`} fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
+                          strokeWidth={dirty ? 1.3 : 0.9} opacity={edit ? (dirty ? 0.95 : 0.8) : 0.5} points={sg} />
+              ))}
               {/* anchored frames → pink vertical ticks (circles squash under the stretched viewBox) */}
               {edit && curAnchors && [...curAnchors.entries()].map(([f, d], i) => (
                 <line key={`a${i}`} x1={f + 0.5} y1={d - depthVox / 50} x2={f + 0.5} y2={d + depthVox / 50}

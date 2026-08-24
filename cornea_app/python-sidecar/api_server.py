@@ -2129,6 +2129,10 @@ class OctPreprocessRequest(BaseModel):
                                              # certain FRAME columns over a RANGE of LATERAL slices (zeroed before
                                              # SAM2). A STICKY oct_param recorded so scar-alignment excludes the
                                              # lost box. None = carry persisted; {} or empty frames = clear the crop.
+    crop_bands: dict | None = None           # #9 v3 per-lateral ARTIFACT band {'str(lateral)':[lo,hi]} — a
+                                             # time-domain artifact whose frame extent VARIES per slice; marked on
+                                             # several slices, interpolated across laterals, EXCLUDED from the fit +
+                                             # zeroed before SAM2. Sticky. None = carry persisted; {} = clear.
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
     manual_patch: dict | None = None         # reviewer-accepted RIGID patch: {frame_index: [depth_px, tilt_px]}.
@@ -2170,6 +2174,33 @@ class OctPreprocessRequest(BaseModel):
     ascan_rate_hz: float | None = None        # eye-motion tab: A-scan (line) rate → frame rate → Hz axis (Avanti ~70000)
     detrend_order: int | None = None          # eye-motion tab: per-A-line shape-removal polynomial order (default 2)
     sinc_correct: bool | None = None          # eye-motion tab: divide out the intra-frame motion-blur boxcar
+    want_conf: bool | None = None             # oct-border-curves-all: also return a per-(slice,frame) confidence
+                                              # map (surface_confidence_map) over the SERVED edge, so the fix-columns
+                                              # editor can flag the LOW-confidence stretches that still need marking.
+    clear_all_corrections: bool | None = None  # "Clear all corrections & re-preprocess": drop EVERY sticky manual
+                                              # correction (border/corrected-edge/axial anchors, crop bands, surface
+                                              # crop, marks, force/good columns, manual patch/shifts) from oct_params
+                                              # before this AUTO run, so the scan returns to a pure fresh-detect state.
+                                              # Detection config (dp_*), classification, review flags + training GT are
+                                              # kept. See _CORRECTION_PARAM_FIELDS.
+
+
+# EVERY per-scan oct_params field that stores a MANUAL reviewer correction/mark. "Clear all corrections" pops all of
+# these so the scan is re-processed as pure AUTO. Deliberately EXCLUDES: dp_*/detect config, oct_max_iterations,
+# auto_tune (tuning, not a correction); scar_classification/scar_range/subgroup (not corrections); and the training
+# corpus GT (manifest.border_gt) + review metadata (review_flags/difficult_scan), which are not this scan's live edits.
+_CORRECTION_PARAM_FIELDS = (
+    "border_anchors", "border_generalize", "border_guided", "parabola", "parabola_slices",  # anterior edge / quadratic
+    "manual_shifts", "manual_patch",                                                          # legacy per-frame nudges
+    "corrected_edge_anchors", "corrected_trusted_laterals",                                   # corrected-result edge / trusted
+    "axial_anchors",                                                                          # axial fix-tool
+    "crop_bands", "crop_region", "crop_lateral", "crop_post_anchors",                          # artifact / box / bottom-line crops
+    "surface_crop_frames", "surface_crop_mode", "auto_surface_crop",                          # surface crop (manual + auto flag)
+    "surface_cut", "zero_cols",                                                                # cut / zeroed frames
+    "force_columns", "good_columns",                                                           # fix-columns force / good
+    "detilt",                                                                                  # applied de-tilt
+    "redetect_seed_window", "redetect_seed_window_slices",                                     # seed windows tied to anchors
+)
 
 
 def _oct_working_path(case_id: str, src: str) -> Path:
@@ -2483,6 +2514,32 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # sticks, so the user's column fix survives later re-runs). A normal preprocess (full params
     # from the loader, no force_columns) keeps its prior behaviour.
     eff_params = {**(m.get("oct_params") or {}), **(req.params or {})}
+    # CLEAR ALL CORRECTIONS: drop every sticky manual correction so this becomes a pure fresh AUTO run. Do it FIRST,
+    # before any correction is read back below (the plain-auto path already pops border_anchors + rmtrees border_cache,
+    # but it KEEPS corrected_edge_anchors / crop_bands / axial_anchors / surface-crop / force-columns sticky — so those
+    # must be popped explicitly here). Also force the auto branch (no re-detect / no smooth-align) and drop the derived
+    # caches so nothing stale is re-served. defect_marks (top-level) is already wiped by every preprocess run.
+    if req.clear_all_corrections:
+        for _cf in _CORRECTION_PARAM_FIELDS:
+            eff_params.pop(_cf, None)
+        req.use_redetect = False
+        req.corrected_smooth_align = False
+        req.corrected_edge_anchors = None
+        req.corrected_trusted_laterals = None
+        req.axial_anchors = None
+        req.crop_bands = None
+        _AXIAL_SURF_CACHE.pop(case_id, None)
+        try:
+            import shutil as _sh_clr
+            _sh_clr.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+        # surface_crop_manual is a TOP-LEVEL review mark (not oct_params, steers nothing) — clear it too so the
+        # scan reads as never-reviewed. Not in `extra` below, so this write survives the end-of-run manifest merge.
+        try:
+            orch.write_manifest_value(case_id, {"surface_crop_manual": None})
+        except Exception:  # noqa: BLE001
+            pass
     # apply_proposals is a ONE-SHOT approve action (bake in the detected de-tilt/crop/surface-crop), NOT a sticky
     # oct_param — pop it so it isn't persisted (a later fresh auto-preprocess proposes again for re-review); it's
     # re-injected only into the worker params for this run.
@@ -2560,6 +2617,23 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
             eff_params["crop_lateral"] = cl
         else:
             eff_params.pop("crop_lateral", None)
+    # #9 v3 ARTIFACT BANDS — STICKY per-lateral artifact crop, its OWN independent `if` (NOT part of the
+    # crop_region/crop_lateral if/elif chain above — placed after it so the legacy elif still binds to crop_region).
+    # REPLACE when this request supplies crop_bands (non-None); empty dict clears. Interpolated across laterals +
+    # excluded from the fit at run time (oct_preprocess._artifact_bands).
+    if req.crop_bands is not None:
+        cb: dict = {}
+        for lk, band in (req.crop_bands if isinstance(req.crop_bands, dict) else {}).items():
+            if not isinstance(band, (list, tuple)) or len(band) != 2:
+                continue
+            try:
+                cb[str(int(lk))] = [int(band[0]), int(band[1])]
+            except (TypeError, ValueError):
+                continue
+        if cb:
+            eff_params["crop_bands"] = cb
+        else:
+            eff_params.pop("crop_bands", None)
     eff_params.pop("coronal_check", None)    # removed feature — strip any stale persisted flag
     eff_params.pop("manual_columns", None)   # removed feature — strip any stale persisted nudges
     # surface_cut (fix-columns "Re-run with cuts") is a PER-RUN override like force_columns, NOT a sticky
@@ -2584,6 +2658,25 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # raw-GT Run rather than being superseded). Request set REPLACES; omitted carries the persisted set through.
     if req.corrected_edge_anchors is not None:
         eff_params["corrected_edge_anchors"] = req.corrected_edge_anchors
+    # CORRECTED-RESULT EDIT FEEDBACK (reviewer directive): fold edits/approvals made on the CORRECTED result BACK
+    # into the ORIGINAL scan's border_anchors GT, then re-run the warp from the improved GT — instead of the old
+    # post-hoc rigid warp on the already-corrected volume (align_corrected_to_smooth / apply_sagittal_surface_gt).
+    # "alter the corrections to the original scan such that a better corrected result is formed, not correcting the
+    # corrected scan itself." Folds only on a corrections re-run; a strict no-op if there are no corrected edits.
+    # NOTE: pure GT-fold-back is OFF by default (corrected_edit_feedback). Verified it does NOT work on its own:
+    # a corrected-result edit folds into border_anchors correctly, but the RIGID per-frame warp (which fits ONE
+    # motion across ALL laterals) averages a local few-lateral GT edit away (measured: -30px edit → ~0.5px in the
+    # result). Residual corrected-result error is inter-frame MOTION, not a surface-position error, so it needs a
+    # per-frame rigid transform fit from the trusted laterals (align_corrected_to_smooth), not a GT edit. Kept
+    # gated for the record; the default path runs align_corrected_to_smooth (which now composes with the fixed
+    # rotation warp). See notes to the reviewer.
+    _folded_corrected = False
+    if (req.use_redetect or req.corrected_smooth_align) and bool(eff_params.get("corrected_edit_feedback")):
+        try:
+            _folded_corrected = _fold_corrected_edits_into_border_anchors(
+                case_id, m, eff_params, req.corrected_trusted_laterals)
+        except Exception:  # noqa: BLE001 — never fail the re-run over the fold-back; fall through to a plain re-run
+            _folded_corrected = False
     # Sanitize the EFFECTIVE set (request-provided OR carried-through from persisted oct_params): drop any
     # zero / NaN / Infinity / malformed entry so the manifest never accumulates no-op garbage and always
     # matches the frontend's zero-free view (a zero shift is a no-op the frontend already removes).
@@ -2605,7 +2698,15 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     # undulation. It does NOT depend on a re-detected surface: on an AUTO-only scan there are no border anchors
     # to flatten to, so fall back to a normal auto preprocess (+ the align at the end) instead of erroring.
     _want_redetect = bool(req.use_redetect) and bool((m.get("oct_params") or {}).get("border_anchors"))
-    if req.use_redetect and not _want_redetect and not req.corrected_smooth_align:
+    # use_redetect with NO confirmed border anchors: there is no re-detected surface to flatten to. Rather than
+    # hard-erroring, fall back to a normal AUTO preprocess whenever there is still work it WILL do — a smooth-align,
+    # or a STICKY CROP to apply (surface_crop / crop_region / crop_bands / legacy crop_lateral). The auto pass
+    # re-detects and applies those (e.g. crop_bands excludes the artifact from the fit + zeroes it before SAM2), so
+    # "Re-run with corrections" works after marking a crop even with no border edit. Only error when there is
+    # genuinely nothing to do.
+    _has_sticky_crop = bool(eff_params.get("crop_bands") or eff_params.get("crop_region")
+                            or eff_params.get("surface_crop_frames") or eff_params.get("crop_lateral"))
+    if req.use_redetect and not _want_redetect and not req.corrected_smooth_align and not _has_sticky_crop:
         raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
     if _want_redetect:
         anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
@@ -2618,6 +2719,10 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         surf_for_warp = _redetect_surface_cached(case_id, m, anchors)
         if surf_for_warp is None:
             raise HTTPException(400, "No re-detected surface to apply — drag the border and Confirm first.")
+        # LIMBUS/edge-band smoothing of the warp TARGET so the corrected tissue ascends smoothly onto the faint
+        # limbus (the reviewer's "not smooth at the right end" — the flatten reproduces the target's edge roughness).
+        # Gentle-average (no anchor re-pin); gated by edge_band_smooth_frames; corrections path only.
+        surf_for_warp = oct_mod.smooth_surface_edge_band(surf_for_warp, {**oct_mod.DEFAULT_PARAMS, **eff_params})
         pe_path = orch.case_root(case_id) / "border_cache" / "provided_edges.npz"
         pe_path.parent.mkdir(parents=True, exist_ok=True)
         _pe_tmp = pe_path.with_name("provided_edges.tmp.npz")   # MUST end .npz (savez appends it otherwise)
@@ -2669,7 +2774,9 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
     _wparams = dict(eff_params)
     if _apply_prop:
         _wparams["apply_proposals"] = True
-    if req.corrected_smooth_align:
+    if req.corrected_smooth_align and not _folded_corrected:
+        # Only the OLD post-hoc smooth-align path (warp the corrected volume). Skipped when the edits were folded
+        # back into the raw GT above — that re-runs the warp from the improved GT instead (reviewer's spec).
         _wparams["corrected_smooth_align"] = True
         if req.corrected_trusted_laterals:
             _wparams["corrected_trusted_laterals"] = [int(v) for v in req.corrected_trusted_laterals
@@ -3472,6 +3579,9 @@ class OctMarksRequest(BaseModel):
     surface_crop_frames: list[int] | None = None      # frames whose apex is above the window
     crop_region: dict | None = None                   # {"lateral":[lo,hi], "frames":[...]}
     crop_post_anchors: dict | None = None             # {slice: {frame: depth}} manual posterior edge
+    crop_bands: dict | None = None                    # #9 v3 per-lateral artifact band: {str(lateral):[lo,hi]}
+                                                       #   marked on several slices, interpolated across laterals.
+                                                       #   REPLACE semantics (full map each commit); {} clears.
 
 
 @app.post("/api/case/{case_id}/oct-marks")
@@ -3524,6 +3634,23 @@ def set_oct_marks(case_id: str, req: OctMarksRequest) -> dict:
         else:
             op.pop("crop_post_anchors", None)
         changed["crop_post_anchors"] = {k: len(v) for k, v in cur.items()}
+    if req.crop_bands is not None:
+        # #9 v3 per-lateral artifact band. REPLACE semantics (the frontend holds the full {lateral:[lo,hi]} map):
+        # this request fully defines the set; an empty dict CLEARS. Interpolated across laterals at run time.
+        cb: dict = {}
+        for lk, band in (req.crop_bands or {}).items():
+            if not isinstance(band, (list, tuple)) or len(band) != 2:
+                continue
+            try:
+                lat = int(lk); lo, hi = sorted((int(band[0]), int(band[1])))
+            except (TypeError, ValueError):
+                continue
+            cb[str(lat)] = [lo, hi]
+        if cb:
+            op["crop_bands"] = cb
+        else:
+            op.pop("crop_bands", None)
+        changed["crop_bands"] = op.get("crop_bands")
     if not changed:
         return {"ok": True, "changed": {}}
     orch.write_manifest_value(cid, {"oct_params": op})
@@ -4032,6 +4159,7 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         _crop_lo, _crop_hi, _crop_fs = _crop_box if _crop_box else (0, -1, [])
         _crop_keep = (np.array([j not in set(int(f) for f in _crop_fs) for j in range(n_frames)])
                       if _crop_fs else None)
+        _art_bands = oct_mod._artifact_bands(p, n_frames, n)   # #9 v3 per-lateral artifact band → exclude from the fit
         edges: list = []; fits: list = []
         for i in range(n):
             if use_surf:
@@ -4044,18 +4172,36 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
                 e = oct_mod._smooth_median(oct_mod._correct_surface(raw, max_jump), mfs).astype(np.float64)
             in_crop = (_crop_box is not None and _crop_lo <= i <= _crop_hi
                        and _crop_keep is not None and int(_crop_keep.sum()) >= 3)
+            # frames EXCLUDED from the cyan fit for THIS lateral: crop_region box cols (when in range) + this
+            # lateral's artifact band — so the flat-held band can't drag the parabola off the cornea (#9 v3).
+            _fitkeep = (_crop_keep.copy() if in_crop else np.ones(n_frames, dtype=bool))
+            _ab = _art_bands[i] if (_art_bands is not None and i < len(_art_bands)) else None
+            if _ab is not None and _ab.size:
+                _fitkeep[_ab[(_ab >= 0) & (_ab < n_frames)]] = False
             try:
-                if in_crop:
-                    f = np.polyval(np.polyfit(xs[_crop_keep], e[_crop_keep], 2), xs)  # fit kept frames, extrapolate
-                    e = e.copy(); e[~_crop_keep] = f[~_crop_keep]                     # interpolate edge over cropped cols
+                if int(_fitkeep.sum()) >= 3 and not bool(_fitkeep.all()):
+                    f = np.polyval(np.polyfit(xs[_fitkeep], e[_fitkeep], 2), xs)   # fit cornea frames, extrapolate
+                    if in_crop:
+                        e = e.copy(); e[~_crop_keep] = f[~_crop_keep]              # crop_region interpolates the EDGE too
                 else:
                     f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
             except Exception:  # noqa: BLE001
                 f = e
             edges.append([round(float(v), 1) for v in e])
             fits.append([round(float(v), 1) for v in f])
-        return {"slices": n, "n_frames": n_frames, "depth_vox": depth_vox, "pass": pass_n,
-                "edges": edges, "fits": fits}
+        out = {"slices": n, "n_frames": n_frames, "depth_vox": depth_vox, "pass": pass_n,
+               "edges": edges, "fits": fits}
+        # Per-(slice,frame) confidence over the SERVED edge (the array actually displayed) — the fix-columns
+        # editor uses it to flag the low-confidence stretches that still need edge corrections. Measured on the
+        # same `edges` we return, so preview == what the banner reasons about. ~0.4s over the whole volume; only
+        # computed when the editor asks (want_conf), so the non-assist scrub path is unchanged.
+        if bool(req.want_conf):
+            try:
+                conf = oct_mod.surface_confidence_map(arr, np.asarray(edges, dtype=np.float64), p)
+                out["conf"] = [[round(float(v), 3) for v in row] for row in conf]
+            except Exception:  # noqa: BLE001 — confidence is advisory; never fail the curve fetch over it
+                pass
+        return out
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -4240,7 +4386,8 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
                 edge = oct_mod._merged_side_edge(sl, p)
         else:
             edge = oct_mod._merged_side_edge(sl, p)
-        fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
+        # cyan fit EXCLUDES this lateral's artifact band (else the flat-held band drags the parabola off the cornea).
+        fit = oct_mod.fit_quadratic_excluding_bands(edge, p, idx, n)
         return {"slices": n, "index": int(idx), "n_frames": int(sl.shape[1]), "depth_vox": int(sl.shape[0]),
                 "pass": pass_n, "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
     except HTTPException:
@@ -4323,18 +4470,37 @@ _DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColo
                       # generalize_surface (propagate learned correction to the whole volume) — its params change
                       # the generalized surface, so they must invalidate the generalize.npz cache
                       "gen_min_slices", "gen_min_resid", "gen_sign_frac", "gen_resid_cap", "gen_taper_slices",
-                      "gen_frame_margin", "gen_slice_sigma", "gen_frame_sigma")
+                      "gen_frame_margin", "gen_slice_sigma", "gen_frame_sigma",
+                      # frame-edge epithelium snap (frame-axis sibling of edge_follow) — toggling it changes the
+                      # detected surface at the left/right frame edges, so it must invalidate the surface caches
+                      "frame_edge_snap",
+                      # PURE interpolation between dense manual corrections — its params change the served/warp
+                      # surface on the dense-anchor path, so they must invalidate the redetect.npz cache
+                      "dense_pure_interp", "interp_min_slices", "interp_frame_taper")
 
 # Bumped whenever redetect_surface()'s region/march LOGIC changes (not just its params), so an APP UPDATE
 # invalidates surfaces written by the old algorithm. "per-slice-v2" = the per-slice frame-region fix (a
 # redetect.npz from the prior global-union code would otherwise be served unchanged after an update — the
 # detection params are identical — silently keeping the old buggy surface on already-confirmed cases).
-_REDETECT_ALGO_VERSION = "dp-v4-scarguard-interp1"   # DP + legacy-vicinity scar-guard (pulls DP off bright scars)
+_REDETECT_ALGO_VERSION = "dp-v7-pure-interp"   # dense-anchor path now PURE-interpolates the drawn edge between slices (interpolate_anchors_surface) instead of re-detecting; + dp-v6 corner re-trace
 
 
 def _detect_params_sig(p: dict) -> str:
     """Canonical signature of the detection-relevant params + algorithm version (for surface-cache freshness)."""
-    return f"algo={_REDETECT_ALGO_VERSION};" + ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS)
+    sig = f"algo={_REDETECT_ALGO_VERSION};" + ";".join(f"{k}={p.get(k)}" for k in _DETECT_PARAM_KEYS)
+    # #9 v3: crop_bands now ALTERS detect_surface_all's output (the band-reconstruction that makes the DISPLAYED
+    # surface ignore the artifact), so it MUST invalidate the surface caches — otherwise the cheap mark-then-scrub
+    # path (set_oct_marks, no re-run) serves a stale baseline that still dives into the artifact. Sorted JSON so
+    # the same bands hash identically regardless of key order. (This is the first sticky crop that touches the
+    # detector; the "detection is independent of crop_*" assumption elsewhere no longer holds for crop_bands.)
+    _cb = p.get("crop_bands")
+    if _cb:
+        import json as _j
+        try:
+            sig += ";crop_bands=" + _j.dumps({str(k): [int(v[0]), int(v[1])] for k, v in _cb.items()}, sort_keys=True)
+        except (TypeError, ValueError, IndexError):
+            sig += f";crop_bands={_cb}"
+    return sig
 
 
 def _redetect_cache_path(case_id: str) -> Path:
@@ -4442,8 +4608,12 @@ def _redetect_surface_fresh(case_id: str, anchors: dict):
             return None
         if abs(float(z["raw_mtime"]) - float(os.path.getmtime(raw))) > 1e-6:
             return None
-        p = {**oct_mod.DEFAULT_PARAMS, **(orch.read_manifest(case_id).get("oct_params") or {})}
-        if str(z["params_sig"]) != _detect_params_sig(p):    # detection params changed → stale
+        try:
+            _nlat = int(_load_border_vol(raw).shape[0])   # cached; needed for the dense-anchor window override
+        except Exception:  # noqa: BLE001
+            _nlat = None
+        p = _effective_redetect_params(anchors, _nlat, orch.read_manifest(case_id))  # dense → window=0 (match compute)
+        if str(z["params_sig"]) != _detect_params_sig(p):    # detection params (incl. dense window) changed → stale
             return None
         return np.asarray(z["surface"], dtype=np.float32)
     except Exception:  # noqa: BLE001 — a corrupt/old cache just forces a recompute
@@ -4461,11 +4631,65 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     arr = _load_border_vol(raw)                              # (lateral, depth, frames)
     p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
     baseline = _baseline_surface(case_id, arr, p)           # cached auto surface (the satisfactory rest)
-    surface = oct_mod.redetect_surface(arr, anchors, p, baseline=baseline)   # local-band correction (lateral, frames)
+    # DENSE anchors → pure connect-the-dots interpolation (redetect_interp_window=0): the per-slice re-detect
+    # snap adds detection bumps to the warp target without improving tightness. Baseline stays on the original
+    # params (window unused by detect_surface_all); only the redetect surface + its cache sig use p_eff.
+    p_eff = _effective_redetect_params(anchors, int(arr.shape[0]), m)
+    surface = oct_mod.redetect_surface(arr, anchors, p_eff, baseline=baseline)   # local-band correction (lateral, frames)
     # PIN the reviewer's drawn frames to their exact value: the local-band march snaps to within a couple of
     # px of the drawn line (redetect_seed_window), which drifts a correction off where it was drawn. Ground
     # truth wins at the frames the reviewer actually touched; the march still governs the propagated band.
-    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)))
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)))
+    # DENSE (only): light across-FRAME smoothing to remove the pinned hand-drawn jitter that would otherwise
+    # STEP the rigid warp (bumpy, un-curved B-scan). Confined to cornea frames (below the earliest crop-band lo),
+    # so the artifact-band reconstruction can't be blurred into the cornea. Applied AFTER pin so it smooths the
+    # drawn line itself — a reviewer's line is approximate; the low-frequency correction survives, only jitter goes.
+    _fs = float(p_eff.get("redetect_frame_smooth", 0.0) or 0.0)
+    if _fs > 0.0:
+        from scipy import ndimage as _ndi
+        _depth = int(arr.shape[1])
+        _lo = int(arr.shape[2])
+        _ab = oct_mod._artifact_bands(p_eff, int(arr.shape[2]), int(arr.shape[0]))
+        if _ab is not None:
+            _los = [int(b.min()) for b in _ab if b is not None and getattr(b, "size", 0)]
+            if _los:
+                _lo = max(1, min(_los))
+        surface[:, :_lo] = _ndi.gaussian_filter1d(surface[:, :_lo], sigma=_fs, axis=1, mode="nearest")
+        # CLAMP the smooth at the reviewer's DRAWN frames (fidelity option 2). The across-frame blur above
+        # removes hand-drawn frame-to-frame jitter (which would step the rigid warp) — but on a large correction
+        # it pulls the pinned point back toward its un-corrected neighbours by several px, silently UNDOING the
+        # correction (measured mean 3.3px, up to 16px off the drawn line). Re-cap each drawn point to within
+        # ±clamp px of EXACTLY what was drawn: the un-drawn frames stay smoothed, but the drawn line is honoured
+        # to ~subpixel. Uses the same anchor normalization as pin_anchors (ABSENT sentinel skipped, above-canvas
+        # negatives clamped to [-crop_max_pad, depth-1]). clamp<0 disables (falls back to the pure blur).
+        _clamp = float(p_eff.get("redetect_frame_smooth_anchor_clamp", 1.0))
+        _pad = float(p_eff.get("crop_max_pad", 120))
+        if _clamp >= 0.0:
+            for _sk, _frames in (anchors or {}).items():
+                try:
+                    _s = int(_sk)
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= _s < surface.shape[0]) or not isinstance(_frames, dict):
+                    continue
+                for _fk, _d in _frames.items():
+                    try:
+                        _f = int(_fk); _dv = float(_d)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= _f < _lo and np.isfinite(_dv) and _dv < _depth - 1:
+                        _tgt = float(np.clip(_dv, -_pad, _depth - 1))
+                        surface[_s, _f] = float(np.clip(surface[_s, _f], _tgt - _clamp, _tgt + _clamp))
+    # PURE INTERPOLATION between manually corrected slices (reviewer directive, cs048). The local-band re-detect
+    # above interpolates each slice's WHOLE border (drawn frames mixed with auto for the undrawn ones) then
+    # re-detects within a window, so the auto detector's faint-limbus jitter leaks in across slices (measured
+    # 5-12px) even though the drawn limbus values are smooth — the "bumpy right end". Replace it with a per-frame
+    # linear interp of ONLY the drawn values across slices: smooth AND exact at every drawn edge. Frames drawn on
+    # < interp_min_slices keep the auto baseline (the mid-dome the reviewer left alone). Only for DENSE anchors
+    # (gap-bounded, so interpolation never spans a huge un-marked gap). See interpolate_anchors_surface.
+    if p.get("dense_pure_interp", True) and _anchors_are_dense(anchors, int(arr.shape[0]), p):
+        surface = oct_mod.interpolate_anchors_surface(anchors, baseline, p)
+        oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)))
     cp = _redetect_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     # tmp MUST end in .npz — np.savez_compressed appends '.npz' to any path that doesn't, which would make
@@ -4474,7 +4698,7 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     np.savez_compressed(tmp, surface=surface.astype(np.float32),
                         anchors_sig=_border_anchors_sig(anchors),
                         raw_mtime=float(os.path.getmtime(raw)),
-                        params_sig=_detect_params_sig(p))
+                        params_sig=_detect_params_sig(p_eff))
     os.replace(tmp, cp)
     return surface
 
@@ -4545,6 +4769,56 @@ def _generalize_surface_cached(case_id: str, m: dict, anchors: dict):
     return surf
 
 
+def _anchors_are_dense(anchors: dict, n_lateral, p: dict) -> bool:
+    """True when the fix-columns anchors span the volume with no large gap — so the LOCAL-redetect surface
+    (redetect_surface step-2: linear connect-the-dots interpolation of the residual between adjacent anchored
+    slices) already covers the whole volume, and we can serve that TIGHT surface instead of the smoothed/gated
+    whole-volume generalize field. Generalize is tuned to spread a FEW corrections robustly across laterals and
+    so attenuates ~40% of the drawn correction between dense anchors; redetect follows the drawn points ~3×
+    tighter and still drives the rigid flatten with volume-spanning anchors. Sparse anchors → False → keep
+    generalize. Gated by dense_anchor_redetect so the behaviour can be disabled."""
+    if not p.get("dense_anchor_redetect", True):
+        return False
+    try:
+        sl = sorted(int(k) for k in (anchors or {}).keys())
+    except (TypeError, ValueError):
+        return False
+    if len(sl) < 4:                                    # too few to call "dense" — let generalize generalize
+        return False
+    band = max(1, int(p.get("redetect_slice_band", 20)))
+    max_gap = max(sl[i + 1] - sl[i] for i in range(len(sl) - 1))
+    if max_gap > 2 * band:                             # a gap wider than two redetect bands → generalize spreads better
+        return False
+    if n_lateral and int(n_lateral) > 1:               # the anchored span must reach both ends, else the ends taper
+        if sl[0] > band or sl[-1] < int(n_lateral) - 1 - band:   # to auto and generalize reaches more of those laterals
+            return False
+    return True
+
+
+def _effective_redetect_params(anchors: dict, n_lateral, m: dict) -> dict:
+    """Detection params for the LOCAL-redetect surface, with the DENSE-anchor override: dense anchors use
+    redetect_interp_window=0 (PURE connect-the-dots interpolation between drawn slices) instead of the per-slice
+    re-detect snap. The snap re-detects every in-between slice from the image within ±window px of the interp
+    prior, which adds per-slice detection BUMPS to the warp target without improving tightness to the drawn
+    points (measured cs007: across-slice roughness 1.00→0.54px = as smooth as generalize, tightness unchanged
+    ~1.9px, dome preserved). redetect_interp_window is in _DETECT_PARAM_KEYS, so keying it here makes a stale
+    window=3 (bumpy) redetect.npz auto-invalidate on the next access for a dense scan."""
+    p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+    if _anchors_are_dense(anchors, n_lateral, p):
+        # window=0 → pure connect-the-dots interpolation across slices; frame_smooth → remove the hand-drawn
+        # anchors' frame-to-frame JITTER, which otherwise steps the rigid warp into a bumpy, "un-curved" B-scan.
+        # σ≈1.5 matches generalize's across-frame smoothness (frame-roughness 1.94→0.99px) while KEEPING the tight
+        # across-slice interpolation (the smoothing is a different axis). Corrections are approximate by design —
+        # BUT the σ=1.5 blur alone dragged a big drawn correction (a floating edge snapped down onto the
+        # epithelium) back toward its un-corrected neighbours by up to 16px (mean 3.3px off the drawn line),
+        # silently undoing it. redetect_frame_smooth_anchor_clamp caps how far a DRAWN point may move from
+        # exactly what the reviewer placed (±1px): jitter is still smoothed on the un-drawn frames, but the drawn
+        # line is honoured to ~subpixel. See _compute_redetect_cache for the clamp application.
+        p = {**p, "redetect_interp_window": 0.0, "redetect_frame_smooth": 1.5,
+             "redetect_frame_smooth_anchor_clamp": 1.0}
+    return p
+
+
 def _redetect_surface_cached(case_id: str, m: dict, anchors: dict):
     """The re-detected surface for `anchors`: the fresh cache if valid, else recompute+cache. This makes an
     ALGORITHM upgrade (or a param change) transparently refresh the surface for BOTH the scrub display and the
@@ -4553,11 +4827,33 @@ def _redetect_surface_cached(case_id: str, m: dict, anchors: dict):
 
     If oct_params['border_generalize'] is set, returns the WHOLE-VOLUME generalized surface (generalize.npz)
     instead of the local-band redetect — rerouting scrub + Run to the generalization in one place."""
-    # GUIDED first, when it won its guard. It is a detection of every slice from the image (seeded by the
-    # corrections), rather than the corrections interpolated across slices, and it is only ever written when
-    # it measured better than auto — so wherever the flag is set, this is the best surface the scan has.
-    # Falls through if the cache is missing or stale, rather than serving a surface that no longer matches
-    # the anchors it was judged on.
+    # DENSE anchors FIRST — the reviewer wants their marks INTERPOLATED between the drawn slices, NOT re-detected.
+    # Serve the local-redetect PURE connect-the-dots surface (redetect_interp_window=0 via
+    # _effective_redetect_params) and SKIP guided. Guided is a from-image re-detection of EVERY slice — i.e.
+    # "automatic edge detection between the manually marked slices", the OPPOSITE of interpolation (reviewer
+    # directive 2026-08-17: "not interpolating between the manually drawn slices, instead reverting to automatic
+    # edge detection between them"). guided/generalize stay for SPARSE marks, where interpolating across large
+    # gaps is unreliable and from-image detection genuinely helps.
+    if anchors:
+        _pden = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        _nlden = None
+        try:
+            _nlden = int(_load_border_vol(_ensure_raw_border_nifti(case_id)).shape[0])
+        except Exception:  # noqa: BLE001
+            _nlden = None
+        if _anchors_are_dense(anchors, _nlden, _pden):
+            _surf = _redetect_surface_fresh(case_id, anchors)
+            if _surf is None:
+                try:
+                    _surf = _compute_redetect_cache(case_id, m, anchors)
+                except Exception:  # noqa: BLE001
+                    _surf = None
+            if _surf is not None:
+                return _surf
+    # GUIDED (now only for SPARSE marks), when it won its guard. It is a detection of every slice from the image
+    # (seeded by the corrections), rather than the corrections interpolated across slices, and it is only ever
+    # written when it measured better than auto. Falls through if the cache is missing or stale, rather than
+    # serving a surface that no longer matches the anchors it was judged on.
     if (m.get("oct_params") or {}).get("border_guided"):
         gp = _guided_cache_path(case_id)
         try:
@@ -4570,10 +4866,23 @@ def _redetect_surface_cached(case_id: str, m: dict, anchors: dict):
     if not anchors:
         return None
     if (m.get("oct_params") or {}).get("border_generalize"):
-        gs = _generalize_surface_cached(case_id, m, anchors)
-        if gs is not None:
-            return gs
-        # generalize failed → fall through to the local redetect rather than showing bare auto
+        # DENSE anchors (spanning the volume, no gap > 2×redetect_slice_band) → skip the smoothed/gated
+        # generalize field and serve the TIGHT local-redetect connect-the-dots surface instead: it follows the
+        # drawn points ~3× tighter (≈1.4px vs ≈4px from the neighbour blend) and still drives the rigid flatten
+        # (measured 4.2px median shift / 74% laterals on cs007). Both the scrub display and the warp call this,
+        # so preview == result is preserved. Sparse corrections keep generalize (its robust wide-lateral spread
+        # is why it exists). n_lateral from the cached raw-border volume (a warm dict lookup on every caller).
+        _p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
+        _nlat = None
+        try:
+            _nlat = int(_load_border_vol(_ensure_raw_border_nifti(case_id)).shape[0])
+        except Exception:  # noqa: BLE001 — density falls back to gap-only (no span check) if the shape is unknown
+            _nlat = None
+        if not _anchors_are_dense(anchors, _nlat, _p):
+            gs = _generalize_surface_cached(case_id, m, anchors)
+            if gs is not None:
+                return gs
+            # generalize failed → fall through to the local redetect rather than showing bare auto
     surf = _redetect_surface_fresh(case_id, anchors)
     if surf is None:
         try:
@@ -4703,9 +5012,112 @@ def _axial_surface_cached(case_id: str, work: Path, p: dict):
         # Bypass the DP where it fails on steep limbus descents: reconstruct from the drawn edges + across-lateral
         # interpolation (pixel-exact where drawn). See oct_preprocess.generalize_corrected_surface.
         surf = oct_mod.generalize_corrected_surface(surf, _cea, p)
+    # Match the warp TARGET's limbus/edge-band smoothing so the SERVED surface (the corrected-pane red line + the
+    # segmentation clip) is as smooth as the delivered tissue — the re-detection re-jitters ~3px at the faint edge
+    # on top of the now-smooth tissue, and left raw it would read as "still bumpy". DEFAULT_PARAMS carries the gate.
+    surf = oct_mod.smooth_surface_edge_band(surf, {**oct_mod.DEFAULT_PARAMS, **p})
     shape = (int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2]))
     _AXIAL_SURF_CACHE[case_id] = (mt, sig, surf, shape)
     return surf, shape
+
+
+def _fold_corrected_edits_into_border_anchors(case_id: str, m: dict, eff_params: dict,
+                                              trusted_laterals=None) -> bool:
+    """Reviewer edits/approves the edge on the CORRECTED result → fold them BACK into the ORIGINAL scan's
+    border_anchors (the raw GT the warp flattens to), so the NEXT re-run produces a better corrected result.
+    This REPLACES the old post-hoc rigid warp on the already-corrected volume (align_corrected_to_smooth /
+    apply_sagittal_surface_gt), which corrected the corrected scan itself — the reviewer's explicit spec is to
+    alter the ORIGINAL scan's corrections instead.
+
+    The warp is a per-column DEPTH SHIFT, so a depth DELTA the reviewer makes in corrected-output space maps 1:1
+    to raw/GT space:   new_GT[l,f] = served[l,f] + (corrected_edit[l,f] - corrected_detected[l,f]).
+    REPLACE where a border mark already exists at (l,f), ADD where it doesn't. Approved laterals are PINNED to
+    their current served surface (delta 0) so the re-run reproduces them. Updates m['oct_params'] + eff_params in
+    place, persists the manifest, invalidates the served-surface caches, and drops the post-hoc corrected-edit
+    flags. Returns True if it folded anything (→ caller skips the post-hoc warp and re-runs from the new GT)."""
+    import numpy as np
+    import nibabel as nib
+    cea = eff_params.get("corrected_edge_anchors") or {}
+    trusted = [int(x) for x in (trusted_laterals or []) if isinstance(x, (int, float))]
+    if not cea and not trusted:
+        return False
+    op = dict(m.get("oct_params") or {})
+    p = {**oct_mod.DEFAULT_PARAMS, **op}
+    anchors = dict(op.get("border_anchors") or {})
+    # served = current GT surface (RAW depth) the warp flattened to — add the reviewer's delta to THIS
+    served = _redetect_surface_cached(case_id, m, anchors)
+    if served is None:
+        try:
+            _arr0 = _load_border_vol(_ensure_raw_border_nifti(case_id))
+            served = _baseline_surface(case_id, _arr0, p)
+        except Exception:  # noqa: BLE001
+            return False
+    if served is None:
+        return False
+    served = np.asarray(served, dtype=np.float64)
+    L, F = served.shape
+    # corrected DETECTED surface (corrected-output depth) — the surface the reviewer edited FROM (plain detect,
+    # NOT generalized: the delta is drawn-line minus the actual tissue edge on the delivered volume)
+    try:
+        _work = _oct_corrected_vol_path(case_id, m)
+        _cvol = np.asarray(nib.load(str(_work)).dataobj)               # (lateral, depth, frame)
+        depth = int(_cvol.shape[1])
+        cdet = oct_mod.detect_surface_all(_cvol.astype(np.float32), p).astype(np.float64)   # (lateral, frames)
+    except Exception:  # noqa: BLE001
+        return False
+    if cdet.shape != served.shape:
+        return False
+
+    def _clamp(x: float) -> float:
+        return float(max(0.0, min(depth - 1.0, x)))
+
+    ba = {str(int(k)): {str(int(ff)): float(dd) for ff, dd in v.items()}
+          for k, v in anchors.items() if isinstance(v, dict)}
+    n_edit = 0
+    for l_str, fm in cea.items():
+        try:
+            l = int(l_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= l < L) or not isinstance(fm, dict):
+            continue
+        for f_str, d_new in fm.items():
+            try:
+                f = int(f_str); dn = float(d_new)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= f < F) or not np.isfinite(cdet[l, f]) or not np.isfinite(served[l, f]):
+                continue
+            delta = dn - float(cdet[l, f])                             # correction (corrected space == raw shift)
+            ba.setdefault(str(l), {})[str(f)] = int(round(_clamp(served[l, f] + delta)))
+            n_edit += 1
+    # PIN approved laterals to their current good served surface (delta 0) so the re-run reproduces them
+    for l in trusted:
+        if not (0 <= l < L) or str(l) in cea:
+            continue
+        row = ba.setdefault(str(l), {})
+        for f in range(F):
+            if np.isfinite(served[l, f]):
+                row[str(f)] = int(round(_clamp(served[l, f])))
+    if n_edit == 0 and not trusted:
+        return False
+    op["border_anchors"] = ba
+    op.pop("corrected_edge_anchors", None)                            # folded into the raw GT → no post-hoc warp
+    op.pop("border_generalize", None); op.pop("border_guided", None)  # serve the clean dense-redetect of the new GT
+    orch.write_manifest_value(case_id, {"oct_params": op})
+    m["oct_params"] = op
+    eff_params["border_anchors"] = ba
+    eff_params.pop("corrected_edge_anchors", None)
+    eff_params.pop("border_generalize", None); eff_params.pop("border_guided", None)
+    _bc = orch.case_root(case_id) / "border_cache"                    # served surface changed → drop its caches
+    for _nm in ("redetect.npz", "generalize.npz", "guided.npz", "provided_edges.npz"):
+        try:
+            (_bc / _nm).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 
 
 @app.get("/api/case/{case_id}/oct-axial-slice")
