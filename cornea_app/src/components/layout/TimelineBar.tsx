@@ -131,6 +131,13 @@ export function TimelineBar() {
   const verifiedMarked = Object.keys((octParams?.corrected_accurate ?? {}) as Record<string, unknown>);
   const foldableLats = new Set([...verifiedDrawn, ...verifiedMarked, ...dirtyCorrLats]).size;
   const [corpusEligible, setCorpusEligible] = useState(true);
+  // ARM-THEN-ACT, because window.confirm is inert here. It returns FALSE without ever showing a dialog in the
+  // WebKitGTK webview AND in the review browser pane (probed 2026-09-02), so every button guarded by it did
+  // nothing at all when clicked: "↻ Re-preprocess" on any scan carrying border corrections, and "⟲ Clear all
+  // corrections" always. OctLoader hit this before and swapped in a Dialog (OctLoader.tsx:749); this is the
+  // same fix in one line of state — first click arms and relabels, second acts, 4 s to change your mind.
+  const [armed, setArmed] = useState<null | "reprocess" | "clearall">(null);
+  const arm = (k: "reprocess" | "clearall") => { setArmed(k); window.setTimeout(() => setArmed((c) => (c === k ? null : c)), 4000); };
   const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const caseBusy = useCaseStore((s) => s.busy);
@@ -981,30 +988,28 @@ export function TimelineBar() {
             improved detector without hunting through Fix-columns → Run. */}
         <Button size="small" variant="outlined" color="warning" disabled={busy}
           onClick={() => {
-            if (hasBorderCorrection && !window.confirm(
-              "Re-preprocess from the raw .OCT?\n\nThis DISCARDS your manual border corrections on this scan — the edge drags and the shaped curve. Surface-crop frames, crop region and classification are kept. Continue?")) return;
+            if (hasBorderCorrection && armed !== "reprocess") { arm("reprocess"); return; }
+            setArmed(null);
             setBusyAction("rerun"); void rerunPreprocess();
           }}
           startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Re-preprocess from the raw .OCT — fresh corneal-surface detection, surface-crop detection and warp. DISCARDS your manual border corrections (edge drags / shaped curve; asks first if any exist); KEEPS surface-crop frames, crop region and classification. Resets to Preprocessed — re-inspect, then Approve.">
-          {busyAction === "rerun" && caseBusy ? "Re-preprocessing…" : "↻ Re-preprocess"}
+          {busyAction === "rerun" && caseBusy ? "Re-preprocessing…"
+            : armed === "reprocess" ? "↻ Discards border corrections — click again" : "↻ Re-preprocess"}
         </Button>
         {/* FULL reset — the superset of Re-preprocess. Discards EVERY manual correction (border + corrected-edge +
             axial anchors, artifact/surface crops, marks, force/good columns, manual patch/shifts) and re-runs pure
             AUTO. For starting a scan over from scratch. Always confirms (it is destructive of all edits). */}
         <Button size="small" variant="outlined" color="error" disabled={busy}
           onClick={() => {
-            if (!window.confirm(
-              "Clear ALL corrections on this scan and start fresh?\n\n"
-              + "This DISCARDS every manual correction — edge drags, shaped curves, corrected-result edge edits, "
-              + "artifact + surface crops, axial fixes, marks and approved slices — then re-runs pure AUTO detection "
-              + "from the raw .OCT.\n\nDetection settings, scar classification and recorded training GT are kept. "
-              + "This cannot be undone. Continue?")) return;
+            if (armed !== "clearall") { arm("clearall"); return; }
+            setArmed(null);
             setBusyAction("clearall"); void clearAllCorrections();
           }}
           startIcon={busyAction === "clearall" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title="Discard ALL manual corrections on this scan (border / corrected-edge / axial anchors, artifact + surface crops, marks, approved slices, force/good columns, manual patch + shifts) and re-run pure AUTO detection from the raw .OCT — a clean slate. KEEPS detection settings, classification and training GT. Resets to Preprocessed — re-inspect, then Approve.">
-          {busyAction === "clearall" && caseBusy ? "Clearing…" : "⟲ Clear all corrections"}
+          {busyAction === "clearall" && caseBusy ? "Clearing…"
+            : armed === "clearall" ? "⟲ Discards EVERYTHING — click again" : "⟲ Clear all corrections"}
         </Button>
         {proposals.hasProposal && (
           <Button size="small" variant="outlined" color="secondary" disabled={busy}

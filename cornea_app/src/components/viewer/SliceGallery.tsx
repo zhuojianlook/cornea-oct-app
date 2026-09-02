@@ -344,6 +344,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                                               drawn: number[]; median_rms_px: number | null;
                                               p90_rms_px: number | null } | null>(null);
   const [corrQueueBusy, setCorrQueueBusy] = useState(false);
+  const [clearArm, setClearArm] = useState<"idle" | "armed">("idle");
   // Kept OUT of corrQueue on purpose: the ranking takes ~30 s on a cold cache, and a mark made in that window
   // would be dropped if it had to merge into a queue object that is still null.
   const [corrAccurate, setCorrAccurate] =
@@ -3101,10 +3102,16 @@ const PROP_SLICE_BAND = 20;
                         {(Object.keys(corrAccurate).length > 0 || (corrQueue.drawn?.length ?? 0) > 0) && (
                           <button onClick={() => {
                               if (!caseId) return;
-                              if (!window.confirm("Clear every verified slice on the corrected scan?\n\n"
-                                + "This removes the corrected-pane edges you drew AND the slices you marked "
-                                + "accurate, so the next round starts clean.\n\n"
-                                + "Your ORIGINAL-scan corrections (border anchors) are NOT touched.")) return;
+                              // TWO-STEP, NOT window.confirm. This pane returns false from window.confirm without
+                              // ever showing a dialog, so the guarded version simply did nothing when clicked —
+                              // the reviewer pressed it and watched nothing happen. Arm on the first click,
+                              // act on the second, disarm after 4 s.
+                              if (clearArm !== "armed") {
+                                setClearArm("armed");
+                                window.setTimeout(() => setClearArm("idle"), 4000);
+                                return;
+                              }
+                              setClearArm("idle");
                               setCorrAccurate({});
                               clearTrustedSlices(caseId);
                               setCorrectedEdge(null);
@@ -3118,10 +3125,14 @@ const PROP_SLICE_BAND = 20;
                             title={"Clear every verified slice on the corrected scan — the edges you drew here and "
                               + "the slices you marked accurate.\n\nYour original-scan border corrections are kept; "
                               + "this only resets the current round's verifications."}
-                            style={{ border: "1px solid var(--c-border)", background: "none",
-                                     color: "var(--c-text-dim)", borderRadius: 4, fontSize: 10,
-                                     padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
-                            ⟲ clear all verified
+                            // Legible on purpose: the first version was dim-grey on no background, wedged
+                            // between the counter and the chips, and the reviewer could not find it.
+                            style={{ border: `1px solid ${clearArm === "armed" ? "#ef4444" : "#f0a3a3"}`,
+                                     background: clearArm === "armed" ? "rgba(239,68,68,0.25)" : "rgba(240,163,163,0.12)",
+                                     color: "#f5c2c2", borderRadius: 4, fontSize: 11, fontWeight: 600,
+                                     padding: "2px 9px", cursor: "pointer", whiteSpace: "nowrap",
+                                     marginLeft: 6 }}>
+                            {clearArm === "armed" ? "⟲ Click again to clear" : "⟲ Clear all verified slices"}
                           </button>
                         )}
                         {corrQueue.all_within_accurate && (
