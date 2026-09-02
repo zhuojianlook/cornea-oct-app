@@ -46,7 +46,7 @@ function anchorsToApi(m: CeMap): Record<string, Record<string, number>> {
   return o;
 }
 
-export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, bPan, filterCss, readOnly = false, stairEdge = false, markMode = false, onZoomWheel }: {
+export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, bPan, filterCss, readOnly = false, stairEdge = false, markMode = false, onPan, onZoomWheel }: {
   sliceIndex: number;
   bDispW: number; bDispH: number; bSized: boolean; bZoom: number; bPan: { x: number; y: number };
   filterCss?: string; readOnly?: boolean;
@@ -58,6 +58,10 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
    *  Marks nothing in the pipeline — it is how the reviewer points at something on the picture they are
    *  actually judging, instead of describing it in words. */
   markMode?: boolean;
+  /** Middle/right-drag pan, delegated to the parent (which owns bPan). The corrected pane had NO pan handler
+   *  of its own — the original pane's lives on a different SVG — so a middle-drag here did nothing useful and,
+   *  before the button guard, dragged the surface instead. */
+  onPan?: (dx: number, dy: number) => void;
   /** scroll-to-zoom, shared with the left editor: (clientX, clientY, deltaY, this pane's host rect). */
   onZoomWheel?: (clientX: number, clientY: number, deltaY: number, rect: DOMRect | undefined) => void;
 }) {
@@ -245,6 +249,7 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
                   JSON.stringify({ params: { marks: next } })).catch(() => { /* pointing is cheap; retry by re-marking */ });
   };
   const markStart = useRef<number | null>(null);
+  const panRef = useRef<{ x: number; y: number } | null>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef(false);
   const applyDrag = (clientX: number, clientY: number, svg: SVGSVGElement) => {
@@ -271,10 +276,15 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
   const [markDrag, setMarkDrag] = useState<[number, number] | null>(null);
   const onDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if (!edit) return;
-    // MIDDLE / RIGHT BUTTON PANS. Only the LEFT button edits: a middle-drag is how the reviewer moves the
-    // image, and it was dragging the surface instead (2026-09-02). Returning without capture lets the event
-    // reach the pan handler underneath.
-    if (e.button !== 0) return;
+    // MIDDLE / RIGHT BUTTON PANS. Only the LEFT button edits. There is no pan handler underneath this pane —
+    // the original pane owns the one that moves bPan — so the drag is captured here and forwarded to the
+    // parent, otherwise a middle-drag simply did nothing (reviewer, 2026-09-02).
+    if (e.button !== 0) {
+      panRef.current = { x: e.clientX, y: e.clientY };
+      e.currentTarget.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      return;
+    }
     if (markMode) {                       // ⚑ start a band (or click an existing one to remove it)
       const f = frameAt(e.clientX, e.currentTarget);
       markStart.current = f; setMarkDrag([f, f]);
@@ -284,7 +294,13 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     dragRef.current = true; e.currentTarget.setPointerCapture(e.pointerId); applyDrag(e.clientX, e.clientY, e.currentTarget);
   };
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (e.buttons && !(e.buttons & 1)) return;      // middle/right drag in progress → leave it to the pan
+    if (panRef.current) {                            // middle/right drag → move the image, never the surface
+      const d = panRef.current;
+      onPan?.(e.clientX - d.x, e.clientY - d.y);
+      panRef.current = { x: e.clientX, y: e.clientY };
+      return;
+    }
+    if (e.buttons && !(e.buttons & 1)) return;
     if (markMode) {
       if (markStart.current != null) setMarkDrag([markStart.current, frameAt(e.clientX, e.currentTarget)]);
       return;
@@ -292,6 +308,7 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     if (dragRef.current) applyDrag(e.clientX, e.clientY, e.currentTarget);
   };
   const onUp = (e?: React.PointerEvent<SVGSVGElement>) => {
+    if (panRef.current) { panRef.current = null; return; }
     if (markMode && markStart.current != null) {
       const a = markStart.current;
       const b = e ? frameAt(e.clientX, e.currentTarget) : a;
@@ -368,6 +385,7 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
           {edge && nFrames > 1 && depthVox > 1 && (
             <svg viewBox={`0 0 ${nFrames} ${depthVox}`} preserveAspectRatio="none"
                  onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}
+                 onAuxClick={(e) => e.preventDefault()} onContextMenu={(e) => e.preventDefault()}
                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
                           cursor: edit ? (markMode ? "col-resize" : "row-resize") : "default", touchAction: "none",
                           pointerEvents: edit ? "auto" : "none" }}>

@@ -345,6 +345,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
                                               p90_rms_px: number | null } | null>(null);
   const [corrQueueBusy, setCorrQueueBusy] = useState(false);
   const [clearArm, setClearArm] = useState<"idle" | "armed">("idle");
+  // Bumped after a clear so CorrectedEdgePanel REMOUNTS with fresh state. Without it the panel kept its own
+  // copy of the drawn anchors, saw them as "dirty" against the now-empty persisted set, and its ~900 ms
+  // autosave wrote them straight back — the reviewer cleared and the edge reappeared (2026-09-02).
+  const [corrResetNonce, setCorrResetNonce] = useState(0);
   // Kept OUT of corrQueue on purpose: the ranking takes ~30 s on a cold cache, and a mark made in that window
   // would be dropped if it had to merge into a queue object that is still null.
   const [corrAccurate, setCorrAccurate] =
@@ -3099,7 +3103,13 @@ const PROP_SLICE_BAND = 20;
                             restarted from scratch. It does NOT touch border_anchors: the original-scan ground
                             truth built up over previous rounds stays, which is what separates this from
                             "⟲ Clear all corrections". */}
-                        {(Object.keys(corrAccurate).length > 0 || (corrQueue.drawn?.length ?? 0) > 0) && (
+                        {/* Visible when ANY of the round's state exists — including ⚑ marks alone, which the
+                            button now also clears. Keyed off the manifest for the marks because the queue
+                            response does not carry them. */}
+                        {(Object.keys(corrAccurate).length > 0 || (corrQueue.drawn?.length ?? 0) > 0
+                          || Object.keys(((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as
+                                          Record<string, unknown> | undefined)?.corrected_defect_marks
+                                         ?? {}).length > 0) && (
                           <button onClick={() => {
                               if (!caseId) return;
                               // TWO-STEP, NOT window.confirm. This pane returns false from window.confirm without
@@ -3120,11 +3130,19 @@ const PROP_SLICE_BAND = 20;
                                          JSON.stringify({ corrected_trusted_laterals: [] })),
                                 api.json(`/api/case/${caseId}/oct-corrected-redetect`, "POST",
                                          JSON.stringify({ corrected_edge_anchors: {} })),
-                              ]).then(() => openCase()).catch(() => { /* re-open reconciles whatever landed */ });
+                                // ⚑ marks go too (reviewer, 2026-09-02). They describe the corrected scan the
+                                // round was working on, so leaving them behind carries stale "look here"
+                                // annotations onto a result they no longer refer to.
+                                api.json(`/api/case/${caseId}/oct-corrected-marks`, "POST",
+                                         JSON.stringify({ params: { marks: {} } })),
+                              ])
+                                .then(() => openCase())            // persisted set is empty from here
+                                .then(() => setCorrResetNonce((n) => n + 1))   // ...then drop the panel's copy
+                                .catch(() => setCorrResetNonce((n) => n + 1));
                             }}
-                            title={"Clear every verified slice on the corrected scan — the edges you drew here and "
-                              + "the slices you marked accurate.\n\nYour original-scan border corrections are kept; "
-                              + "this only resets the current round's verifications."}
+                            title={"Clear this round on the corrected scan — the edges you drew here, the slices you "
+                              + "marked accurate, and your ⚑ defect marks.\n\nYour ORIGINAL-scan border corrections "
+                              + "are kept: those are the ground truth built up across rounds."}
                             // Legible on purpose: the first version was dim-grey on no background, wedged
                             // between the counter and the chips, and the reviewer could not find it.
                             style={{ border: `1px solid ${clearArm === "armed" ? "#ef4444" : "#f0a3a3"}`,
@@ -3624,9 +3642,11 @@ const PROP_SLICE_BAND = 20;
               <div style={showOriginal
                 ? { display: "contents" }
                 : { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 5 }}>
-                <CorrectedEdgePanel sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
+                <CorrectedEdgePanel key={`ce-${corrResetNonce}`}
+                                    sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
                                     bZoom={bZoom} bPan={bPan} filterCss={enhanceFilter} readOnly={readOnly}
                                     stairEdge={stairEdge} markMode={markMode && editTarget === "corrected"}
+                                    onPan={(dx, dy) => setBPan((q) => ({ x: q.x + dx, y: q.y + dy }))}
                                     onZoomWheel={onCorrectedWheel} />
               </div>
             )}
