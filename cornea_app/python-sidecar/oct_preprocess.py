@@ -71,6 +71,15 @@ DEFAULT_PARAMS: dict = {
     # motion, not curvature), not a defect. So this stays 0; rigid_frame_rotate owns the corrections path. The earlier
     # "3x collapse" that reopened this was a gradient-trace artifact ([[mistakes]] #14). See [[cornea-corrections-dome-flatten]].
     "provided_flatten_smooth": 0.0,
+    "flatten_rigid_quad": True,   # DEFAULT ON (2026-09-02). The reviewer's 2026-08-25 spec for the corrections
+                                  #   path: the corrected edge must be the best-fit quadratic reachable with a
+                                  #   RIGID axial shift — one depth shift per B-scan, every lateral equally, never
+                                  #   a per-column deform. It lived only as an inline p.get default and was set
+                                  #   per-case, so an untuned scan silently fell back to the per-lateral deg-4
+                                  #   clip_fit, which fits each lateral INDEPENDENTLY and under-corrects: cs048
+                                  #   _02 (set) looked quadratic while _01 (unset) came out "much flatter in the
+                                  #   center". Declared here so it is visible and can be turned off per-case.
+                                  #   Read ONLY on the provided/corrections path — auto scans are unaffected.
     # Corrections-path rigid ROTATION (the reviewer's algorithm): "interpolate the manual edge GT, find the best
     # axial rotation/translation to correct it toward a quadratic". rigid_frame_warp (below) already fits ONE per-
     # frame depth shift (translation) as the median across laterals; with this on, it additionally fits a per-frame
@@ -5881,7 +5890,13 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     bad_cols = [] if use_provided else [int(c) for c in (p.get("force_columns") or [])]
     good_cols = [] if use_provided else [int(c) for c in (p.get("good_columns") or [])]
     _pfs = float(p.get("provided_flatten_smooth", 2.0) or 0.0)
-    if use_provided and bool(p.get("flatten_rigid_quad", False)):
+    # DEFAULT ON for the corrections path (2026-09-02). This is the reviewer's own 2026-08-25 spec — "the
+    # corrected edge must be the best-fit quadratic reachable with a RIGID axial shift" — but it was only ever
+    # enabled per-case, so a scan that had not been through the tuning carried flatten_rigid_quad=None and
+    # silently fell back to the per-lateral deg-4 clip_fit, which fits each lateral INDEPENDENTLY and
+    # under-corrects. cs048_od_v1 vs _02 is exactly that: same eye, same reviewer, one looked quadratic and
+    # the other "much flatter in the center". Auto scans are unaffected (use_provided is false there).
+    if use_provided and bool(p.get("flatten_rigid_quad", True)):
         # RIGID BEST-FIT QUADRATIC (reviewer spec 2026-08-25): the corrected edge must be the best-fit quadratic
         # reachable with a RIGID axial shift — ONE depth shift per B-scan applied to every lateral equally, never a
         # per-column deform. Per lateral, fit the DRAWN edge to its own deg-2 across frames; the part of the

@@ -2762,6 +2762,12 @@ def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
         # the cached surface so a later fix-columns scrub/Run can't show/apply a stale re-detected border.
         eff_params.pop("border_anchors", None)
         eff_params.pop("border_generalize", None)   # whole-volume-generalize flag (its cache is in border_cache)
+        # ...and the per-lateral artifact bands. "↻ Re-preprocess" means "start this scan again from the raw
+        # .OCT", and the reviewer reasonably expects their ⊟ Crop artifact marks to go with the rest of the
+        # manual state (2026-09-02). They were being kept as "sticky geometry", which left a re-preprocessed
+        # scan still carrying bands the reviewer thought they had cleared — and crop_bands interpolate across
+        # the FULL width, so a stale one is not a local leftover.
+        eff_params.pop("crop_bands", None)
         eff_params.pop("detect_lo", None); eff_params.pop("detect_hi", None)   # legacy band keys, if any
         import shutil as _sh0
         _sh0.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)

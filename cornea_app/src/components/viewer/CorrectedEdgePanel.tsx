@@ -271,6 +271,10 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
   const [markDrag, setMarkDrag] = useState<[number, number] | null>(null);
   const onDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if (!edit) return;
+    // MIDDLE / RIGHT BUTTON PANS. Only the LEFT button edits: a middle-drag is how the reviewer moves the
+    // image, and it was dragging the surface instead (2026-09-02). Returning without capture lets the event
+    // reach the pan handler underneath.
+    if (e.button !== 0) return;
     if (markMode) {                       // ⚑ start a band (or click an existing one to remove it)
       const f = frameAt(e.clientX, e.currentTarget);
       markStart.current = f; setMarkDrag([f, f]);
@@ -280,6 +284,7 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     dragRef.current = true; e.currentTarget.setPointerCapture(e.pointerId); applyDrag(e.clientX, e.clientY, e.currentTarget);
   };
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.buttons && !(e.buttons & 1)) return;      // middle/right drag in progress → leave it to the pan
     if (markMode) {
       if (markStart.current != null) setMarkDrag([markStart.current, frameAt(e.clientX, e.currentTarget)]);
       return;
