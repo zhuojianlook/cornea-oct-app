@@ -149,6 +149,24 @@ DEFAULT_PARAMS: dict = {
                                   #   actually WRITTEN (the pass metrics describe a pre-rigid intermediate that is never
                                   #   delivered). Telemetry ONLY — emitted into oct_iter.final_qa, gates nothing.
                                   #   Costs one extra detector pass; set False to skip.
+    # ── DETERMINISM REPORT ("where would MORE drawing change the RESULT?") ─────────────────────────────
+    # Reviewer request 2026-08-25: "if it requires the user to provide more drawn edges it should point the
+    # user towards them after running so that the user can rerun and a more deterministic result can be made."
+    # Measures, from the DRAWN anchors + the shipped estimator ONLY (never a detector as arbiter), how many px
+    # of the reviewer's own drawn edge the delivered surface currently DISCARDS — and converts that into a
+    # short list of slices to extend. Telemetry ONLY — emitted into oct_iter.determinism, gates nothing,
+    # touches no voxel (same contract as final_qa above).
+    "determinism_report": True,
+    "determinism_min_px": 4.0,    # ABSOLUTE px floor of the fire threshold T — a suggestion must clear the
+                                  #   most precise reviewer's hand (measured σ 0.61 px on cs002_os_v1).
+    "determinism_k_sigma": 3.0,   # T = max(k*σ_eff, determinism_min_px): a flagged effect cannot be the
+                                  #   reviewer's own drawing scatter. Binds on cs042_od_v1_2 (T=5.45) / cs007 (7.26).
+    "determinism_sigma_floor": 1.2,   # σ_eff = max(σ, floor) — an unusually tidy reviewer must not be nagged
+                                  #   below the ~3.0-3.5 px residual that is irreducible under the rigid rule.
+    "determinism_min_sigma_n": 50,    # minimum 2nd-difference samples before σ is trusted (cs020 n=44,
+                                  #   cs046 n=40 → σ reported null and the floor is used instead).
+    "determinism_max_suggest": 8,     # hard cap on suggested slices per round. The prompt is ITERATIVE (the
+                                  #   reviewer re-runs); measured to reach silence in 2-4 rounds.
     "qa_jitter_flag": 3.0,        # advisory review flag: residual per-frame depth jitter (px). ADVISORY, never rejects.
     "qa_dev_flag": 2.0,           # advisory review flag: delivered boundary deviation (px)
     "qa_coverage_flag": 0.60,     # advisory: below this valid-column fraction, `dev` is not trustworthy — a zeroed /
@@ -183,7 +201,15 @@ DEFAULT_PARAMS: dict = {
     # + rigid_sagittal_mc flattened the corrected dome to 97px (0.32x), the "edge doesn't follow the corneal
     # curvature" the reviewer saw. The corrections path now mirrors the dome-PRESERVING normal path (validated: 15
     # approved scans keep dome ratio ~1.0). Re-enable per-scan ONLY for a genuine across-frame undulation.
-    "sag_quad_align": False,
+    # RE-ENABLED 2026-08-24 (user directive: "make it a smooth quadratic... as long as it does not break the axial
+    # rule"). Corrections-path ONLY (called at ~L9698, inside the provided_edges branch — auto scans byte-unchanged).
+    # Verified axial-only: it fits ONE rigid per-frame translation (+clamped rotation, currently sqa_max_deg=0 →
+    # translation-only) and moves the WHOLE B-scan — never a per-column shear (docstring), confirmed empirically
+    # (per-lateral shift within a frame is ~constant). It only removes the deviation from the quadratic that is SHARED
+    # across laterals (= inter-frame motion); per-lateral speckle is preserved by construction, so it best-fits (not
+    # forces) the quadratic within the rigid limit. The reviewer accepts the small dome flattening this causes. The old
+    # DEFAULT-OFF note below is why it was parked; the directive now wants the quadratic. See [[cornea-corrections-dome-flatten]].
+    "sag_quad_align": True,
     "sqa_iters": 8,               # alternating fit rounds (target = per-lateral quad → per-frame median shift)
     "sqa_max_shift": 30.0,        # clamp on the per-frame depth TRANSLATION (px)
     "sqa_max_deg": 0.0,           # per-frame ROTATION cap (deg). 0 = translation-only: a clamped tilt over-fit the
@@ -192,10 +218,12 @@ DEFAULT_PARAMS: dict = {
                                   #   it again only with a per-lateral (not aggregate) step guard.
     "sqa_smooth": 1.0,            # gaussian sigma (frames) on the accumulated shift/tilt — inter-frame motion is smooth
     "sqa_min_gain": 0.3,          # keep only if central off-quad drops by >= this (px), else a strict no-op
-    "sqa_edge_pad": 8,            # frames excluded per end from the quadratic fit → the edge follows the CENTRAL
-                                  #   curvature (extrapolated), not the deep-edited edge that would drag it steep
-    "sqa_edge_slope_frac": 0.0,   # edge target slope as a fraction of the central slope (1=follow curvature, 0=flat);
-                                  #   <1 flattens the residual edge descent (motion) the reviewer wants removed
+    "sqa_edge_pad": 0,            # 0 (user directive 2026-08-24): fit ONE deg-2 parabola over the WHOLE cornea so the
+                                  #   edges FOLLOW the quadratic curvature down to the limbus. >0 excluded the outer
+                                  #   frames and replaced them with a near-flat linear edge — the reviewer called that
+                                  #   FLATTENING "not physiological"; the whole cornea should fit toward a quadratic.
+    "sqa_edge_slope_frac": 1.0,   # edge target slope as a fraction of the central slope (1=follow curvature, 0=flat).
+                                  #   1.0 = edges follow the corneal curvature (moot when sqa_edge_pad=0). Was 0 (flat).
     "sqa_step_tol": 12.0,         # sagittal-step guard: reject a move whose worst per-lateral frame jump grows by >this
     "sqa_step_abs": 25.0,         #   AND exceeds this absolute (px) — never introduce a gross localized sagittal step
     # corrections path: let sag_quad_align be the SOLE fine axial correction (skip rigid_height_refine/derotate/
@@ -252,6 +280,11 @@ DEFAULT_PARAMS: dict = {
     "csa_from_detected": True,
     "csa_tilt_min_laterals": 2,
     "csa_min_improve": 0.3,
+    # csa_max_offquad_regress: how far a run that DID improve the reviewer's drawn anchors may still regress the
+    # VOLUME-WIDE off-quadratic metric before it is declined. Improving a handful of clustered anchors says nothing
+    # about the other ~500 laterals, and measured on cs048_od_v1_2 such runs were worse on 13-22 of 26 HELD-OUT
+    # slices while passing the anchor check. Small on purpose: this is a damage cap, not a budget.
+    "csa_max_offquad_regress": 0.5,
     "csa_max_tilt": 30.0,            # px: cap the tilt SWING across the width (was 20 — too tight for a real rotation);
                                      # the never-worse guard + wide-spread requirement keep a 2-point fit from running away
     "seg_clip_anterior": True,       # SAM2 label's anterior is clipped onto the reconstructed corneal surface (see api_server segment_sam2)
@@ -339,6 +372,12 @@ DEFAULT_PARAMS: dict = {
                                   #   -12.7px). Low-passing keeps the first and cancels the second
     "rfr_bands": 10,              # lateral bands used to see ACROSS the width (the central-band profile cannot)
     "rfr_band_margin": 0.05,      # outermost lateral fraction excluded from those bands — the boundary estimate there is
+    "rfr_band_margin_manual": 0.0,  # ...but ZERO on the MANUAL path (reviewer, 2026-09-02): "the automatic
+                                  #   boundary 5% only needs to be present for the first automatic preprocessing,
+                                  #   not the manual 1,2,3,4 workflow". The margin exists because the AUTO detector
+                                  #   is unreliable at the outermost laterals; once the reviewer is correcting the
+                                  #   border by hand the surface is theirs, and excluding the outer 5% only stopped
+                                  #   them fixing the slices they were pointing at (cs048 slices 6 / 495 / 506).
                                   #   noise (cs039_os_v1 laterals 2 and 508 read 193px and 115px off the arc)
     "rfr_seam_step_frac": 0.35,   # ...but the cap is max(px, frac x ask): a real edge defect BEGINS at the seam and grows
                                   #   outward, so a small step there is the price of removing a large one. What this refuses
@@ -847,6 +886,11 @@ DEFAULT_PARAMS: dict = {
     # weight ramps to 0 at ±N so there is no seam. 0 = strictly local (only the edited slices). Was 0 in v0.0.50;
     # re-enabled in v0.0.51 now that the leak (corrections bleeding onto un-edited frames) is fixed.
     "redetect_slice_band": 20,
+    # Widest gap (slices) between drawn anchors that still INTERPOLATES (connect-the-dots) instead of re-detecting
+    # between them. User directive 2026-08-24 ("allow interpolation even at 40 slices apart"): 50 gives clear margin
+    # over 40-slice spacing. Higher = interpolate across wider gaps (linear across slices → very wide gaps can miss
+    # real across-slice curvature). Used by api_server._anchors_are_dense (was hard-coded 2×redetect_slice_band=40).
+    "dense_max_gap": 50,
     # The user-drawn line is trusted: the seed re-detection only snaps to the nearest gradient within
     # ±redetect_seed_window depth px of the drag (1-2 px), instead of a generous search that could wander off
     # the line. The march to neighbouring slices then tracks the surface within ±detect_window.
@@ -1042,6 +1086,23 @@ DEFAULT_PARAMS: dict = {
     "guided_conf_lo": 0.20,      # best-edge < this fraction of the slice's strong edge → fully tight
     "guided_conf_hi": 0.50,      # best-edge > this fraction → full window; linear ramp between
     "guided_conf_pctl": 80.0,    # percentile of per-frame edge strength taken as the slice's "strong edge"
+    # CORRECTED-PANE PRIOR WINDOW (reviewer, 2026-08-25): "for the automatic edge that is detected in the
+    # corrected result, please perform the same operation whereby it redetects within 1px of the curve that was
+    # used for correction of the original edge". The corrected pane's red line is today a FREE detection over the
+    # corrected volume, which can sit tens of px off at the faint steep limbus. When the scan carries a correction
+    # curve (border_cache/provided_edges.npz — the surface the warp flattened to, pinned to the reviewer's drawn
+    # anchors), that curve is carried into corrected depth space by the RIGID move the pipeline applied and used
+    # as the prior for a ±corrected_prior_window guided re-detection instead. 0 = OFF (free detection, the old
+    # behaviour), settable per scan via oct_params.corrected_prior_window.
+    # The gate is STRUCTURAL, not a per-scan default: this value is 1.0 for every scan, and what decides whether
+    # the path engages is whether border_cache/provided_edges.npz EXISTS. A scan that was never corrected has no
+    # curve to carry, so _corrected_prior_surface returns None and the free detection runs — byte-unchanged. Note
+    # provided_edges.npz is written on every fix-columns Run, so the engaged set grows as scans get corrected.
+    # See api_server._corrected_detected_surface / _axial_surface_cached.
+    "corrected_prior_window": 1.0,
+    "corrected_prior_max_lag": 48,     # depth lags (px) searched when measuring the applied move; the pipeline
+    #                                    move on cs048 spans -44..+28 px, so 48 covers it with headroom
+    "corrected_prior_min_cols": 60,    # valid laterals a frame needs before its move is FITTED (else extrapolated)
     # Extra rows kept above the highest drawn point when the canvas is extended for a corrected above-window
     # apex, so the epithelium does not sit flush against the new top edge.
     "crop_pad_margin": 8,
@@ -3069,6 +3130,195 @@ def guided_redetect_all(sag: np.ndarray, prior: np.ndarray, params: dict | None 
     return _surface_post_passes(out, sag, p)
 
 
+# ── DETECTOR-FREE measurement of the RIGID move the pipeline applied, raw → corrected ────────────────────────
+# Nothing here picks a surface row. The only primitive is a normalised cross-correlation of WHOLE A-scan depth
+# columns between the same frame of two volumes, which aligns CONTENT rather than a detected boundary. It exists
+# so a surface known in RAW depth space (the reviewer's drawn/served correction curve) can be carried into
+# CORRECTED depth space without ever consulting the automatic detector — the reviewer's rule 2.
+def _move_column_gate(vol: np.ndarray, lo: int, hi: int,
+                      contrast_min: float = 400.0, zero_frac_max: float = 0.05,
+                      smooth: int = 9) -> np.ndarray:
+    """Which (lateral, frame) A-scan columns carry tissue worth correlating, measured inside [lo,hi).
+    contrast = P95-P25 of the depth-smoothed column (background is flat noise, ~150 raw units; a cornea-bearing
+    column sits at 400-1100), plus a zeroed-sample test that excludes crop-banded and canvas-truncated columns."""
+    win = vol[:, lo:hi, :]
+    sm = ndimage.uniform_filter1d(win, int(smooth), axis=1, mode="nearest")
+    contrast = np.percentile(sm, 95, axis=1) - np.percentile(sm, 25, axis=1)
+    zfrac = (win == 0).mean(axis=1)
+    return (contrast >= float(contrast_min)) & (zfrac <= float(zero_frac_max))
+
+
+def measure_applied_move(raw: np.ndarray, cor: np.ndarray, params: dict | None = None) -> dict:
+    """Per-(lateral, frame) axial move the pipeline applied, as a RIGID per-frame shift + tilt. DETECTOR-FREE.
+
+    raw, cor = (lateral, depth, frame), same shape. For each frame the whole-A-scan NCC gives a sub-pixel depth
+    offset per lateral; a robust (3x MAD-reweighted) LINE in lateral is then fitted to those offsets, which is
+    exactly the shift+rotation model the pipeline is allowed to apply. Measured on cs048 the residual about that
+    line is 0.01-0.12 px MAD, i.e. the model is not an approximation — the move really is rigid. Ignoring the
+    tilt term would be: its half-span reaches 5.7 px on cs048 frame 25, far outside a +-1 px prior window.
+
+    Frames with fewer than `corrected_prior_min_cols` usable laterals are NOT fitted (cs048 frames 99-100 have
+    27 and 0) — their coefficients are linearly interpolated across frames, and extrapolated at the ends from
+    the nearest four fitted frames with the step clamped to the fitted range. Those frames are reported in
+    `extrapolated_frames` so a caller can treat the carried prior there as the least trustworthy part.
+
+    Returns {"move": (lateral, frames) float32, "a": per-frame shift, "b": per-frame half-span tilt,
+             "n_cols": valid laterals per frame, "fitted_frames": [...], "extrapolated_frames": [...],
+             "resid_mad": per-frame MAD about the fitted line}. Positive move = corrected content sits DEEPER,
+    so   corrected_depth = raw_depth + move."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    r = np.asarray(raw, dtype=np.float32)
+    c = np.asarray(cor, dtype=np.float32)
+    if r.ndim != 3 or r.shape != c.shape:
+        raise ValueError(f"measure_applied_move: shape mismatch {r.shape} vs {c.shape}")
+    L, D, F = r.shape
+    max_lag = int(p.get("corrected_prior_max_lag", 48))
+    margin = max(40, max_lag)
+    lo = max(margin, max_lag)
+    hi = min(D - margin, D - max_lag)
+    if hi - lo < 100:                     # a shallow canvas: fall back to the widest window the lags allow
+        lo, hi = max_lag, D - max_lag
+    if hi - lo < 20:
+        raise ValueError("measure_applied_move: depth canvas too shallow for the lag search")
+    gA = _move_column_gate(r, lo, hi)
+    gB = _move_column_gate(c, lo, hi)
+    K = 2 * max_lag + 1
+    lat = np.arange(L, dtype=np.float64)
+    lc = (lat - (L - 1) / 2.0) / max(1.0, (L - 1) / 2.0)          # centred, normalised → b is the HALF-SPAN px
+    A = np.full(F, np.nan); Bt = np.full(F, np.nan)
+    n_cols = np.zeros(F, dtype=np.int32); resid = np.full(F, np.nan)
+    min_cols = int(p.get("corrected_prior_min_cols", 60))
+    for f in range(F):
+        a0 = r[:, lo:hi, f]
+        a0 = a0 - a0.mean(axis=1, keepdims=True)
+        na = np.sqrt((a0 * a0).sum(axis=1))
+        C = np.empty((L, K), dtype=np.float64)
+        for k in range(K):
+            s = k - max_lag
+            b0 = c[:, lo + s:hi + s, f]
+            b0 = b0 - b0.mean(axis=1, keepdims=True)
+            nb = np.sqrt((b0 * b0).sum(axis=1))
+            den = na * nb
+            with np.errstate(invalid="ignore", divide="ignore"):
+                C[:, k] = np.where(den > 0, (a0 * b0).sum(axis=1) / den, -1.0)
+        i = C.argmax(axis=1)
+        rows = np.arange(L)
+        peak = C[rows, i]
+        interior = (i > 0) & (i < K - 1)                          # a peak ON the lag boundary is out of range
+        ii = np.clip(i, 1, K - 2)
+        y0, y1, y2 = C[rows, ii - 1], C[rows, ii], C[rows, ii + 1]
+        den = y0 - 2 * y1 + y2
+        with np.errstate(invalid="ignore", divide="ignore"):
+            delta = np.where(np.abs(den) > 1e-12, 0.5 * (y0 - y2) / den, 0.0)
+        shift = (ii - max_lag) + np.clip(delta, -1.0, 1.0)
+        ok = gA[:, f] & gB[:, f] & interior & (peak >= 0.30) & np.isfinite(shift)
+        n_cols[f] = int(ok.sum())
+        if n_cols[f] < min_cols:
+            continue
+        m = ok.copy()
+        co = None
+        for _ in range(3):                                        # robust: 3x MAD-reweight against outliers
+            co = np.polyfit(lc[m], shift[m], 1)
+            rr = shift[m] - np.polyval(co, lc[m])
+            sd = 1.4826 * np.median(np.abs(rr - np.median(rr))) + 1e-6
+            keep = m.copy(); keep[m] = np.abs(rr) <= 4.0 * sd
+            if int(keep.sum()) < min_cols:
+                break
+            m = keep
+        rr = shift[m] - np.polyval(co, lc[m])
+        A[f] = float(co[1]); Bt[f] = float(co[0])
+        resid[f] = float(1.4826 * np.median(np.abs(rr - np.median(rr))))
+    fit = np.where(np.isfinite(A))[0]
+    if fit.size < 4:
+        raise ValueError(f"measure_applied_move: only {fit.size} frames could be measured")
+
+    def _fill(v: np.ndarray) -> np.ndarray:
+        out = np.asarray(v, dtype=np.float64).copy()
+        out[fit[0]:fit[-1] + 1] = np.interp(np.arange(fit[0], fit[-1] + 1), fit, out[fit])
+        vmin, vmax = float(np.min(out[fit])), float(np.max(out[fit]))
+        for side in ("lo", "hi"):
+            if side == "lo" and fit[0] > 0:
+                ref = fit[:4]; tgt = np.arange(0, fit[0])
+            elif side == "hi" and fit[-1] < F - 1:
+                ref = fit[-4:]; tgt = np.arange(fit[-1] + 1, F)
+            else:
+                continue
+            co = np.polyfit(ref, out[ref], 1)
+            out[tgt] = np.clip(np.polyval(co, tgt), vmin, vmax)    # clamp: never extrapolate past what was seen
+        return out
+
+    Af, Bf = _fill(A), _fill(Bt)
+    move = (Af[None, :] + Bf[None, :] * lc[:, None]).astype(np.float32)
+    return {"move": move, "a": Af, "b": Bf, "n_cols": n_cols,
+            "fitted_frames": [int(x) for x in fit],
+            "extrapolated_frames": [int(x) for x in range(F) if not np.isfinite(A[x])],
+            "resid_mad": resid, "depth_window": (int(lo), int(hi))}
+
+
+# ── THE CORRECTED-PANE BASELINE, as three reusable primitives ────────────────────────────────────────────────
+# These exist so the corrected PANE (api_server._corrected_detected_surface / _axial_surface_cached) and the
+# corrections-path WARPS (align_corrected_to_smooth, apply_axial_surface_gt, apply_sagittal_surface_gt) diff the
+# reviewer's edits against the SAME line. They used to differ: the pane drew a re-detection constrained to
+# ±corrected_prior_window of the correction curve while all three warps called a bare detect_surface_all, and on
+# cs048_od_v1_2 those two lines are a median 3.471 px apart and up to 253.862 px apart at the limbus (from ~frame
+# 65 the carried curve descends 255→481 px while the free detection flatlines at ~261 px). A reviewer who approved
+# the constrained line and pressed Run got a surface propagated up to ~254 px away from what they approved.
+def carry_correction_curve(curve: np.ndarray, move: np.ndarray, depth: int) -> np.ndarray:
+    """A surface known in RAW depth space (the reviewer's correction curve) carried into CORRECTED depth space
+    by the per-frame RIGID move measured by measure_applied_move. Both (lateral, frames). DETECTOR-FREE."""
+    s = np.asarray(curve, dtype=np.float64)
+    m = np.asarray(move, dtype=np.float64)
+    if s.shape != m.shape:
+        raise ValueError(f"carry_correction_curve: shape mismatch {s.shape} vs {m.shape}")
+    return np.clip(s + m, 0.0, float(depth) - 1.0).astype(np.float32)
+
+
+def constrained_corrected_surface(det_sag: np.ndarray, prior, params: dict | None = None,
+                                  window: float | None = None):
+    """Re-detect the anterior surface of a CORRECTED volume within ±window px of `prior` (the carried correction
+    curve). `det_sag` = (lateral, depth, frames); `prior` = (lateral, frames). Returns (lateral, frames) float32,
+    or None when there is no prior / no window → the caller keeps its own free detection, byte-unchanged.
+
+    The ±window bound is enforced by an EXPLICIT CLIP because guided_redetect_all does not guarantee it: measured
+    on cs048, _redetect_one_slice's tail (cubic outlier fill + across-frame median) puts 44.1% of picks further
+    than 1 px from the prior (max 20.4), and _surface_post_passes' whole-volume smoothers take 38.8% of points out
+    of the band (max 66.5). guided_window_min is clamped to the window so the ADAPTIVE window can only shrink."""
+    if prior is None:
+        return None
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    cpw = float(window if window is not None else (p.get("corrected_prior_window", 0.0) or 0.0))
+    if cpw <= 0:
+        return None
+    gp = {**p, "guided_window_min": min(float(p.get("guided_window_min", 1.0) or 1.0), cpw)}
+    s = np.asarray(guided_redetect_all(det_sag, prior, gp, window=cpw), dtype=np.float64)
+    return np.clip(s, prior - cpw, prior + cpw).astype(np.float32)
+
+
+def constrained_served_surface(det_sag: np.ndarray, prior, params: dict | None = None,
+                               window: float | None = None):
+    """constrained_corrected_surface + the SERVED tail (smooth_surface_edge_band, then the band RE-ASSERTED last,
+    because that smoother is unbounded). Mirrors api_server._axial_surface_cached, which is what the reviewer
+    actually looks at. edge_band_smooth_frames defaults to 0, so today this is exactly the clipped re-detection on
+    all six engaged scans; it is here so the pane and the warp stay identical if the reviewer ever sets it.
+
+    DELIBERATELY NOT INCLUDED: generalize_corrected_surface and the drawn-anchor re-pin that the pane applies when
+    the scan carries corrected_edge_anchors. If the warps diffed against a line with the reviewer's drawn edges
+    already baked in, their residual (`good - S` in align_corrected_to_smooth, `tt - cur` in
+    apply_sagittal_surface_gt) would be ZERO at exactly the points the reviewer drew and the correction would
+    silently stop propagating — the failure documented at align_corrected_to_smooth's csa_from_detected comment.
+    So the warps get the un-generalized line, which is the same object detect_surface_all used to hand them, and
+    align_corrected_to_smooth's own csa_from_detected flag still decides whether to generalize it. Measured on
+    cs020_od_v2 (20 drawn anchors) the resulting pane-vs-warp gap is median 0.370 / max 20.476 px, confined to
+    laterals the reviewer drew on — 12-18x smaller than the 253-362 px gap this whole change removes."""
+    s = constrained_corrected_surface(det_sag, prior, params, window)
+    if s is None:
+        return None
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    cpw = float(window if window is not None else (p.get("corrected_prior_window", 0.0) or 0.0))
+    s = smooth_surface_edge_band(s, p)
+    return np.clip(np.asarray(s, dtype=np.float64), prior - cpw, prior + cpw).astype(np.float32)
+
+
 def surface_gradient_score(sag: np.ndarray, S: np.ndarray, stride: int = 8) -> float:
     """Mean |d intensity / d depth| at the detected surface — how strong a boundary it is sitting on.
 
@@ -4601,6 +4851,445 @@ def interpolate_anchors_surface(anchors, baseline: np.ndarray, params: dict | No
     return out.astype(baseline.dtype if baseline.dtype.kind == "f" else np.float32)
 
 
+def _frame_common_shift(edges: np.ndarray):
+    """The corrections path's per-frame RIGID shift: per lateral fit the DRAWN edge to its own deg-2 across
+    frames, then take the part of (quad - drawn) that is COMMON to all laterals (median over the central
+    15-85% band). Returns (sh[F], quad[L,F]).
+
+    Extracted VERBATIM out of flatten_rigid_quad (which now calls this) so the determinism report can score a
+    candidate with the SAME code that produces the delivered shift. Two copies would drift and the report
+    would eventually describe a shift the pipeline no longer applies."""
+    _e = np.asarray(edges, np.float64); _nl, _nf = _e.shape; _fr2 = np.arange(_nf)
+    _quad = np.empty_like(_e)
+    for _l in range(_nl):
+        _y = _e[_l]; _ok = np.isfinite(_y) & (_y > 1.0)
+        _quad[_l] = np.polyval(np.polyfit(_fr2[_ok], _y[_ok], 2), _fr2) if int(_ok.sum()) >= 20 else _y
+    with np.errstate(all="ignore"):
+        _sh = np.nanmedian((_quad - _e)[int(0.15 * _nl):int(0.85 * _nl)], axis=0)
+    return np.where(np.isfinite(_sh), _sh, 0.0), _quad
+
+
+def _frame_common_tilt(edges: np.ndarray, quad: np.ndarray, p: dict):
+    """The per-frame ROTATION the rigid shift cannot see (reviewer, 2026-09-02).
+
+    `_frame_common_shift` takes the MEDIAN of (quad - drawn) across laterals. A rotation of the B-scan is
+    antisymmetric about the centre lateral, so its median is exactly ZERO — the shift is structurally blind
+    to it, and every "how much is frame-common?" measurement built on that median inherits the blindness.
+    Measured on cs048: total off-quadratic 5.00 px rms = shift 2.52 + TILT 2.38 + irreducible 3.60, with
+    8-11 px of rotation across the width sitting on the acquisition-edge frames the reviewer was pointing at.
+
+    A depth ramp that is linear across laterals IS a rigid rotation of the frame — the same quantity
+    rigid_frame_derotate and _rfr_edge_tilt apply, and it preserves every distance within the B-scan, so it
+    is legal under the axial rule. Fitted by least squares on the same central band the shift uses, with one
+    outlier pass, and clamped so a bad frame cannot introduce an absurd rotation.
+
+    Returns tilt[F] in px at the OUTERMOST lateral (the ramp is tilt * x, x in [-1, 1])."""
+    _e = np.asarray(edges, np.float64); _q = np.asarray(quad, np.float64)
+    _nl, _nf = _e.shape
+    lo, hi = int(0.15 * _nl), int(0.85 * _nl)
+    x_all = (np.arange(_nl, dtype=np.float64) - (_nl - 1) / 2.0)
+    x_all /= max(1e-9, np.abs(x_all).max())
+    res = (_q - _e)[lo:hi]                      # what the flatten would have to remove, per lateral
+    x = x_all[lo:hi]
+    cap = float(p.get("flatten_rigid_tilt_max_px", 30.0))
+    out = np.zeros(_nf)
+    for f in range(_nf):
+        col = res[:, f]; ok = np.isfinite(col)
+        if int(ok.sum()) < 40:
+            continue
+        for _ in range(2):                      # one robust pass: a few wild laterals must not set the angle
+            A = np.vstack([np.ones(int(ok.sum())), x[ok]]).T
+            try:
+                sol, *_ = np.linalg.lstsq(A, col[ok], rcond=None)
+            except Exception:  # noqa: BLE001
+                sol = None
+                break
+            r = col - (sol[0] + sol[1] * x)
+            sd = float(np.nanstd(r[ok]))
+            if not np.isfinite(sd) or sd <= 0:
+                break
+            ok2 = ok & (np.abs(r) < 2.5 * sd)
+            if int(ok2.sum()) < 40 or np.array_equal(ok2, ok):
+                break
+            ok = ok2
+        if sol is None:
+            continue
+        # A LINE MUST GENUINELY EXPLAIN THE WIDTH. Without this the fit turns any across-width scatter into a
+        # rotation: surveyed over the store's manual scans it wanted 52-60 px ramps on 3 of 6 (cs042_od_v1_2,
+        # cs048_od_v1, cs042_os_v1), which is estimator noise being read as torsion, not real inter-frame
+        # rotation. Same test the edge-tilt fitter uses: the residual about the fitted line must be a small
+        # fraction of the spread it claims to explain, and the ramp must clear a floor worth applying.
+        _pred = sol[0] + sol[1] * x
+        _r = (col - _pred)[ok]
+        _spread = float(np.nanmax(col[ok]) - np.nanmin(col[ok])) if int(ok.sum()) else 0.0
+        _rr = float(np.sqrt(np.mean(_r ** 2))) if _r.size else float("inf")
+        if _spread <= 0 or _rr > float(p.get("flatten_rigid_tilt_fit", 0.35)) * _spread:
+            continue
+        if abs(float(sol[1])) * 2.0 < float(p.get("flatten_rigid_tilt_min_px", 2.0)):
+            continue
+        out[f] = float(np.clip(sol[1], -cap, cap))
+    return out
+
+
+def _normalize_anchors(anchors) -> dict:
+    """{int slice: {int frame: float depth}} from the manifest's str-or-int-keyed border_anchors."""
+    A: dict[int, dict[int, float]] = {}
+    for s, fv in (anchors or {}).items():
+        try:
+            si = int(s)
+        except (TypeError, ValueError):
+            continue
+        row: dict[int, float] = {}
+        for f, d in (fv or {}).items():
+            try:
+                fi, dv = int(f), float(d)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(dv):
+                row[fi] = dv
+        if row:
+            A[si] = row
+    return A
+
+
+def _drawing_sigma(A: dict, min_n: int = 50):
+    """The REVIEWER'S OWN drawing scatter in px, re-derived per scan — the noise floor of every claim the
+    determinism report makes, never quoted from a note. Robust sigma of the SECOND difference along the frame
+    axis within one drawn slice (strictly consecutive frames), MAD-scaled and divided by sqrt(6) (the
+    second-difference variance inflation for iid noise). A second difference is used rather than a residual
+    because it annihilates whatever smooth shape the reviewer was tracing and leaves only their hand.
+    Returns (sigma or None, n_samples); None when there are too few samples to trust it."""
+    d2 = []
+    for _s, row in (A or {}).items():
+        fs = sorted(row)
+        for i in range(1, len(fs) - 1):
+            a, b, c = fs[i - 1], fs[i], fs[i + 1]
+            if c - a == 2:                                   # strictly consecutive frames
+                d2.append(row[a] - 2.0 * row[b] + row[c])
+    if len(d2) < int(min_n):
+        return None, len(d2)
+    v = np.asarray(d2, dtype=np.float64)
+    return float(1.4826 * np.median(np.abs(v - np.median(v))) / np.sqrt(6.0)), len(d2)
+
+
+def _contig_groups(frames) -> list:
+    out: list[list[int]] = []
+    for f in sorted(frames):
+        if out and f == out[-1][-1] + 1:
+            out[-1].append(f)
+        else:
+            out.append([f])
+    return out
+
+
+def _widest_gap_picks(existing, k: int, lo: int, hi: int) -> list:
+    """k slice positions inside [lo,hi] placed by repeated widest-gap bisection against the slices that
+    already carry the frames in question. Deterministic; no randomness, no detector."""
+    import heapq
+    pts = sorted({int(lo), int(hi)} | {int(s) for s in existing if lo <= int(s) <= hi})
+    if len(pts) < 2:
+        return []
+    h = [(-(pts[i + 1] - pts[i]), pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    heapq.heapify(h)
+    out: list[int] = []
+    while len(out) < int(k) and h:
+        _d, a, b = heapq.heappop(h)
+        mid = (a + b) // 2
+        if mid in (a, b):
+            continue
+        out.append(mid)
+        heapq.heappush(h, (-(mid - a), a, mid))
+        heapq.heappush(h, (-(b - mid), mid, b))
+    return sorted(out)
+
+
+def determinism_report(anchors, baseline: np.ndarray, served: np.ndarray | None,
+                       params: dict | None = None) -> dict:
+    """WHERE WOULD MORE DRAWING CHANGE THE DELIVERED RESULT? (reviewer request 2026-08-25: "if it requires the
+    user to provide more drawn edges it should point the user towards them after running".)
+
+    ADVISORY TELEMETRY. Rides in oct_iter next to final_qa, gates nothing, moves no voxel.
+
+    It asks a question the shipped confidence banner does not. That banner asks "where is the DETECTOR
+    unsure?" (surface_confidence_map + unmarked). This asks "where does the delivered surface currently
+    DISCARD what I drew?" — answerable WITHOUT trusting a detector, because it compares two things that both
+    come from the reviewer's own anchors: the pure interpolation of their drawn lines, and the surface the
+    pipeline actually delivers. The auto baseline enters only as an INPUT (the pipeline itself substitutes it
+    inside interpolate_anchors_surface); it is never evidence about where the true surface is.
+
+    THREE RULES, each firing per FRAME on a MEASURED px effect — never on a count of marks, which is exactly
+    the pure-sparsity rule that false-fired 410x on cs046:
+      ROUTE       the anchors are not dense, so the scan is served the smoothed/gated whole-volume field
+                  instead of a direct interpolation of the drawn lines.
+      DISCARDED   the reviewer drew at frame f but on fewer than interp_min_slices slices, so that frame's
+                  weight is ~0 and the delivered surface reverts to the baseline everywhere except the pinned
+                  points.
+      UNSPANNED   the drawn slices at frame f do not bracket the median band, so np.interp holds ONE drawn
+                  line's endpoint FLAT across hundreds of laterals that the shift's median reads.
+
+    ALL THREE ARE SCORED IN PER-FRAME SHIFT PX, i.e. |sh(what your lines imply) - sh(what is delivered)| via
+    _frame_common_shift — the SAME quantity the flatten actually applies (one rigid move per B-scan; see
+    smooth_volume's flatten_rigid_quad and rigid_frame_warp's per-frame translation + clamped tilt). An earlier
+    version scored R1/R2 as a per-lateral SURFACE gap, which is not commensurable with what moves voxels: a
+    large surface gap collapses to almost nothing once the whole correction is reduced to one number per frame.
+    Measured, that mis-scoring quoted 27.6 px on cs046_od_v1_3 and 77.3 px on cs020_od_v2 for changes that
+    realise ~0.00 px of delivered move, while the genuine cs048_od_v1_2 finding realises 3.49 px. Scoring in
+    shift units is what makes the three findings comparable with each other and with T.
+
+    A finding fires only when E clears T = max(k*max(sigma,floor), min_px), sigma being the reviewer's OWN
+    drawing scatter re-derived from their anchors — so a flagged effect cannot be their hand. E is an UPPER
+    bound, not a lower one: held-out, P(realised >= quoted) measured 0.00-0.38 across 8 of 8 anchored scans, so
+    wording built on it must read "up to ~E px" and should carry E_typ_px beside it (on cs020_od_v2 the p99 is
+    77 px where the typical place is 1 px, and only the pair is honest).
+
+    `floor` reports what survives the rigid rule at the drawn points — per-slice anatomy plus the reviewer's
+    hand. Where nothing fires, that is the honest answer: more drawing will NOT reduce it.
+
+    Returns {} / {"error": ...} on any failure — this must never break a preprocessing run."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not p.get("determinism_report", True):
+        return {}
+    try:
+        base = np.asarray(baseline, dtype=np.float64)
+        if base.ndim != 2:
+            return {}
+        A = _normalize_anchors(anchors)
+        if not A:
+            return {}                                   # no correction curve → structurally absent
+        L, F = base.shape
+        LO, HI = int(0.15 * L), int(0.85 * L)           # the ONLY laterals _frame_common_shift's median reads
+        min_slices = int(p.get("interp_min_slices", 12))
+        taper = float(p.get("interp_frame_taper", 3.0))
+        band_sl = max(1, int(p.get("redetect_slice_band", 20)))
+        max_gap_ok = int(p.get("dense_max_gap", 2 * band_sl))
+        cap = max(1, int(p.get("determinism_max_suggest", 8)))
+
+        # ── noise floor: the reviewer's own hand ────────────────────────────────────────────────────────
+        sigma, sig_n = _drawing_sigma(A, int(p.get("determinism_min_sigma_n", 50)))
+        sig_floor = float(p.get("determinism_sigma_floor", 1.2))
+        sig_eff = sig_floor if sigma is None else max(float(sigma), sig_floor)
+        T = max(float(p.get("determinism_k_sigma", 3.0)) * sig_eff,
+                float(p.get("determinism_min_px", 4.0)))
+
+        # ── rebuild the delivered chain exactly as interpolate_anchors_surface + pin_anchors does ───────
+        SL = sorted(A)
+        pure = base.copy(); wf = np.zeros(F); n_sl = np.zeros(F, dtype=int); xs = np.arange(L)
+        # The laterals the reviewer's lines at frame f actually BRACKET. Outside them np.interp holds the
+        # endpoint FLAT, so |pure - delivered| there measures np.interp's extrapolation, not the reviewer's
+        # data — quoting it as "px of your drawn edge" would be a fabrication (it reads 67 px on a 4-slice
+        # scan). E is therefore measured only inside the span; the laterals OUTSIDE it are exactly what
+        # R3 UNSPANNED reports separately, with a proper leave-one-out counterfactual.
+        span = np.zeros((F, 2), dtype=int); span[:, 0] = 0; span[:, 1] = L - 1
+        for f in range(F):
+            pts = sorted((s, A[s][f]) for s in A if f in A[s])
+            n_sl[f] = len(pts)
+            if len(pts) >= 2:
+                pure[:, f] = np.interp(xs, [q[0] for q in pts], [q[1] for q in pts])
+                span[f] = (pts[0][0], pts[-1][0])
+                if len(pts) >= min_slices:
+                    wf[f] = 1.0
+        MIN_W = 8                                   # laterals; narrower than this is not a measurement
+        wfs = ndimage.gaussian_filter1d(wf, taper) if wf.max() > 0 else wf
+        deliv = pure * wfs[None, :] + base * (1.0 - wfs[None, :])
+        for s, row in A.items():
+            if 0 <= s < L:
+                for f, d in row.items():
+                    if 0 <= f < F:
+                        deliv[s, f] = d
+        sh0, quad0 = _frame_common_shift(deliv)
+
+        gaps = [(SL[i + 1] - SL[i], SL[i], SL[i + 1]) for i in range(len(SL) - 1)]
+        dense = (len(SL) >= 4 and (max(g[0] for g in gaps) if gaps else L) <= max_gap_ok
+                 and SL[0] <= band_sl and SL[-1] >= L - 1 - band_sl)
+
+        findings: list[dict] = []
+
+        # ── R1 ROUTE: not dense → served the smoothed whole-volume field, not the drawn lines ───────────
+        srv = None if served is None else np.asarray(served, dtype=np.float64)
+        r1_lo, r1_hi = max(LO, SL[0]), min(HI, SL[-1] + 1)
+        if (not dense) and srv is not None and srv.shape == deliv.shape and (r1_hi - r1_lo) >= MIN_W:
+            # SHIFT UNITS, not surface units. What the reviewer's lines are worth is the difference they make
+            # to the ONE per-frame move the flatten applies — not the per-lateral gap between two surfaces,
+            # which the median across laterals mostly cancels. Scored on the same band the shift's median reads.
+            _shp = _frame_common_shift(pure)[0]
+            _shs = _frame_common_shift(srv)[0]
+            _dR1 = np.abs(np.asarray(_shp, np.float64) - np.asarray(_shs, np.float64))
+            _dR1 = _dR1[np.isfinite(_dR1)]
+            if _dR1.size == 0:
+                _dR1 = np.zeros(1)
+            E = float(np.percentile(_dR1, 99))          # the WORST frame
+            E_med = float(np.median(_dR1))              # the TYPICAL frame — quoted beside it, never alone
+            if E > T:
+                need: list[int] = []
+                for d, a, _b in gaps:
+                    if d > max_gap_ok:                  # close every gap the density rule rejects on …
+                        k = int(np.ceil(d / max_gap_ok)) - 1
+                        need += [int(round(a + d * j / (k + 1))) for j in range(1, k + 1)]
+                if SL[0] > band_sl:
+                    need.append(band_sl)                # … and bring the span within a band of both ends
+                if SL[-1] < L - 1 - band_sl:
+                    need.append(L - 1 - band_sl)
+                picks = sorted(set(need))[:cap]
+                if picks:
+                    # E_px is always THE NUMBER THAT FIRED (here the p99: the worst place). E_typ_px carries
+                    # the typical place beside it, because on a lightly-drawn scan the two are far apart
+                    # (cs020_od_v2: p99 77 px, median 1 px) and quoting only one of them would mislead.
+                    findings.append({"kind": "ROUTE", "E_px": E, "E_typ_px": E_med, "frames": None,
+                                     "n_min": int(n_sl.max()), "K": len(picks), "picks": picks,
+                                     "picks_are_existing": [bool(s in A) for s in picks]})
+
+        # ── R2 DISCARDED: drawn, but on too few slices → the delivered surface reverts to the baseline ──
+        # Ef is measured unconditionally (it is a property of the anchors + the delivered chain, and the
+        # editor recomputes the still-needed count live from it); only the FIRING is gated on the route.
+        missed = 0
+        Ef = np.zeros(F)
+        # SHIFT UNITS (see the docstring): |sh(pure) - sh(delivered)| per frame — the number that moves voxels.
+        # The previous per-lateral surface median over-stated this by an order of magnitude on lightly-drawn
+        # scans, because the flatten's median across laterals absorbs most of a per-lateral gap.
+        _shp_all = np.asarray(_frame_common_shift(pure)[0], np.float64)
+        _shd_all = np.asarray(sh0, np.float64)
+        for f in range(F):
+            if 2 <= n_sl[f] < min_slices:
+                a, b = max(LO, int(span[f, 0])), min(HI, int(span[f, 1]) + 1)
+                if b - a >= MIN_W and np.isfinite(_shp_all[f]) and np.isfinite(_shd_all[f]):
+                    Ef[f] = float(abs(_shp_all[f] - _shd_all[f]))
+        if dense:
+            fired = [f for f in range(F) if Ef[f] > T]
+            missed = int(sum(1 for f in range(F) if 0.0 < Ef[f] <= T))
+            if fired:
+                K = min(cap, max(1, min_slices - int(min(n_sl[f] for f in fired))))
+                drawn_here = sorted({s for f in fired for s in A if f in A[s]})
+                raw_picks = _widest_gap_picks(drawn_here, K, LO, HI)
+                # SNAP each pick to a slice the reviewer already drew but which does not yet carry these
+                # frames → the ask reads "extend the line you already have", not "draw a new slice".
+                spare = [s for s in SL if s not in drawn_here]
+                picks = sorted({(min(spare, key=lambda s: abs(s - q)) if spare else q) for q in raw_picks})
+                if picks:
+                    findings.append({"kind": "DISCARDED",
+                                     "E_px": float(np.median([Ef[f] for f in fired])),
+                                     "E_max_px": float(max(Ef[f] for f in fired)),
+                                     "frames": [[g[0], g[-1]] for g in _contig_groups(fired)],
+                                     "n_frames": len(fired), "n_min": int(min(n_sl[f] for f in fired)),
+                                     "K": len(picks), "picks": picks,
+                                     "picks_are_existing": [bool(s in A) for s in picks]})
+
+        # ── R3 UNSPANNED: one drawn line's endpoint is held FLAT across the median band ─────────────────
+        # De-duplicated to the EXTREMAL drawn slices: ONE re-run per such slice scores EVERY frame it clamps.
+        # (A naive per-frame leave-one-out costs 5.3 s on a 4-slice scan; this is ~0.1 s.)
+        extremal: dict[int, list[int]] = {}
+        for f in range(F):
+            ss = sorted(s for s in A if f in A[s])
+            if len(ss) < 2 or (ss[0] <= LO and ss[-1] >= HI - 1):
+                continue
+            for s in ({ss[0]} if ss[0] > LO else set()) | ({ss[-1]} if ss[-1] < HI - 1 else set()):
+                extremal.setdefault(s, []).append(f)
+        hits: list[tuple] = []
+        for s, fl in extremal.items():
+            A2 = {k: v for k, v in A.items() if k != s}
+            if not A2:
+                continue
+            p2 = base.copy(); w2 = np.zeros(F)
+            for f in range(F):
+                pts = sorted((q, A2[q][f]) for q in A2 if f in A2[q])
+                if len(pts) >= 2:
+                    p2[:, f] = np.interp(xs, [q[0] for q in pts], [q[1] for q in pts])
+                    if len(pts) >= min_slices:
+                        w2[f] = 1.0
+            w2s = ndimage.gaussian_filter1d(w2, taper) if w2.max() > 0 else w2
+            d2 = p2 * w2s[None, :] + base * (1.0 - w2s[None, :])
+            for q, row in A2.items():
+                if 0 <= q < L:
+                    for f, d in row.items():
+                        if 0 <= f < F:
+                            d2[q, f] = d
+            sh2 = _frame_common_shift(d2)[0]
+            for f in fl:
+                e = abs(float(sh2[f] - sh0[f]))
+                if e > T:
+                    hits.append((f, s, e))
+        if hits:
+            seen: set[int] = set()
+            for grp in _contig_groups({h[0] for h in hits}):
+                sub = [h for h in hits if h[0] in grp]
+                ss_all = sorted({s for f in grp for s in A if f in A[s]})
+                new = int((LO + min(ss_all)) // 2) if min(ss_all) > LO else int((HI + max(ss_all)) // 2)
+                if new in seen:
+                    continue
+                seen.add(new)
+                # NO px NUMBER ON THIS FINDING — it would be a promise the offered action cannot keep.
+                # E here is |sh(without that slice) - sh(with it)|, i.e. "what if the clamping line VANISHED".
+                # The action actually offered is "draw a NEW line beyond the span", and np.interp holds the
+                # endpoint value FLAT past the span, so a new line drawn at the implied value is bit-identical
+                # to what is already delivered. Measured: cs048_od_v1_2's 38.96 px UNSPANNED finding realises
+                # 0.00 px; cs048_od_v1's 4.32/4.89 px realise 0.01/0.02 px. The finding is still worth SAYING —
+                # a frame whose whole shift rests on one line's endpoint is genuinely fragile — so it is
+                # reported STRUCTURALLY, with the leave-one-out magnitude kept only as fragility_px for
+                # telemetry and explicitly NOT for display.
+                findings.append({"kind": "UNSPANNED", "E_px": None,
+                                 "fragility_px": max(h[2] for h in sub),
+                                 "frames": [[grp[0], grp[-1]]], "K": 1, "picks": [new],
+                                 "picks_are_existing": [bool(new in A)],
+                                 "rests_on": sorted({h[1] for h in sub})})
+
+        # ── the HONEST-SILENCE floor: what is left when the rigid rule has done all it can ─────────────
+        # Measured at the DRAWN points only (GT-only): the off-quadratic residual, then the same residual
+        # after removing the per-frame shift, then after also removing one whole-frame rotation. Whatever
+        # survives is per-slice anatomy plus the reviewer's hand — more drawing cannot reduce it.
+        R = quad0 - deliv
+        pts_c = [(s, f) for s in A for f in A[s] if LO <= s < HI and 0 <= f < F]
+        floor: dict = {"quotable": False, "n_points": len(pts_c)}
+        if len(pts_c) >= 20:
+            r0 = np.array([R[s, f] for s, f in pts_c])
+            r1 = np.array([R[s, f] - sh0[f] for s, f in pts_c])
+            r2 = r1.copy(); lc = 0.5 * (LO + HI)
+            for f in {ff for _s, ff in pts_c}:
+                idx = [i for i, (_s, ff) in enumerate(pts_c) if ff == f]
+                if len(idx) >= 3:
+                    x = np.array([pts_c[i][0] for i in idx], dtype=np.float64) - lc
+                    y = r1[idx]; xm = float(x.mean()); sxx = float(((x - xm) ** 2).sum())
+                    if sxx > 0:
+                        b = float(((x - xm) * (y - y.mean())).sum() / sxx)
+                        r2[idx] = y - (float(y.mean()) + b * (x - xm))
+
+            def _rms(v):
+                return float(np.sqrt(np.mean(np.asarray(v, dtype=np.float64) ** 2)))
+            pct = (100.0 * (1.0 - _rms(r1) ** 2 / _rms(r0) ** 2)) if _rms(r0) > 0 else 0.0
+            floor.update({
+                "off_quad_px": _rms(r0), "rms_px": _rms(r1), "rms_rot_px": _rms(r2),
+                "pct_removed": pct,
+                "anatomy_px": float(np.sqrt(max(0.0, _rms(r2) ** 2 - sig_eff ** 2))),
+                # Quotable only with enough drawn points inside the band AND a physically sensible removal:
+                # a 4-slice scan measures a NEGATIVE removal (-260% on cs002_os_v1), which is exactly the
+                # nonsense the reviewer must never be shown as "your floor".
+                "quotable": bool(len(pts_c) >= 200 and pct > 0.0),
+            })
+
+        picks_all = sorted({q for fd in findings for q in fd["picks"]})
+        return {
+            "sigma_px": (float(sigma) if sigma is not None else None), "sigma_n": int(sig_n),
+            "sigma_eff_px": float(sig_eff), "T_px": float(T),
+            "route": ("dense" if dense else "sparse"),
+            "n_slices_drawn": len(SL), "n_points_drawn": int(sum(len(v) for v in A.values())),
+            "findings": findings, "n_findings": len(findings),
+            "suggest_slices": picks_all, "n_suggest": len(picks_all),
+            "per_frame": {"n": [int(v) for v in n_sl], "w": [round(float(v), 4) for v in wfs],
+                          "E_px": [round(float(v), 2) for v in Ef]},
+            # missed_below_T counts only frames this test can SEE (2 <= n < interp_min_slices, where Ef is
+            # actually computed). blind_frames counts the rest — n >= interp_min_slices (already driven, so
+            # Ef is 0 by construction) and n < 2 (nothing to leave out) — and those are precisely where the
+            # largest UNFLAGGED effects sit: held-out surface error on already-driven frames runs to a 95 px
+            # p90. So the silence line must claim only what was measured ("nothing above T among the frames
+            # this test can see"), never "more drawing will not help anywhere".
+            "floor": floor, "missed_below_T": missed,
+            "blind_frames": {"driven": int(sum(1 for f in range(F) if n_sl[f] >= min_slices)),
+                             "too_sparse": int(sum(1 for f in range(F) if n_sl[f] < 2)),
+                             "why": "Ef is 0 by construction on these; they are not evidence of sufficiency"},
+            "interp_min_slices": min_slices, "band": [int(LO), int(HI)],
+        }
+    except Exception as exc:  # noqa: BLE001 — advisory only; must never break a preprocessing run
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def _interp_bad_displacement(disp: np.ndarray, bad_cols, good_cols) -> np.ndarray:
     """Replace the DISPLACEMENT (not the edge) at bad columns with a smooth interpolation from the
     GOOD anchor columns, so a bad column gets a correction consistent with its good neighbours.
@@ -5192,7 +5881,40 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     bad_cols = [] if use_provided else [int(c) for c in (p.get("force_columns") or [])]
     good_cols = [] if use_provided else [int(c) for c in (p.get("good_columns") or [])]
     _pfs = float(p.get("provided_flatten_smooth", 2.0) or 0.0)
-    if use_provided and _pfs > 0:
+    if use_provided and bool(p.get("flatten_rigid_quad", False)):
+        # RIGID BEST-FIT QUADRATIC (reviewer spec 2026-08-25): the corrected edge must be the best-fit quadratic
+        # reachable with a RIGID axial shift — ONE depth shift per B-scan applied to every lateral equally, never a
+        # per-column deform. Per lateral, fit the DRAWN edge to its own deg-2 across frames; the part of the
+        # drawn-vs-quadratic gap that is COMMON to all slices (median across central laterals) is the inter-frame
+        # motion, so the flatten TARGET = drawn + that single per-frame shift. Then disp = target - drawn = the
+        # per-frame shift, IDENTICAL for every lateral → the warp is rigid axial (rigid_frame_warp's median leaves it
+        # unchanged), each slice keeps its OWN curvature (smooth slice-to-slice), best-fit (not forced) to a quadratic.
+        # Driven by the DRAWN edge, never the detector. flatten_rigid_quad=False → byte-unchanged.
+        _e = np.asarray(edges, np.float64)
+        _sh, _quad = _frame_common_shift(_e)     # extracted verbatim → determinism_report scores with the
+                                                 # SAME code that produces the delivered shift (never a copy)
+        _ft = _e + _sh[None, :]
+        # + the ROTATION the median-based shift is structurally blind to (see _frame_common_tilt). Same
+        # rigid rule: the displacement varies LINEARLY across laterals, which is a frame rotation, not a
+        # per-column deform. OFF by default so every other scan is byte-unchanged.
+        if bool(p.get("flatten_rigid_tilt", False)):
+            _tl = _frame_common_tilt(_e, _quad, p)
+            _xl = (np.arange(_e.shape[0], dtype=np.float64) - (_e.shape[0] - 1) / 2.0)
+            _xl /= max(1e-9, np.abs(_xl).max())
+            _ft = _ft + _tl[None, :] * _xl[:, None]
+        # VETO ONLY ON clip_cols. A clipped/reconstructed column genuinely needs the EXTRAPOLATING clip_fit, so
+        # the rigid-quad target must stand aside there. zero_cols must NOT veto: `_slice_displacement` already
+        # forces disp=0 on every zero_col AFTER the flatten_target branch (oct_preprocess.py:4673), so the crop
+        # bands stay unwarped either way. Vetoing on them was silently fatal — `crop_bands` interpolates the
+        # reviewer's per-lateral artifact marks across the FULL width (_artifact_bands), so on any scan with a
+        # single crop mark every lateral carries a zero band and this line nulled the target on 513/513 laterals
+        # (measured on cs048). The flatten then fell back to the per-lateral deg-4 clip_fit, which fits each
+        # lateral INDEPENDENTLY — i.e. not a rigid per-frame move at all (measured lateral spread median 3.6px,
+        # max 27.5px, injecting up to 12px of spurious whole-frame tilt at half-width) — and under-corrected the
+        # per-frame amount (-28px where the drawn data asks for -42px). That is the whole reason the corrected
+        # edge kept coming back non-quadratic at off-centre slices while the centre looked fine.
+        flatten_targets = [(None if clip_cols_list[i].size else _ft[i]) for i in range(n)]
+    elif use_provided and _pfs > 0:
         # smooth the DRAWN edge across frames per lateral → the dome-preserving flatten target (keeps the
         # limbus plunge, removes jitter). Not applied where clip/cut columns need the extrapolating clip_fit.
         _ft = ndimage.gaussian_filter1d(np.asarray(edges, np.float64), _pfs, axis=1, mode="nearest")
@@ -6070,9 +6792,41 @@ def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = No
         rec["jitter_null"] = _r2(null_j)
         rec["jitter_thr"] = round(float(thr_j), 2)
 
+        # REVIEWER OVERRIDE (2026-09-02). The null gate asks a statistical question: "is this ask bigger than
+        # how badly a quadratic extrapolates past its own window on THIS scan?" On cs048 the lead block asked
+        # 2.26 px against a 2.75 px sham median and was refused — while the reviewer had marked those exact
+        # frames on the corrected result as visibly wrong. A ⚑ mark is direct human evidence of a defect,
+        # which is evidence the null test does not have and cannot acquire. So when the reviewer has marked
+        # frames inside THIS side's block, the null gate is waived for that side. Nothing else is waived:
+        # the implausible-artefact cap, the seam-step rule, and the run-level seam/roughness/never-worse
+        # guards all still apply, so an override can still be declined by them.
+        _mk_frames: set[int] = set()
+        for _bands in ((p.get("corrected_defect_marks") or {}) or {}).values():
+            for _b in (_bands or []):
+                try:
+                    _mk_frames.update(range(int(_b[0]), int(_b[1]) + 1))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        try:
+            _blk_frames = {int(x) for x in np.arange(F)[blk]}
+        except Exception:  # noqa: BLE001 — an exotic block index must not break the pass
+            _blk_frames = set()
+        _marked = bool(_mk_frames & _blk_frames)
+        rec["reviewer_marked"] = _marked
+        # AUTOMATIC ON THE MANUAL PATH (reviewer, 2026-09-02). The null and kink gates are proxies for "is
+        # there really a defect here?", and they exist because the AUTOMATIC boundary estimate is unreliable at
+        # the edges — the same reason as the lateral margin, which is already zeroed on this path. Once the
+        # reviewer is correcting the border by hand, the proxies are answering a question their own edge has
+        # already answered, and requiring a ⚑ mark just to unlock a correction made marking mean "authorise"
+        # instead of "look here". So: manual path waives both proxies for EVERY block. The run-level guards
+        # (seam step, along-frame roughness, never-worse) are untouched — those measure the RESULT, not a
+        # proxy, and they are what stopped a 9.8 px seam twice today. AUTO scans are byte-unchanged.
+        _manual = bool(p.get("border_anchors") or {})
+        _waive = _marked or _manual
+        rec["waived"] = ("manual" if (_manual and not _marked) else ("mark" if _marked else None))
         if ask > wild:
             rec["decline"] = "implausible (artefact, e.g. an eyelash)"
-        elif not (ask > thr):
+        elif not (ask > thr) and not _waive:
             rec["decline"] = "within this scan's own null"
         elif np.isfinite(near) and abs(float(near)) > max(step_px, step_frac * ask):
             # PROPORTIONAL, not absolute. A genuine edge defect begins AT the seam and grows outward —
@@ -6097,12 +6851,19 @@ def _rfr_edge_deviation(prof: np.ndarray, p: dict, a_int: np.ndarray | None = No
             # off a descending cornea — frames read 61,61,61,62,63 — a 10.5 px defect with a kink ratio of
             # 0.51. So a smooth block may still be corrected, but only when it is far too large to be the
             # estimator's own error: 6 px, against an interior sham median of ~3.4 px across the corpus.
-            if not (kinked or ask > smooth_abs):
+            # The reviewer-marked waiver applies here too. This gate asks "is the block kinked, or too big to
+            # be estimator error?" — both are proxies for "is there really a defect". A ⚑ mark answers that
+            # question directly and better than either proxy, so a marked block is corrected even when it is
+            # smooth and modest. (cs048 lead: ask 2.93, kink 0.96, smooth_abs 6.0 — refused by both proxies
+            # while the reviewer was looking straight at the defect.) The run-level seam/roughness guards
+            # still have the last word.
+            if not (kinked or ask > smooth_abs or _waive):
                 rec["decline"] = "smooth and small — off the extrapolation, but within estimator error"
             else:
                 out[blk] = dev
                 rec["applied"] = True
-                rec["route"] = "kink" if kinked else "large-and-smooth"
+                rec["route"] = (rec["waived"] or "reviewer-marked") if (_waive and not kinked and ask <= smooth_abs) \
+                    else ("kink" if kinked else "large-and-smooth")
         if not rec.get("applied") and rec.get("decline") != "implausible (artefact, e.g. an eyelash)":
             # the block offset stays, but its frame-to-frame wobble does not have to
             big = np.abs(jit) > thr_j
@@ -6123,6 +6884,28 @@ def _rfr_lateral_bands(L: int, p: dict):
     mrg = float(p.get("rfr_band_margin", 0.05))
     n = int(p.get("rfr_bands", 10))
     lo, hi = int(mrg * L), int((1.0 - mrg) * L)
+    # REVIEWER-VERIFIED LATERALS ARE IN THE DOMAIN (2026-09-02). The margin exists because the AUTOMATIC
+    # boundary estimate is unreliable at the outermost laterals — but that reason evaporates on a lateral the
+    # reviewer has verified on the corrected result: drawn its edge, marked it accurate, or ⚑ marked a defect
+    # on it. Excluding those was leaving the reviewer unable to fix the very slices they were pointing at
+    # (cs048 slices 6 and 495 sit in the excluded 5%, with 25-28 px of trailing-edge deviation). Widen the
+    # band to cover them; laterals they have NOT touched stay excluded exactly as before.
+    _verified: set[int] = set()
+    for _src in ("corrected_defect_marks", "corrected_accurate", "corrected_edge_anchors"):
+        for _k in ((p.get(_src) or {}) or {}):
+            try:
+                _verified.add(int(_k))
+            except (TypeError, ValueError):
+                continue
+    _verified = {v for v in _verified if 0 <= v < L}
+    # THE MANUAL PATH USES THE FULL WIDTH. border_anchors present == the reviewer is correcting this scan by
+    # hand, so the "unreliable automatic estimate" the margin protects against is not what is being measured.
+    if (p.get("border_anchors") or {}):
+        _mm = float(p.get("rfr_band_margin_manual", 0.0))
+        lo, hi = int(_mm * L), int((1.0 - _mm) * L)
+    if _verified:
+        lo = min(lo, min(_verified))
+        hi = max(hi, min(L, max(_verified) + 1))
     if hi - lo < 8 * n:
         return []
     edges = np.linspace(lo, hi, n + 1).astype(int)
@@ -6444,7 +7227,17 @@ def _rfr_edge_tilt(S: np.ndarray, edev: np.ndarray, p: dict, allow: np.ndarray |
             continue
         nb = [tilt[g] for g in (f - 1, f + 1) if 0 <= g < F and _in_edge_block(g, F, p)]
         opp = [x for x in nb if x * tilt[f] < 0 and abs(x) > 0.5 * abs(tilt[f])]
-        if len(opp) >= 1 and len(nb) >= 2 and all(x * tilt[f] < 0 for x in nb):
+        # A MONOTONE RAMP THROUGH ZERO IS NOT ALTERNATION (2026-09-02). Both tests below see "my two
+        # neighbours have the opposite sign to me", but they are different shapes:
+        #   zigzag  +10, -9, +11   -> the two neighbours share a sign, opposite to the middle: noise.
+        #   ramp    +8.3, +2.6, -4.0 -> the neighbours have DIFFERENT signs from each other, because the
+        #                              sequence is passing smoothly through zero: real rotation.
+        # Requiring the neighbours to agree with each other separates them. Without this, cs048's edge
+        # rotation (+10.9, +8.3, +2.6, -4.0, -10.4, -8.1 px across the width at frames 0-5 — a clean ramp
+        # crossing zero at frame 3) had its middle frames zeroed, leaving the reviewer looking at a hump
+        # the pass had measured and then discarded.
+        _zigzag = len(nb) >= 2 and nb[0] * nb[1] > 0
+        if len(opp) >= 1 and len(nb) >= 2 and all(x * tilt[f] < 0 for x in nb) and _zigzag:
             tilt[f] = 0.0
     return tilt
 
@@ -6683,6 +7476,34 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     # An earlier draft loosened these to clear the OLD floor, costing 86 points of detection on a 6px
     # interior rotation and 46 on the cs044_os_v1 alternating mode in exchange for nothing.
     step_cap = float(p.get("rfr_seam_step_px", 1.0))
+
+    def _gate_failures(mx: dict) -> list:
+        """The run-level non-regression checks, as a function so a REDUCED plan is scored by exactly the
+        same rules as the full one (see the reviewer-marked fallback below). Behaviour is unchanged for
+        the full plan — this is the same code, called."""
+        rmsx, stepx = mx["rms"], mx["seam_step"]
+        bsdx, spx, ipx = mx.get("bsd", float("nan")), mx.get("edge_spread", float("nan")), mx.get("int_spread", float("nan"))
+        f_bad = []
+        if not np.isfinite(rmsx) or rmsx > rms0 + float(p.get("rfr_gate_rms_px", 0.05)):
+            f_bad.append(f"interior {rms0:.3f}->{rmsx:.3f}")
+        if np.isfinite(step0) and not np.isfinite(stepx):
+            f_bad.append("seam step became unmeasurable")
+        elif np.isfinite(stepx) and stepx > max(step_cap, (step0 if np.isfinite(step0) else 0.0)
+                                                + float(p.get("rfr_gate_step_px", 0.25))):
+            f_bad.append(f"seam step {step0:.2f}->{stepx:.2f}")
+        if int(mx.get("n_finite", 0)) < int(m0.get("n_finite", 0)):
+            f_bad.append(f"frames became unmeasurable {m0.get('n_finite')}->{mx.get('n_finite')}")
+        _b0 = m0.get("bsd", float("nan"))
+        if np.isfinite(_b0) and np.isfinite(bsdx) and bsdx > _b0 + float(p.get("rfr_gate_bsd_px", 0.5)):
+            f_bad.append(f"along-frame roughness {_b0:.2f}->{bsdx:.2f}")
+        _s0 = m0.get("edge_spread", float("nan"))
+        if np.isfinite(_s0) and np.isfinite(spx) and spx > _s0 + float(p.get("rfr_gate_edge_spread_px", 0.75)):
+            f_bad.append(f"across-width edge spread {_s0:.2f}->{spx:.2f}")
+        _i0 = m0.get("int_spread", float("nan"))
+        if np.isfinite(_i0) and np.isfinite(ipx) and ipx > _i0 + float(p.get("rfr_gate_int_spread_px", 0.10)):
+            f_bad.append(f"across-width interior spread {_i0:.2f}->{ipx:.2f}")
+        return f_bad
+
     bad = []
     if not np.isfinite(rms1) or rms1 > rms0 + float(p.get("rfr_gate_rms_px", 0.05)):
         bad.append(f"interior {rms0:.3f}->{rms1:.3f}")
@@ -6715,6 +7536,57 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     ip0, ip1 = m0.get("int_spread", float("nan")), m1.get("int_spread", float("nan"))
     if np.isfinite(ip0) and np.isfinite(ip1) and ip1 > ip0 + float(p.get("rfr_gate_int_spread_px", 0.10)):
         bad.append(f"across-width interior spread {ip0:.2f}->{ip1:.2f}")
+    # REVIEWER-MARKED FALLBACK (2026-09-02). The plan is scored as ONE object, so a bad INTERIOR move drags
+    # down side corrections that are fine on their own — on cs048 the lead block (which the reviewer had
+    # marked) contributes a 0.14 px seam, while the 9.83 px seam that vetoes everything comes from the
+    # interior. When the reviewer has marked frames and the combined plan regresses, retry with ONLY the
+    # marked sides' frames kept and everything else zeroed, scored by the SAME gates. If that passes it is
+    # applied; if it does not, the pass declines exactly as before. Nothing is loosened — a smaller plan is
+    # simply given the chance to be judged on its own.
+    if bad:
+        # Candidate subsets, best-first: every applied side together, then each side alone. One side with a
+        # big seam (cs048 trail: 10.12 px) must not veto a side that is clean on its own (lead: 0.20 px).
+        _side_frames = {}
+        for _sd, _rc in (m0.get("detail") or {}).items():
+            if not (isinstance(_rc, dict) and _rc.get("applied")):
+                continue
+            _w = _rfr_side_windows(F, _sd, p)
+            if _w is None:
+                continue
+            try:
+                _side_frames[_sd] = sorted({int(x) for x in np.arange(F)[_w[1]]})
+            except Exception:  # noqa: BLE001
+                continue
+        _cands = []
+        if len(_side_frames) > 1:
+            _cands.append(sorted({x for v in _side_frames.values() for x in v}))
+        for _sd in sorted(_side_frames):
+            _cands.append(_side_frames[_sd])
+        for _keep in _cands:
+            if not _keep:
+                continue
+            a2 = np.zeros_like(a); b2 = np.zeros_like(b_tilt)
+            a2[_keep] = a[_keep]; b2[_keep] = b_tilt[_keep]
+            try:
+                m2 = _metrics(_rfr_predict_surface(m0["S"], a2, b2))
+            except Exception:  # noqa: BLE001
+                m2 = None
+            if m2 is not None:
+                bad2 = _gate_failures(m2)
+                if not bad2:
+                    _dropped = "; ".join(bad)          # capture BEFORE bad is cleared below
+                    out = volume.copy()
+                    for f in _keep:
+                        if abs(a2[f]) <= 0.05 and abs(b2[f]) <= 1e-6:
+                            continue
+                        d = a2[f] + b2[f] * lat_off
+                        out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), -d, subpixel=True)
+                    a, b_tilt, m1, bad = a2, b2, m2, []
+                    rms1, step1, far1 = m1["rms"], m1["seam_step"], m1["far_dev"]
+                    i_info = dict(i_info or {})
+                    i_info["partial_apply"] = {"frames": [int(_keep[0]), int(_keep[-1])],
+                                              "n_frames": len(_keep), "dropped": _dropped}
+                    break
     if bad:
         return volume, {"applied": False, "reason": "would regress: " + "; ".join(bad),
                         "dev_rms_before": round(rms0, 3), "dev_rms_after": _r3(rms1),
@@ -7117,7 +7989,8 @@ def generalize_corrected_surface(surface: np.ndarray, anchors, params: dict | No
 
 
 def align_corrected_to_smooth(volume: np.ndarray, params: dict | None = None,
-                              workers: int | None = None) -> tuple[np.ndarray, dict]:
+                              workers: int | None = None,
+                              detect: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """PROPAGATE the reviewer's TRUSTED CURVES across the volume — the "Smooth to trusted slices" action.
 
     The reviewer works the before/after view in two passes. First they fix the RAW detection frame-by-frame and
@@ -7144,7 +8017,16 @@ def align_corrected_to_smooth(volume: np.ndarray, params: dict | None = None,
     max_shift = float(p.get("csa_max_shift", 80.0))          # px — clip guard on the per-frame depth shift
     nF, depth, L = volume.shape
     try:
-        S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers).astype(np.float64)   # (lat, frames)
+        # `detect` = a surface of THIS volume the caller already has (same reuse idiom as rigid_height_refine).
+        # On the corrections path the caller hands in the CONSTRAINED line the corrected pane draws (a re-detection
+        # inside ±corrected_prior_window of the carried correction curve). It must: the reviewer approves/edits
+        # against the pane's line, and this function's whole output is the residual (good - S). Diffing against a
+        # free detect_surface_all while the pane drew the constrained line propagated a surface up to ~254 px from
+        # what was approved on cs048_od_v1_2. detect=None → today's free detection, byte-for-byte.
+        _det = np.array(detect, dtype=np.float64) if detect is not None else None   # copy: never alias the caller's
+        _det_ok = _det is not None and _det.ndim == 2 and _det.shape == (L, nF)
+        S = (_det if _det_ok
+             else detect_surface_all(reformat_to_sagittal(volume), p, workers=workers).astype(np.float64))  # (lat, frames)
         # CURRENT surface = the DETECTED corrected surface (where the tissue actually is). The residual that drives
         # the per-frame rigid move is (drawn - detected) = the correction the reviewer made. An earlier version used
         # the RECONSTRUCTION (drawn edges baked in) to dodge a floating DP edge, but then current == target at every
@@ -7345,13 +8227,26 @@ def align_corrected_to_smooth(volume: np.ndarray, params: dict | None = None,
             "off_quad_after": round(oq1, 2) if oq1 is not None else None,
             "max_shift": round(float(np.max(np.abs(shift))), 1),
             "max_tilt_swing": round(float(np.max(np.abs(tilt)) * L), 1)}
-    # Decline on the (central-lateral) off-quadratic metric ONLY when the reviewer did NOT improve their drawn
-    # anchors — i.e. approved-only smooth-align. A per-frame TILT pivots at the lateral centre, so it barely moves
-    # the central-median surface this metric watches; vetoing a rotation that already pulled the drawn edges onto
-    # their line (anchor never-worse passed) would kill exactly the correction the reviewer just drew.
-    if oq0 is not None and oq1 is not None and oq1 >= oq0 - 0.1 and not _anchor_improved:
-        info.update({"applied": False, "reason": "declined — sagittal edge not improved"})
-        return volume, info
+    # Decline on the (central-lateral) off-quadratic metric. A per-frame TILT pivots at the lateral centre, so it
+    # barely moves the central-median surface this metric watches; vetoing a rotation that already pulled the drawn
+    # edges onto their line (anchor never-worse passed) would kill exactly the correction the reviewer just drew.
+    # Hence the anchor-improved path is EXEMPT from "must improve" — but NOT from "must not make things much
+    # worse". Until now `not _anchor_improved` skipped this check ENTIRELY once any drawn anchor got closer, so an
+    # edited run had NO volume-wide never-worse guard at all — only a median over the reviewer's own, typically
+    # clustered, anchors. Measured on cs048_od_v1_2 (held-out, drawn anchors as GT): edited runs that fired were
+    # worse on 13-22 of 26 held-out slices, widened the best/worst spread 3.77x -> 6.5-6.7x, and pushed the surface
+    # 1.2-3.2 px RMS OFF the reviewer's own drawn line — all while passing the anchor check, because improving a
+    # handful of clustered anchors says nothing about the other ~500 laterals. So: anchor-improved runs may now
+    # regress the volume-wide metric by at most csa_max_offquad_regress px, and are declined beyond that.
+    _oq_slack = float(p.get("csa_max_offquad_regress", 0.5))
+    if oq0 is not None and oq1 is not None:
+        if not _anchor_improved and oq1 >= oq0 - 0.1:
+            info.update({"applied": False, "reason": "declined — sagittal edge not improved"})
+            return volume, info
+        if _anchor_improved and oq1 > oq0 + _oq_slack:
+            info.update({"applied": False, "off_quad_slack": _oq_slack,
+                         "reason": "declined — drawn anchors improved but the volume-wide sagittal edge regressed"})
+            return volume, info
     info.update({"applied": bool(nadj), "frames_adjusted": int(nadj)})
     return out, info
 
@@ -7551,17 +8446,43 @@ def sagittal_quad_align(volume: np.ndarray, params: dict | None = None, workers:
     if workers is None:
         workers = auto_workers()
     F, depth = int(volume.shape[0]), int(volume.shape[1])
+    L = int(volume.shape[2])
     if F < 12:
         return volume, {"applied": False}
+    fr = np.arange(F)
+    # CROP-ARTIFACT frames (crop_bands = eyelid/off-cornea, NOT cornea). _artifact_bands gives the per-lateral frame
+    # indices. They are dropped from the fit / metric (via valid0), AND ZEROED in the volume this pass DETECTS on:
+    # in the pipeline sqa runs BEFORE _apply_crop, so those frames still carry noisy off-cornea tissue that the DP
+    # latches onto near the crop boundary, and the redetect self-gate then saw a phantom 37 px across-frame step and
+    # rejected a clean central flatten (cs048). Detecting on the crop-zeroed copy — the SAME surface the delivered
+    # cropped volume shows — drops that phantom step to ~10 px so the flatten (verified 8.4->3.0 px off deg-2) is
+    # kept. The WARP is still applied to the real (un-zeroed) volume; only the two detections use the zeroed copy.
+    # No crop_bands → _artifact_bands is None → _am all False → detection copy == volume → byte-unchanged.
+    _art = _artifact_bands(p, F, L)
+    _am = np.zeros((L, F), dtype=bool)
+    if _art is not None:
+        for _l in range(min(L, len(_art))):
+            _al = _art[_l]
+            if _al is not None and len(_al):
+                _am[_l, np.clip(np.asarray(_al, dtype=int), 0, F - 1)] = True
+
+    def _crop_zeroed(vol: np.ndarray) -> np.ndarray:
+        """Zero the per-lateral crop-artifact frames in a (frames,depth,lateral) volume, for DETECTION only."""
+        if not _am.any():
+            return vol
+        vz = vol.copy()
+        vz *= (~_am.T)[:, None, :].astype(vol.dtype)   # _am is (L,F) → mask (F,1,L) broadcasts over depth
+        return vz
+
     _shape_ok = (detect is not None and np.asarray(detect).ndim == 2
                  and int(np.asarray(detect).shape[1]) == F)
     try:
         S = (np.asarray(detect, dtype=np.float32) if _shape_ok
-             else detect_surface_all(reformat_to_sagittal(volume), p, workers=workers))  # (lat, frames)
+             else detect_surface_all(reformat_to_sagittal(_crop_zeroed(volume)), p, workers=workers))  # (lat, frames)
     except Exception:  # noqa: BLE001
         return volume, {"applied": False}
-    L = int(S.shape[0]); fr = np.arange(F)
     valid0 = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
+    valid0 = valid0 & ~_am
     if int(valid0.sum()) < (L * F) // 4:
         return volume, {"applied": False}
     # The corrected surface must fit the OVERALL corneal curvature — so the quadratic is fit to the CENTRAL frames
@@ -7595,7 +8516,7 @@ def sagittal_quad_align(volume: np.ndarray, params: dict | None = None, workers:
         the overall curvature. Central laterals only (0.15-0.85 L): the FOV-edge laterals fade (detection artefact)."""
         vals = []
         for l in range(int(0.15 * L), int(0.85 * L), 3):
-            e = surf[l]; ok = (e > 1.0) & np.isfinite(e) & (e < depth - 1)
+            e = surf[l]; ok = (e > 1.0) & np.isfinite(e) & (e < depth - 1) & ~_am[l]   # exclude crop-artifact frames
             if int(ok.sum()) < 20:
                 continue
             r = np.abs(e - _cquad(e, ok))
@@ -7647,15 +8568,58 @@ def sagittal_quad_align(volume: np.ndarray, params: dict | None = None, workers:
                     step = np.nanmedian(R, axis=0)
                 shift = shift + np.where(np.isfinite(step), step, 0.0)
             shift = ndimage.gaussian_filter1d(shift, sig, mode="nearest")
+        # HOLD the per-frame move FLAT across the frames sqa must NOT try to flatten — LOW-SUPPORT frames (crop /
+        # faint FOV corners, <half the laterals usable) AND the outermost sqa_hold_edge acquisition-edge frames.
+        # The residual across-frame surface is ~96% FRAME-COMMON motion (verified on cs048: 13.6 px off-quadratic is
+        # 13.6 px frame-common, leaving 3.5 px per-lateral) so a per-frame shift lands the CENTRAL body on the blue
+        # quadratic. But at the very edges the cornea makes its REAL steep limbus/apex descent AND the DP detection is
+        # faint/ambiguous — chasing the deg-2 there just railed the clamp and destabilised the redetect. Holding those
+        # frames' move at the nearest interior value (numpy interp holds flat past the ends) keeps the shift smooth
+        # (verified peak |Δshift/frame| ~2 px, no clamp railing) and confines the flatten to where it is reliable. The
+        # crop frames are zeroed later anyway. good.all() → byte-unchanged.
+        _supp = valid0.mean(axis=0)
+        _hold_edge = int(p.get("sqa_hold_edge", 10))
+        _good = _supp >= float(p.get("sqa_support_frac", 0.5))
+        if _hold_edge > 0:
+            _good = _good & ~((fr < _hold_edge) | (fr >= F - _hold_edge))
+        if bool(_good.any()) and not bool(_good.all()):
+            _gi = fr[_good]
+            shift = np.interp(fr.astype(float), _gi.astype(float), shift[_gi])
+            if use_tilt:
+                tilt = np.interp(fr.astype(float), _gi.astype(float), tilt[_gi])
         shift = np.clip(shift - np.median(shift), -max_shift, max_shift)
         return shift, np.clip(tilt, -tilt_cap, tilt_cap)
 
-    shift_s, _ = _fit(False)                                    # translation only
-    shift_j, tilt_j = _fit(True)                               # translation + rotation
-    if _offq(S + shift_s[None, :]) <= _offq(S + shift_j[None, :] + tilt_j[None, :] * xnl[:, None]) + 0.05:
-        shift, tilt = shift_s, np.zeros(F)                     # rotation did not help → translation only
+    _he_c = int(p.get("sqa_hold_edge", 10))
+    _frc = (fr >= _he_c) & (fr < F - _he_c)
+    def _cand_step(surf: np.ndarray) -> float:
+        """98th-pct across CENTRAL laterals of the max frame-to-frame jump of a CANDIDATE surface (crop frames and
+        the held outermost edge frames excluded — the flatten's domain). Lets the translation-vs-rotation choice see
+        the sagittal STEP a candidate would introduce, not only its off-quad — a rotation that lowers off-quad by a
+        hair but steps the central surface must not be chosen."""
+        with np.errstate(all="ignore"):
+            m = np.where(valid0, surf, np.nan)[int(0.15 * L):int(0.85 * L)][:, _frc]
+            per = np.nanmax(np.abs(np.diff(m, axis=1)), axis=1)
+        per = per[np.isfinite(per)]
+        return float(np.percentile(per, 98)) if per.size else 0.0
+
+    shift_s, _ = _fit(False)                                    # translation only (axial-pure)
+    # The residual across-frame surface is ~96% FRAME-COMMON (verified on cs048), so a pure per-frame TRANSLATION lands
+    # the central body on the quadratic (measured 8.4 px -> 3.0 px off deg-2, smooth shift, step 16 px). The optional
+    # per-frame ROTATION only ever moved the peripheral laterals and its step does not show until the physical warp +
+    # redetect (invisible to the analytic _cand_step), so it kept blowing the self-gate on cs048. It is now OPT-IN
+    # (sqa_use_rotation, default off): axial-only translation is the proven-clean move.
+    if bool(p.get("sqa_use_rotation", False)):
+        shift_j, tilt_j = _fit(True)                           # translation + rotation
+        surf_s = S + shift_s[None, :]
+        surf_j = S + shift_j[None, :] + tilt_j[None, :] * xnl[:, None]
+        _tol = float(p.get("sqa_step_tol", 12.0))
+        if (_offq(surf_j) < _offq(surf_s) - 0.05) and (_cand_step(surf_j) <= _cand_step(surf_s) + _tol):
+            shift, tilt = shift_j, tilt_j
+        else:
+            shift, tilt = shift_s, np.zeros(F)
     else:
-        shift, tilt = shift_j, tilt_j
+        shift, tilt = shift_s, np.zeros(F)                     # axial-only translation (default)
     alpha = np.clip(2.0 * tilt / float(L), -amax, amax)        # per-frame rotation (rad); adds tilt L*alpha/2, as derotate
     if float(np.max(np.abs(shift))) < 0.1 and float(np.degrees(np.max(np.abs(alpha)))) < 0.05:
         return volume, {"applied": False, "off_quad_before": round(oq0, 2), "reason": "no move needed"}
@@ -7684,23 +8648,32 @@ def sagittal_quad_align(volume: np.ndarray, params: dict | None = None, workers:
     if nadj == 0:
         return volume, {"applied": False, "off_quad_before": round(oq0, 2), "reason": "no move needed"}
     # SELF-GATE: re-detect the delivered surface and keep the move only if the off-quad really dropped (never worse).
+    # Detect on the crop-zeroed copy (same as the initial S) so the phantom crop-boundary step is not re-introduced.
     try:
-        S2 = detect_surface_all(reformat_to_sagittal(out), p, workers=workers)
+        S2 = detect_surface_all(reformat_to_sagittal(_crop_zeroed(out)), p, workers=workers)
         oq1 = _offq(S2)
     except Exception:  # noqa: BLE001
         return volume, {"applied": False, "reason": "redetect failed"}
     # SAGITTAL-EDGE STEP GUARD: a rigid move must never introduce a gross LOCALISED across-frame step (a per-lateral
-    # frame-to-frame jump), even at the peripheral laterals the central off-quad metric under-weights.
+    # frame-to-frame jump). Measured on the FLATTEN'S DOMAIN — central laterals, and the outermost sqa_hold_edge frames
+    # EXCLUDED (those hold the move flat and carry the cornea's REAL steep limbus/apex descent + the faint-edge DP
+    # flicker, a legitimate 40-70 px frame-to-frame drop that is NOT something the flatten introduced). Counting the
+    # edges made the guard veto a clean CENTRAL flatten on the off-centre cs048 purely on that untouched real descent.
+    _lo_l, _hi_l = int(0.15 * L), int(0.85 * L)
     def _mstep(SS):
         with np.errstate(all="ignore"):
-            per_lat = np.nanmax(np.abs(np.diff(np.where((SS > 1) & np.isfinite(SS), SS, np.nan), axis=1)), axis=1)
+            M = np.where((SS > 1) & np.isfinite(SS), SS, np.nan)[_lo_l:_hi_l][:, _frc]
+            per_lat = np.nanmax(np.abs(np.diff(M, axis=1)), axis=1)
         per_lat = per_lat[np.isfinite(per_lat)]
         return float(np.percentile(per_lat, 98)) if per_lat.size else 0.0
     st0, st1 = _mstep(S), _mstep(S2)
     _step_abs = float(p.get("sqa_step_abs", 25.0))
-    # Only reject a step this move INTRODUCED: st0 must have been small (a pre-existing large jump is a detection
-    # artefact at a weak corner, not something the rigid move made — and it must not veto a legitimate flatten).
-    if st0 < _step_abs and st1 > st0 + float(p.get("sqa_step_tol", 12.0)) and st1 > _step_abs:
+    # Reject a step this move INTRODUCED. A rigid flatten that WORSENS the worst across-frame jump past sqa_step_abs
+    # is never acceptable — even when st0 was ALREADY large. The old guard gated on `st0 < step_abs`, so a scan with a
+    # pre-existing corner artefact (cs048: st0=43.8 at a faint limbus corner) had NO step protection and a rotation was
+    # free to blow the jump out to 160 px. Now: any move that makes the step meaningfully WORSE and lands above the cap
+    # is refused (a genuine flatten LOWERS the jump → st1 < st0 → not vetoed, so legitimate corrections are unaffected).
+    if st1 > st0 + float(p.get("sqa_step_tol", 12.0)) and st1 > _step_abs:
         return volume, {"applied": False, "off_quad_before": round(oq0, 2),
                         "step_before": round(st0, 1), "step_after": round(st1, 1), "reason": "introduced sagittal step"}
     if not (np.isfinite(oq1) and oq1 < oq0 - float(p.get("sqa_min_gain", 0.3))):
@@ -8557,7 +9530,8 @@ def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
 
 
 def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | None = None,
-                           workers: int | None = None) -> tuple[np.ndarray, dict]:
+                           workers: int | None = None,
+                           detect: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """AXIAL fix-tool GT (v0.0.186). The annotator opened an AXIAL B-scan (fixed FRAME, lateral×depth) and dragged
     the anterior corneal surface across LATERALS onto the true band where the auto-detector got it wrong — a notch
     at the apex/limbus of the first/last low-SNR frames that the SAGITTAL fix-columns tool (which corrects along the
@@ -8578,7 +9552,14 @@ def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | Non
     nF, depth, L = volume.shape
     fm = int(p.get("axial_gt_feather", 14) or 0)
     try:
-        surf = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lat, frames)
+        # `detect` = the current surface of THIS volume, supplied by the caller (rigid_height_refine's idiom).
+        # On the corrections path it is the CONSTRAINED line the corrected pane draws, so the "re-detect and
+        # re-diff" this function is built on re-diffs against what the reviewer actually saw, not a free DP that
+        # can sit ~254 px away at the limbus. detect=None → today's free detection, byte-for-byte.
+        _det = np.array(detect, dtype=np.float32) if detect is not None else None
+        _det_ok = _det is not None and _det.ndim == 2 and _det.shape == (L, nF)
+        surf = (_det if _det_ok
+                else detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers))  # (lat, frames)
     except Exception:  # noqa: BLE001 — best effort; without a current surface we cannot diff → no-op
         return volume, {"applied": False, "frames_adjusted": 0}
     out = volume.copy(); nadj = 0; xs = np.arange(L, dtype=np.float64)
@@ -8622,7 +9603,8 @@ def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | Non
 
 
 def apply_sagittal_surface_gt(volume: np.ndarray, sag_anchors, params: dict | None = None,
-                              workers: int | None = None) -> tuple[np.ndarray, dict]:
+                              workers: int | None = None,
+                              detect: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """CORRECTED-RESULT sagittal fix-tool GT. The annotator opened the before/after view and dragged the
     anterior surface on the CORRECTED result along the FRAME axis (a fixed lateral, across frames) — the axis
     where residual INTER-FRAME drift lives (a trough on the early frames, a bump on the later ones = a
@@ -8650,7 +9632,14 @@ def apply_sagittal_surface_gt(volume: np.ndarray, sag_anchors, params: dict | No
     # cross-lateral guard already guarantees an applied correction is a genuine alignment, so no smoothing is due.
     fm = int(p.get("sag_gt_feather", 0) or 0)
     try:
-        surf = detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers)  # (lat, frames)
+        # `detect` = the current surface of THIS volume, supplied by the caller (rigid_height_refine's idiom).
+        # On the corrections path it is the CONSTRAINED line the corrected pane draws. This function's residual is
+        # `drawn_target - detected`, so a detection that differs from what the reviewer drew ON is the error, 1:1.
+        # detect=None → today's free detection, byte-for-byte.
+        _det = np.array(detect, dtype=np.float32) if detect is not None else None
+        _det_ok = _det is not None and _det.ndim == 2 and _det.shape == (L, nF)
+        surf = (_det if _det_ok
+                else detect_surface_all(reformat_to_sagittal(_fill_black_bands(volume)), p, workers=workers))  # (lat, frames)
     except Exception:  # noqa: BLE001 — without a current surface we cannot diff → no-op
         return volume, {"applied": False, "frames_adjusted": 0}
     # gather the drawn anchors PER FRAME (across the drawn laterals): f -> {lateral: absolute target depth}
@@ -9615,6 +10604,73 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                      "depth_before": int(vol.shape[1] - _ext_pad),
                                      "depth_after": int(vol.shape[1])}
         p_all = {**DEFAULT_PARAMS, **(params or {})}
+
+        # ── THE BASELINE THE REVIEWER'S EDITS ARE DIFFED AGAINST (2026-08-25) ────────────────────────────────
+        # The corrected pane no longer draws a free DP detection: on a scan carrying a correction curve it draws a
+        # re-detection constrained to ±corrected_prior_window px of that curve, carried into corrected depth space
+        # by the measured rigid move (api_server._corrected_detected_surface). The three GT warps below re-detect
+        # internally to diff the reviewer's edits against "the current surface", and until now that was a bare
+        # detect_surface_all — a DIFFERENT line. Measured on cs048_od_v1_2 the two are a median 3.471 px apart and
+        # up to 253.862 px apart at the limbus (from ~frame 65 the carried curve descends 255→481 px while the free
+        # detection flatlines at ~261 px), so the reviewer approved one line and Run propagated another.
+        #
+        # WHY THE MOVE IS RE-MEASURED PER CALL SITE INSTEAD OF ONCE. Four DEFAULT-ON rigid stages run between
+        # smooth_volume above and these call sites (rigid_height_refine, rigid_frame_derotate, rigid_frame_refine,
+        # sagittal_quad_align — corrections_sole_sag defaults False, so none of them is skipped), with caps summing
+        # past 75 px of per-frame move. `cur` is passed in AS IT STANDS, so the measured move is the composition of
+        # everything applied so far. Measured on cs048 against a synthetic in-cap rigid move, a prior measured once
+        # beforehand is median 13.570 / max 27.982 px stale against a ±1 px window; re-measured here it is median
+        # 0.017 / max 2.647 px, and the only frames above 1 px are the ones measure_applied_move already reports in
+        # `extrapolated_frames`. It is not a cost either: measure_applied_move (~5.5 s) + guided_redetect_all
+        # (~5.6 s) replaces a detect_surface_all (~15.6 s) each site was already paying.
+        #
+        # `vol` is the right reference and is unmodified here: every pre-branch mutation of it is gated
+        # `provided_edges is None` (axial_motion_correct, intra_frame_dewarp, apply_global_detilt, auto crop_region),
+        # smooth_volume returns a fresh array, and every rigid stage starts from `volume.copy()`. The canvas
+        # extension above reassigns `vol` BEFORE this point and pads `provided_edges` to match, so curve and volume
+        # stay in one depth space.
+        #
+        # Any failure returns None → detect=None → the function's own free detection, i.e. today's behaviour.
+        _cpw_gt = float(p_all.get("corrected_prior_window", 0.0) or 0.0)
+        _gt_base: dict = {}
+
+        def _corr_detect(cur: np.ndarray, filled: bool):
+            """The constrained corrected-pane line for `cur`, or None to fall back to a free detection."""
+            if provided_edges is None or _cpw_gt <= 0 or tuple(vol.shape) != tuple(cur.shape):
+                return None
+            try:
+                # MEASURE THE MOVE AGAINST THE *CROPPED* VOLUME, because _apply_crop runs AFTER these three call
+                # sites (below) — so the file the reviewer's pane is served from is the CROPPED one, and the api
+                # measures raw→DELIVERED while this measured raw→CALL-SITE. On a scan with crop_bands the two
+                # gates disagree (the api sees frames 99-100 as extrapolated with n_cols_min 0; here they are
+                # fitted with n_cols_min 394), which moved the prior by up to 23.98 px and the served line by
+                # 24.755 px — i.e. exactly the pane-vs-warp divergence this whole change exists to remove.
+                # np.array() COPY is required: _apply_crop mutates its argument in place.
+                # No crop_bands → _apply_crop is a no-op → byte-unchanged.
+                _cur_delivered = _apply_crop(np.array(cur), p_all)[0]
+                mv = measure_applied_move(reformat_to_sagittal(vol), reformat_to_sagittal(_cur_delivered), p_all)
+                pr = carry_correction_curve(provided_edges, mv["move"], int(cur.shape[1]))
+                # ASYMMETRY, on purpose: the MOVE is measured on the UNFILLED volumes (_move_column_gate rejects
+                # columns by zero-fraction, and filling the black bands would defeat that gate and let canvas-
+                # truncated columns into the rigid fit), while the constrained RE-DETECT runs on whatever volume
+                # the calling function detects on — filled for the two *_surface_gt warps, unfilled for
+                # align_corrected_to_smooth — so the substitution is exact.
+                base = _fill_black_bands(cur) if filled else cur
+                out = constrained_served_surface(reformat_to_sagittal(base), pr, p_all, window=_cpw_gt)
+                if out is not None:
+                    _gt_base[f"{'filled' if filled else 'raw'}"] = {
+                        "window_px": _cpw_gt,
+                        "n_extrapolated": len(mv["extrapolated_frames"]),
+                        "extrapolated_frames": [int(x) for x in mv["extrapolated_frames"]],
+                        # a frame whose residual about the rigid shift+tilt line is large is a frame where the
+                        # per-frame-rigid model itself does not hold (crop bands, clipped laterals) — visible here
+                        # rather than silently folded into the prior.
+                        "resid_mad_max": float(np.nanmax(mv["resid_mad"])) if np.any(np.isfinite(mv["resid_mad"])) else None,
+                    }
+                return out
+            except Exception:  # noqa: BLE001 — degrade to the free detection, never to a wrong prior
+                return None
+
         # ── FINAL RIGID PASSES on the fix-columns path ───────────────────────────────────────────────────────
         # REVIEWER DIRECTIVE: "not to manipulate the columns directly in sagittal view but to correct the
         # detected edge / corneal curvature. This will inform detector and still allow the axial transforms to
@@ -9691,12 +10747,6 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if p_all.get("rigid_frame_refine", True) and not _sole:
                 corrected, _rfr = rigid_frame_refine(corrected, params, workers=workers)
                 info["rigid_frame_refine"] = _rfr
-            # FINAL: flatten the sagittal (across-frame) surface to its per-lateral QUADRATIC with a rigid per-frame
-            # translation + (clamped, gated) rotation — the reviewer's "corrected result should fit a nice smooth
-            # quadratic". With corrections_sole_sag this is the ONLY fine axial pass; self-gated on the sagittal edge.
-            if p_all.get("sag_quad_align", True):
-                corrected, _sqa = sagittal_quad_align(corrected, params, workers=workers)
-                info["sagittal_quad_align"] = _sqa
             # EDGE-FRAME GUARD: nudge the outermost acquisition-edge frames back onto the interior corneal curvature
             # (the faint FOV corner where the de-jitter dips them below the dome). Rigid, tapered, self-gated.
             if p_all.get("edge_guard", True):
@@ -9707,18 +10757,37 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             if provided_edges is not None and p_all.get("reconcile_line", True):
                 corrected, _rec = reconcile_manual_line(corrected, provided_edges, params, workers=workers)
                 info["reconcile_manual_line"] = _rec
+            # TRULY FINAL flatten: land the sagittal (across-frame) surface on its per-lateral QUADRATIC with a rigid
+            # per-frame axial translation — the reviewer's "corrected result should fit a nice smooth quadratic". Runs
+            # AFTER edge_frame_guard + reconcile so it flattens the SAME surface the viewer sees: on the off-centre
+            # cs048 the residual is ~96% frame-common motion, and doing this on the settled surface takes the central
+            # body 8.4->3.0 px off deg-2 with step 16 px (self-gate passes), whereas running it mid-pipeline saw a
+            # 37 px redetect step (the edge stages had not yet settled the surface) and the gate rejected it. The
+            # edge/crop frames are held flat, so the reconciled manual line is preserved. Self-gated on the central body.
+            if p_all.get("sag_quad_align", True):
+                corrected, _sqa = sagittal_quad_align(corrected, params, workers=workers)
+                info["sagittal_quad_align"] = _sqa
+        # The three GT warps below get `detect=` — the SAME constrained line the corrected pane draws for the
+        # volume as it stands right here. See _corr_detect above. `filled` mirrors each function's own detection
+        # input exactly (_fill_black_bands for the two *_surface_gt warps, raw for align_corrected_to_smooth).
         _axa = p_all.get("axial_anchors")   # AXIAL fix-tool GT (see main path) — applies on the fix-columns path too
         if _axa:
-            corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers)
+            corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers,
+                                                        detect=_corr_detect(corrected, filled=True))
             info["axial_anchors"] = _axinfo
         # "Smooth to trusted slices" propagates the reviewer's edited + approved curves; it CONSUMES
         # corrected_edge_anchors as the edited GT, so the standalone warp is skipped in that mode (no double-apply).
         if p_all.get("corrected_smooth_align"):
-            corrected, _csa = align_corrected_to_smooth(corrected, params, workers=workers)
+            corrected, _csa = align_corrected_to_smooth(corrected, params, workers=workers,
+                                                        detect=_corr_detect(corrected, filled=False))
             info["corrected_smooth_align"] = _csa
         elif p_all.get("corrected_edge_anchors"):   # standalone CORRECTED-edge fix-tool (guarded rigid axial move)
-            corrected, _ceinfo = apply_sagittal_surface_gt(corrected, p_all.get("corrected_edge_anchors"), params, workers=workers)
+            corrected, _ceinfo = apply_sagittal_surface_gt(corrected, p_all.get("corrected_edge_anchors"), params,
+                                                           workers=workers,
+                                                           detect=_corr_detect(corrected, filled=True))
             info["corrected_edge_anchors"] = _ceinfo
+        if _gt_base:
+            info["corrected_gt_baseline"] = _gt_base
         ms = p_all.get("manual_shifts")
         if ms:
             corrected, n_ms = apply_manual_shifts(corrected, ms)

@@ -133,7 +133,11 @@ interface CaseState {
   /** Search + adopt better DETECTOR parameters from every correction drawn so far (guarded). */
   startDetectorTune: () => Promise<{ started: number; n_points?: number; note?: string } | null>;
   /** Re-run THIS scan against the corrections drawn on it, and stay on it. The per-scan iteration step. */
-  rerunWithCorrections: (opts?: { smoothAlign?: boolean; trustedLaterals?: number[] }) => Promise<boolean>;
+  rerunWithCorrections: (opts?: { smoothAlign?: boolean; trustedLaterals?: number[];
+                                 /** Reviewer directive 2026-09-01: corrected-pane edits are the more accurate
+                                  *  observation, so fold them into the ORIGINAL scan's border_anchors and re-run
+                                  *  from the improved GT (corrected_edit_feedback) instead of the post-hoc warp. */
+                                 foldToOriginal?: boolean }) => Promise<boolean>;
   // "Surface-crop" manual mark → manifest.surface_crop_manual (human review of the auto-detected clipped-cornea set).
   setSurfaceCrop: (surfaceCrop: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
@@ -370,10 +374,20 @@ export const useCaseStore = create<CaseState>()(
         // judged is what you get.
         const pre = await api.json<{ case_info?: { manifest?: { oct_iter?: {
           corrected_edge_anchors?: { applied?: boolean; declined?: boolean; frames_adjusted?: number; dev_before?: number; dev_after?: number };
+          corrected_fold?: { folded?: boolean; n_points?: number; laterals?: number[]; pinned_laterals?: number[];
+                             verified_cleared?: Record<string, unknown>;
+                             anchors_before?: { laterals?: number; points?: number };
+                             anchors_after?: { laterals?: number; points?: number }; backup?: string };
           corrected_smooth_align?: SmoothAlignInfo } } } }>(
           `/api/case/${id}/oct-preprocess`, "POST",
-          JSON.stringify({ use_redetect: true, corrected_smooth_align: opts?.smoothAlign ?? false,
-                           corrected_trusted_laterals: opts?.smoothAlign ? (opts?.trustedLaterals ?? null) : null }));
+          // FOLD and SMOOTH-ALIGN are mutually exclusive by construction: a successful fold rewrites the raw GT,
+          // so the backend skips the post-hoc warp (api_server.py `if req.corrected_smooth_align and not
+          // _folded_corrected`). Sending both would just mean "fold, and warp if the fold found nothing".
+          JSON.stringify({ use_redetect: true,
+                           corrected_edit_feedback: opts?.foldToOriginal ?? false,
+                           corrected_smooth_align: opts?.smoothAlign ?? false,
+                           corrected_trusted_laterals: (opts?.smoothAlign || opts?.foldToOriginal)
+                             ? (opts?.trustedLaterals ?? null) : null }));
         await get().openCase();                  // reload the re-corrected volume (cache-busted URL)
         const wf = useWorkflowStore.getState();
         wf.set("segVersion", wf.segVersion + 1);  // re-render previews
@@ -386,11 +400,22 @@ export const useCaseStore = create<CaseState>()(
         // Smooth-align outcome: propagated the reviewer's edited (drawn) + approved trusted curves across the volume.
         // Same formatter the corrected-mode toolbar uses (store/smoothAlign), so the toast and the persistent toolbar
         // line explain a decline identically (which guard fired + the numbers) rather than "made no change".
+        // FOLD outcome. This one CHANGED the reviewer's raw ground truth, so the toast states the count and
+        // where the backup went; oct_iter.corrected_fold carries the same record across a reload.
+        const fold = pre?.case_info?.manifest?.oct_iter?.corrected_fold;
+        const foldNote = fold?.folded
+          ? `Regenerated from ${((fold.laterals ?? []).length + (fold.pinned_laterals ?? []).length)} verified slice(s) `
+            + `(${(fold.laterals ?? []).length} drawn, ${(fold.pinned_laterals ?? []).length} marked accurate): `
+            + `${fold.n_points ?? 0} drawn point(s) written into the original edge `
+            + `(${fold.anchors_before?.points ?? 0} → ${fold.anchors_after?.points ?? 0} anchors), then the whole `
+            + `correction re-run. Your verifications are cleared — check the new scan and verify again. `
+            + `Backup: ${fold.backup ?? "none"}. `
+          : (opts?.foldToOriginal ? "Nothing to regenerate — no verified slices on this scan. " : "");
         const csa = pre?.case_info?.manifest?.oct_iter?.corrected_smooth_align;
         const csaDesc = opts?.smoothAlign ? describeSmoothAlign(csa) : null;
         const csaNote = csaDesc ? `${csaDesc.detail} ` : "";
         wf.set("status", { kind: "done", title: "Re-run complete",
-          detail: csaNote + ceNote + (guided?.accepted
+          detail: foldNote + csaNote + ceNote + (guided?.accepted
                     ? `Detection improved and kept — ${guided.why}. `
                     : (guided ? `Guided detection did NOT beat auto (${guided.why}), so the scan keeps the better surface. ` : ""))
                  + "Inspect it — correct again, Approve, or Skip." });
@@ -473,6 +498,18 @@ export const useCaseStore = create<CaseState>()(
       // No warp happens here — only on the following preprocess Run. Empty {} clears.
       await api.json(`/api/case/${id}/oct-corrected-redetect`, "POST",
         JSON.stringify({ corrected_edge_anchors: anchors ?? {} }));
+      // Reflect the write back into the in-memory manifest. Without this, oct_params still holds the OLD set, so
+      // the panel keeps reporting the drawing as unsaved and a later re-seed would restore the stale anchors over
+      // the ones just written. Mirrors the persisted state rather than re-fetching the case (a full openCase()
+      // here would remount the editor mid-drawing).
+      set((s) => {
+        if (!s.caseInfo) return;
+        const m = s.caseInfo.manifest as Record<string, unknown>;
+        const op = { ...((m.oct_params as Record<string, unknown>) ?? {}) };
+        if (anchors && Object.keys(anchors).length) op.corrected_edge_anchors = anchors;
+        else delete op.corrected_edge_anchors;
+        m.oct_params = op;
+      });
     },
 
     setDifficult: async (difficult, reason) => {

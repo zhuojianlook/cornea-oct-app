@@ -6,7 +6,6 @@ import { api } from "../../api/client";
 import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, type LifecycleStep } from "../../api/lifecycle";
 import { useReviewQueueStore, nextAfter } from "../../store/reviewQueueStore";
 import { usePendingEditStore } from "../../store/pendingEditStore";
-import { describeSmoothAlign, type SmoothAlignInfo } from "../../store/smoothAlign";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
    the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
@@ -90,13 +89,13 @@ export function TimelineBar() {
   const editedLaterals = (correctedEdge?.dirty && correctedEdge.anchors)
     ? Object.keys(correctedEdge.anchors).filter((k) => Object.keys(correctedEdge.anchors[k] ?? {}).length > 0).length : 0;
   const trustedCount = trustedForCase.length + editedLaterals;
-  // Outcome of the LAST "Smooth to trusted slices & re-run" (align_corrected_to_smooth), persisted by the backend
-  // to manifest.oct_iter.corrected_smooth_align. Surfaced in the corrected-mode toolbar so a DECLINE is explained
-  // (which guard fired + the numbers) instead of the reviewer seeing a good edge but no volume change and no reason.
-  const lastSmoothAlign = describeSmoothAlign(
-    ((manifest?.oct_iter as Record<string, unknown> | undefined)?.corrected_smooth_align as SmoothAlignInfo | undefined) ?? null);
-  const smoothAlignTone = (t: "ok" | "info" | "muted") =>
-    t === "ok" ? "var(--c-green)" : t === "info" ? "var(--c-amber, #d9a441)" : "var(--c-text-dim)";
+  // FOLD-BACK readiness. Counts the PERSISTED corrected-edge laterals (they autosave ~900 ms after drawing,
+  // so by the time the reviewer reaches a button they are already on disk) unioned with anything still dirty
+  // in the panel. Persisted-only is the normal case after a reload, and it must still be foldable.
+  const dirtyCorrLats = (correctedEdge?.dirty && correctedEdge.anchors)
+    ? Object.keys(correctedEdge.anchors).filter((k) => Object.keys(correctedEdge.anchors[k] ?? {}).length > 0) : [];
+  // (The smooth-align verdict readout lived here until 2026-09-01. Its button is gone, so nothing renders it;
+  //  store/smoothAlign.ts and the backend record are left in place for when the guard is fixed.)
   // What the reject button is about to save. Counting only border POINTS read "(0)" whenever the pending work
   // was crop or defect marks — telling the reviewer their marks would be discarded, which was the opposite of
   // the truth.
@@ -125,6 +124,12 @@ export function TimelineBar() {
   const octParams = (manifest?.oct_params ?? null) as Record<string, unknown> | null;
   const anchorObj = (octParams?.border_anchors ?? null) as Record<string, unknown> | null;
   const hasBorderCorrection = Boolean(anchorObj && Object.keys(anchorObj).length);
+  // VERIFIED slices on the corrected scan. The reviewer's loop (2026-09-02) treats a DRAWN edge and a slice
+  // MARKED accurate as the same thing — "in either case those slices are verified as accurate" — so both feed
+  // the regenerate. Sources: persisted drawings, persisted marks, and anything still dirty in the panel.
+  const verifiedDrawn = Object.keys((octParams?.corrected_edge_anchors ?? {}) as Record<string, unknown>);
+  const verifiedMarked = Object.keys((octParams?.corrected_accurate ?? {}) as Record<string, unknown>);
+  const foldableLats = new Set([...verifiedDrawn, ...verifiedMarked, ...dirtyCorrLats]).size;
   const [corpusEligible, setCorpusEligible] = useState(true);
   const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
@@ -541,6 +546,29 @@ export function TimelineBar() {
     await advance();
   };
 
+  // FOLD THE CORRECTED-PANE EDITS INTO THE ORIGINAL EDGE, then re-run from the improved GT.
+  // Reviewer directive 2026-09-01: "corrections on the corrected image are always to be treated as more
+  // accurate and therefore should inform an appropriate change in the edge of the original such that an
+  // improved corrected image is resultant." Where the corrected-pane line disagrees with an earlier raw
+  // anchor at the same (lateral, frame), the corrected one WINS and replaces it.
+  // This is the only action that rewrites the reviewer's own raw ground truth, so it is deliberately a
+  // SEPARATE button (never the default re-run) and the backend snapshots the pre-fold anchors first.
+  // STEP 3 of the reviewer's loop: take every verified slice on the corrected scan (drawn or marked) and
+  // regenerate the corrected scan from them, then hand back the new one with the verifications cleared.
+  const foldToOriginalAndRerun = async () => {
+    setBusyAction("rerun");
+    try {
+      const ce = activeCaseId ? takeCorrectedEdge(activeCaseId) : null;
+      if (ce) await commitCorrectedEdgeAnchors(ce);       // persist anything still dirty, then fold ALL of it
+      const ok = await rerunWithCorrections({ foldToOriginal: true,
+                                              trustedLaterals: trustedForCase.length ? trustedForCase : undefined });
+      if (!ok) setQueueNote("Fold + re-run failed — your corrected-edge drawing is saved; try again or Skip.");
+      else setQueueNote(null);
+    } catch (e) {
+      setQueueNote(`Fold problem (${e instanceof Error ? e.message : String(e)}) — the drawing is saved.`);
+    } finally { setBusyAction(null); }
+  };
+
   // ITERATE ON THIS SCAN. Commit whatever is drawn, re-run the scan against it, and STAY — so the reviewer
   // can look at the result and correct again. This is the loop that actually converges per scan: unlike the
   // detector-parameter search, an anchor is not a hint the detector may decline, it defines the surface.
@@ -568,10 +596,10 @@ export function TimelineBar() {
       if (ce) await commitCorrectedEdgeAnchors(ce);
       // In Corrected mode, the re-run is "Smooth to trusted slices": propagate the edited (drawn, just committed)
       // + approved slices across the volume. Only a raw change diverts to a plain raw re-run.
-      const ok = await rerunWithCorrections(
-        editTarget === "corrected" && !rawChanged
-          ? { smoothAlign: true, trustedLaterals: trustedForCase.length ? trustedForCase : undefined }
-          : undefined);
+      // Always a plain corrections re-run now. The smooth-align branch that used to live here is gone with
+      // its button (2026-09-01); corrected-pane edits go through the fold instead, which is the reviewer's
+      // stated model — the corrected line is the more accurate observation, so it belongs in the ORIGINAL GT.
+      const ok = await rerunWithCorrections(undefined);
       if (!ok) setQueueNote("Re-run failed — your correction is saved; try again or Skip.");
       else setQueueNote(null);
     } catch (e) {
@@ -765,11 +793,41 @@ export function TimelineBar() {
                  border: "1px solid var(--c-border)", borderRadius: 4, padding: "3px 6px" }}
       />
       {/* ITERATE — the scan stays on screen. Primary action whenever something is drawn: a correction is
-          worth more applied to this scan than filed against it. */}
+          worth more applied to this scan than filed against it.
+          NOT rendered in corrected mode with no raw change (`smoothAlignReady`), because there this button WAS
+          "Smooth to N trusted slices & re-run" — the post-hoc align_corrected_to_smooth warp. Removed on the
+          reviewer's instruction 2026-09-01: it declined on every recorded real-scan run, and its decline test
+          compares a CONSTRAINED-line off-quadratic against a FREE-detection one (1.19 vs 16.41 px on the same
+          unmoved volume), so its verdicts carry no information. The engine and its request flag are untouched —
+          only the way to invoke it from here is gone. Restoring it should wait until that guard measures both
+          sides with the same line and csa_tilt_min_laterals goes 2 → 8.
+          Corrected mode keeps: ⤴ fold-to-original (which also pins approved/trusted laterals), Approve, Skip,
+          Difficult, Re-preprocess. A pending RAW change still shows this button as "Correct & re-run". */}
+      {!smoothAlignReady && (
       <Button size="small" variant="contained" color="warning" disabled={busy || navigating}
-        onClick={() => void correctAndRerun()}
+        onClick={() => {
+          // GUARD THE FREE PATH. On a scan with NO border_anchors the smooth-align stage is called without a
+          // constrained surface, so an APPROVED lateral's target becomes a completely unconstrained detection —
+          // measured a median 5.4 px and up to 255 px from the reviewer's own drawn line. Across 30 held-out
+          // trials on that path it fired 28 times and was worse on 23-25 of 26 slices, pushed the surface
+          // 16-55 px RMS off the drawn line, took zero-voxels 6.30% -> 9.72% and cost 3.2% of signal energy.
+          // 300 of the 308 scans in the store are in exactly that state, so this is the common case, not an
+          // edge case. Confirm rather than disable: the reviewer may still want it, but not by accident.
+          if (smoothAlignReady && !hasBorderCorrection && !window.confirm(
+            "This scan has no drawn border corrections, so \"trusted\" slices are judged against the automatic "
+            + "detector rather than your own lines.\n\nMeasured on scans in this state, the move it makes is "
+            + "wrong far more often than it is right — it typically pushes the surface further from a hand-drawn "
+            + "edge and empties voxels at the volume ends.\n\nDraw a border correction first, or use the "
+            + "corrected-edge fix-tool on the specific slice.\n\nRun it anyway?")) return;
+          void correctAndRerun();
+        }}
         startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-        title={smoothAlignReady
+        title={smoothAlignReady && !hasBorderCorrection
+          ? "NOT RECOMMENDED on this scan: it has no drawn border corrections, so an approved slice's target is\n"
+            + "the automatic detector's own smoothed curve, not your line. Measured on scans in this state the\n"
+            + "move is worse on 23-25 of 26 slices and lands 16-55 px from a hand-drawn edge. Draw a border\n"
+            + "correction first, or use the corrected-edge fix-tool on the slice you care about."
+          : smoothAlignReady
           ? "Smooth to trusted slices (~2 min). Takes the corrected-surface curves you EDITED (drew) plus the\n"
             + "slices you APPROVED as trusted ground truth, and propagates them across the whole volume — each\n"
             + "B-scan rigidly shifts/rotates so the result follows the curvature YOU defined. Rigid only: the\n"
@@ -784,16 +842,35 @@ export function TimelineBar() {
               ? `↻ Smooth to ${trustedCount} trusted slice${trustedCount === 1 ? "" : "s"} & re-run`
           : "↻ Re-run with corrections"}
       </Button>
-      {/* WHY the last "Smooth to trusted slices" did (or, more often, did NOT) change the volume. Shown only in
-          Corrected mode, and hidden while a re-run is in flight (the result is about to change). A rigid move that
-          would worsen the already-quadratic surface, or drag the drawn edges off, is DECLINED by design — this makes
-          that verdict visible with the numbers instead of leaving the reviewer with a good edge and no explanation. */}
-      {editTarget === "corrected" && lastSmoothAlign && busyAction !== "rerun" && (
-        <span className="text-[11px]" style={{ maxWidth: 340, lineHeight: 1.2, color: smoothAlignTone(lastSmoothAlign.tone) }}
-              title={lastSmoothAlign.detail}>
-          {lastSmoothAlign.headline}
-        </span>
       )}
+      {/* FOLD INTO THE ORIGINAL EDGE. Separate from the primary re-run because it changes the reviewer's raw GT
+          rather than the delivered volume: the corrected-pane line is taken as the more accurate observation and
+          REPLACES the raw anchor at the same (lateral, frame). Corrected mode only, and only when there is
+          something to fold. Green — it is a "promote my better observation" action, not a destructive one from
+          the reviewer's point of view, though it does rewrite border_anchors (backed up server-side first). */}
+      {editTarget === "corrected" && foldableLats > 0 && !rawDirty && (
+        <Button size="small" variant="outlined" color="success" disabled={busy || navigating}
+          onClick={() => void foldToOriginalAndRerun()}
+          startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title={"REGENERATE the corrected scan from every slice you have verified on it (~2 min).\n\n"
+            + "Both kinds of verification count and are treated the same way:\n"
+            + "  \u2022 slices you DREW on — those depths are written into the original scan's edge, replacing the\n"
+            + "    earlier raw anchor wherever they disagree;\n"
+            + "  \u2022 slices you MARKED accurate — pinned frame-by-frame to the surface you vouched for, so the\n"
+            + "    new scan has to reproduce them.\n\n"
+            + "The whole correction is then re-run from that improved ground truth, so the defect is not\n"
+            + "re-created — nothing is warped after the fact.\n\n"
+            + "Your verifications are CLEARED afterwards: they described the previous corrected scan, and the next\n"
+            + "round starts on the one just produced. Their readings are kept in oct_iter.corrected_fold, and the\n"
+            + "pre-run anchors are snapshotted to cases/<id>/fold_backup/prefold_<ts>.json."}
+          sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>
+          {busyAction === "rerun" ? "Regenerating…"
+            : `\u2934 Regenerate from ${foldableLats} verified slice${foldableLats === 1 ? "" : "s"}`}
+        </Button>
+      )}
+      {/* The "why the smooth-align did nothing" line went with its button (2026-09-01). It explained declines of
+          an action that can no longer be invoked here; the outcome is still recorded in
+          manifest.oct_iter.corrected_smooth_align for anyone reading the case. */}
       {/* MOVE ON without judging. Session-only: nothing is written, so it returns to the queue next time. */}
       <Button size="small" variant="outlined" disabled={busy || navigating}
         onClick={() => void skipToNext()}

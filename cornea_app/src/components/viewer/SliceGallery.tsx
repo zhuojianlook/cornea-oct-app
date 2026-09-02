@@ -38,6 +38,31 @@ const COV_EDGE_BAND = 12;    // == DEFAULT_PARAMS.frame_edge_band (first/last N 
 const CONF_LO = 0.35;        // mirrors backend calibration: interior≈1.0, faint floating corner→0 (1.1% interior false-flag)
 const CONF_ASSIST = true;    // request + use the confidence map (kill-switch: set false to fall back to auto-only edges)
 
+// ── UNDER-DETERMINATION PROMPT (oct_iter.determinism, measured by the LAST corrections run) ───────────────
+// A SECOND, structurally different prompt. The confidence banner above asks "where is the DETECTOR unsure?";
+// this asks "where does the delivered surface currently DISCARD what I drew?" — measured in px from the
+// reviewer's own anchors, with no detector involved. The two are complementary, not redundant: the
+// confidence rule only ever inspects the first/last COV_EDGE_BAND frames, while under-determination on
+// cs048_od_v1_2 sits at frames 26-61, the MIDDLE of the B-scan.
+type DetFinding = {
+  kind: "ROUTE" | "DISCARDED" | "UNSPANNED";
+  // E_px is null on UNSPANNED — that finding is structural and promises no gain (see determinism_report).
+  // All non-null E_px are in PER-FRAME SHIFT px, the one rigid move the flatten applies, and are UPPER bounds.
+  E_px: number | null; E_max_px?: number; E_typ_px?: number; fragility_px?: number;
+  frames: number[][] | null; n_frames?: number; n_min?: number;
+  K: number; picks: number[]; picks_are_existing?: boolean[]; rests_on?: number[];
+};
+type DeterminismReport = {
+  sigma_px: number | null; sigma_n: number; sigma_eff_px: number; T_px: number;
+  route: "dense" | "sparse"; n_slices_drawn: number; n_points_drawn: number;
+  findings: DetFinding[]; n_findings: number; suggest_slices: number[]; n_suggest: number;
+  per_frame: { n: number[]; w: number[]; E_px: number[] };
+  floor: { quotable: boolean; n_points: number; rms_px?: number; rms_rot_px?: number;
+           off_quad_px?: number; pct_removed?: number; anatomy_px?: number };
+  missed_below_T: number; interp_min_slices: number; band: number[];
+  blind_frames?: { driven?: number; too_sparse?: number; why?: string };
+};
+
 // When embedded as the de-nested "Fix columns" panel (driven by the single top toolbar in
 // VolumeCanvas), `fixCols` auto-enters column-marking and hides this panel's own duplicate toggles
 // (group/orient/before-after/contrast/blur/scar) — orientation + display filter come from props so the
@@ -185,7 +210,8 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // on in fix-columns; no column selection. x=frame/n_frames, y=depth/depth_vox (depth 0 = top).
   // ALL per-slice border curves (FAST detector), fetched ONCE per pass → scrubbing is an instant client-side
   // lookup instead of a ~258ms per-slice round-trip (the user's "can't wait for the red line" complaint).
-  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][]; conf?: number[][] } | null>(null);
+  const [allCurves, setAllCurves] = useState<{ edges: number[][]; fits: number[][]; conf?: number[][];
+    determinism?: DeterminismReport } | null>(null);
   // The slice the user SETTLES on is refined to the slower, more ACCURATE (robust) detector + cached here,
   // so the border you actually inspect/drag is the precise one while scrubbing stays smooth.
   const [accurate, setAccurate] = useState<Map<number, { edge: number[]; fit: number[] }>>(new Map());
@@ -301,6 +327,67 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // Border edit MODE (2c): drag the noisy per-frame EDGE (red) or the smooth PARABOLA (blue). In parabola mode
   // a drag adds a point the quadratic must pass through; the curve re-fits live and Confirm uses it EXACTLY.
   const [borderMode, setBorderMode] = useState<"edge" | "parabola">("edge");
+  // Stairstep edge: render the RED detected surface as a per-column HORIZONTAL step at that column's exact depth
+  // (not a sloped polyline between column centres) — so a steep edge reads as a staircase and the true per-column
+  // value is visible, letting the reviewer see/place exactly where each column's surface is.
+  const [stairEdge, setStairEdge] = useState(false);
+  // CORRECTED-MODE QUEUE. Where to look on the CORRECTED result, scored as each lateral's distance from its
+  // OWN quadratic best fit (/oct-corrected-suggest). Separate from the cyan determinism prompt, which
+  // measures the ORIGINAL drawn line and is hidden in this mode — two different questions, two banners.
+  const [corrQueue, setCorrQueue] = useState<{ picks: { lateral: number; rms_px: number;
+                                                        over_px?: number | null; ref_px?: number | null }[];
+                                              ref_from_marks?: boolean; n_marks?: number; margin_px?: number;
+                                              all_within_accurate?: boolean;
+                                              done?: { lateral: number; rms_px: number | null }[];
+                                              accurate?: Record<string, { baseline_px: number | null;
+                                                                          current_px: number | null }>;
+                                              drawn: number[]; median_rms_px: number | null;
+                                              p90_rms_px: number | null } | null>(null);
+  const [corrQueueBusy, setCorrQueueBusy] = useState(false);
+  // Kept OUT of corrQueue on purpose: the ranking takes ~30 s on a cold cache, and a mark made in that window
+  // would be dropped if it had to merge into a queue object that is still null.
+  const [corrAccurate, setCorrAccurate] =
+    useState<Record<string, { baseline_px: number | null; current_px: number | null }>>({});
+  // Which suggested slices have been EDITED. Two sources, unioned: the panel's live pending edits (marks a
+  // pick done the instant the reviewer draws, before the ~900 ms autosave) and the persisted set on the case
+  // (survives a reload). Session-live is what makes the queue read as progress rather than a static list.
+  const correctedEdgePending = usePendingEditStore((s) => s.correctedEdge);
+  const corrEditedLats = useMemo(() => {
+    const out = new Set<number>();
+    const persisted = ((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as
+                        Record<string, unknown> | undefined)?.corrected_edge_anchors as
+                        Record<string, Record<string, number>> | undefined;
+    for (const k of Object.keys(persisted ?? {})) {
+      if (Object.keys(persisted?.[k] ?? {}).length) out.add(Number(k));
+    }
+    if (correctedEdgePending && correctedEdgePending.caseId === caseId) {
+      for (const k of Object.keys(correctedEdgePending.anchors ?? {})) {
+        if (Object.keys(correctedEdgePending.anchors[k] ?? {}).length) out.add(Number(k));
+        else out.delete(Number(k));          // cleared that slice again → back to outstanding
+      }
+    }
+    return out;
+  }, [caseInfo, correctedEdgePending, caseId]);
+
+  // Pull the ranking when the reviewer switches INTO corrected mode, and again after any re-run/re-detect
+  // (segSig) since the corrected surface it scores has changed. Cheap: it reads the same cached corrected
+  // surface the pane already draws. Failure is silent — this is guidance, and a missing queue must never
+  // block editing.
+  useEffect(() => {
+    if (!caseId || editTarget !== "corrected") { setCorrQueue(null); setCorrAccurate({}); return; }
+    let cancelled = false;
+    setCorrQueueBusy(true);
+    api.json<{ picks: { lateral: number; rms_px: number; over_px?: number | null; ref_px?: number | null }[];
+               ref_from_marks?: boolean; n_marks?: number; margin_px?: number; all_within_accurate?: boolean;
+               done?: { lateral: number; rms_px: number | null }[]; drawn: number[];
+               accurate?: Record<string, { baseline_px: number | null; current_px: number | null }>;
+               median_rms_px: number | null; p90_rms_px: number | null }>(
+      `/api/case/${caseId}/oct-corrected-suggest`, "POST", JSON.stringify({ params: { n: 8 } }))
+      .then((r) => { if (!cancelled) { setCorrQueue(r); setCorrAccurate(r.accurate ?? {}); } })
+      .catch(() => { if (!cancelled) setCorrQueue(null); })
+      .finally(() => { if (!cancelled) setCorrQueueBusy(false); });
+    return () => { cancelled = true; };
+  }, [caseId, editTarget, segSig]);
   // Parabola points (2c): sliceIdx → frame → depth the quadratic must pass through. The displayed parabola
   // re-fits through (detected edge with these points overriding); Confirm sends it as the EXACT surface.
   const [paraAnchors, setParaAnchors] = useState<Map<number, Map<number, number>>>(new Map());
@@ -817,6 +904,77 @@ const PROP_SLICE_BAND = 20;
     return out;
   }, [lowConfBands]);
 
+  // ── UNDER-DETERMINATION: what the last corrections run measured, minus whatever has been drawn SINCE ────
+  // The backend persists the MEASUREMENT (per-frame px, and the slices it picked); the arithmetic of "still
+  // needed" is redone here against borderAnchors so the count drops live as the reviewer draws — the same
+  // division of labour the confidence banner already uses. A pick is satisfied once this slice carries a
+  // drawn point inside the frames the finding is about (any frame, for a whole-volume ROUTE finding).
+  const detAdvice = useMemo(() => {
+    // E is NULLABLE: an UNSPANNED finding carries no px figure at all, because the action it offers (extend
+    // past the drawn span) is bit-identical to what np.interp already delivers there. It is reported for its
+    // structural fragility, not for a promised gain.
+    type Adv = { kind: DetFinding["kind"]; E: number | null; Emax: number | null; Etyp: number | null;
+                 picks: number[]; frames: number[][] | null; label: string; side: string; extend: boolean };
+    const out: Adv[] = [];
+    const d = allCurves?.determinism;
+    if (!fixCols || orient !== "sagittal" || !d || !d.findings?.length) return out;
+    const covers = (s: number, frames: number[][] | null) => {
+      const fm = borderAnchors.get(s);
+      if (!fm || fm.size === 0) return false;
+      if (!frames) return true;                        // ROUTE: any drawn point on this slice counts
+      for (const f of fm.keys()) for (const [a, b] of frames) if (f >= a && f <= b) return true;
+      return false;
+    };
+    // The border panel is scaleX(-1), so display-LEFT = HIGH frame indices (same convention as lowConfBands).
+    const sideOf = (frames: number[][] | null): string => {
+      if (!frames || !nFrames) return "";
+      const lo = Math.min(...frames.map((r) => r[0])), hi = Math.max(...frames.map((r) => r[1]));
+      const eb = Math.min(COV_EDGE_BAND, Math.floor(nFrames / 3));
+      if (lo >= nFrames - eb) return "display-left edge";
+      if (hi < eb) return "display-right edge";
+      return "middle of B-scan";
+    };
+    for (const f of d.findings) {
+      const picks = (f.picks || []).filter((s) => !covers(s, f.frames));
+      if (!picks.length) continue;
+      const fr = f.frames
+        ? f.frames.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).slice(0, 4).join(", ")
+          + (f.frames.length > 4 ? ", …" : "")
+        : "the whole volume";
+      const label = f.kind === "ROUTE"
+        ? `your ${d.n_slices_drawn} lines are too far apart to be interpolated — the result is built from a smoothed field instead`
+        : f.kind === "DISCARDED"
+          ? `frames ${fr} drawn on as few as ${f.n_min} slices — below the ${d.interp_min_slices} the result needs, so they are dropped`
+          : (f.frames && (f.frames.length > 1 || f.frames[0][0] !== f.frames[0][1])
+              ? `frames ${fr} rest on one drawn line’s end`
+              : `frame ${fr} rests on one drawn line’s end`);
+      out.push({ kind: f.kind, E: f.E_px ?? null, Emax: f.E_max_px ?? f.E_px ?? null,
+                 Etyp: f.E_typ_px ?? null,
+                 picks, frames: f.frames, label, side: sideOf(f.frames),
+                 extend: (f.picks_are_existing || []).some(Boolean) });
+    }
+    return out;
+  }, [fixCols, orient, nFrames, allCurves, borderAnchors]);
+
+  // HONEST SILENCE. Nothing fires AND the floor is measurable ⇒ say that more drawing will not help, and
+  // quote the measured floor rather than implying zero. Never shown while a finding is outstanding.
+  const detSilence = useMemo(() => {
+    const d = allCurves?.determinism;
+    if (!fixCols || orient !== "sagittal" || !d) return null;
+    if (detAdvice.length > 0) return null;
+    return { quotable: !!d.floor?.quotable, rms: d.floor?.rms_px, rot: d.floor?.rms_rot_px,
+             pct: d.floor?.pct_removed, sigma: d.sigma_px, sigmaEff: d.sigma_eff_px,
+             anatomy: d.floor?.anatomy_px, nPts: d.floor?.n_points, missed: d.missed_below_T,
+             T: d.T_px };
+  }, [fixCols, orient, allCurves, detAdvice]);
+
+  // Frames the under-determination test is structurally BLIND to (already driven, or drawn on <2 slices).
+  // Surfaced beside the silence line so "determined" is never read as "nothing more could possibly help".
+  const detBlind = useMemo(() => {
+    const b = allCurves?.determinism?.blind_frames;
+    return b ? (b.driven ?? 0) + (b.too_sparse ?? 0) : 0;
+  }, [allCurves]);
+
   // GUIDED-MARKING QUEUE — the concrete slices to visit so every low-confidence gap gets a correction. Greedy:
   // walk the band and suggest a slice whenever a still-needed one lies more than COV_SLICE_BAND beyond the last
   // suggestion (one mark covers ±COV_SLICE_BAND). Robust to the sparse, interleaved way low-confidence slices
@@ -833,6 +991,14 @@ const PROP_SLICE_BAND = 20;
     }
     return out;
   }, [lowConfBands]);
+  // The UNDER-DETERMINATION walk is a SEPARATE queue from the confidence walk above, deliberately: the two
+  // prompts mean different things ("this edge may be WRONG" vs "this edge is not being USED"), so merging
+  // their counters into one number would make both unreadable. Same shape, same live-shrink behaviour.
+  const detQueue = useMemo(() => {
+    const seen = new Set<number>(); const out: number[] = [];
+    for (const a of detAdvice) for (const s of a.picks) if (!seen.has(s)) { seen.add(s); out.push(s); }
+    return out.sort((x, y) => x - y);
+  }, [detAdvice]);
 
   // Which pass to fix → its INPUT is what we detect + draw the border on (pass 1 = the RAW original; pass k
   // = pass k-1's output). Editing the detection on the INPUT improves that pass's result — editing the
@@ -910,6 +1076,13 @@ const PROP_SLICE_BAND = 20;
     const next = ordered.find((q) => dispSlice(q.slice) > cur0 + 0.5) ?? ordered[0];
     jumpToSlice(next.slice);
   };
+  // Same walk for the under-determination queue (separate counter — see detQueue).
+  const jumpNextExtend = () => {
+    if (!detQueue.length) return;
+    const cur0 = borderSliceIdx != null ? dispSlice(borderSliceIdx) : -1;
+    const ordered = [...detQueue].sort((a, b) => dispSlice(a) - dispSlice(b));
+    jumpToSlice(ordered.find((s) => dispSlice(s) > cur0 + 0.5) ?? ordered[0]);
+  };
   // The artifact-band draft is PER SLICE: clear it whenever the current slice changes so painting on slice B
   // never carries slice A's frames. (Marked bands live in cropBands and are unaffected.)
   useEffect(() => { setBandDraft(new Set()); }, [borderSliceIdx]);
@@ -938,10 +1111,11 @@ const PROP_SLICE_BAND = 20;
     if (!fixCols || !caseId) { setAllCurves(null); setAccurate(new Map()); return; }
     let cancelled = false;
     setBorderBusy(true); setAllCurves(null); setAccurate(new Map());
-    api.json<{ edges: number[][]; fits: number[][]; conf?: number[][] }>(
+    api.json<{ edges: number[][]; fits: number[][]; conf?: number[][]; determinism?: DeterminismReport }>(
       `/api/case/${caseId}/oct-border-curves-all`, "POST",
       JSON.stringify({ border_pass: borderPass, want_conf: CONF_ASSIST }))
-      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [], conf: r.conf }); })
+      .then((r) => { if (!cancelled) setAllCurves({ edges: r.edges || [], fits: r.fits || [], conf: r.conf,
+                                                    determinism: r.determinism }); })
       .catch(() => !cancelled && setAllCurves(null))
       .finally(() => !cancelled && setBorderBusy(false));
     return () => { cancelled = true; };
@@ -2288,15 +2462,23 @@ const PROP_SLICE_BAND = 20;
                 const segs: string[][] = []; let cur: string[] = [];
                 for (let f = 0; f < nFrames; f++) {
                   const y = inBand(f) ? NaN : edgeY(f);          // gap over the cropped artifact band
-                  if (Number.isFinite(y)) cur.push(`${f + 0.5},${y}`);
-                  else if (cur.length) { segs.push(cur); cur = []; }
+                  if (Number.isFinite(y)) {
+                    // stairEdge: a HORIZONTAL step spanning the whole column [f, f+1] at its exact depth (the
+                    // polyline then rises vertically to the next column → a staircase). else: sloped centre-to-centre.
+                    if (stairEdge) cur.push(`${f},${y}`, `${f + 1},${y}`);
+                    else cur.push(`${f + 0.5},${y}`);
+                  } else if (cur.length) { segs.push(cur); cur = []; }
                 }
                 if (cur.length) segs.push(cur);
                 return segs.filter((sg) => sg.length > 1).map((sg, i) => (
                   <polyline key={`ed${i}`} fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"
                     className={editPulse === "edge" ? "bpulse" : undefined}
                     strokeWidth={anchorsDirty ? 1.4 : 1.0}
-                    opacity={cropMode ? 0.55 : (anchorsDirty ? 0.95 : 0.8)}
+                    // Reviewer 2026-09-01: the red line was hiding the tissue under it. Held translucent
+                    // enough to read the epithelium THROUGH the line, since the line is a hypothesis and
+                    // the tissue is the evidence. The dirty/crop ordering is kept — an edited line still
+                    // reads stronger than an untouched one.
+                    opacity={cropMode ? 0.4 : (anchorsDirty ? 0.7 : 0.6)}
                     points={sg.join(" ")} />
                 ));
               })()}
@@ -2604,7 +2786,10 @@ const PROP_SLICE_BAND = 20;
                     // and edits are aimed at the corrected line (editTarget forced to "corrected"), so drags land on
                     // pan-only (see onBorderDown) — the tool "does nothing". Reveal the original pane and aim edits at
                     // it so the tool works. (Fixes "changing tools to Crop artifact does not work" in corrected-only.)
-                    if (!showOriginal) { setEditTarget("original"); onNeedOriginalPane?.(); }
+                    // ⚑ Mark works on BOTH panes now (2026-09-02), so it must not drag the reviewer back to the
+                    // original when they are inspecting the corrected result — that is exactly where they want to
+                    // point. Every OTHER tool still paints on the original pane only, so those still reveal it.
+                    if (v !== "mark" && !showOriginal) { setEditTarget("original"); onNeedOriginalPane?.(); }
                     // EDITS SURVIVE A MODE SWITCH. This used to wipe the inactive mode's un-confirmed edits,
                     // so leaving Parabola discarded the shaped curve and leaving Edge reset the drags to the
                     // persisted set — which is why every other view still showed the ORIGINAL parabola. The
@@ -2651,6 +2836,18 @@ const PROP_SLICE_BAND = 20;
                       ? "BLUE bands — frames to remove from the scan entirely.\nAn automatic crop was DETECTED but not applied: open to load the pink proposal and adjust it.\nSaved when you Reject."
                       : "BLUE bands — frames to remove from the scan entirely (blink, off-cornea, junk).\nDrag across them to add, drag again to remove. Applies to all slices.\nThese frames are zeroed before SAM2 and excluded from scar alignment. Saved when you Reject."}>⊟ Crop artifact</ToggleButton>
                 </ToggleButtonGroup>
+                {/* STAIRSTEP toggle — draw the red detected edge as a per-column horizontal step at each column's
+                    exact depth (a slope becomes a staircase), so the true per-column surface is visible. Display only.
+                    Drives BOTH panes: on the corrected pane a step is one FRAME, which is the unit the corrected-edge
+                    correction actually moves (one rigid depth per frame), so the staircase is the shape being edited. */}
+                <button onClick={() => setStairEdge((v) => !v)}
+                  title="Stairstep edge — draw the red surface as a horizontal step at each column's exact depth (a slope becomes a staircase), so you can see/place exactly where the surface is. Applies to the corrected pane too, where one step = one frame."
+                  style={{ background: stairEdge ? "var(--c-surface2)" : "none", border: "1px solid",
+                           borderColor: stairEdge ? "#fbbf24" : "var(--c-border)", borderRadius: 4,
+                           color: stairEdge ? "#fbbf24" : "var(--c-text-dim)", cursor: "pointer",
+                           fontSize: 11, padding: "2px 7px", whiteSpace: "nowrap" }}>
+                  ⊐ stairstep
+                </button>
                 {/* Surface-crop sub-mode. Painting columns and dragging the bottom edge are different
                     gestures on the same picture, so they get their own switch rather than a hidden modifier. */}
                 {onToggleRaw && (
@@ -2686,26 +2883,54 @@ const PROP_SLICE_BAND = 20;
                     ))}
                   </span>
                 )}
-                {/* APPROVE-SLICE marking — in the Corrected smooth-align workflow. Approve a slice whose corrected
-                    border is already good (its detection becomes a trusted GOOD curve); slices you EDIT are trusted
-                    automatically via their drawn line. "↻ Smooth to trusted slices" propagates edited + approved
-                    curves across the whole volume. Scroll to a good slice, click, repeat. */}
+                {/* MARK-ACCURATE — repurposed 2026-09-01 from "approve slice", whose only consumer (smooth-align)
+                    was removed. The reviewer marks a slice whose corrected edge they judge ACCURATE, and the app
+                    records the RED-vs-BLUE gap there (how far the corrected surface sits from its own quadratic —
+                    the measure the reviewer proposed, and the same number the queue chips show). The FIRST mark
+                    fixes the baseline; every later reading is compared to it, so after a re-run you can see whether
+                    the slices you vouched for improved. Persisted per case, unlike the old session-only set.
+                    It is still fed to the fold as a trusted lateral (pinned to its current surface). */}
                 {onToggleRaw && showRaw && editTarget === "corrected" && cur && cur.slice_index != null && (() => {
                   const tl = (trustedSlices && trustedSlices.caseId === caseId) ? trustedSlices.slices : [];
                   const isT = tl.includes(cur.slice_index);
                   return (
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 3, whiteSpace: "nowrap", marginLeft: 4 }}>
-                      <button onClick={() => caseId && toggleTrustedSlice(caseId, cur.slice_index as number)}
-                        title="APPROVE this sagittal slice — its corrected border is already good, so its detection becomes a trusted GOOD curve. Slices you EDIT (draw on) are trusted automatically. Smooth-align propagates all trusted curves across the volume. Toggles off if already approved."
+                      <button onClick={() => {
+                          if (!caseId) return;
+                          const sl = cur.slice_index as number;
+                          toggleTrustedSlice(caseId, sl);
+                          // PERSIST the new set + capture/refresh the red-vs-blue reading for each marked slice.
+                          // The set MUST be built from the PERSISTED marks unioned with the session set, never from
+                          // `tl` alone: the endpoint REPLACES what is stored, and after a reload the session set is
+                          // empty while the marks live on in the manifest — so marking one slice then wiped every
+                          // earlier mark. (Broke the reviewer's five marks exactly this way, 2026-09-02.)
+                          const union = new Set<number>([...Object.keys(corrAccurate).map(Number), ...tl]);
+                          if (union.has(sl)) union.delete(sl); else union.add(sl);
+                          const next = [...union].sort((a, b) => a - b);
+                          api.json<{ accurate?: Record<string, { baseline_px: number | null; current_px: number | null }> }>(
+                            `/api/case/${caseId}/oct-corrected-accurate`, "POST",
+                            JSON.stringify({ corrected_trusted_laterals: next }))
+                            .then((r) => setCorrAccurate(r.accurate ?? {}))
+                            .catch(() => { /* marking is a judgement; a failed write must not block the review */ });
+                        }}
+                        title={"Mark this sagittal slice ACCURATE — the DETECTED edge here follows the true surface, whether or not it is smooth.\n\n"
+                          + "That is the point: on a verified slice the gap to the blue quadratic is REAL shape, not detector\n"
+                          + "error, so nothing should try to flatten it. Other slices are judged against the deviation you\n"
+                          + "verified as real here, not against zero. On a fold your marked slices are pinned frame-by-frame.\n\n"
+                          + "Marking changes nothing in the volume. Click again to unmark."}
                         style={{ background: isT ? "rgba(52,211,153,0.18)" : "none",
                                  border: "1px solid", borderColor: isT ? "#34d399" : "var(--c-border)",
                                  borderRadius: 4, color: isT ? "#34d399" : "var(--c-text-dim)",
                                  cursor: "pointer", fontSize: 11, padding: "2px 7px", whiteSpace: "nowrap" }}>
-                        {isT ? "✓ slice approved" : "✓ approve slice"}</button>
+                        {isT ? "✓ accurate" : "✓ mark accurate"}</button>
                       {tl.length > 0 && (
                         <span style={{ fontSize: 10, opacity: 0.7 }}>
-                          {tl.length} approved
-                          <button onClick={() => caseId && clearTrustedSlices(caseId)} title="Clear all approved-slice marks"
+                          {tl.length} marked
+                          <button onClick={() => { if (!caseId) return; clearTrustedSlices(caseId);
+                              setCorrAccurate({});
+                              api.json(`/api/case/${caseId}/oct-corrected-accurate`, "POST",
+                                JSON.stringify({ corrected_trusted_laterals: [] })).catch(() => {});
+                            }} title="Clear all accurate marks (and their baselines)"
                             style={{ marginLeft: 3, border: "none", background: "none", color: "var(--c-text-dim)",
                                      cursor: "pointer", fontSize: 10, textDecoration: "underline" }}>clear</button>
                         </span>
@@ -2763,6 +2988,239 @@ const PROP_SLICE_BAND = 20;
                         </button>
                       </span>
                     ))}
+                  </div>
+                )}
+                {/* CORRECTED-MODE QUEUE (violet). Replaces the cyan determinism prompt while the corrected line is
+                    the edit target — that one measures the ORIGINAL drawn line and answers a different question.
+                    Each pick is the lateral, inside the central band, furthest from its OWN quadratic best fit.
+                    Wording is "check", never "wrong": the score is computed on a DETECTED surface, and only the
+                    reviewer's drawn line adjudicates where the edge really is. */}
+                {editTarget === "corrected"
+                  && (corrQueueBusy || (corrQueue?.picks?.length ?? 0) > 0 || Object.keys(corrAccurate).length > 0) && (
+                  <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+                                marginTop: 3, padding: "3px 8px", borderRadius: 4,
+                                background: "rgba(192,132,252,0.10)", border: "1px solid rgba(192,132,252,0.45)" }}>
+                    <span style={{ fontSize: 11, color: "#d8b4fe", whiteSpace: "nowrap" }}>
+                      ◈ Corrected edge — slices to check
+                    </span>
+                    {corrQueueBusy && (
+                      <span style={{ fontSize: 11, color: "var(--c-text-dim)" }}>ranking…</span>
+                    )}
+                    {(() => {
+                      // VERIFIED-SLICE TRACKING. The reviewer certified the DETECTED edge on these slices as true
+                      // ("accurate even if not smooth"), so their gap to the quadratic is REAL shape and is NOT
+                      // supposed to shrink. What matters is MOVEMENT: a re-run that shifts one of these altered a
+                      // surface already accepted. Improvement is judged on the slices NOT verified.
+                      const acc = Object.entries(corrAccurate)
+                        .map(([k, v]) => ({ lateral: Number(k), base: v.baseline_px, now: v.current_px }))
+                        .filter((a) => a.base != null && a.now != null)
+                        .sort((a, b) => a.lateral - b.lateral);
+                      if (!acc.length) return null;
+                      const dsum = acc.reduce((t, a) => t + ((a.now as number) - (a.base as number)), 0) / acc.length;
+                      return (
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexBasis: "100%",
+                                       fontSize: 11, color: "var(--c-text-dim)", marginTop: 2 }}>
+                          <b style={{ color: "#34d399" }}>✓ {acc.length} verified accurate</b>
+                          <span title={"Red-vs-blue gap at your verified slices: the reading when you marked them against "
+                            + "the reading now. You certified the edge there as TRUE, so that gap is real shape and is not "
+                            + "meant to shrink — what matters is MOVEMENT, which means a re-run altered a surface you had "
+                            + "already accepted. Judge improvement on the slices you have NOT verified."}>
+                            red↔blue{" "}
+                            <b style={{ color: Math.abs(dsum) < 0.25 ? "#86efac" : "#fbbf24" }}>
+                              {(acc.reduce((t, a) => t + (a.base as number), 0) / acc.length).toFixed(2)} →{" "}
+                              {(acc.reduce((t, a) => t + (a.now as number), 0) / acc.length).toFixed(2)} px
+                              {" "}({dsum >= 0 ? "+" : ""}{dsum.toFixed(2)})
+                            </b>{" "}mean movement since you verified them
+                          </span>
+                          {acc.map((a) => (
+                            <span key={`acc${a.lateral}`} style={{ display: "inline-flex", alignItems: "center",
+                                  border: "1px solid #34d399", background: "rgba(52,211,153,0.12)", borderRadius: 4,
+                                  overflow: "hidden", whiteSpace: "nowrap" }}>
+                              <button onClick={() => jumpToSlice(a.lateral)}
+                                title={`Slice ${dispSlice(a.lateral)} — verified accurate at ${(a.base as number).toFixed(2)} px, `
+                                  + `now ${(a.now as number).toFixed(2)} px. Click to go back and look at it.`}
+                                style={{ border: "none", background: "none", color: "#a7f3d0", fontSize: 10,
+                                         padding: "0px 4px", cursor: "pointer" }}>
+                                {dispSlice(a.lateral)} {(a.now as number) < (a.base as number) ? "↓" : (a.now as number) > (a.base as number) ? "↑" : "="}
+                                {Math.abs((a.now as number) - (a.base as number)).toFixed(1)}
+                              </button>
+                              {/* UN-VERIFY from here. Otherwise removing a mark means navigating back to that exact slice to
+                                  toggle it — a long walk to undo one click. Drops the PERSISTED mark and the session pin set,
+                                  so the next fold stops pinning it and the queue stops using it as a reference. */}
+                              <button onClick={() => {
+                                  if (!caseId) return;
+                                  const next = acc.map((x) => x.lateral).filter((x) => x !== a.lateral);
+                                  const tlNow = (trustedSlices && trustedSlices.caseId === caseId) ? trustedSlices.slices : [];
+                                  if (tlNow.includes(a.lateral)) toggleTrustedSlice(caseId, a.lateral);
+                                  setCorrAccurate((m0) => { const c = { ...m0 }; delete c[String(a.lateral)]; return c; });
+                                  api.json<{ accurate?: Record<string, { baseline_px: number | null; current_px: number | null }> }>(
+                                    `/api/case/${caseId}/oct-corrected-accurate`, "POST",
+                                    JSON.stringify({ corrected_trusted_laterals: next }))
+                                    .then((r) => setCorrAccurate(r.accurate ?? {}))
+                                    .catch(() => { /* keep the optimistic removal; the next fetch reconciles */ });
+                                }}
+                                title={`Remove the accurate mark on slice ${dispSlice(a.lateral)} — it stops being a reference `
+                                  + `for the queue and stops being pinned on the next fold.`}
+                                style={{ border: "none", borderLeft: "1px solid rgba(52,211,153,0.5)", background: "none",
+                                         color: "#a7f3d0", fontSize: 10, lineHeight: 1, padding: "1px 4px", cursor: "pointer",
+                                         opacity: 0.8 }}>✕</button>
+                            </span>
+                          ))}
+                        </span>
+                      );
+                    })()}
+                    {!corrQueueBusy && corrQueue && (
+                      <>
+                        <span style={{ fontSize: 11, color: "var(--c-text-dim)", whiteSpace: "nowrap" }}>
+                          {corrQueue.ref_from_marks
+                            ? <> · deviating &gt;{corrQueue.margin_px?.toFixed(1)} px beyond the REAL deviation you verified
+                                at {corrQueue.n_marks} accurate slice(s)</>
+                            : <> · furthest from their own quadratic fit</>}
+                          {corrQueue.median_rms_px != null
+                            ? <> · volume median {corrQueue.median_rms_px.toFixed(1)} px, p90 {corrQueue.p90_rms_px?.toFixed(1)} px</>
+                            : null}
+                          {corrQueue.drawn.length ? <> · {corrQueue.drawn.length} already drawn</> : null}
+                          {(() => {
+                            const all = [...(corrQueue.done ?? []).map((d) => d.lateral),
+                                         ...corrQueue.picks.map((q) => q.lateral)]
+                              .filter((v, i, arr) => arr.indexOf(v) === i);
+                            const done = all.filter((l) => corrEditedLats.has(l)).length;
+                            const left = all.length - done;
+                            return done > 0
+                              ? <> · <b style={{ color: left === 0 ? "#86efac" : "#d8b4fe" }}>
+                                  {done}/{all.length} edited{left === 0 ? " — all done" : `, ${left} to go`}</b></>
+                              : null;
+                          })()}
+                        </span>
+                        {corrQueue.all_within_accurate && (
+                          <span style={{ fontSize: 11, color: "#86efac", whiteSpace: "nowrap" }}>
+                            ✓ nothing deviates beyond the real deviation you verified — no work suggested
+                          </span>
+                        )}
+                        {[...(corrQueue.done ?? []).map((d) => ({ lateral: d.lateral, rms_px: d.rms_px })),
+                          ...corrQueue.picks]
+                          .filter((v, i, arr) => arr.findIndex((w) => w.lateral === v.lateral) === i)
+                          .sort((a, b) => a.lateral - b.lateral)
+                          .map((pk) => {
+                          // DONE = this slice now carries a corrected-edge drawing. Green + tick, so the row reads
+                          // as a worklist: what is left is what is still violet. It stays in the list rather than
+                          // disappearing — a vanishing button loses the count of how many were done.
+                          const done = corrEditedLats.has(pk.lateral);
+                          return (
+                            <button key={pk.lateral} onClick={() => jumpToSlice(pk.lateral)}
+                              title={done
+                                ? `Slice ${dispSlice(pk.lateral)} — EDITED. Your drawing is saved on this slice; click to go back `
+                                  + `and adjust it.`
+                                  + (pk.rms_px != null ? ` Its corrected surface currently sits ${pk.rms_px} px RMS from its own deg-2 best fit.` : "")
+                                : `Jump to slice ${dispSlice(pk.lateral)} and draw on the CORRECTED pane.\n\n`
+                                  + `Its corrected surface sits ${pk.rms_px} px RMS from its own deg-2 best fit — `
+                                  + `the largest in its part of the volume. That is where to LOOK; whether the edge is `
+                                  + `actually wrong is your call, not the detector's.\n\n`
+                                  + `Picks are spread one per band so they do not cluster, and slices you have already `
+                                  + `drawn (or within 20 of one) are skipped.`}
+                              style={{ border: `1px solid ${done ? "#4ade80" : "#c084fc"}`,
+                                       background: done ? "rgba(74,222,128,0.16)" : "rgba(192,132,252,0.14)",
+                                       color: done ? "#bbf7d0" : "#e9d5ff",
+                                       borderRadius: 4, fontSize: 11, padding: "1px 7px", cursor: "pointer",
+                                       whiteSpace: "nowrap", opacity: done ? 0.85 : 1 }}>
+                              {done ? "✓ " : ""}{dispSlice(pk.lateral)}
+                              {pk.rms_px != null
+                                ? <span style={{ opacity: 0.7 }}>
+                                    {" "}({pk.rms_px}px{(pk as { over_px?: number | null }).over_px != null
+                                      ? `, +${((pk as { over_px?: number | null }).over_px as number).toFixed(1)} over`
+                                      : ""})
+                                  </span>
+                                : null}
+                            </button>
+                          );
+                        })}
+                      </>
+                    )}
+                  </div>
+                )}
+                {/* UNDER-DETERMINATION (measured by the last corrections run; oct_iter.determinism). Cyan, not
+                    amber, and a different verb — nothing here says the edge is WRONG, only that the delivered
+                    surface does not yet DEPEND on what was drawn. Every number is px measured from the drawn
+                    anchors; no detector is involved. Absent on scans with no correction curve. */}
+                {detAdvice.length > 0 && editTarget !== "corrected" && (
+                  <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+                                marginTop: 3, padding: "3px 8px", borderRadius: 4,
+                                background: "rgba(34,211,238,0.10)", border: "1px solid rgba(34,211,238,0.45)" }}>
+                    <span style={{ fontSize: 11, color: "#67e8f9", whiteSpace: "nowrap" }}>
+                      ◐ Under-determined — your lines aren’t reaching the result
+                    </span>
+                    {detQueue.length > 0 && (
+                      <button onClick={jumpNextExtend}
+                        title={`Step to the next of ${detQueue.length} slice(s) where drawing would actually change the delivered surface. `
+                          + `This is NOT a claim that the edge is wrong — it is a measurement, in px, of how much of your own drawn line `
+                          + `the result currently discards, taken over the laterals your lines bracket. `
+                          + `Fire threshold ${allCurves?.determinism?.T_px?.toFixed(1)} px = 3x your own measured drawing scatter `
+                          + `(${allCurves?.determinism?.sigma_px != null ? `${allCurves.determinism.sigma_px.toFixed(2)} px, from ${allCurves.determinism.sigma_n} samples`
+                            : `not measurable here — only ${allCurves?.determinism?.sigma_n} samples, so the ${allCurves?.determinism?.sigma_eff_px?.toFixed(1)} px floor is used`}), `
+                          + `so nothing flagged here can be your hand. The px figure is an UPPER bound scored in per-frame `
+                          + `shift units (the one rigid move the flatten applies): held-out, the realised change came in BELOW `
+                          + `the quoted value in 8 of 8 scans, so read it as a ceiling on what drawing here can buy, not a promise. `
+                          + `Draw across the named frames, then Correct & re-run.`}
+                        style={{ border: "1px solid #22d3ee", background: "rgba(34,211,238,0.20)", color: "#a5f3fc",
+                                 borderRadius: 4, fontSize: 11, fontWeight: 600, padding: "2px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                        → Next slice to {detAdvice.some((a) => a.extend) ? "extend" : "draw"} ({detQueue.length} left)
+                      </button>
+                    )}
+                    {detAdvice.map((a, i) => (
+                      <span key={`${a.kind}-${i}`} style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                                                             fontSize: 11, color: "var(--c-text-dim)", whiteSpace: "nowrap" }}>
+                        {a.side ? <b style={{ color: "#67e8f9" }}>{a.side}</b> : null}
+                        {/* "up to", never "at least": held-out, P(realised >= quoted) measured 0.00-0.38 across
+                            8 of 8 anchored scans, so E behaves as an UPPER bound. The typical-place figure is
+                            quoted beside it whenever the two diverge, because on a lightly-drawn scan the worst
+                            frame and the typical frame differ by ~70x and either alone misleads. A finding with
+                            no E at all (UNSPANNED) is structural — it states fragility and promises no gain. */}
+                        <span>· {a.label}
+                          {a.E != null ? (
+                            <> · <b style={{ color: "#67e8f9" }}>up to ~{a.E.toFixed(0)} px</b>
+                              {a.Etyp != null && a.Etyp < a.E / 1.5 ? <> (~{a.Etyp.toFixed(0)} px in a typical frame)</> : null}
+                              {" "}of per-frame shift your lines imply is not reaching the result</>
+                          ) : (
+                            <> · this frame&rsquo;s shift <b style={{ color: "#67e8f9" }}>rests on a single drawn line&rsquo;s end</b>
+                              {" "}— fragile, though extending it may change nothing</>
+                          )}</span>
+                        <button onClick={() => jumpToSlice(a.picks[0])}
+                          title={`Jump to slice ${dispSlice(a.picks[0])} and draw`
+                            + (a.frames ? ` across frames ${a.frames.map(([x, y]) => (x === y ? `${x}` : `${x}-${y}`)).join(", ")}` : "")
+                            + `. ${a.picks.length} slice(s) still to go for this finding.`}
+                          style={{ border: "1px solid #22d3ee", background: "rgba(34,211,238,0.14)", color: "#67e8f9",
+                                   borderRadius: 4, fontSize: 11, padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          Jump to slice {dispSlice(a.picks[0])}
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {/* HONEST SILENCE. Where the residual is irreducible under the rigid rule, say so — do not
+                    send the reviewer to draw for nothing. The floor is quoted ONLY when it was measured on
+                    enough drawn points inside the band to mean anything. */}
+                {detSilence && editTarget !== "corrected" && (
+                  <div style={{ flexBasis: "100%", marginTop: 3, fontSize: 11, color: "var(--c-text-dim)" }}>
+                    <span style={{ color: "#8fd9a8" }}>✓ Determined by your lines.</span>{" "}
+                    {detSilence.quotable ? (
+                      <>Residual <b>{detSilence.rms?.toFixed(1)} px</b> at your drawn points — the per-frame shift
+                        already removes {detSilence.pct?.toFixed(0)}% of the off-quadratic residual
+                        {detSilence.rot != null ? <> (a whole-frame rotation would take it to {detSilence.rot.toFixed(1)} px)</> : null};
+                        what is left is per-slice shape the rigid rule cannot remove (~{detSilence.anatomy?.toFixed(1)} px)
+                        plus your own ±{(detSilence.sigma ?? detSilence.sigmaEff)?.toFixed(1)} px drawing scatter.
+                        More drawing will not reduce <i>that</i> part.</>
+                    ) : (
+                      <>Nothing measurable is being discarded above the {detSilence.T?.toFixed(1)} px threshold.
+                        Too few drawn points inside the central laterals ({detSilence.nPts}) to state the residual floor,
+                        so none is quoted.</>
+                    )}
+                    {detSilence.missed ? <> · {detSilence.missed} frame(s) sit below the threshold and are
+                      deliberately not listed.</> : null}
+                    {/* Scope the silence to what was actually tested. Frames already driven by enough drawn
+                        slices, and frames drawn on fewer than two, both score 0 by construction — they are not
+                        evidence of sufficiency, and the largest unflagged effects live there. */}
+                    {detBlind ? <> · {detBlind} frame(s) are outside what this test can see
+                      (already driven, or drawn on fewer than two slices), so nothing is claimed about them.</> : null}
                   </div>
                 )}
               </>
@@ -3125,6 +3583,7 @@ const PROP_SLICE_BAND = 20;
                 : { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 5 }}>
                 <CorrectedEdgePanel sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
                                     bZoom={bZoom} bPan={bPan} filterCss={enhanceFilter} readOnly={readOnly}
+                                    stairEdge={stairEdge} markMode={markMode && editTarget === "corrected"}
                                     onZoomWheel={onCorrectedWheel} />
               </div>
             )}
