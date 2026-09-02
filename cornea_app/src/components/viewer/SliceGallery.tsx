@@ -330,7 +330,10 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // Stairstep edge: render the RED detected surface as a per-column HORIZONTAL step at that column's exact depth
   // (not a sloped polyline between column centres) — so a steep edge reads as a staircase and the true per-column
   // value is visible, letting the reviewer see/place exactly where each column's surface is.
-  const [stairEdge, setStairEdge] = useState(false);
+  // ON by default (reviewer, 2026-09-02). A sloped polyline hides which frame a depth actually belongs to;
+  // the staircase shows each frame's own value, and on the corrected pane one step is one frame — the unit
+  // the per-frame correction moves.
+  const [stairEdge, setStairEdge] = useState(true);
   // CORRECTED-MODE QUEUE. Where to look on the CORRECTED result, scored as each lateral's distance from its
   // OWN quadratic best fit (/oct-corrected-suggest). Separate from the cyan determinism prompt, which
   // measures the ORIGINAL drawn line and is hidden in this mode — two different questions, two banners.
