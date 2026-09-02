@@ -352,6 +352,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // pick done the instant the reviewer draws, before the ~900 ms autosave) and the persisted set on the case
   // (survives a reload). Session-live is what makes the queue read as progress rather than a static list.
   const correctedEdgePending = usePendingEditStore((s) => s.correctedEdge);
+  const setCorrectedEdge = usePendingEditStore((s) => s.setCorrectedEdge);
   const corrEditedLats = useMemo(() => {
     const out = new Set<number>();
     const persisted = ((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as
@@ -3092,6 +3093,37 @@ const PROP_SLICE_BAND = 20;
                               : null;
                           })()}
                         </span>
+                        {/* CLEAR ALL VERIFIED (reviewer request 2026-09-02). Wipes both kinds of verification on
+                            the CORRECTED scan — the drawn edges and the accurate marks — so a round can be
+                            restarted from scratch. It does NOT touch border_anchors: the original-scan ground
+                            truth built up over previous rounds stays, which is what separates this from
+                            "⟲ Clear all corrections". */}
+                        {(Object.keys(corrAccurate).length > 0 || (corrQueue.drawn?.length ?? 0) > 0) && (
+                          <button onClick={() => {
+                              if (!caseId) return;
+                              if (!window.confirm("Clear every verified slice on the corrected scan?\n\n"
+                                + "This removes the corrected-pane edges you drew AND the slices you marked "
+                                + "accurate, so the next round starts clean.\n\n"
+                                + "Your ORIGINAL-scan corrections (border anchors) are NOT touched.")) return;
+                              setCorrAccurate({});
+                              clearTrustedSlices(caseId);
+                              setCorrectedEdge(null);
+                              void Promise.all([
+                                api.json(`/api/case/${caseId}/oct-corrected-accurate`, "POST",
+                                         JSON.stringify({ corrected_trusted_laterals: [] })),
+                                api.json(`/api/case/${caseId}/oct-corrected-redetect`, "POST",
+                                         JSON.stringify({ corrected_edge_anchors: {} })),
+                              ]).then(() => openCase()).catch(() => { /* re-open reconciles whatever landed */ });
+                            }}
+                            title={"Clear every verified slice on the corrected scan — the edges you drew here and "
+                              + "the slices you marked accurate.\n\nYour original-scan border corrections are kept; "
+                              + "this only resets the current round's verifications."}
+                            style={{ border: "1px solid var(--c-border)", background: "none",
+                                     color: "var(--c-text-dim)", borderRadius: 4, fontSize: 10,
+                                     padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                            ⟲ clear all verified
+                          </button>
+                        )}
                         {corrQueue.all_within_accurate && (
                           <span style={{ fontSize: 11, color: "#86efac", whiteSpace: "nowrap" }}>
                             ✓ nothing deviates beyond the real deviation you verified — no work suggested
