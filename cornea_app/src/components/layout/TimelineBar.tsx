@@ -138,6 +138,12 @@ export function TimelineBar() {
   // same fix in one line of state — first click arms and relabels, second acts, 4 s to change your mind.
   const [armed, setArmed] = useState<null | "reprocess" | "clearall">(null);
   const arm = (k: "reprocess" | "clearall") => { setArmed(k); window.setTimeout(() => setArmed((c) => (c === k ? null : c)), 4000); };
+  // FIXED HEIGHT for the review-row buttons (reviewer, 2026-09-02). Their labels swap between states —
+  // "✓ Approve → next (1)" / "Approving…" / "Opening next…", "↻ Re-preprocess" / "↻ Discards border
+  // corrections — click again" — and a spinner startIcon appears mid-action, so the row changed height and
+  // nudged everything below it. Height pinned, labels never wrap.
+  const ACT_SX = { height: 26, minHeight: 26, py: 0, px: 1, fontSize: 12,
+                   textTransform: "none" as const, whiteSpace: "nowrap" as const, lineHeight: 1.2 };
   const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const caseBusy = useCaseStore((s) => s.busy);
@@ -778,7 +784,7 @@ export function TimelineBar() {
   const ReviewLoop = (
     <span className="flex items-center gap-1">
       {VettedTicker}
-      <Button size="small" variant="contained" color="success" disabled={busy || rejecting || navigating}
+      <Button size="small" variant="contained" color="success" disabled={busy || rejecting || navigating} sx={ACT_SX}
         onClick={() => void approveAndNext()}
         startIcon={busyAction === "approve" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
         title={`Approve this scan's preprocessing and open the next one awaiting approval (${nLeft} in the queue).`}>
@@ -811,7 +817,7 @@ export function TimelineBar() {
           Corrected mode keeps: ⤴ fold-to-original (which also pins approved/trusted laterals), Approve, Skip,
           Difficult, Re-preprocess. A pending RAW change still shows this button as "Correct & re-run". */}
       {!smoothAlignReady && (
-      <Button size="small" variant="contained" color="warning" disabled={busy || navigating}
+      <Button size="small" variant="contained" color="warning" disabled={busy || navigating} sx={ACT_SX}
         onClick={() => {
           // GUARD THE FREE PATH. On a scan with NO border_anchors the smooth-align stage is called without a
           // constrained surface, so an APPROVED lateral's target becomes a completely unconstrained detection —
@@ -870,7 +876,7 @@ export function TimelineBar() {
             + "Your verifications are CLEARED afterwards: they described the previous corrected scan, and the next\n"
             + "round starts on the one just produced. Their readings are kept in oct_iter.corrected_fold, and the\n"
             + "pre-run anchors are snapshotted to cases/<id>/fold_backup/prefold_<ts>.json."}
-          sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>
+          sx={ACT_SX}>
           {busyAction === "rerun" ? "Regenerating…"
             : `\u2934 Regenerate from ${foldableLats} verified slice${foldableLats === 1 ? "" : "s"}`}
         </Button>
@@ -879,7 +885,7 @@ export function TimelineBar() {
           an action that can no longer be invoked here; the outcome is still recorded in
           manifest.oct_iter.corrected_smooth_align for anyone reading the case. */}
       {/* MOVE ON without judging. Session-only: nothing is written, so it returns to the queue next time. */}
-      <Button size="small" variant="outlined" disabled={busy || navigating}
+      <Button size="small" variant="outlined" disabled={busy || navigating} sx={ACT_SX}
         onClick={() => void skipToNext()}
         title={"Leave this scan unjudged and open the next one. Nothing is written — it stays in the queue\n"
           + "and will come back. Use it when a scan needs thought, or cannot be fixed right now."}>
@@ -887,7 +893,7 @@ export function TimelineBar() {
       </Button>
       {/* Flag as difficult + advance. Now the LAST resort rather than the way to record a correction — the
           correction path is the re-run above, which acts on the scan instead of filing a complaint. */}
-      <Button size="small" variant="outlined" color="error" disabled={busy || navigating}
+      <Button size="small" variant="outlined" color="error" disabled={busy || navigating} sx={ACT_SX}
         onClick={() => void rejectAndNext()}
         startIcon={busyAction === "reject" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
         title={pendingEdit
@@ -986,7 +992,7 @@ export function TimelineBar() {
             manual surface-crop / crop params; DISCARDS Fix-columns border corrections, so it is guarded by a confirm
             when the scan has any. Useful to un-stick a scan (e.g. one left in a bad manual state) or pick up an
             improved detector without hunting through Fix-columns → Run. */}
-        <Button size="small" variant="outlined" color="warning" disabled={busy}
+        <Button size="small" variant="outlined" color="warning" disabled={busy} sx={ACT_SX}
           onClick={() => {
             if (hasBorderCorrection && armed !== "reprocess") { arm("reprocess"); return; }
             setArmed(null);
@@ -1000,7 +1006,7 @@ export function TimelineBar() {
         {/* FULL reset — the superset of Re-preprocess. Discards EVERY manual correction (border + corrected-edge +
             axial anchors, artifact/surface crops, marks, force/good columns, manual patch/shifts) and re-runs pure
             AUTO. For starting a scan over from scratch. Always confirms (it is destructive of all edits). */}
-        <Button size="small" variant="outlined" color="error" disabled={busy}
+        <Button size="small" variant="outlined" color="error" disabled={busy} sx={ACT_SX}
           onClick={() => {
             if (armed !== "clearall") { arm("clearall"); return; }
             setArmed(null);
