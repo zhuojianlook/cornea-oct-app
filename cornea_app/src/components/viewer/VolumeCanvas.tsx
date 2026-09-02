@@ -567,7 +567,12 @@ export function VolumeCanvas() {
           {crisp ? "◾ Crisp" : "◇ Smooth"}
         </button>
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
-        {hasRaw && preprocStep && (
+        {/* HIDDEN IN FIX-COLUMNS (reviewer, 2026-09-02). There it only drove fcViewMode original<->both, which
+            is a strict subset of what "⇆ view:" already does (original -> both -> corrected) — two buttons
+            writing the same state, one of them able to reach less. Everywhere ELSE it is not redundant: it
+            opens BeforeAfterViewer with the iterative-pass stepper, which the view cycle has no equivalent
+            for, so it stays outside fix-columns. */}
+        {hasRaw && preprocStep && !fixColsView && (
           <ToggleButton
             size="small"
             value="ba"
@@ -580,8 +585,8 @@ export function VolumeCanvas() {
               // The fix-cols panel is gated on fcViewMode (not compareView), so in that mode DRIVE fcViewMode
               // (original <-> both) instead — else this button is a dead no-op there ("before/after doesn't work").
               // "both" keeps the original pane shown+editable (showOriginal stays true), so no tool gesture breaks.
-              if (fixColsView) {
-                setFcViewMode((v) => (v === "original" ? "both" : "original"));
+              if (fixColsView) {            // unreachable since the button is hidden there; kept as a
+                setFcViewMode((v) => (v === "original" ? "both" : "original"));   // safe fallback
                 return;
               }
               const on = !compareView;
