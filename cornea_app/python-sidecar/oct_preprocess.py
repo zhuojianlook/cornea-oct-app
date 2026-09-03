@@ -9116,9 +9116,20 @@ def reconcile_manual_line(volume: np.ndarray, provided_edges: np.ndarray, params
                  "max_shift": round(float(np.max(np.abs(shift))), 1), "unreliable_frames": int(unrel.sum())}
 
 
-def _rough_from_surface(S) -> np.ndarray:
-    """Per-lateral frame-to-frame roughness from an ALREADY DETECTED surface (lateral, frames)."""
+def _rough_from_surface(S, n_lat: int | None = None) -> np.ndarray:
+    """Per-lateral frame-to-frame roughness from an ALREADY DETECTED surface.
+
+    ORIENTATION IS NOT UNIFORM ACROSS THE STAGES: most hand over (lateral, frames), but rigid_frame_refine
+    works in (frame, lateral) and handed over surfaces in that layout, so the roughness came out per FRAME
+    and the comparison raised "operands could not be broadcast together with shapes (513,) (101,)". It only
+    surfaced when that stage APPLIES — it declined in every run I tested, so the path never executed until
+    the reviewer pressed Regenerate. n_lat pins the expected orientation; without it, ambiguity is resolved
+    by preferring the axis that matches."""
     S = np.asarray(S, dtype=np.float64)
+    if S.ndim != 2:
+        return np.full(0, np.nan)
+    if n_lat is not None and S.shape[0] != n_lat and S.shape[1] == n_lat:
+        S = S.T
     out = np.full(S.shape[0], np.nan)
     for l in range(S.shape[0]):
         d = np.diff(S[l]); d = d[np.isfinite(d)]
@@ -9171,13 +9182,17 @@ def _reject_if_rougher(before_vol: np.ndarray, after_vol: np.ndarray, stage: str
     _S0 = _rec_in.pop("_surface_before", None)
     _S1 = _rec_in.pop("_surface_after", None)
     try:
+        _nl = int(np.asarray(before_vol).shape[2]) if np.asarray(before_vol).ndim == 3 else None
         if before_rough is not None:
             r0 = before_rough
         elif _S0 is not None:
-            r0 = _rough_from_surface(_S0)
+            r0 = _rough_from_surface(_S0, _nl)
         else:
             r0 = _per_lateral_roughness(before_vol, params, workers)
-        r1 = _rough_from_surface(_S1) if _S1 is not None else _per_lateral_roughness(after_vol, params, workers)
+        r1 = _rough_from_surface(_S1, _nl) if _S1 is not None else _per_lateral_roughness(after_vol, params, workers)
+        if r0.shape != r1.shape:      # orientation still ambiguous -> measure honestly rather than guess
+            r0 = _per_lateral_roughness(before_vol, params, workers)
+            r1 = _per_lateral_roughness(after_vol, params, workers)
     except Exception:  # noqa: BLE001 — a measurement failure must not fail the run
         return after_vol, before_rough
     ok = np.isfinite(r0) & np.isfinite(r1)
