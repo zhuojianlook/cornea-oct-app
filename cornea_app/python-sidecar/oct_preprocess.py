@@ -7775,7 +7775,9 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
                  "int_spread_before": _r2(ip0), "int_spread_after": _r2(ip1),
                  "interior_tilt": i_info,
                  "sides": m0["detail"],
-                 "shift": [round(float(v), 3) for v in a]}
+                 "shift": [round(float(v), 3) for v in a],
+                 "_surface_before": m0["S"],
+                 "_surface_after": _rfr_predict_surface(m0["S"], a, b_tilt)}   # analytic, no extra detection
 
 
 def axial_refine_volume(v_sag: np.ndarray, params: dict | None = None, workers: int | None = None):
@@ -8580,7 +8582,8 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
         return volume, {"applied": False, "max_jitter": round(float(np.max(np.abs(jitter))), 2),
                         "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
     return out, {"applied": bool(nadj), "frames_adjusted": int(nadj), "max_jitter": round(float(np.max(np.abs(jitter))), 2),
-                 "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+                 "rough_before": round(r0, 3), "rough_after": round(r1, 3),
+                 "_surface_before": S, "_surface_after": S2}   # handed to the never-rougher check, then stripped
 
 
 def sagittal_quad_align(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
@@ -8965,7 +8968,8 @@ def edge_frame_guard(volume: np.ndarray, params: dict | None = None, workers: in
                         "reason": "no edge gain"}
     return out, {"applied": True, "frames_adjusted": int(nadj),
                  "off_dome_before": round(float(od0), 2), "off_dome_after": round(float(od1), 2),
-                 "max_shift": round(float(np.max(np.abs(shift))), 1)}
+                 "max_shift": round(float(np.max(np.abs(shift))), 1),
+                 "_surface_before": S, "_surface_after": S2}   # handed to the never-rougher check, then stripped
 
 
 def reconcile_manual_line(volume: np.ndarray, provided_edges: np.ndarray, params: dict | None = None,
@@ -9078,11 +9082,25 @@ def reconcile_manual_line(volume: np.ndarray, provided_edges: np.ndarray, params
                  "max_shift": round(float(np.max(np.abs(shift))), 1), "unreliable_frames": int(unrel.sum())}
 
 
+def _rough_from_surface(S) -> np.ndarray:
+    """Per-lateral frame-to-frame roughness from an ALREADY DETECTED surface (lateral, frames)."""
+    S = np.asarray(S, dtype=np.float64)
+    out = np.full(S.shape[0], np.nan)
+    for l in range(S.shape[0]):
+        d = np.diff(S[l]); d = d[np.isfinite(d)]
+        if d.size >= 8:
+            out[l] = float(np.sqrt(np.mean(d ** 2)))
+    return out
+
+
 def _per_lateral_roughness(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """Frame-to-frame roughness of the detected anterior surface, PER LATERAL. Lower = smoother."""
     p = {**DEFAULT_PARAMS, **(params or {})}
-    sag = reformat_to_sagittal(volume).astype(np.float32)
-    S = np.asarray(detect_surface_all(sag, p, workers=workers), dtype=np.float64)   # (lateral, frames)
+    # rough_stride subsamples the laterals. Default 1 (every lateral): the reviewer's rule is that NO
+    # lateral may be rougher, and sampling would let a regression through unseen. Kept as a knob only.
+    _st = max(1, int(p.get("rough_stride", 1)))    # exhaustive by default: the invariant must not be weakened
+    sag = reformat_to_sagittal(volume).astype(np.float32)[::_st]
+    S = np.asarray(detect_surface_all(sag, p, workers=workers), dtype=np.float64)   # (lateral/stride, frames)
     out = np.full(S.shape[0], np.nan)
     for l in range(S.shape[0]):
         d = np.diff(S[l]); d = d[np.isfinite(d)]
@@ -9092,7 +9110,8 @@ def _per_lateral_roughness(volume: np.ndarray, params: dict | None = None, worke
 
 
 def _reject_if_rougher(before_vol: np.ndarray, after_vol: np.ndarray, stage: str, info: dict,
-                       params: dict | None = None, workers: int | None = None):
+                       params: dict | None = None, workers: int | None = None,
+                       before_rough: np.ndarray | None = None):
     """NEVER ROUGHER THAN THE INPUT (reviewer, 2026-09-02: a corrected edge that is "noticably rougher with more
     column to column variation than the same original slice ... should never be the case").
 
@@ -9101,29 +9120,46 @@ def _reject_if_rougher(before_vol: np.ndarray, after_vol: np.ndarray, stage: str
     `rough_regress_tol_px` absorbs detector noise; `rough_regress_max_lat` allows a small number of laterals to
     regress before the stage is rejected (0 = strict).
 
-    Returns the volume to keep, and records the verdict in info[stage]."""
+    Returns (volume_to_keep, roughness_of_that_volume) and records the verdict in info[stage]. The roughness
+    is handed back so the caller can pass it as `before_rough` to the NEXT stage: each stage's "before" is
+    the previous stage's "after", so the chain needs n+1 detections rather than 2n. On a 4-stage chain that
+    is 5 instead of 8 full-volume detections — the invariant had roughly doubled a run (157 s -> 310 s)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     if not bool(p.get("never_rougher", False)):
-        return after_vol
+        return after_vol, None
     tol = float(p.get("rough_regress_tol_px", 0.2))
     allow = int(p.get("rough_regress_max_lat", 0))
+    # REUSE THE STAGE'S OWN DETECTIONS. Every one of these stages already detects the surface before and after
+    # to run its own self-gate, so re-detecting here was pure duplication — it had roughly doubled a re-run
+    # (157 s -> 310 s). When the stage hands its surfaces over (keys stripped below, never persisted), the
+    # invariant costs almost nothing. Falling back to detecting keeps it correct for stages that do not.
+    _rec_in = info.get(stage) if isinstance(info.get(stage), dict) else {}
+    _S0 = _rec_in.pop("_surface_before", None)
+    _S1 = _rec_in.pop("_surface_after", None)
     try:
-        r0 = _per_lateral_roughness(before_vol, params, workers)
-        r1 = _per_lateral_roughness(after_vol, params, workers)
+        if before_rough is not None:
+            r0 = before_rough
+        elif _S0 is not None:
+            r0 = _rough_from_surface(_S0)
+        else:
+            r0 = _per_lateral_roughness(before_vol, params, workers)
+        r1 = _rough_from_surface(_S1) if _S1 is not None else _per_lateral_roughness(after_vol, params, workers)
     except Exception:  # noqa: BLE001 — a measurement failure must not fail the run
-        return after_vol
+        return after_vol, before_rough
     ok = np.isfinite(r0) & np.isfinite(r1)
     n_worse = int(np.count_nonzero((r1 - r0)[ok] > tol))
     rec = info.get(stage) if isinstance(info.get(stage), dict) else {}
     rec["rougher_laterals"] = n_worse
     rec["rougher_worst_px"] = (round(float(np.nanmax((r1 - r0)[ok])), 2) if int(ok.sum()) else None)
+    for _k in [k for k in rec if isinstance(k, str) and k.startswith("_")]:
+        rec.pop(_k, None)                     # never persist a surface array into the manifest
     if n_worse > allow:
         rec["applied"] = False
         rec["reason"] = f"declined: made {n_worse} lateral(s) rougher than the input (max +{rec['rougher_worst_px']} px)"
         info[stage] = rec
-        return before_vol
+        return before_vol, r0            # volume unchanged -> its roughness is still r0
     info[stage] = rec
-    return after_vol
+    return after_vol, r1
 
 
 def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
@@ -9269,7 +9305,8 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
     if not (r1 < r0):
         return volume, {"applied": False, "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
     return out, {"applied": True, "frames_rotated": int(nrot), "max_deg": round(max_deg, 2), "iters": int(it_done),
-                 "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+                 "rough_before": round(r0, 3), "rough_after": round(r1, 3),
+                 "_surface_before": S, "_surface_after": Scur}   # handed to the never-rougher check, then stripped
 
 
 def intra_frame_dewarp(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
@@ -10949,28 +10986,28 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                         del _cs
                     except Exception:  # noqa: BLE001
                         _rhr_det = None
-                _before = corrected
+                _before = corrected; _rgh = None
                 corrected, _rhr = rigid_height_refine(corrected, params, workers=workers, detect=_rhr_det)
                 _rhr["surface"] = "guided" if _rhr_det is not None else "self-detected"
                 info["rigid_height_refine"] = _rhr
-                corrected = _reject_if_rougher(_before, corrected, "rigid_height_refine", info, params, workers)
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_height_refine", info, params, workers, _rgh)
             if p_all.get("rigid_frame_derotate", True) and not _sole:
                 _before = corrected
                 corrected, _rfd = rigid_frame_derotate(corrected, params, workers=workers)
                 info["rigid_frame_derotate"] = _rfd
-                corrected = _reject_if_rougher(_before, corrected, "rigid_frame_derotate", info, params, workers)
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_frame_derotate", info, params, workers, _rgh)
             if p_all.get("rigid_frame_refine", True) and not _sole:
                 _before = corrected
                 corrected, _rfr = rigid_frame_refine(corrected, params, workers=workers)
                 info["rigid_frame_refine"] = _rfr
-                corrected = _reject_if_rougher(_before, corrected, "rigid_frame_refine", info, params, workers)
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_frame_refine", info, params, workers, _rgh)
             # EDGE-FRAME GUARD: nudge the outermost acquisition-edge frames back onto the interior corneal curvature
             # (the faint FOV corner where the de-jitter dips them below the dome). Rigid, tapered, self-gated.
             if p_all.get("edge_guard", True):
                 _before = corrected
                 corrected, _efg = edge_frame_guard(corrected, params, workers=workers)
                 info["edge_frame_guard"] = _efg
-                corrected = _reject_if_rougher(_before, corrected, "edge_frame_guard", info, params, workers)
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "edge_frame_guard", info, params, workers, _rgh)
             # RECONCILE TO THE MANUAL LINE: keep the de-jitter in the reliable interior, but pin the faint FOV-corner
             # frames back to the user's drawn line (provided_edges) where the de-jitter's correction is unreliable.
             if provided_edges is not None and p_all.get("reconcile_line", True):
