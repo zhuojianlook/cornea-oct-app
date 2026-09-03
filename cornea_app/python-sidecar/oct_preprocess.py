@@ -7715,7 +7715,7 @@ def rigid_frame_refine(volume: np.ndarray, params: dict | None = None, workers: 
     that arrives smooth is returned byte-unchanged. `volume` is (frames, depth, lateral)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     if not bool(p.get("rigid_frame_refine", True)):
-        return volume, {"applied": False}
+        return volume, {"applied": False, "reason": "gate: if not bool(p.get('rigid_frame_refine', True))"}
     F, L = int(volume.shape[0]), int(volume.shape[2])
     lead, tail = _rfr_split(p)
     if F < lead + tail + 24 or L < 32:
@@ -8765,7 +8765,7 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
         workers = auto_workers()
     F, depth = int(volume.shape[0]), int(volume.shape[1])
     if F < 12:
-        return volume, {"applied": False}
+        return volume, {"applied": False, "reason": "gate: if F < 12"}
     # `detect` = a surface of THIS volume the caller already has, same reuse idiom as axial_motion_correct.
     # It matters most on the CORRECTIONS path: this stage aligns every frame to a smooth dome fitted through
     # the detected surface, so wherever the detector is wrong the frame is moved to the wrong height — and the
@@ -8777,12 +8777,13 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
     try:
         S = (np.asarray(detect, dtype=np.float32) if _shape_ok
              else detect_surface_all(reformat_to_sagittal(volume), p, workers=workers))  # (lat, frames)
-    except Exception:  # noqa: BLE001
-        return volume, {"applied": False}
+    except Exception as _exc:  # noqa: BLE001
+        return volume, {"applied": False, "reason": f"surface detection failed: {type(_exc).__name__}"}
     L = int(S.shape[0])
     valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
     if int(valid.sum()) < (L * F) // 4:
-        return volume, {"applied": False}
+        return volume, {"applied": False,
+                        "reason": f"too little valid surface ({int(valid.sum())}/{L * F} points, needs a quarter)"}
 
     def _rough(surf):
         sm = np.where((surf > 1) & (surf < depth - 1) & np.isfinite(surf), surf, np.nan)
@@ -8813,7 +8814,8 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
     jitter = (Mcum - ndimage.gaussian_filter1d(Mcum, sig, mode="nearest")) if sig > 0 else Mcum
     jitter = np.clip(jitter, -float(p.get("rhr_max", 8.0)), float(p.get("rhr_max", 8.0)))
     if float(np.max(np.abs(jitter))) < 0.15:       # no meaningful jitter → strict no-op
-        return volume, {"applied": False, "max_jitter": round(float(np.max(np.abs(jitter))), 2)}
+        return volume, {"applied": False, "reason": "no meaningful jitter to remove (max < 0.15 px)",
+                        "max_jitter": round(float(np.max(np.abs(jitter))), 2)}
     r0 = _rough(S)
     out = volume.copy(); nadj = 0
     for f in range(F):
@@ -9131,7 +9133,7 @@ def edge_frame_guard(volume: np.ndarray, params: dict | None = None, workers: in
     deg = int(p.get("edge_guard_deg", 4))
     pad = K + taper
     if F < 3 * pad + 6:
-        return volume, {"applied": False}
+        return volume, {"applied": False, "reason": "gate: if F < 3 * pad + 6"}
     _shape_ok = (detect is not None and np.asarray(detect).ndim == 2
                  and int(np.asarray(detect).shape[1]) == F)
     try:
@@ -9139,7 +9141,7 @@ def edge_frame_guard(volume: np.ndarray, params: dict | None = None, workers: in
         S = (np.asarray(detect, dtype=np.float32) if _shape_ok
              else detect_surface_all(sag, p, workers=workers))      # (lat, frames)
     except Exception:  # noqa: BLE001
-        return volume, {"applied": False}
+        return volume, {"applied": False, "reason": "gate: except Exception:  # noqa: BLE001"}
     L = int(S.shape[0]); fr = np.arange(F)
     valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
     lo_c, hi_c = int(0.15 * L), int(0.85 * L)
@@ -9205,7 +9207,7 @@ def edge_frame_guard(volume: np.ndarray, params: dict | None = None, workers: in
         out[f] = _warp_by_displacement(np.ascontiguousarray(volume[f]), np.full(L, shift[f]), subpixel=True)
         nadj += 1
     if nadj == 0:
-        return volume, {"applied": False}
+        return volume, {"applied": False, "reason": "gate: if nadj == 0"}
     try:
         sag2 = reformat_to_sagittal(out)
         S2 = detect_surface_all(sag2, p, workers=workers)
@@ -9463,15 +9465,16 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
         workers = auto_workers()
     F, depth = int(volume.shape[0]), int(volume.shape[1])
     if F < 12:
-        return volume, {"applied": False}
+        return volume, {"applied": False, "reason": "gate: if F < 12"}
     try:
         S = detect_surface_all(reformat_to_sagittal(volume), p, workers=workers)  # (lat, frames)
-    except Exception:  # noqa: BLE001
-        return volume, {"applied": False}
+    except Exception as _exc:  # noqa: BLE001
+        return volume, {"applied": False, "reason": f"surface detection failed: {type(_exc).__name__}"}
     L = int(S.shape[0])
     valid = (S > 1.0) & np.isfinite(S) & (S < depth - 1)
     if int(valid.sum()) < (L * F) // 4:
-        return volume, {"applied": False}
+        return volume, {"applied": False,
+                        "reason": f"too little valid surface ({int(valid.sum())}/{L * F} points, needs a quarter)"}
 
     def _rough(surf):
         sm = np.where((surf > 1) & (surf < depth - 1) & np.isfinite(surf), surf, np.nan)
@@ -9562,7 +9565,8 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
     total_alpha = np.clip(total_alpha, -amax, amax)
     max_deg = float(np.degrees(np.max(np.abs(total_alpha))))
     if max_deg < 0.03:                                   # nothing meaningful to rotate → strict no-op
-        return volume, {"applied": False, "max_deg": round(max_deg, 2)}
+        return volume, {"applied": False, "reason": "rotation below the 0.03 deg no-op threshold",
+                        "max_deg": round(max_deg, 2)}
     scen0 = _pivots(S)                                   # pivot on the ORIGINAL surface for the net one-shot rotation
     out = volume.copy(); nrot = 0
     for f in range(F):
@@ -9575,7 +9579,9 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
         nrot += 1
     r1 = _rough(Scur)                                    # SELF-GATE on the nearest-filled iterate (stable corners)
     if not (r1 < r0):
-        return volume, {"applied": False, "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+        return volume, {"applied": False,
+                        "reason": f"self-gate: roughness did not improve ({r0:.3f} -> {r1:.3f} px)",
+                        "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
     return out, {"applied": True, "frames_rotated": int(nrot), "max_deg": round(max_deg, 2), "iters": int(it_done),
                  "rough_before": round(r0, 3), "rough_after": round(r1, 3),
                  "_surface_before": S, "_surface_after": Scur}   # handed to the never-rougher check, then stripped
