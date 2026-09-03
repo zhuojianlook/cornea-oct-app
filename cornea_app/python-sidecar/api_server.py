@@ -2489,8 +2489,52 @@ def oct_volume(case_id: str, req: OctPreprocessRequest) -> dict:
     return out
 
 
+# ── ONE PREPROCESSING RUN PER SCAN AT A TIME ──────────────────────────────────────────────────────────────
+# The re-run button's only guard was React state (`busy`), which lives in one page. Reload the page mid-run and
+# the UI forgets a run is going; open a second client and it never knew. Either way a second POST starts while
+# the first is still writing, and BOTH runs write previews/volume.nii.gz, the border caches and manifest.json
+# for the same case — a data race on the reviewer's real data whose loser is silently interleaved, not
+# detected. Observed on case_cs048_od_v1: two full runs back to back, outputs 14:38:33 and 14:40:27.
+#
+# The lock is per case (two different scans may legitimately run at once) and non-blocking: a second request is
+# REFUSED with 409 rather than queued, because queueing would silently do the work twice — the caller wants to
+# know its click did nothing. Same idiom the cohort endpoints already use.
+_CASE_RUN_LOCKS: dict = {}
+_CASE_RUN_GUARD = threading.Lock()
+
+
+def _case_run_lock(case_id: str) -> threading.Lock:
+    with _CASE_RUN_GUARD:
+        lk = _CASE_RUN_LOCKS.get(case_id)
+        if lk is None:
+            lk = _CASE_RUN_LOCKS[case_id] = threading.Lock()
+        return lk
+
+
+def case_run_in_progress(case_id: str) -> bool:
+    return _case_run_lock(case_id).locked()
+
+
+@app.get("/api/case/{case_id}/oct-preprocess-running")
+def oct_preprocess_running(case_id: str) -> dict:
+    """Is a preprocessing run in flight for this scan? Lets a page that was reloaded mid-run restore its
+    busy state instead of offering a button that would be refused (or, before the lock, would double-run)."""
+    return {"running": case_run_in_progress(case_id)}
+
+
 @app.post("/api/case/{case_id}/oct-preprocess")
 def oct_preprocess_case(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Preprocess this scan, refusing to start a second concurrent run on the same case (409)."""
+    lk = _case_run_lock(case_id)
+    if not lk.acquire(blocking=False):
+        raise HTTPException(409, "A preprocessing run is already in progress for this scan.")
+    try:
+        return _oct_preprocess_case_impl(case_id, req)
+    finally:
+        lk.release()
+
+
+def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
     """Run the corneal-edge + column + 3D-active correction on the case's .OCT and make
     the corrected volume (correct Avanti geometry) the working volume for SAM2/consensus.
     Persists the scar/control classification + scar frame range for the later Scar stage."""
