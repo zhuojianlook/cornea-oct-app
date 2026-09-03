@@ -5369,14 +5369,21 @@ def _fold_corrected_edits_into_border_anchors(case_id: str, m: dict, eff_params:
             delta = dn - float(cdet[l, f])                             # correction (corrected space == raw shift)
             ba.setdefault(str(l), {})[str(f)] = int(round(_clamp(served[l, f] + delta)))
             n_edit += 1
-    # PIN approved laterals to their current good served surface (delta 0) so the re-run reproduces them
-    for l in trusted:
-        if not (0 <= l < L) or str(l) in cea:
-            continue
-        row = ba.setdefault(str(l), {})
-        for f in range(F):
-            if np.isfinite(served[l, f]):
-                row[str(f)] = int(round(_clamp(served[l, f])))
+    # MARKED-ACCURATE LATERALS ARE EVIDENCE, NOT A FREEZE (reviewer, 2026-09-03, correcting an earlier
+    # misreading of the tag): "A slice marked as accurate does not mean that it is a pinned real cornea edge,
+    # it merely means that the edge that is detected/edited is correct and this edge can then be used to be
+    # pulled towards a better fit towards a quadratic. It is functionally the same as correcting an edge on
+    # the corrected slice, just a faster way to do it."
+    #
+    # So marking certifies the SHAPE of the detected edge, not its POSITION. Writing served[l] back as raw GT
+    # for every frame (the old "pin", delta 0) certified the position instead: it made the lateral hand-drawn
+    # ground truth the warp must reproduce, which is exactly what stops the rigid move from pulling it onto
+    # the quadratic. Measured on cs048 with 8 marks + 1 drawing: off-quadratic at the marked laterals went
+    # 9.55 -> 9.52 px mean, i.e. nothing moved, because every marked lateral had been frozen where it was.
+    #
+    # A marked lateral therefore contributes NO anchor row. What it contributes is trust, carried to the fit
+    # through corrected_accurate (see _frame_rigid_minimax's frq_verified_weight), which is why the pops below
+    # no longer strip it from this run's params.
     if n_edit == 0 and not trusted:
         return False
     # REVERSIBILITY. This is the one operation that REWRITES the reviewer's own raw GT (1877 hand-drawn
@@ -5415,6 +5422,7 @@ def _fold_corrected_edits_into_border_anchors(case_id: str, m: dict, eff_params:
     # no longer exists. They are absorbed here (drawn depths into the GT, marked slices pinned to the surface
     # they vouched for) and their readings are kept in the run record rather than in live state.
     _verified_cleared = dict(op.get("corrected_accurate") or {})
+    _verified_for_fit = {str(int(_l)): (_verified_cleared.get(str(int(_l))) or {}) for _l in trusted}
     op.pop("corrected_accurate", None)
     # GENERALIZE ACROSS LATERALS (reviewer, 2026-09-01: "make the fold generalize across laterals").
     # Why this is not optional: the flatten applies ONE rigid depth shift per frame, and that shift is the
@@ -5432,8 +5440,16 @@ def _fold_corrected_edits_into_border_anchors(case_id: str, m: dict, eff_params:
     orch.write_manifest_value(case_id, {"oct_params": op})
     m["oct_params"] = op
     eff_params["border_anchors"] = ba
+    # KEEP the verified sets on THIS run's params. They are what tells the rigid fit which laterals' edges the
+    # reviewer has certified (frq_verified_weight), and the fold is precisely the run that should use them —
+    # popping them here meant the one run that was supposed to act on the reviewer's verification was the one
+    # run that could not see it. They are still cleared from the PERSISTED oct_params above, so the next round
+    # starts from the scan just produced (reviewer's step 3).
+    # corrected_edge_anchors stays POPPED: those edits are now raw GT anchors, and leaving them in params would
+    # also arm the post-hoc apply_sagittal_surface_gt warp, applying the same correction twice.
     eff_params.pop("corrected_edge_anchors", None)
-    eff_params.pop("corrected_accurate", None)
+    if _verified_for_fit:
+        eff_params["corrected_accurate"] = _verified_for_fit
     eff_params["border_generalize"] = True
     eff_params.pop("border_guided", None)
     _bc = orch.case_root(case_id) / "border_cache"                    # served surface changed → drop its caches
