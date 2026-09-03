@@ -5844,9 +5844,27 @@ def oct_corrected_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
             op["corrected_edge_anchors"] = anchors
         else:
             op.pop("corrected_edge_anchors", None)
+        # DRAWING A CORRECTED EDGE IS ALSO VOUCHING FOR IT (reviewer, 2026-09-03: "corrected edge corrections
+        # should automatically be considered as marked accurate"). A slice the reviewer has just drawn is, by
+        # definition, one whose surface they have decided — so it joins corrected_accurate without them having
+        # to press the second button. That makes the two paths identical everywhere the mark is read: the
+        # queue's reference level, the tracking readout, the fold's pinning, and the fit's trust weight.
+        # baseline_px is left null here — this endpoint is the ~900 ms autosave and must not trigger a cold
+        # surface detection; /oct-corrected-accurate and /oct-corrected-suggest fill the reading in later.
+        _acc = dict(op.get("corrected_accurate") or {})
+        for _k in anchors:
+            if str(_k) not in _acc:
+                _acc[str(_k)] = {"baseline_px": None, "current_px": None, "at": int(time.time()),
+                                 "from": "drawn"}
+        for _k in [k for k in _acc if (_acc[k] or {}).get("from") == "drawn" and str(k) not in anchors]:
+            _acc.pop(_k, None)          # a cleared drawing withdraws the mark it implied
+        if _acc:
+            op["corrected_accurate"] = _acc
+        else:
+            op.pop("corrected_accurate", None)
         orch.write_manifest_value(case_id, {"oct_params": op})
         n_anchors = sum(len(v) for v in anchors.values() if isinstance(v, dict))
-        return {"ok": True, "n_anchors": int(n_anchors)}
+        return {"ok": True, "n_anchors": int(n_anchors), "accurate": sorted(int(k) for k in _acc)}
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
