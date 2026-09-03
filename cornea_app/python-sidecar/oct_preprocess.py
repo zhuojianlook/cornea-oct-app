@@ -2832,6 +2832,33 @@ def _reject_apex_lateral_spike(edges: np.ndarray, p: dict) -> np.ndarray:
     return out.astype(np.float32) if changed else edges
 
 
+_DSA_CACHE: dict = {}          # within-run memo for detect_surface_all — see _dsa_key
+_DSA_CACHE_MAX = 6
+
+
+def _dsa_key(sag: np.ndarray, p: dict):
+    """Content key for the detection memo. Several stages detect the SAME unchanged volume in one run
+    (the guard's "before" is usually the previous stage's "after", a stage that declines returns its input
+    untouched, and QA re-detects the delivered volume), so the same 15.6 s call was being paid repeatedly.
+
+    The key is deliberately over-specified rather than fast: buffer address, shape, dtype AND two moments of
+    a strided subsample, plus the detector params signature. A stale hit would silently corrupt every gate
+    downstream, so the checksum has to be strong enough that an in-place edit at the same address cannot
+    collide. Returns None if anything is unusual, which disables the memo for that call."""
+    # A FULL CONTENT HASH, not a subsample. The first version keyed on the buffer address plus two moments of
+    # a strided subsample, and it was demonstrably unsafe: an IN-PLACE edit that misses the sampled grid
+    # produced an identical key, which would have returned a stale surface and silently corrupted every gate
+    # downstream. Hashing the whole buffer costs ~1% of a detection, so there is no reason to gamble.
+    try:
+        import hashlib
+        arr = np.ascontiguousarray(sag)
+        h = hashlib.blake2b(memoryview(arr).cast("B"), digest_size=16).hexdigest()
+        return (h, tuple(arr.shape), str(arr.dtype),
+                _detect_params_sig(p) if "_detect_params_sig" in globals() else None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int | None = None,
                        progress=None) -> np.ndarray:
     """The robust auto-detected corneal surface for EVERY sagittal slice (n_slices, n_frames) — the same
@@ -2841,6 +2868,9 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     n = int(sag.shape[0])
     if workers is None:
         workers = auto_workers()
+    _k = _dsa_key(sag, p) if bool(p.get("detect_memo", True)) else None
+    if _k is not None and _k in _DSA_CACHE:
+        return _DSA_CACHE[_k].copy()          # copy: callers mutate what they get back
     edges = _map_slices(_edge_worker, [(np.ascontiguousarray(sag[i]).astype(np.float32), p) for i in range(n)],
                         progress, 0.0, 1.0, workers)
     out = np.array([(e[0] if isinstance(e, tuple) else e) for e in edges], dtype=np.float32)
@@ -2852,6 +2882,10 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # inside the band; replace it with a smooth reconstruction from the cornea on either side. Last, so nothing
     # re-introduces the dive. No-op without crop_bands; does not affect the flatten (which excludes the band).
     out = _reconstruct_surface_over_bands(out, p)
+    if _k is not None:
+        if len(_DSA_CACHE) >= _DSA_CACHE_MAX:
+            _DSA_CACHE.pop(next(iter(_DSA_CACHE)), None)
+        _DSA_CACHE[_k] = out.copy()
     return out
 
 
