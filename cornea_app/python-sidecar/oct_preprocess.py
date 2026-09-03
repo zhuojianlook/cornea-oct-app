@@ -4957,12 +4957,30 @@ def _frame_rigid_minimax(edges: np.ndarray, quad: np.ndarray, p: dict):
     R = np.where(_artifact_mask(p or {}, _nl, _nf), np.nan, R)   # artifact cells vote on nothing
     a_out = np.zeros(_nf); b_out = np.zeros(_nf)
     n_it = max(1, int(p.get("frq_minimax_iters", 6)))
+    # VERIFIED LATERALS CARRY MORE WEIGHT (reviewer, 2026-09-03: "correction of an edge on the corrected slice
+    # and marking an edge as accurate should be the same thing and should feed into the same improvement
+    # workflow"). Both are the reviewer certifying the surface at that lateral — a drawing states where it is,
+    # a mark confirms the detection already had it right — so they join one trust set and the fit prefers them
+    # over laterals nobody has looked at. Artifact cells are already excluded above; this is the opposite
+    # direction, preferring known-good evidence rather than removing known-bad.
+    _verified = set()
+    for _src in ("corrected_edge_anchors", "corrected_accurate"):
+        for _k in ((p.get(_src) or {}) or {}):
+            try:
+                _verified.add(int(_k))
+            except (TypeError, ValueError):
+                continue
+    _wv = float(p.get("frq_verified_weight", 4.0))
+    _base_w = np.ones(_nl)
+    for _l in _verified:
+        if 0 <= _l < _nl:
+            _base_w[_l] = _wv
     for f in range(_nf):
         col = R[:, f]; ok = np.isfinite(col)
         if int(ok.sum()) < 20:
             continue
         xx, yy = x[ok], col[ok]
-        w = np.ones(xx.size)
+        w = _base_w[ok].copy()          # verified laterals start (and stay) preferred
         a = b = 0.0
         for _ in range(n_it):
             W = np.sqrt(w)
@@ -4972,7 +4990,7 @@ def _frame_rigid_minimax(edges: np.ndarray, quad: np.ndarray, p: dict):
                 break
             a, b = float(sol[0]), float(sol[1])
             r = np.abs(yy - (a + b * xx))
-            w = r / (np.median(r) + 1e-6)          # push weight onto the worst laterals
+            w = (r / (np.median(r) + 1e-6)) * _base_w[ok]   # worst laterals, times the trust weight
             w = np.clip(w, 1e-3, 1e3)
         a_out[f], b_out[f] = a, b
     # SMOOTH ACROSS FRAMES. B-scans are ~40 ms apart, so real inter-frame motion is smooth; a per-frame move
