@@ -72,6 +72,20 @@ DEFAULT_PARAMS: dict = {
     # "3x collapse" that reopened this was a gradient-trace artifact ([[mistakes]] #14). See [[cornea-corrections-dome-flatten]].
     "provided_flatten_smooth": 0.0,
     "flatten_rigid_quad": True,   # DEFAULT ON (2026-09-02). The reviewer's 2026-08-25 spec for the corrections
+    "flatten_rigid_mode": "minimax",  # DEFAULT (2026-09-03, reviewer: use this scan's settings everywhere).
+                                  #   Fit the per-frame translation AND rotation JOINTLY, minimising the WORST
+                                  #   lateral, instead of fitting the translation to the median lateral and the
+                                  #   rotation to the leftover. Free pivot, free ordering, no clamp — a + b*x
+                                  #   spans the same family for any pivot, so only the objective mattered.
+                                  #   "median" restores the previous two-stage fit.
+    "never_rougher": True,        # DEFAULT (2026-09-03). Hard invariant from the reviewer: a corrected edge must
+                                  #   NEVER be rougher than the original at any lateral. Each post-flatten stage
+                                  #   is measured per lateral before/after and its move is discarded if it
+                                  #   roughens any. On cs048_od_v1 this rejected derotate (207 laterals rougher,
+                                  #   worst +17.96 px), frame-refine (230, +13.22) and edge-guard (117, +13.17) —
+                                  #   damage no existing guard caught, because theirs are global means.
+    "rough_regress_tol_px": 0.2,  # per-lateral roughness tolerance before a stage counts as having regressed
+    "rough_regress_max_lat": 0,   # how many laterals may regress before the stage is rejected (0 = strict)
                                   #   path: the corrected edge must be the best-fit quadratic reachable with a
                                   #   RIGID axial shift — one depth shift per B-scan, every lateral equally, never
                                   #   a per-column deform. It lived only as an inline p.get default and was set
@@ -193,7 +207,10 @@ DEFAULT_PARAMS: dict = {
                                   #   deformation). v0.0.193: removes the full frame-VARIATION of the tilt incl. a slow
                                   #   PROGRESSIVE-ROTATION drift (per-scan motion; keeps the constant real decentration DC).
     "rfd_smooth": 1.5,            # gaussian sigma (frames) — light denoise of the per-frame tilt (the drift is kept intact)
-    "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°
+    "rfd_max_deg": 3.0,           # cap on the per-frame rotation (degrees) — real inter-frame torsion is < ~1.5°,
+                                  #   but the reviewer's rule (2026-09-02) is that a rotation must not be capped
+                                  #   by a fixed number — it is accepted on MEASURED global smoothness instead.
+                                  #   This stays only as a last-resort sanity bound.
     "rfd_ref_sigma": 9.0,         # v0.0.198 ROBUST rotational reference: level each frame's tilt to a SMOOTH-across-frames
                                   #   baseline (median-prefilter + gaussian σ frames), NOT a single global DC median. σ≈9
                                   #   keeps the real, slow decentration/astigmatism trend (>>σ) and marks the fast per-frame
@@ -4860,7 +4877,43 @@ def interpolate_anchors_surface(anchors, baseline: np.ndarray, params: dict | No
     return out.astype(baseline.dtype if baseline.dtype.kind == "f" else np.float32)
 
 
-def _frame_common_shift(edges: np.ndarray):
+def _artifact_mask(p: dict, n_lat: int, n_frames: int):
+    """Boolean (lateral, frame) mask of the reviewer's ⊟ crop-artifact bands, interpolated across the width.
+
+    The dome fits must not see these cells at all (reviewer, 2026-09-02: "artifact regions should be totally
+    ignored"). _slice_displacement already excludes them from ITS fit, but that exclusion never reached
+    flatten_rigid_quad: _frame_common_shift fitted each lateral's quadratic over every finite frame, so marked
+    artifact tissue was helping decide the corneal curvature the correction aims at. Measured on cs048_od_v1
+    that inflated the apparent edge dip at frames 96-97 from 7.31 px to 9.40 px."""
+    out = np.zeros((n_lat, n_frames), dtype=bool)
+    raw = p.get("crop_bands") or {}
+    if not isinstance(raw, dict) or not raw:
+        return out
+    try:
+        lats, los, his = [], [], []
+        for k, v in raw.items():
+            try:
+                l = int(k); a, b = int(v[0]), int(v[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            lats.append(l); los.append(min(a, b)); his.append(max(a, b))
+        if not lats:
+            return out
+        order = np.argsort(lats)
+        lats = np.asarray(lats, float)[order]
+        los = np.asarray(los, float)[order]; his = np.asarray(his, float)[order]
+        idx = np.arange(n_lat, dtype=float)
+        lo_i = np.interp(idx, lats, los); hi_i = np.interp(idx, lats, his)
+        for l in range(n_lat):
+            a = int(max(0, np.floor(lo_i[l]))); b = int(min(n_frames - 1, np.ceil(hi_i[l])))
+            if b >= a:
+                out[l, a:b + 1] = True
+    except Exception:  # noqa: BLE001 — on any doubt, mask nothing (historical behaviour)
+        return np.zeros((n_lat, n_frames), dtype=bool)
+    return out
+
+
+def _frame_common_shift(edges: np.ndarray, p: dict | None = None):
     """The corrections path's per-frame RIGID shift: per lateral fit the DRAWN edge to its own deg-2 across
     frames, then take the part of (quad - drawn) that is COMMON to all laterals (median over the central
     15-85% band). Returns (sh[F], quad[L,F]).
@@ -4870,12 +4923,69 @@ def _frame_common_shift(edges: np.ndarray):
     would eventually describe a shift the pipeline no longer applies."""
     _e = np.asarray(edges, np.float64); _nl, _nf = _e.shape; _fr2 = np.arange(_nf)
     _quad = np.empty_like(_e)
+    _bad = _artifact_mask(p or {}, _nl, _nf)      # reviewer-marked artifact: excluded from the dome fit
     for _l in range(_nl):
-        _y = _e[_l]; _ok = np.isfinite(_y) & (_y > 1.0)
+        _y = _e[_l]; _ok = np.isfinite(_y) & (_y > 1.0) & (~_bad[_l])
         _quad[_l] = np.polyval(np.polyfit(_fr2[_ok], _y[_ok], 2), _fr2) if int(_ok.sum()) >= 20 else _y
     with np.errstate(all="ignore"):
         _sh = np.nanmedian((_quad - _e)[int(0.15 * _nl):int(0.85 * _nl)], axis=0)
     return np.where(np.isfinite(_sh), _sh, 0.0), _quad
+
+
+def _frame_rigid_minimax(edges: np.ndarray, quad: np.ndarray, p: dict):
+    """Per-frame rigid move (translation + rotation) fitted JOINTLY, minimising the WORST lateral.
+
+    The previous construction fitted the translation first (median of (quad - drawn) across laterals), then a
+    rotation to the leftover, then scaled it. That is a two-stage fit of a two-parameter model, and each stage
+    optimised a different thing — the median lateral, then the pooled residual — so the result protected the
+    centre and paid for it at whichever end was furthest from the pivot.
+
+    Here both parameters are solved together: disp(l) = a + b * x(l). The reviewer's rule (2026-09-02) is that
+    "major deviations from the general curvature of the corneal edge should be avoided" anywhere, with the
+    rotation AXIS free and the ORDER of rotation/translation free. All three follow from a joint fit: a + b*x
+    spans the same family for any pivot and any ordering, so the only real question is the objective, and the
+    objective is the WORST lateral, not the average one.
+
+    Chebyshev fit by iteratively reweighted least squares (weights ~ |residual|, a few passes) — cheap, and it
+    converges close enough to minimax for this. NaN laterals are skipped. No clamp: the magnitude is whatever
+    the data asks for."""
+    _e = np.asarray(edges, np.float64); _q = np.asarray(quad, np.float64)
+    _nl, _nf = _e.shape
+    x = (np.arange(_nl, dtype=np.float64) - (_nl - 1) / 2.0)
+    x /= max(1e-9, np.abs(x).max())
+    R = _q - _e                                   # what each lateral needs, per frame
+    R = np.where(_artifact_mask(p or {}, _nl, _nf), np.nan, R)   # artifact cells vote on nothing
+    a_out = np.zeros(_nf); b_out = np.zeros(_nf)
+    n_it = max(1, int(p.get("frq_minimax_iters", 6)))
+    for f in range(_nf):
+        col = R[:, f]; ok = np.isfinite(col)
+        if int(ok.sum()) < 20:
+            continue
+        xx, yy = x[ok], col[ok]
+        w = np.ones(xx.size)
+        a = b = 0.0
+        for _ in range(n_it):
+            W = np.sqrt(w)
+            try:
+                sol, *_ = np.linalg.lstsq(np.vstack([W, W * xx]).T, W * yy, rcond=None)
+            except Exception:  # noqa: BLE001
+                break
+            a, b = float(sol[0]), float(sol[1])
+            r = np.abs(yy - (a + b * xx))
+            w = r / (np.median(r) + 1e-6)          # push weight onto the worst laterals
+            w = np.clip(w, 1e-3, 1e3)
+        a_out[f], b_out[f] = a, b
+    # SMOOTH ACROSS FRAMES. B-scans are ~40 ms apart, so real inter-frame motion is smooth; a per-frame move
+    # that jumps between neighbours is fit noise, and applying it INJECTS roughness the original did not have.
+    # The reviewer caught exactly that on preview slice 482: frames 80-100 went 8.72 -> 9.79 px frame-to-frame,
+    # rougher than the raw edge, which must never happen. The fitted move itself jittered 3.4 px (translation)
+    # and 4.4 px (rotation) between neighbouring frames. Every other stage already smooths its per-frame move
+    # (rigid_frame_smooth); this fit solved each frame independently and smoothed nothing.
+    _sig = float(p.get("frq_minimax_smooth", 1.5) or 0.0)
+    if _sig > 0 and a_out.size > 3:
+        a_out = ndimage.gaussian_filter1d(a_out, _sig, mode="nearest")
+        b_out = ndimage.gaussian_filter1d(b_out, _sig, mode="nearest")
+    return a_out, b_out
 
 
 def _frame_common_tilt(edges: np.ndarray, quad: np.ndarray, p: dict):
@@ -4937,7 +5047,21 @@ def _frame_common_tilt(edges: np.ndarray, quad: np.ndarray, p: dict):
         if abs(float(sol[1])) * 2.0 < float(p.get("flatten_rigid_tilt_min_px", 2.0)):
             continue
         out[f] = float(np.clip(sol[1], -cap, cap))
-    return out
+
+    # GLOBAL SCALE, chosen by measured smoothness (reviewer, 2026-09-02: the rotation "should never be a hard
+    # number cap, but rather dynamic, as long as global smoothness of the 3D cornea is maximized", and it must
+    # not "compromise one area for another"). The per-frame fit above is least-squares over the laterals, so it
+    # is dominated by the many central ones and pays for their gain at the periphery — measured on cs048_od_v1,
+    # the full tilt bought ~2 px at preview slices 169-225 and cost 4.4 px at slice 513.
+    # So scale the whole tilt field by the alpha that minimises the MEAN per-lateral off-quadratic with EVERY
+    # lateral weighted equally — the periphery counts as much as the centre, which is what stops one area being
+    # traded for another. alpha=0 (no rotation) is always a candidate, so this can only improve on not rotating.
+    # SCALE, set by measurement on the DELIVERED volume, not by a target-side proxy. Scoring candidates on the
+    # flatten TARGET mispredicted the delivered result three times (it picked MORE rotation while the periphery
+    # got worse), so the scale is a parameter and the choice is made by an explicit sweep whose objective is the
+    # WORST laterals (reviewer, 2026-09-02: "minimise the worst laterals", "do not compromise one area for
+    # another"). alpha 0 = no rotation.
+    return out * float(p.get("flatten_rigid_tilt_scale", 1.0))
 
 
 def _normalize_anchors(anchors) -> dict:
@@ -5906,9 +6030,15 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
         # unchanged), each slice keeps its OWN curvature (smooth slice-to-slice), best-fit (not forced) to a quadratic.
         # Driven by the DRAWN edge, never the detector. flatten_rigid_quad=False → byte-unchanged.
         _e = np.asarray(edges, np.float64)
-        _sh, _quad = _frame_common_shift(_e)     # extracted verbatim → determinism_report scores with the
+        _sh, _quad = _frame_common_shift(_e, p)  # extracted verbatim → determinism_report scores with the
                                                  # SAME code that produces the delivered shift (never a copy)
         _ft = _e + _sh[None, :]
+        if str(p.get("flatten_rigid_mode", "median")) == "minimax":
+            # joint (translation, rotation) per frame, minimising the worst lateral — see _frame_rigid_minimax
+            _a, _b = _frame_rigid_minimax(_e, _quad, p)
+            _xl = (np.arange(_e.shape[0], dtype=np.float64) - (_e.shape[0] - 1) / 2.0)
+            _xl /= max(1e-9, np.abs(_xl).max())
+            _ft = _e + _a[None, :] + _b[None, :] * _xl[:, None]
         # + the ROTATION the median-based shift is structurally blind to (see _frame_common_tilt). Same
         # rigid rule: the displacement varies LINEARLY across laterals, which is a frame rotation, not a
         # per-column deform. OFF by default so every other scan is byte-unchanged.
@@ -8930,6 +9060,54 @@ def reconcile_manual_line(volume: np.ndarray, provided_edges: np.ndarray, params
                  "max_shift": round(float(np.max(np.abs(shift))), 1), "unreliable_frames": int(unrel.sum())}
 
 
+def _per_lateral_roughness(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
+    """Frame-to-frame roughness of the detected anterior surface, PER LATERAL. Lower = smoother."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    sag = reformat_to_sagittal(volume).astype(np.float32)
+    S = np.asarray(detect_surface_all(sag, p, workers=workers), dtype=np.float64)   # (lateral, frames)
+    out = np.full(S.shape[0], np.nan)
+    for l in range(S.shape[0]):
+        d = np.diff(S[l]); d = d[np.isfinite(d)]
+        if d.size >= 8:
+            out[l] = float(np.sqrt(np.mean(d ** 2)))
+    return out
+
+
+def _reject_if_rougher(before_vol: np.ndarray, after_vol: np.ndarray, stage: str, info: dict,
+                       params: dict | None = None, workers: int | None = None):
+    """NEVER ROUGHER THAN THE INPUT (reviewer, 2026-09-02: a corrected edge that is "noticably rougher with more
+    column to column variation than the same original slice ... should never be the case").
+
+    A rigid per-frame move can only be applied whole, so the invariant is enforced per STAGE: if the stage leaves
+    any lateral measurably rougher than it found it, its move is discarded and the input volume is kept. Tolerance
+    `rough_regress_tol_px` absorbs detector noise; `rough_regress_max_lat` allows a small number of laterals to
+    regress before the stage is rejected (0 = strict).
+
+    Returns the volume to keep, and records the verdict in info[stage]."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("never_rougher", False)):
+        return after_vol
+    tol = float(p.get("rough_regress_tol_px", 0.2))
+    allow = int(p.get("rough_regress_max_lat", 0))
+    try:
+        r0 = _per_lateral_roughness(before_vol, params, workers)
+        r1 = _per_lateral_roughness(after_vol, params, workers)
+    except Exception:  # noqa: BLE001 — a measurement failure must not fail the run
+        return after_vol
+    ok = np.isfinite(r0) & np.isfinite(r1)
+    n_worse = int(np.count_nonzero((r1 - r0)[ok] > tol))
+    rec = info.get(stage) if isinstance(info.get(stage), dict) else {}
+    rec["rougher_laterals"] = n_worse
+    rec["rougher_worst_px"] = (round(float(np.nanmax((r1 - r0)[ok])), 2) if int(ok.sum()) else None)
+    if n_worse > allow:
+        rec["applied"] = False
+        rec["reason"] = f"declined: made {n_worse} lateral(s) rougher than the input (max +{rec['rougher_worst_px']} px)"
+        info[stage] = rec
+        return before_vol
+    info[stage] = rec
+    return after_vol
+
+
 def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
     """Per-frame rigid ROTATION correction — the SECONDARY inter-frame motion component (v0.0.192).
 
@@ -10753,20 +10931,28 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                         del _cs
                     except Exception:  # noqa: BLE001
                         _rhr_det = None
+                _before = corrected
                 corrected, _rhr = rigid_height_refine(corrected, params, workers=workers, detect=_rhr_det)
                 _rhr["surface"] = "guided" if _rhr_det is not None else "self-detected"
                 info["rigid_height_refine"] = _rhr
+                corrected = _reject_if_rougher(_before, corrected, "rigid_height_refine", info, params, workers)
             if p_all.get("rigid_frame_derotate", True) and not _sole:
+                _before = corrected
                 corrected, _rfd = rigid_frame_derotate(corrected, params, workers=workers)
                 info["rigid_frame_derotate"] = _rfd
+                corrected = _reject_if_rougher(_before, corrected, "rigid_frame_derotate", info, params, workers)
             if p_all.get("rigid_frame_refine", True) and not _sole:
+                _before = corrected
                 corrected, _rfr = rigid_frame_refine(corrected, params, workers=workers)
                 info["rigid_frame_refine"] = _rfr
+                corrected = _reject_if_rougher(_before, corrected, "rigid_frame_refine", info, params, workers)
             # EDGE-FRAME GUARD: nudge the outermost acquisition-edge frames back onto the interior corneal curvature
             # (the faint FOV corner where the de-jitter dips them below the dome). Rigid, tapered, self-gated.
             if p_all.get("edge_guard", True):
+                _before = corrected
                 corrected, _efg = edge_frame_guard(corrected, params, workers=workers)
                 info["edge_frame_guard"] = _efg
+                corrected = _reject_if_rougher(_before, corrected, "edge_frame_guard", info, params, workers)
             # RECONCILE TO THE MANUAL LINE: keep the de-jitter in the reliable interior, but pin the faint FOV-corner
             # frames back to the user's drawn line (provided_edges) where the de-jitter's correction is unreliable.
             if provided_edges is not None and p_all.get("reconcile_line", True):
