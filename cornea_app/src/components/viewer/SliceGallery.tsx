@@ -83,6 +83,7 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const caseInfo = useCaseStore((s) => s.caseInfo);
   const openCase = useCaseStore((s) => s.openCase); // refetch caseInfo after a fix-cols re-run (fresh persisted nudges)
   const commitCropBands = useCaseStore((s) => s.commitCropBands);  // persist per-lateral artifact bands (sticky)
+  const commitCorrectedAccurate = useCaseStore((s) => s.commitCorrectedAccurate);  // mark accurate -> manifest, so the fold button sees it
   // Iterative-refinement pass count (for the "fix at pass" selector) — from the manifest.
   const octIter = (caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as { passes?: number } | undefined;
   const passCount = Math.max(1, Number(octIter?.passes ?? 1));
@@ -2916,10 +2917,8 @@ const PROP_SLICE_BAND = 20;
                           const union = new Set<number>([...Object.keys(corrAccurate).map(Number), ...tl]);
                           if (union.has(sl)) union.delete(sl); else union.add(sl);
                           const next = [...union].sort((a, b) => a - b);
-                          api.json<{ accurate?: Record<string, { baseline_px: number | null; current_px: number | null }> }>(
-                            `/api/case/${caseId}/oct-corrected-accurate`, "POST",
-                            JSON.stringify({ corrected_trusted_laterals: next }))
-                            .then((r) => setCorrAccurate(r.accurate ?? {}))
+                          commitCorrectedAccurate(next)
+                            .then((acc) => setCorrAccurate(acc))
                             .catch(() => { /* marking is a judgement; a failed write must not block the review */ });
                         }}
                         title={"Mark this sagittal slice ACCURATE — the DETECTED edge here follows the true surface, whether or not it is smooth.\n\n"
@@ -2937,8 +2936,7 @@ const PROP_SLICE_BAND = 20;
                           {tl.length} marked
                           <button onClick={() => { if (!caseId) return; clearTrustedSlices(caseId);
                               setCorrAccurate({});
-                              api.json(`/api/case/${caseId}/oct-corrected-accurate`, "POST",
-                                JSON.stringify({ corrected_trusted_laterals: [] })).catch(() => {});
+                              void commitCorrectedAccurate([]).catch(() => {});
                             }} title="Clear all accurate marks (and their baselines)"
                             style={{ marginLeft: 3, border: "none", background: "none", color: "var(--c-text-dim)",
                                      cursor: "pointer", fontSize: 10, textDecoration: "underline" }}>clear</button>
@@ -3062,10 +3060,8 @@ const PROP_SLICE_BAND = 20;
                                   const tlNow = (trustedSlices && trustedSlices.caseId === caseId) ? trustedSlices.slices : [];
                                   if (tlNow.includes(a.lateral)) toggleTrustedSlice(caseId, a.lateral);
                                   setCorrAccurate((m0) => { const c = { ...m0 }; delete c[String(a.lateral)]; return c; });
-                                  api.json<{ accurate?: Record<string, { baseline_px: number | null; current_px: number | null }> }>(
-                                    `/api/case/${caseId}/oct-corrected-accurate`, "POST",
-                                    JSON.stringify({ corrected_trusted_laterals: next }))
-                                    .then((r) => setCorrAccurate(r.accurate ?? {}))
+                                  commitCorrectedAccurate(next)
+                                    .then((acc) => setCorrAccurate(acc))
                                     .catch(() => { /* keep the optimistic removal; the next fetch reconciles */ });
                                 }}
                                 title={`Remove the accurate mark on slice ${dispSlice(a.lateral)} — it stops being a reference `
@@ -3129,8 +3125,7 @@ const PROP_SLICE_BAND = 20;
                               clearTrustedSlices(caseId);
                               setCorrectedEdge(null);
                               void Promise.all([
-                                api.json(`/api/case/${caseId}/oct-corrected-accurate`, "POST",
-                                         JSON.stringify({ corrected_trusted_laterals: [] })),
+                                commitCorrectedAccurate([]),
                                 api.json(`/api/case/${caseId}/oct-corrected-redetect`, "POST",
                                          JSON.stringify({ corrected_edge_anchors: {} })),
                                 // ⚑ marks go too (reviewer, 2026-09-02). They describe the corrected scan the

@@ -129,7 +129,11 @@ export function TimelineBar() {
   // the regenerate. Sources: persisted drawings, persisted marks, and anything still dirty in the panel.
   const verifiedDrawn = Object.keys((octParams?.corrected_edge_anchors ?? {}) as Record<string, unknown>);
   const verifiedMarked = Object.keys((octParams?.corrected_accurate ?? {}) as Record<string, unknown>);
-  const foldableLats = new Set([...verifiedDrawn, ...verifiedMarked, ...dirtyCorrLats]).size;
+  // Marks the reviewer has just made live in pendingEditStore until the POST round-trips, so include them too:
+  // otherwise the button flickers out between the click and the manifest mirror, and a mark made while the
+  // write is in flight looks like it did not count.
+  const foldableLats = new Set([...verifiedDrawn, ...verifiedMarked, ...dirtyCorrLats,
+                                ...trustedForCase.map(String)]).size;
   const [corpusEligible, setCorpusEligible] = useState(true);
   // ARM-THEN-ACT, because window.confirm is inert here. It returns FALSE without ever showing a dialog in the
   // WebKitGTK webview AND in the review browser pane (probed 2026-09-02), so every button guarded by it did

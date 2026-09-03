@@ -120,6 +120,7 @@ interface CaseState {
    *  apply_sagittal_surface_gt — a guarded per-frame depth shift (+ tilt) that moves the tissue onto the drawn
    *  curve. So a correction the DP detector would smooth away actually sticks. Empty {} clears. */
   commitCorrectedEdgeAnchors: (anchors: Record<string, Record<string, number>>) => Promise<void>;
+  commitCorrectedAccurate: (laterals: number[]) => Promise<Record<string, { baseline_px: number | null; current_px: number | null }>>;
   /** Persist crop marks (surface-crop frames / crop region) WITHOUT re-running the pipeline — the cheap
    *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
   commitOctMarks: (cropFrames: number[] | null, cropRegion: { lateral: [number, number]; frames: number[] } | null,
@@ -510,6 +511,30 @@ export const useCaseStore = create<CaseState>()(
         else delete op.corrected_edge_anchors;
         m.oct_params = op;
       });
+    },
+
+    // MARKING A SLICE ACCURATE IS A VERIFICATION, exactly like drawing on it (reviewer, 2026-09-02: "in either
+    // case those slices are verified as accurate"), so it has to reach the same place drawings do — the
+    // in-memory manifest. It previously went straight to the API from SliceGallery and updated only that
+    // component's local state, so oct_params.corrected_accurate stayed empty for the rest of the app and
+    // "⤴ Regenerate from N verified slices" never appeared for marks alone. Mirroring here rather than
+    // re-fetching the case keeps the editor mounted (same reason commitCorrectedEdgeAnchors mirrors).
+    commitCorrectedAccurate: async (laterals) => {
+      const id = get().caseId;
+      if (!id) return {};
+      const r = await api.json<{ accurate?: Record<string, { baseline_px: number | null; current_px: number | null }> }>(
+        `/api/case/${id}/oct-corrected-accurate`, "POST",
+        JSON.stringify({ corrected_trusted_laterals: laterals ?? [] }));
+      const acc = r.accurate ?? {};
+      set((s) => {
+        if (!s.caseInfo) return;
+        const m = s.caseInfo.manifest as Record<string, unknown>;
+        const op = { ...((m.oct_params as Record<string, unknown>) ?? {}) };
+        if (Object.keys(acc).length) op.corrected_accurate = acc;
+        else delete op.corrected_accurate;
+        m.oct_params = op;
+      });
+      return acc;
     },
 
     setDifficult: async (difficult, reason) => {
