@@ -3028,7 +3028,7 @@ def detect_surface_all(sag: np.ndarray, params: dict | None = None, workers: int
     # FIX apexspec: LATERAL specular-spike reject on the assembled (lateral, frame) surface. Auto detection only;
     # a supplied per-slice prior means fix-columns re-detection, which carries its own user-seeded surface and must
     # not be laterally re-smoothed here (the per-worker _edge_worker never receives a prior, so this is the auto path).
-    out = _surface_post_passes(out, sag, p)
+    out = _surface_post_passes(out, sag, p, workers=workers)
     # #9 v3: make the DISPLAYED surface IGNORE any marked artifact band — the raw detector dives into the artifact
     # inside the band; replace it with a smooth reconstruction from the cornea on either side. Last, so nothing
     # re-introduces the dive. No-op without crop_bands; does not affect the flatten (which excludes the band).
@@ -3246,7 +3246,72 @@ def _corner_edge_retrace(surf, vol, p=None):
     return out.astype(surf.dtype)
 
 
-def _surface_post_passes(out: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarray:
+# ── PARALLEL PER-LATERAL EDGE PASSES ──────────────────────────────────────────────────────────────────────
+# After the RANSAC fix, _surface_post_passes became the detector's hot spot: 4.31 s of a 5.63 s
+# detect_surface_all call, single-threaded, twelve times per preprocessing run. Measured breakdown —
+# _corner_edge_retrace 59.5%, _frame_edge_epithelium_snap 10.7%, everything else under 11% each.
+#
+# ONLY _corner_edge_retrace is split. MEASURED, not assumed: f(S, V) == concat(f(S[a:b], V[a:b])) EXACTLY,
+# for even splits, 23-way splits, 92-way splits and deliberately ragged ones, on every scan tried — so each
+# lateral's output depends only on its own row and the volume rows under it, and distributing the laterals
+# over processes is bit-identical by construction rather than within a tolerance.
+#
+# EVERY OTHER PASS HERE COUPLES LATERALS and must stay whole. _faint_snap_coherent (up to 3.4 px change when
+# chunked), _edge_dome_constrain (6.8), _edge_dome_follow (11.1) and _edge_regularize_surface (7.0) do so by
+# design. _frame_edge_epithelium_snap looks per-lateral and tests exact on most scans, but its trailing
+# isolated-spike guard is gated on a WHOLE-CALL `fired` flag: if any lateral snapped, the guard runs over ALL
+# laterals, including ones that never fired. Split the volume and a chunk where nothing fired skips a guard it
+# would otherwise have received (cs007: 4.6 px on 5 laterals, and it depends on where the cuts land). That is
+# a latent inconsistency in the pass itself, not something this parallelisation should paper over, so the pass
+# stays serial and unchanged. Re-run .work/gpu_dp/rowindep2.py before parallelising anything else here.
+#
+# The volume is inherited through fork rather than pickled (the parent already holds it; children are
+# copy-on-write), so only the small surface chunks travel.
+_PP_SHARED: dict = {}
+
+
+def _pp_edge_worker(bounds):
+    lo, hi = bounds
+    S = _PP_SHARED["surf"]; V = _PP_SHARED["vol"]; pp = _PP_SHARED["p"]
+    return np.asarray(_corner_edge_retrace(S[lo:hi], V[lo:hi], pp))
+
+
+def _pp_parallel_edge_passes(out: np.ndarray, sag: np.ndarray, p: dict,
+                             workers: int | None = None) -> np.ndarray:
+    """_corner_edge_retrace, distributed over laterals.
+
+    Falls back to the serial call on any failure, when there is nothing to gain, and when we are already
+    inside a worker process (no nested pools)."""
+    def _serial():
+        return _corner_edge_retrace(out, sag, p)
+
+    L = int(out.shape[0]) if getattr(out, "ndim", 0) == 2 else 0
+    if workers is None:
+        workers = auto_workers()
+    import multiprocessing as mp
+    if L < 64 or int(workers) <= 1 or mp.parent_process() is not None:
+        return _serial()
+    try:
+        import concurrent.futures
+        n_chunks = min(L, max(1, int(workers)) * 4)       # 4x workers so a slow lateral cannot stall a core
+        edges_ = np.linspace(0, L, n_chunks + 1).astype(int)
+        bounds = [(int(a), int(b)) for a, b in zip(edges_[:-1], edges_[1:]) if b > a]
+        _PP_SHARED["surf"] = out; _PP_SHARED["vol"] = sag; _PP_SHARED["p"] = p
+        try:
+            ctx = mp.get_context("fork")                  # children inherit the volume; nothing big is pickled
+            with concurrent.futures.ProcessPoolExecutor(max_workers=int(workers), mp_context=ctx) as ex:
+                parts = list(ex.map(_pp_edge_worker, bounds, chunksize=1))
+        finally:
+            _PP_SHARED.clear()
+        if any(q is None for q in parts):
+            return _serial()
+        return np.concatenate(parts, axis=0)
+    except Exception:  # noqa: BLE001 — a pool failure must never cost the surface
+        return _serial()
+
+
+def _surface_post_passes(out: np.ndarray, sag: np.ndarray, p: dict,
+                         workers: int | None = None) -> np.ndarray:
     """The whole-volume tail every detected surface gets: specular reject, despike, dip suppression, robust
     dome smoothing, lateral confidence smoothing, faint-onset snap, the two edge-dome passes, untrusted-column
     repair and edge regularization.
@@ -3290,7 +3355,8 @@ def _surface_post_passes(out: np.ndarray, sag: np.ndarray, p: dict) -> np.ndarra
     # where the epithelium plunges toward the limbus (~14+px/frame) — a local relaxed-DP re-trace follows that
     # descent onto the real band, matching the reviewer's manual anchors (cs046 corner 21.5→3.7px). Descend-gated,
     # whole-lateral tissue-validity skip, no-op on flat corners → never degrades a scan whose corner is already right.
-    out = _corner_edge_retrace(out, sag, p)
+    # Run across processes, split by lateral — see _pp_parallel_edge_passes.
+    out = _pp_parallel_edge_passes(out, sag, p, workers=workers)
     # EDGE REGULARIZATION: smooth the faint FOV-boundary laterals' jagged border across frames (depth-preserving),
     # a strict no-op on the confident interior. Handles the sagittal edge-slice jitter (CS001 OD__4 lateral 0/1)
     # AND, via the outer-band floor sigma, the BRIGHT tissue-bearing FOV edge (CS001 OD__4 visual-left / array-right).
