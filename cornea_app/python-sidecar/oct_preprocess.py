@@ -9172,6 +9172,12 @@ def _reject_if_rougher(before_vol: np.ndarray, after_vol: np.ndarray, stage: str
     p = {**DEFAULT_PARAMS, **(params or {})}
     if not bool(p.get("never_rougher", False)):
         return after_vol, None
+    # A STAGE THAT DECLINED RETURNS ITS INPUT UNCHANGED — the same object. There is nothing to compare, so
+    # measuring it was pure waste: profiling a run showed _reject_if_rougher spending 24.9 s on exactly this,
+    # because the surface handover only covers the APPLIED return and a declining stage exits earlier.
+    # Identity, not equality: a stage that genuinely rebuilt an identical volume still gets measured.
+    if after_vol is before_vol:
+        return after_vol, before_rough
     tol = float(p.get("rough_regress_tol_px", 0.2))
     allow = int(p.get("rough_regress_max_lat", 0))
     # REUSE THE STAGE'S OWN DETECTIONS. Every one of these stages already detects the surface before and after
