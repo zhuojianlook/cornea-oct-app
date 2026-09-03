@@ -5141,8 +5141,19 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape):
         try:
             rv = np.asarray(nib.load(str(raw)).dataobj).astype(np.float32)
             cv = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)
+            # A CANVAS PAD IS NOT A REASON TO GIVE UP. When the corrected apex would sit above the window the
+            # pipeline extends the canvas upward (oct_iter.canvas_extend) — 9 px on cs048_od_v1_3 — so the
+            # corrected volume is DEEPER than the raw one and the content sits that many rows lower. Bailing
+            # here turned the corrected pane into a free re-detection: it stopped following the reviewer's own
+            # line, and the two surfaces drifted 36 px apart. The move is still perfectly rigid; only the frame
+            # of reference moved. Pad the raw volume by the same amount, at the same end, and measure normally.
             if rv.shape != cv.shape:
-                return None, f"raw {rv.shape} != corrected {cv.shape} (canvas was resized — move is not rigid)"
+                if rv.shape[0] == cv.shape[0] and rv.shape[2] == cv.shape[2] and cv.shape[1] > rv.shape[1]:
+                    _pad = int(cv.shape[1] - rv.shape[1])
+                    rv = np.concatenate([np.zeros((rv.shape[0], _pad, rv.shape[2]), dtype=rv.dtype), rv], axis=1)
+                else:
+                    return None, (f"raw {rv.shape} != corrected {cv.shape} "
+                                  f"(canvas changed in lateral/frame — move is not rigid)")
             r = oct_mod.measure_applied_move(rv, cv, p)
         except Exception as exc:  # noqa: BLE001
             return None, f"applied-move measurement failed: {exc}"
