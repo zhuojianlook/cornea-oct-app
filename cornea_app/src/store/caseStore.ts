@@ -175,6 +175,41 @@ function hasVolume(info: CaseInfo): boolean {
   return Boolean(m["corrected_volume"] || m["input_volume"]);
 }
 
+
+// ── A DEAD SOCKET MUST NOT LOOK LIKE A RUNNING SCAN ───────────────────────────────────────────────────────
+// The preprocess POST is a single request held open for a minute or more. If the connection dies mid-run — a
+// sidecar restart, a dropped socket, a laptop sleeping — the run still COMPLETES server-side, but our promise
+// never settles. The `finally` that clears `busy` therefore never runs, and the button sits on "Re-running…",
+// disabled, over a scan that finished long ago. Observed twice in one review session; the reviewer's read was
+// the honest one: "why is the re-run taking forever" — it wasn't, it was done.
+//
+// So don't trust the socket as the signal. Race it against the server's own run-state: once the case reports
+// not-running on two consecutive checks, the work is over whatever happened to our request. Two checks, not
+// one, because the endpoint reads a lock that is only taken once the run actually starts; the initial delay
+// covers the same gap from the other side. Returns null when the watchdog wins — every caller already reads
+// the response with optional chaining, so a null simply means "reload the case and show the result".
+async function raceRunWatchdog<T>(caseId: string, req: Promise<T>): Promise<T | null> {
+  let settled = false;
+  void req.then(() => { settled = true; }, () => { settled = true; });
+  const watchdog = (async (): Promise<null> => {
+    await new Promise((r) => setTimeout(r, 10000));       // let the run take its lock before we start asking
+    let idle = 0;
+    while (!settled) {
+      await new Promise((r) => setTimeout(r, 5000));
+      if (settled) break;
+      try {
+        const st = await api.json<{ running?: boolean }>(`/api/case/${caseId}/oct-preprocess-running`, "GET");
+        idle = st?.running ? 0 : idle + 1;
+        if (idle >= 2) return null;
+      } catch {
+        idle = 0;               // server unreachable is NOT evidence the run finished — keep waiting
+      }
+    }
+    return null;
+  })();
+  return await Promise.race([req, watchdog]);
+}
+
 export const useCaseStore = create<CaseState>()(
   immer((set, get) => ({
     config: null,
@@ -373,7 +408,7 @@ export const useCaseStore = create<CaseState>()(
         // use_redetect: flatten to the CONFIRMED surface — which _redetect_surface_cached now serves from
         // generalize.npz because the flag above is set. The editor previews the same surface, so what you
         // judged is what you get.
-        const pre = await api.json<{ case_info?: { manifest?: { oct_iter?: {
+        const pre = await raceRunWatchdog(id, api.json<{ case_info?: { manifest?: { oct_iter?: {
           corrected_edge_anchors?: { applied?: boolean; declined?: boolean; frames_adjusted?: number; dev_before?: number; dev_after?: number };
           corrected_fold?: { folded?: boolean; n_points?: number; laterals?: number[]; pinned_laterals?: number[];
                              verified_cleared?: Record<string, unknown>;
@@ -388,7 +423,7 @@ export const useCaseStore = create<CaseState>()(
                            corrected_edit_feedback: opts?.foldToOriginal ?? false,
                            corrected_smooth_align: opts?.smoothAlign ?? false,
                            corrected_trusted_laterals: (opts?.smoothAlign || opts?.foldToOriginal)
-                             ? (opts?.trustedLaterals ?? null) : null }));
+                             ? (opts?.trustedLaterals ?? null) : null })));
         await get().openCase();                  // reload the re-corrected volume (cache-busted URL)
         const wf = useWorkflowStore.getState();
         wf.set("segVersion", wf.segVersion + 1);  // re-render previews
