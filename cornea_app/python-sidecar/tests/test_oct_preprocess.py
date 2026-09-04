@@ -1024,3 +1024,113 @@ def test_manual_patch_is_ground_truth_and_survives_the_auto_passes():
     for bad in ({}, None, {5: [float("nan"), 0.0]}, {999: [3.0, 0.0]}, {6: [0.001, 0.001]}):
         _o, k = M.apply_manual_patch(vol, bad)
         assert k == 0                                      # never crash, never act on nonsense
+
+
+# ───────────────────────── tissue-step guard (non-waivable companion of the roughness waiver) ─────────────
+class TestTissueStepGuard:
+    """`_reject_if_stepped` must decline a rigid stage that INTRODUCES a localised across-frame step in the
+    tissue and keep one that moves every frame together (a uniform shift is not a step). Trace-free: the
+    synthetic volume has NO detectable "surface" logic involved — only speckle + a bright dome band."""
+
+    @staticmethod
+    def _dome(F=40, D=160, L=64, seed=0):
+        rng = np.random.default_rng(seed)
+        vol = rng.uniform(400.0, 600.0, size=(F, D, L)).astype(np.float32)   # speckle background
+        f = np.arange(F)[:, None]; l = np.arange(L)[None, :]
+        top = (30 + 0.03 * (f - F / 2) ** 2 + 0.02 * (l - L / 2) ** 2).astype(int)   # (F, L) dome
+        for fi in range(F):
+            for li in range(L):
+                vol[fi, top[fi, li]:top[fi, li] + 50, li] += 900.0
+        return vol
+
+    @staticmethod
+    def _shift(vol, frames, px):
+        out = vol.copy()
+        for fi in frames:
+            out[fi] = 0.0
+            out[fi, px:] = vol[fi, :-px]      # tissue pushed DOWN by px, zero-fill above
+        return out
+
+    def test_map_shape_and_uniform_motion(self):
+        vol = self._dome()
+        Mp, lats = M._tissue_step_map(vol)
+        assert Mp.shape == (lats.size, vol.shape[0] - 1)
+        assert np.isfinite(Mp).all()
+        # the dome's own frame-to-frame motion is small and SMOOTH -> no kink anywhere
+        K = M._tissue_step_kinks(Mp)
+        assert np.nanmax(K) < 6.0
+
+    def test_block_offset_is_declined(self):
+        vol = self._dome()
+        stepped = self._shift(vol, range(20, 40), 8)      # frames 20.. pushed 8 px: a step at pair 19->20
+        info = {"stage": {"applied": True}}
+        kept, _m = M._reject_if_stepped(vol, stepped, "stage", info, {"drawn_edge_step_guard": True})
+        assert kept is vol
+        assert info["stage"]["applied"] is False
+        assert "tissue step" in info["stage"]["reason"].lower() or "TISSUE step" in info["stage"]["reason"]
+        assert info["stage"]["tissue_step"]["frame_pair"] == [19, 20]
+        assert info["stage"]["tissue_step"]["stepped_by_stage"] >= info["stage"]["tissue_step"]["need"]
+
+    def test_uniform_shift_is_kept(self):
+        vol = self._dome()
+        moved = self._shift(vol, range(40), 8)             # every frame together: not a step
+        info = {"stage": {"applied": True}}
+        kept, m = M._reject_if_stepped(vol, moved, "stage", info, {"drawn_edge_step_guard": True})
+        assert kept is moved
+        assert info["stage"]["applied"] is True
+        assert m is not None and m.shape[1] == 39
+
+    def test_removing_a_step_is_never_penalised(self):
+        vol = self._dome()
+        stepped = self._shift(vol, range(20, 40), 8)
+        info = {"stage": {"applied": True}}
+        kept, _m = M._reject_if_stepped(stepped, vol, "stage", info, {"drawn_edge_step_guard": True})
+        assert kept is vol and info["stage"]["applied"] is True
+
+    def test_declined_stage_and_switch_off_are_untouched(self):
+        vol = self._dome()
+        info = {"stage": {"applied": False}}
+        kept, m = M._reject_if_stepped(vol, vol, "stage", info, {"drawn_edge_step_guard": True}, before_map=None)
+        assert kept is vol and m is None and "tissue_step" not in info["stage"]
+        stepped = self._shift(vol, range(20, 40), 8)
+        kept, _m = M._reject_if_stepped(vol, stepped, "stage", info, {"drawn_edge_step_guard": False})
+        assert kept is stepped and "tissue_step" not in info["stage"]
+
+    def test_default_params_declare_the_guard(self):
+        assert M.DEFAULT_PARAMS["drawn_edge_step_guard"] is True
+        assert M.DEFAULT_PARAMS["step_guard_px"] == 6.0
+        assert 0.0 < M.DEFAULT_PARAMS["step_guard_frac"] < 1.0
+
+    def test_zero_filled_bands_are_unjudged_not_counted(self):
+        vol = self._dome()
+        # blank the left 24 laterals entirely (zero-filled canvas) -> those bands are NaN in the map
+        vol[:, :, :24] = 0.0
+        Mp, lats = M._tissue_step_map(vol)
+        # bands fully inside the blank region are NaN; a band straddling its boundary still averages tissue
+        assert np.isnan(Mp[lats <= 20]).all() and np.isfinite(Mp[lats >= 28]).all()
+        # a step confined to the blank laterals cannot be seen and must not decline the stage
+        stepped = self._shift(vol, range(20, 40), 8)
+        stepped[:, :, 24:] = vol[:, :, 24:]
+        info = {"stage": {"applied": True}}
+        kept, _m = M._reject_if_stepped(vol, stepped, "stage", info, {"drawn_edge_step_guard": True})
+        assert kept is stepped and info["stage"]["applied"] is True
+        assert info["stage"]["tissue_step"]["finite_bands"] < lats.size
+
+    def test_before_map_threading_matches_fresh(self):
+        v0 = self._dome(); v1 = self._shift(v0, range(40), 3); v2 = self._shift(v1, range(20, 40), 8)
+        info_a = {"s": {"applied": True}}; _k, m1 = M._reject_if_stepped(v0, v1, "s", info_a, {"drawn_edge_step_guard": True})
+        info_b = {"s": {"applied": True}}; M._reject_if_stepped(v1, v2, "s", info_b, {"drawn_edge_step_guard": True}, before_map=m1)
+        info_c = {"s": {"applied": True}}; M._reject_if_stepped(v1, v2, "s", info_c, {"drawn_edge_step_guard": True})
+        assert info_b["s"]["tissue_step"] == info_c["s"]["tissue_step"]
+        assert info_b["s"]["applied"] is False
+
+    def test_enlarging_an_existing_step_counts(self):
+        v0 = self._dome(); small = self._shift(v0, range(20, 40), 6)   # a pre-existing ~6 px step
+        big = self._shift(v0, range(20, 40), 14)                       # the stage makes it 14 px
+        info = {"s": {"applied": True, "rougher_note": "kept: made 3 lateral(s) rougher than the input (max +1.0 px)",
+                      "roughness_veto": "waived — this run follows your drawn edge"}}
+        kept, _m = M._reject_if_stepped(small, big, "s", info, {"drawn_edge_step_guard": True})
+        assert kept is small and info["s"]["applied"] is False
+        assert info["s"]["rougher_note"].startswith("measured on the discarded move")
+        assert info["s"]["roughness_veto"].endswith("discarded by the tissue-step guard")
+        assert "_surface_before" not in info["s"]

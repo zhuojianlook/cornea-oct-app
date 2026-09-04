@@ -20,6 +20,8 @@ import json
 import math
 import os
 import re
+import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +96,51 @@ DEFAULT_PARAMS: dict = {
                                   #   _02 (set) looked quadratic while _01 (unset) came out "much flatter in the
                                   #   center". Declared here so it is visible and can be turned off per-case.
                                   #   Read ONLY on the provided/corrections path — auto scans are unaffected.
+    "drawn_edge_overrides_roughness": True,
+                                  # DEFAULT ON (2026-09-03), the reviewer's explicit call: "Because the edge that
+                                  #   is drawn on the original image after (every 40 slices correction +
+                                  #   interpolation) is likely to be very near ground truth, you should always let
+                                  #   the correction happen and let the determination of rougher be a user
+                                  #   determination, of which the edge of the corrected slice can be determined
+                                  #   manually in the step 2." So on a run that flattens to a DRAWN edge
+                                  #   (provided_edges present) every ROUGHNESS veto is waived: the cross-stage
+                                  #   never_rougher invariant AND the rigid_height_refine / rigid_frame_derotate
+                                  #   roughness self-gates AND rigid_frame_refine's along-frame roughness term.
+                                  #   Two reasons this is right, beyond it being their call: (a) all three vetoes
+                                  #   score roughness through detect_surface_all, the very detector the drawn edge
+                                  #   exists to correct, so they are the least trustworthy judge at exactly the
+                                  #   faint laterals where they fire; (b) the roughness is judged for real in
+                                  #   step 2, on the corrected result, by the reviewer's eyes. Every OTHER gate
+                                  #   (seam step, deviation from the drawn line, across-width spread, physical
+                                  #   plausibility) is untouched. The waived cost is still MEASURED and reported
+                                  #   per stage (`rougher_laterals` / `rougher_note`) — waived, not hidden.
+    "rough_regress_veto": True,   # act on the never_rougher measurement (False = measure and report only).
+                                  #   Set False by the waiver above; not meant to be set per-case by hand.
+    "rhr_roughness_gate": True,   # rigid_height_refine's own "keep only if the surface got smoother" self-gate
+    "rfd_roughness_gate": True,   # rigid_frame_derotate's own "keep only if the surface got smoother" self-gate
+    "drawn_edge_step_guard": True,
+                                  # NON-WAIVABLE companion of the waiver above (2026-09-03). Waiving the roughness
+                                  #   vetoes on cs048_od_v1_3 let rigid_frame_derotate through, and it put a
+                                  #   visible SHELF into the cornea band at frames 88->89 across a third of the
+                                  #   laterals (old run: none) — a step, the reviewer's own hard "never" — while
+                                  #   every stage's OWN step gate read the DP surface, which at those faint edge
+                                  #   frames was flickering between the eyelid line and the cornea (an 87 px
+                                  #   "step" that is not in the tissue at all). So this guard reads the TISSUE:
+                                  #   `_tissue_step_map` cross-correlates whole A-scan columns of adjacent frames
+                                  #   (no surface is detected or picked) and a stage that NEWLY steps >= step_guard_frac
+                                  #   of the sampled laterals at one frame pair by >= step_guard_px is declined
+                                  #   (`_reject_if_stepped`). It is not a roughness measure and it is not waived:
+                                  #   the reviewer's call was that roughness is theirs to judge, not that a step is.
+                                  #   Runs ONLY on the waived (drawn-edge) path — the auto path is byte-unchanged.
+    "step_guard_px": 6.0,         # px: a lateral is STEPPED at a frame pair when its tissue shift there departs this far
+                                  #   from the local (+-3 pairs) median — a localised jump, not the dome's own curvature.
+                                  #   Lags are integers and the local median is one too, so the practical firing point
+                                  #   is ~5 px where the dome's own slope sits at +-1 px per frame.
+    "step_guard_frac": 0.15,      # fraction of sampled laterals that must be NEWLY stepped at ONE frame pair to decline the
+                                  #   stage (cs048 waived derotate: 0.32 at f88; every clean arm measured: <= 0.02)
+    "step_guard_lat_step": 4,     # sample every 4th lateral as a 5-lateral band mean (128 bands on a 513-wide scan)
+    "step_guard_min_bands": 8,    # absolute floor on the number of newly-stepped bands needed to decline a stage
+    "step_guard_max_lag": 40,     # px: cross-correlation search half-range for the adjacent-frame tissue shift
     # Corrections-path rigid ROTATION (the reviewer's algorithm): "interpolate the manual edge GT, find the best
     # axial rotation/translation to correct it toward a quadratic". rigid_frame_warp (below) already fits ONE per-
     # frame depth shift (translation) as the median across laterals; with this on, it additionally fits a per-frame
@@ -235,7 +282,20 @@ DEFAULT_PARAMS: dict = {
     # across laterals (= inter-frame motion); per-lateral speckle is preserved by construction, so it best-fits (not
     # forces) the quadratic within the rigid limit. The reviewer accepts the small dome flattening this causes. The old
     # DEFAULT-OFF note below is why it was parked; the directive now wants the quadratic. See [[cornea-corrections-dome-flatten]].
-    "sag_quad_align": True,
+    "sag_quad_align": False,
+                                  # DEFAULT OFF again (2026-09-04), measured in the reviewer's OWN terms, not the
+                                  #   detector's. On cs048_od_v1_3 (23 drawn slices) their drawn points were
+                                  #   transported through every rigid move the run applied and scored against
+                                  #   per-slice deg-2 fits: as drawn 4.91 px median -> after flatten_rigid_quad
+                                  #   2.88 -> after rigid_height_refine 2.38 -> after rigid_frame_refine 2.48
+                                  #   (the rigid floor, one shift per frame, is 2.13) -> after THIS stage 5.47 px
+                                  #   median, 9.7 max (slices 0/512/272/152/232 ended WORSE than the raw drawing).
+                                  #   It re-flattens to detect_surface_all's quadratic of the corrected volume,
+                                  #   so where the DP is off (faint edge frames, the eyelid line) it moves frames
+                                  #   up to 24 px AWAY from the drawn edge, and its self-gate cannot see that
+                                  #   because it scores with the same detector. flatten_rigid_quad already does
+                                  #   the rigid best-fit quadratic with the DRAWN edge; this stage only runs on the
+                                  #   corrections path, so off here = off everywhere. Re-enable per case to compare.
     "sqa_iters": 8,               # alternating fit rounds (target = per-lateral quad → per-frame median shift)
     "sqa_max_shift": 30.0,        # clamp on the per-frame depth TRANSLATION (px)
     "sqa_max_deg": 0.0,           # per-frame ROTATION cap (deg). 0 = translation-only: a clamped tilt over-fit the
@@ -8827,16 +8887,23 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
         r1 = _rough(S2)
     except Exception:  # noqa: BLE001
         r1 = r0 + 1.0
+    _waived = None
     if not (r1 < r0):                               # no improvement → revert (never worse)
-        # max_jitter is the MEASURED input motion severity, not a result of the correction — so it must be
-        # reported even when the correction is reverted. Omitting it here made the field structurally absent
-        # on exactly the scans whose refinement failed (the ones most likely to be bad), which capped any
-        # jitter-based triage at ~44% recall. The revert still returns the untouched volume.
-        return volume, {"applied": False, "max_jitter": round(float(np.max(np.abs(jitter))), 2),
-                        "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
-    return out, {"applied": bool(nadj), "frames_adjusted": int(nadj), "max_jitter": round(float(np.max(np.abs(jitter))), 2),
-                 "rough_before": round(r0, 3), "rough_after": round(r1, 3),
-                 "_surface_before": S, "_surface_after": S2}   # handed to the never-rougher check, then stripped
+        if bool(p.get("rhr_roughness_gate", True)):
+            # max_jitter is the MEASURED input motion severity, not a result of the correction — so it must be
+            # reported even when the correction is reverted. Omitting it here made the field structurally absent
+            # on exactly the scans whose refinement failed (the ones most likely to be bad), which capped any
+            # jitter-based triage at ~44% recall. The revert still returns the untouched volume.
+            return volume, {"applied": False, "max_jitter": round(float(np.max(np.abs(jitter))), 2),
+                            "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+        # WAIVED — see drawn_edge_overrides_roughness. The reviewer's drawn edge decides, not this metric.
+        _waived = "roughness self-gate waived — this run follows your drawn edge"
+    rec = {"applied": bool(nadj), "frames_adjusted": int(nadj), "max_jitter": round(float(np.max(np.abs(jitter))), 2),
+           "rough_before": round(r0, 3), "rough_after": round(r1, 3),
+           "_surface_before": S, "_surface_after": S2}   # handed to the never-rougher check, then stripped
+    if _waived:
+        rec["roughness_veto"] = _waived
+    return out, rec
 
 
 def sagittal_quad_align(volume: np.ndarray, params: dict | None = None, workers: int | None = None,
@@ -9428,12 +9495,143 @@ def _reject_if_rougher(before_vol: np.ndarray, after_vol: np.ndarray, stage: str
     for _k in [k for k in rec if isinstance(k, str) and k.startswith("_")]:
         rec.pop(_k, None)                     # never persist a surface array into the manifest
     if n_worse > allow:
-        rec["applied"] = False
-        rec["reason"] = f"declined: made {n_worse} lateral(s) rougher than the input (max +{rec['rougher_worst_px']} px)"
-        info[stage] = rec
-        return before_vol, r0            # volume unchanged -> its roughness is still r0
+        if bool(p.get("rough_regress_veto", True)):
+            rec["applied"] = False
+            rec["reason"] = f"declined: made {n_worse} lateral(s) rougher than the input (max +{rec['rougher_worst_px']} px)"
+            info[stage] = rec
+            return before_vol, r0            # volume unchanged -> its roughness is still r0
+        # WAIVED (reviewer, 2026-09-03 — see drawn_edge_overrides_roughness). The run is flattening to their
+        # DRAWN edge, so the move is kept and the roughness cost is REPORTED rather than acted on: they judge
+        # it in step 2 on the corrected result. The measurement is not skipped — it is free here (both stages
+        # hand their own surfaces over) and it is what tells them what the waiver bought.
+        rec["roughness_veto"] = "waived — this run follows your drawn edge"
+        rec["rougher_note"] = (f"kept: made {n_worse} lateral(s) rougher than the input "
+                               f"(max +{rec['rougher_worst_px']} px)")
     info[stage] = rec
     return after_vol, r1
+
+
+def _tissue_step_map(volume: np.ndarray, lat_step: int = 4, band: int = 2, max_lag: int = 40,
+                     min_fill: float = 0.7):
+    """TRACE-FREE across-frame motion of the tissue. For every sampled lateral band (a `2*band+1`-lateral mean)
+    and every adjacent frame pair, the integer depth lag that best cross-correlates the two whole A-scan columns
+    — the content is aligned, no surface is detected or picked, so an eyelid line / a faint limbus corner cannot
+    fool it the way they fool detect_surface_all (see [[mistakes]] #11/#14). `volume` is (frames, depth, lateral).
+    Returns ((n_bands, F-1) float32 lags in px, the sampled lateral indices); NaN where either column is mostly
+    zero-filled canvas (fill < min_fill). ~1.2 s on a 101x649x513 volume (FFT correlation)."""
+    F, D, L = int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2])
+    lats = np.arange(band, L - band, max(1, int(lat_step)))
+    M = np.full((lats.size, F - 1), np.nan, dtype=np.float32)
+    if F < 2 or lats.size == 0:
+        return M, lats
+    n = 1 << int(np.ceil(np.log2(2 * D)))
+    max_lag = int(min(max_lag, D - 1))
+    lag = np.concatenate([np.arange(0, max_lag + 1), np.arange(-max_lag, 0)])   # FFT bin -> lag (px)
+    for i, l in enumerate(lats):
+        cols = volume[:, :, l - band:l + band + 1].mean(axis=2).T.astype(np.float64)   # (D, F)
+        fill = (cols > 0).mean(axis=0)
+        cols = cols - cols.mean(axis=0, keepdims=True)
+        A = np.fft.rfft(cols[:, :-1], n=n, axis=0)
+        B = np.fft.rfft(cols[:, 1:], n=n, axis=0)
+        xc = np.fft.irfft(A * np.conj(B), n=n, axis=0)          # xc[s] = sum_k a[k+s] * b[k]; zero-padded, no wrap
+        xc = np.concatenate([xc[:max_lag + 1], xc[n - max_lag:]], axis=0)
+        best = lag[np.argmax(xc, axis=0)].astype(np.float32)
+        ok = (fill[:-1] >= min_fill) & (fill[1:] >= min_fill)
+        best[~ok] = np.nan
+        M[i] = best
+    return M, lats
+
+
+def _tissue_step_kinks(M: np.ndarray, half: int = 3) -> np.ndarray:
+    """|shift - local median over +-half frame pairs|, per (band, frame pair): a LOCALISED across-frame step, as
+    opposed to the smooth frame-to-frame motion the dome's own curvature produces (which the local median
+    follows). NaN where the shift itself is NaN."""
+    K = np.full_like(M, np.nan)
+    n = int(M.shape[1])
+    for f in range(n):
+        w = M[:, max(0, f - half):min(n, f + half + 1)]
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            med = np.nanmedian(w, axis=1)
+        K[:, f] = np.abs(M[:, f] - med)
+    return K
+
+
+def _reject_if_stepped(before_vol: np.ndarray, after_vol: np.ndarray, stage: str, info: dict,
+                       params: dict | None = None, before_map: np.ndarray | None = None):
+    """A rigid stage must never INTRODUCE a localised across-frame step in the TISSUE (reviewer: a step in the
+    corrected result is never acceptable). This is the NON-WAIVABLE companion of the roughness waiver
+    (`drawn_edge_overrides_roughness`): the waiver hands the roughness judgement to the reviewer, it does not
+    hand them a step. Measured trace-free (`_tissue_step_map`) because every stage's own seam/step gate reads the
+    DP surface, and on cs048_od_v1_3 that surface flickered by 87 px between the eyelid line and the cornea at
+    exactly the frames where the derotate then shelved the real tissue by 6-16 px.
+
+    Per frame pair, a sampled lateral band counts as STEPPED BY THIS STAGE when its kink is >= step_guard_px
+    after and was either below that before (newly stepped) or grew by another step_guard_px (an existing small
+    step made much worse). Only bands the guard can see at that pair (both maps finite — not zero-filled canvas)
+    are judged, and the requirement is step_guard_frac of THOSE, with an absolute floor of step_guard_min_bands
+    so a handful of columns cannot veto. If any one pair reaches it, the stage's move is discarded and the input
+    kept. A stage that removes or shrinks a step is never penalised.
+
+    Returns (volume_to_keep, tissue-step map of that volume) — hand the map back as `before_map` to the next
+    stage so a 4-stage chain costs 5 maps, not 8. Records `tissue_step` in info[stage] either way (a measurement
+    failure is recorded as {"error": ...} and the move is kept, like the never-rougher check)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("drawn_edge_step_guard", True)):
+        return after_vol, before_map
+    if after_vol is before_vol:                   # the stage declined on its own — nothing to judge
+        return after_vol, before_map
+    rec = info.get(stage) if isinstance(info.get(stage), dict) else {}
+    for _k in [k for k in rec if isinstance(k, str) and k.startswith("_")]:
+        rec.pop(_k, None)                         # never persist a surface array into the manifest
+    px = float(p.get("step_guard_px", 6.0))
+    frac = float(p.get("step_guard_frac", 0.15))
+    min_bands = int(p.get("step_guard_min_bands", 8))
+    ls = int(p.get("step_guard_lat_step", 4))
+    ml = int(p.get("step_guard_max_lag", 40))
+    try:
+        M0 = before_map if before_map is not None else _tissue_step_map(before_vol, lat_step=ls, max_lag=ml)[0]
+        M1 = _tissue_step_map(after_vol, lat_step=ls, max_lag=ml)[0]
+        if M0.shape != M1.shape:
+            M0 = _tissue_step_map(before_vol, lat_step=ls, max_lag=ml)[0]
+        K0, K1 = _tissue_step_kinks(M0), _tissue_step_kinks(M1)
+    except Exception as exc:  # noqa: BLE001 — a measurement failure must not fail the run, but it must be visible
+        rec["tissue_step"] = {"error": type(exc).__name__, "note": "guard could not measure — move kept unjudged"}
+        info[stage] = rec
+        print(f"[rigid] tissue-step guard could not measure {stage}: {type(exc).__name__}", file=sys.stderr)
+        return after_vol, None
+    n_bands = int(M1.shape[0])
+    if not K1.size:
+        rec["tissue_step"] = {"note": "too few frames to judge"}
+        info[stage] = rec
+        return after_vol, M1
+    with np.errstate(all="ignore"):
+        seen = np.isfinite(K0) & np.isfinite(K1)                               # bands the guard can judge
+        stepped = seen & (K1 >= px) & ((K0 < px) | (K1 >= K0 + px))            # newly stepped, or grew by a step
+        n_fin = seen.sum(axis=0).astype(int)                                   # per pair
+        n_new = stepped.sum(axis=0).astype(int)
+        need = np.maximum(min_bands, np.ceil(frac * n_fin)).astype(int)
+        ratio = np.where(n_fin > 0, n_new / np.maximum(need, 1), 0.0)
+    f = int(np.argmax(ratio))
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        worst = float(np.nanmax(np.where(stepped[:, f], K1[:, f], np.nan))) if int(n_new[f]) else 0.0
+    rec["tissue_step"] = {"frame_pair": [f, f + 1], "stepped_by_stage": int(n_new[f]), "finite_bands": int(n_fin[f]),
+                          "of_bands": n_bands, "need": int(need[f]), "worst_px": round(worst, 1)}
+    if int(n_new[f]) >= int(need[f]) and int(n_fin[f]) > 0:
+        rec["applied"] = False
+        rec["reason"] = (f"declined: introduced an across-frame TISSUE step at frames {f}->{f + 1} on {int(n_new[f])} of "
+                         f"{int(n_fin[f])} judged laterals (worst {worst:.0f} px) — a step is never allowed; "
+                         f"this is the tissue-step guard, not a roughness veto")
+        # keep the record self-consistent: the roughness cost below was measured on a move that is now discarded
+        if rec.get("rougher_note"):
+            rec["rougher_note"] = "measured on the discarded move: " + str(rec["rougher_note"]).replace("kept: ", "", 1)
+        if rec.get("roughness_veto"):
+            rec["roughness_veto"] = str(rec["roughness_veto"]) + " — move then discarded by the tissue-step guard"
+        info[stage] = rec
+        return before_vol, M0
+    info[stage] = rec
+    return after_vol, M1
 
 
 def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
@@ -9578,13 +9776,20 @@ def rigid_frame_derotate(volume: np.ndarray, params: dict | None = None, workers
         out[f] = np.ascontiguousarray(ndimage.affine_transform(fr_ld, Mrot, offset=offr, order=1, mode="constant", cval=0.0).T)
         nrot += 1
     r1 = _rough(Scur)                                    # SELF-GATE on the nearest-filled iterate (stable corners)
+    _waived = None
     if not (r1 < r0):
-        return volume, {"applied": False,
-                        "reason": f"self-gate: roughness did not improve ({r0:.3f} -> {r1:.3f} px)",
-                        "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
-    return out, {"applied": True, "frames_rotated": int(nrot), "max_deg": round(max_deg, 2), "iters": int(it_done),
-                 "rough_before": round(r0, 3), "rough_after": round(r1, 3),
-                 "_surface_before": S, "_surface_after": Scur}   # handed to the never-rougher check, then stripped
+        if bool(p.get("rfd_roughness_gate", True)):
+            return volume, {"applied": False,
+                            "reason": f"self-gate: roughness did not improve ({r0:.3f} -> {r1:.3f} px)",
+                            "rough_before": round(r0, 3), "rough_after": round(r1, 3)}
+        # WAIVED — see drawn_edge_overrides_roughness. The reviewer's drawn edge decides, not this metric.
+        _waived = f"roughness self-gate waived ({r0:.3f} -> {r1:.3f} px) — this run follows your drawn edge"
+    rec = {"applied": True, "frames_rotated": int(nrot), "max_deg": round(max_deg, 2), "iters": int(it_done),
+           "rough_before": round(r0, 3), "rough_after": round(r1, 3),
+           "_surface_before": S, "_surface_after": Scur}   # handed to the never-rougher check, then stripped
+    if _waived:
+        rec["roughness_veto"] = _waived
+    return out, rec
 
 
 def intra_frame_dewarp(volume: np.ndarray, params: dict | None = None, workers: int | None = None):
@@ -11247,6 +11452,38 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             # guard) — so every axial move answers to a smooth sagittal surface. corrections_sole_sag=False restores
             # the multi-stage passes.
             _sole = bool(p_all.get("corrections_sole_sag", True))
+            # ROUGHNESS VETO WAIVER (reviewer, 2026-09-03 — see drawn_edge_overrides_roughness in DEFAULT_PARAMS).
+            # This block only runs on the corrections path; when it is flattening to an edge the reviewer DREW,
+            # their line is the ground truth and the roughness judgement is theirs to make in step 2. So the four
+            # stages below (and their never-rougher check) run with every ROUGHNESS gate off and every other gate
+            # intact. `_rp` is a per-run copy — nothing is persisted to the case's oct_params.
+            _rough_waived = (provided_edges is not None
+                             and bool(p_all.get("drawn_edge_overrides_roughness", True)))
+            _rp = params
+            if _rough_waived:
+                _rp = {**(params or {}), "rough_regress_veto": False,
+                       "rhr_roughness_gate": False, "rfd_roughness_gate": False,
+                       "rfr_gate_bsd_px": 1e9}
+                info["roughness_veto"] = {
+                    "waived": True,
+                    "why": "this run flattens to the edge you drew, so roughness is your call in step 2",
+                    "stages": ["rigid_height_refine", "rigid_frame_derotate",
+                               "rigid_frame_refine", "edge_frame_guard"]}
+                print("[rigid] roughness veto WAIVED — this run follows the reviewer's drawn edge",
+                      file=sys.stderr)
+            else:
+                info["roughness_veto"] = {"waived": False}
+            # TISSUE-STEP GUARD — the waiver's non-waivable companion (see drawn_edge_step_guard). A stage that
+            # NEWLY steps the tissue at one frame pair is declined even though its roughness gates are off. The
+            # map of the current volume is threaded stage to stage so the chain measures n+1 times, not 2n.
+            _step_guard = bool(_rough_waived) and bool(p_all.get("drawn_edge_step_guard", True))
+            _tsm = None
+            _rgh = None   # never-rougher chain state; was only set inside the height-refine block, so turning
+                          # rigid_height_refine off per-case crashed the derotate's check (UnboundLocalError)
+            if _rough_waived:
+                info["roughness_veto"]["step_guard"] = (
+                    "on — a stage that introduces an across-frame tissue step is still declined"
+                    if _step_guard else "off")
             if p_all.get("rigid_height_refine", True) and not _sole:
                 # GIVE IT AN ACCURATE SURFACE instead of letting it re-detect. This stage fits a smooth dome
                 # through the detected surface and shifts every frame onto it, so the surface it reads decides
@@ -11265,27 +11502,51 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     except Exception:  # noqa: BLE001
                         _rhr_det = None
                 _before = corrected; _rgh = None
-                corrected, _rhr = rigid_height_refine(corrected, params, workers=workers, detect=_rhr_det)
+                corrected, _rhr = rigid_height_refine(corrected, _rp, workers=workers, detect=_rhr_det)
                 _rhr["surface"] = "guided" if _rhr_det is not None else "self-detected"
                 info["rigid_height_refine"] = _rhr
-                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_height_refine", info, params, workers, _rgh)
+                _rgh_in = _rgh
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_height_refine", info, _rp, workers, _rgh)
+                if _step_guard:
+                    _kept = corrected
+                    corrected, _tsm = _reject_if_stepped(_before, corrected, "rigid_height_refine", info, _rp, _tsm)
+                    if corrected is _before and _kept is not _before:
+                        _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
             if p_all.get("rigid_frame_derotate", True) and not _sole:
                 _before = corrected
-                corrected, _rfd = rigid_frame_derotate(corrected, params, workers=workers)
+                corrected, _rfd = rigid_frame_derotate(corrected, _rp, workers=workers)
                 info["rigid_frame_derotate"] = _rfd
-                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_frame_derotate", info, params, workers, _rgh)
+                _rgh_in = _rgh
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_frame_derotate", info, _rp, workers, _rgh)
+                if _step_guard:
+                    _kept = corrected
+                    corrected, _tsm = _reject_if_stepped(_before, corrected, "rigid_frame_derotate", info, _rp, _tsm)
+                    if corrected is _before and _kept is not _before:
+                        _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
             if p_all.get("rigid_frame_refine", True) and not _sole:
                 _before = corrected
-                corrected, _rfr = rigid_frame_refine(corrected, params, workers=workers)
+                corrected, _rfr = rigid_frame_refine(corrected, _rp, workers=workers)
                 info["rigid_frame_refine"] = _rfr
-                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_frame_refine", info, params, workers, _rgh)
+                _rgh_in = _rgh
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "rigid_frame_refine", info, _rp, workers, _rgh)
+                if _step_guard:
+                    _kept = corrected
+                    corrected, _tsm = _reject_if_stepped(_before, corrected, "rigid_frame_refine", info, _rp, _tsm)
+                    if corrected is _before and _kept is not _before:
+                        _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
             # EDGE-FRAME GUARD: nudge the outermost acquisition-edge frames back onto the interior corneal curvature
             # (the faint FOV corner where the de-jitter dips them below the dome). Rigid, tapered, self-gated.
             if p_all.get("edge_guard", True):
                 _before = corrected
-                corrected, _efg = edge_frame_guard(corrected, params, workers=workers)
+                corrected, _efg = edge_frame_guard(corrected, _rp, workers=workers)
                 info["edge_frame_guard"] = _efg
-                corrected, _rgh = _reject_if_rougher(_before, corrected, "edge_frame_guard", info, params, workers, _rgh)
+                _rgh_in = _rgh
+                corrected, _rgh = _reject_if_rougher(_before, corrected, "edge_frame_guard", info, _rp, workers, _rgh)
+                if _step_guard:
+                    _kept = corrected
+                    corrected, _tsm = _reject_if_stepped(_before, corrected, "edge_frame_guard", info, _rp, _tsm)
+                    if corrected is _before and _kept is not _before:
+                        _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
             # RECONCILE TO THE MANUAL LINE: keep the de-jitter in the reliable interior, but pin the faint FOV-corner
             # frames back to the user's drawn line (provided_edges) where the de-jitter's correction is unreliable.
             if provided_edges is not None and p_all.get("reconcile_line", True):
@@ -11298,9 +11559,23 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             # body 8.4->3.0 px off deg-2 with step 16 px (self-gate passes), whereas running it mid-pipeline saw a
             # 37 px redetect step (the edge stages had not yet settled the surface) and the gate rejected it. The
             # edge/crop frames are held flat, so the reconciled manual line is preserved. Self-gated on the central body.
-            if p_all.get("sag_quad_align", True):
+            if p_all.get("sag_quad_align", False):
+                _before = corrected
                 corrected, _sqa = sagittal_quad_align(corrected, params, workers=workers)
                 info["sagittal_quad_align"] = _sqa
+                if _step_guard:   # the 'never a step' promise covers the final flatten too (its own gate reads the DP)
+                    corrected, _tsm = _reject_if_stepped(_before, corrected, "sagittal_quad_align", info, _rp, _tsm)
+            else:
+                info["sagittal_quad_align"] = {
+                    "applied": False,
+                    "reason": ("skipped (sag_quad_align=False): the flatten already fitted your drawn edge to its rigid "
+                               "best-fit quadratic; this detector-driven re-flatten measured 2.48 -> 5.47 px median off "
+                               "your drawn points on cs048_od_v1_3, so it is off by default — set sag_quad_align=True "
+                               "per case to compare")}
+            if _rough_waived:     # record the stages that actually RAN under the waiver, not a fixed list
+                info["roughness_veto"]["stages"] = [s for s in ("rigid_height_refine", "rigid_frame_derotate",
+                                                                 "rigid_frame_refine", "edge_frame_guard",
+                                                                 "sagittal_quad_align") if isinstance(info.get(s), dict)]
         # The three GT warps below get `detect=` — the SAME constrained line the corrected pane draws for the
         # volume as it stands right here. See _corr_detect above. `filled` mirrors each function's own detection
         # input exactly (_fill_black_bands for the two *_surface_gt warps, raw for align_corrected_to_smooth).
