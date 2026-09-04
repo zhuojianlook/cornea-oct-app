@@ -140,6 +140,28 @@ DEFAULT_PARAMS: dict = {
                                   #   stage (cs048 waived derotate: 0.32 at f88; every clean arm measured: <= 0.02)
     "step_guard_lat_step": 4,     # sample every 4th lateral as a 5-lateral band mean (128 bands on a 513-wide scan)
     "step_guard_min_bands": 8,    # absolute floor on the number of newly-stepped bands needed to decline a stage
+    "corrected_edit_mode": "transform",
+                                  # What "⤴ Regenerate from N verified slices" does with the reviewer's CORRECTED-pane
+                                  #   edits (2026-09-04, reviewer: "corrections to the edge of the corrected image
+                                  #   inform the necessary axial transforms/tilts to the original image"; "the
+                                  #   regenerate button should be in charge of modifying the transform").
+                                  #   "transform": fit ONE rigid (depth shift, tilt) per frame to the edit deltas at
+                                  #   the edited laterals (a marked-accurate slice = delta 0) and ADD it to the
+                                  #   case's sticky `edit_transform`, applied to the original as the last rigid move
+                                  #   of every corrections run — so edits accumulate round after round and the
+                                  #   corrected slice converges. Measured on cs048_od_v1_3: the previous "fold"
+                                  #   (write the depths into the raw GT, then re-run) changed the per-frame move by
+                                  #   a median of 0 px at the 8 edited slices, because 8 laterals are ~6% of the
+                                  #   flatten's joint fit; the transform lands the tissue 1.8 px RMS from the drawn
+                                  #   lines at those slices at a cost of ~0.4 px on un-edited slices (accepted).
+                                  #   "fold": the 2026-09-02 surface-GT mechanism, kept for comparison.
+    "edit_transform_min_tilt_lats": 3,   # laterals a frame needs before a tilt is fitted (else shift-only median)
+    "edit_transform_max_px": 80.0,       # clamp on the applied per-column displacement (px)
+    "edit_transform_smooth_frames": 1.0, # gaussian (frames) on the fitted per-frame shift/tilt; 0 = off
+    "rhr_edge_taper": 4,          # rigid_height_refine: taper its de-jitter shift to 0 over the outermost N frames at
+                                  #   both ends (the one-sided high-pass leaves a RAMP there, not jitter; applied as-is
+                                  #   it stepped the last frame pair 6-9 px on cs048 and the step guard then dropped
+                                  #   the whole stage). Interior frames are untouched. 0 = old behaviour.
     "step_guard_max_lag": 40,     # px: cross-correlation search half-range for the adjacent-frame tissue shift
     # Corrections-path rigid ROTATION (the reviewer's algorithm): "interpolate the manual edge GT, find the best
     # axial rotation/translation to correct it toward a quadratic". rigid_frame_warp (below) already fits ONE per-
@@ -8873,6 +8895,21 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
     sig = float(p.get("rhr_smooth", 3.0) or 0.0)
     jitter = (Mcum - ndimage.gaussian_filter1d(Mcum, sig, mode="nearest")) if sig > 0 else Mcum
     jitter = np.clip(jitter, -float(p.get("rhr_max", 8.0)), float(p.get("rhr_max", 8.0)))
+    # EDGE TAPER (2026-09-04). The high-pass above is one-sided at the frame-array ends: with mode="nearest" the
+    # low-pass hugs the last value, so the "jitter" it leaves at the outermost frames is a RAMP into the edge, not
+    # jitter (measured on cs048_od_v1_3 after the fold: frames 96..99 = -1, -2, -3, -6 px, frame 100 = 0). Applied
+    # as-is that is a 6-9 px step at the last frame pair across the whole width, which the tissue-step guard
+    # correctly declined — and with it the interior de-jitter this stage exists for (frame-to-frame waviness
+    # 0.90 -> 0.97 px). Taper the correction to zero over the outermost rhr_edge_taper frames at both ends: the
+    # interior is untouched, the edge frames are left to the edge stages, and no step can be created there.
+    _et = int(p.get("rhr_edge_taper", 4))
+    if _et > 0 and F > 2 * _et + 4:
+        _w = np.ones(F)
+        _ramp = 0.5 * (1.0 - np.cos(np.pi * (np.arange(1, _et + 1) / float(_et + 1))))   # 0 -> 1, edge-exclusive
+        _w[:_et] = _ramp                                   # frame 0 gets the smallest weight
+        _w[F - _et:] = _ramp[::-1]                         # frame F-1 gets the smallest weight
+        _w[0] = 0.0; _w[F - 1] = 0.0
+        jitter = jitter * _w
     if float(np.max(np.abs(jitter))) < 0.15:       # no meaningful jitter → strict no-op
         return volume, {"applied": False, "reason": "no meaningful jitter to remove (max < 0.15 px)",
                         "max_jitter": round(float(np.max(np.abs(jitter))), 2)}
@@ -10219,6 +10256,110 @@ def apply_manual_patch(volume: np.ndarray, patch) -> tuple[np.ndarray, int]:
         out[fi] = _warp_by_displacement(np.ascontiguousarray(out[fi]), d, subpixel=True)
         n += 1
     return out, n
+
+
+def fit_edit_transform(deltas, n_lat: int, n_frames: int, params: dict | None = None) -> dict:
+    """The reviewer's CORRECTED-pane edits as ONE rigid (depth shift, tilt) per frame.
+
+    `deltas` = {lateral: {frame: delta_px}} where delta = the depth the reviewer DREW minus where the tissue edge
+    currently sits on the corrected result (+ = the edge should be DEEPER); a slice marked accurate contributes
+    delta 0. Per frame: least squares of delta ~ a + b*x over the laterals that carry a delta at that frame, x the
+    centred lateral in [-1, 1] (so b is the half-span tilt in px, the same convention as measure_applied_move);
+    fewer than edit_transform_min_tilt_lats laterals -> shift-only median. One outlier is dropped when it sits
+    > 3x the median |residual| off the line (the eyelid-corner flicker at the last frames). Frames without data
+    are interpolated across frames and held at the ends. Detector-free: only the reviewer's numbers enter."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    L, F = int(n_lat), int(n_frames)
+    xc = (np.arange(L, dtype=np.float64) - (L - 1) / 2.0) / max(1.0, (L - 1) / 2.0)
+    per_frame: dict[int, list] = {}
+    for l_key, fm in (deltas or {}).items():
+        try:
+            l = int(l_key)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= l < L) or not isinstance(fm, dict):
+            continue
+        for f_key, dv in fm.items():
+            try:
+                f = int(f_key); d = float(dv)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < F and np.isfinite(d):
+                per_frame.setdefault(f, []).append((l, d))
+    a = np.full(F, np.nan); b = np.full(F, np.nan); nfit = np.zeros(F, dtype=int); resid = []
+    min_tilt = int(p.get("edit_transform_min_tilt_lats", 3))
+    for f, pts in per_frame.items():
+        ls = np.array([q[0] for q in pts], dtype=int); d = np.array([q[1] for q in pts], dtype=np.float64)
+        if d.size >= min_tilt:
+            X = np.vstack([np.ones(d.size), xc[ls]]).T
+            sol = np.linalg.lstsq(X, d, rcond=None)[0]; r = d - X @ sol
+            if d.size >= 4:
+                # ONE outlier, leave-one-out: a lone flicker point would otherwise be absorbed into the tilt (a
+                # 60 px point among five 2 px points fits as shift 14 / tilt 30 with no residual standing out).
+                # Refit without each point in turn; if the held-out point sits > max(6 px, 3x the rest's RMS)
+                # off the line that ignores it, drop it.
+                best = None
+                for k in range(d.size):
+                    Xk = np.delete(X, k, 0); dk = np.delete(d, k)
+                    sk = np.linalg.lstsq(Xk, dk, rcond=None)[0]
+                    rms_k = float(np.sqrt(np.mean(np.square(dk - Xk @ sk))))
+                    held = abs(float(d[k] - X[k] @ sk))
+                    if held > max(6.0, 3.0 * rms_k) and (best is None or held > best[0]):
+                        best = (held, k, sk, Xk, dk)
+                if best is not None:
+                    _h, k, sol, X, d = best; r = d - X @ sol
+            a[f], b[f] = float(sol[0]), float(sol[1]); resid.extend(np.abs(r).tolist())
+        elif d.size:
+            a[f], b[f] = float(np.median(d)), 0.0; resid.extend(np.abs(d - np.median(d)).tolist())
+        nfit[f] = int(d.size)
+    ok = np.isfinite(a)
+    if not ok.any():
+        return {"shift": [0.0] * F, "tilt": [0.0] * F, "fitted_frames": 0, "resid_px": None}
+    fr = np.arange(F, dtype=np.float64)
+    a = np.interp(fr, fr[ok], a[ok]); b = np.interp(fr, fr[ok], b[ok])
+    # LIGHT SMOOTHING ACROSS FRAMES: each frame's (a, b) comes from ~8 hand-drawn points (sigma ~1.2 px), so the
+    # unsmoothed fit carries ~0.5 px of per-frame noise, which the volume then inherits as waviness (measured
+    # 0.89 -> 1.24 px). The reviewer's target is a smooth curve; a gaussian of edit_transform_smooth_frames keeps
+    # multi-frame corrections and attenuates single-frame noise. 0 = off.
+    _sm = float(p.get("edit_transform_smooth_frames", 1.0) or 0.0)
+    if _sm > 0 and F > 4:
+        a = ndimage.gaussian_filter1d(a, _sm, mode="nearest"); b = ndimage.gaussian_filter1d(b, _sm, mode="nearest")
+    return {"shift": [round(float(v), 3) for v in a], "tilt": [round(float(v), 3) for v in b],
+            "fitted_frames": int(ok.sum()), "n_points": int(sum(nfit)),
+            "resid_px": (round(float(np.sqrt(np.mean(np.square(resid)))), 2) if resid else None),
+            "shift_range": [round(float(a.min()), 1), round(float(a.max()), 1)],
+            "tilt_max_px": round(float(np.abs(b).max()), 1)}
+
+
+def apply_edit_transform(volume: np.ndarray, et, params: dict | None = None) -> tuple[np.ndarray, dict]:
+    """Apply the case's sticky corrected-pane transform: per frame a RIGID depth shift + tilt (displacement linear
+    in lateral — the same rigid class rigid_frame_refine applies; no per-column deform). `et` = {"shift": [F],
+    "tilt": [F]} in px; + = content DEEPER (the reviewer drew the edge deeper than it sat). Clamped at
+    edit_transform_max_px. `volume` = (frames, depth, lateral). Returns (volume, info)."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not isinstance(et, dict):
+        return volume, {"applied": False, "reason": "no transform"}
+    F, D, L = int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2])
+    try:
+        a = np.asarray(et.get("shift") or [], dtype=np.float64); b = np.asarray(et.get("tilt") or [], dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return volume, {"applied": False, "reason": "malformed transform"}
+    if a.size != F or (b.size not in (0, F)):
+        return volume, {"applied": False, "reason": f"transform length {a.size} != frames {F}"}
+    if b.size == 0:
+        b = np.zeros(F)
+    a = np.where(np.isfinite(a), a, 0.0); b = np.where(np.isfinite(b), b, 0.0)
+    cap = float(p.get("edit_transform_max_px", 80.0))
+    xc = (np.arange(L, dtype=np.float64) - (L - 1) / 2.0) / max(1.0, (L - 1) / 2.0)
+    out = volume.copy(); n = 0
+    for f in range(F):
+        d = np.clip(a[f] + b[f] * xc, -cap, cap)
+        if float(np.max(np.abs(d))) < 0.05:
+            continue
+        out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), d, subpixel=True)
+        n += 1
+    return out, {"applied": bool(n), "frames_moved": int(n), "max_shift_px": round(float(np.abs(a).max()), 2),
+                 "max_tilt_px": round(float(np.abs(b).max()), 2), "rounds": int(et.get("rounds", 1) or 1)}
 
 
 def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
@@ -11597,6 +11738,25 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             info["corrected_edge_anchors"] = _ceinfo
         if _gt_base:
             info["corrected_gt_baseline"] = _gt_base
+        # STICKY CORRECTED-PANE TRANSFORM (corrected_edit_mode="transform"): the reviewer's accumulated per-frame
+        # shift+tilt from every "Regenerate" round, applied to the original as the LAST rigid move — after the
+        # detector-driven stages, so nothing re-detects and undoes it. Its tissue-step cost is measured and
+        # recorded, not vetoed: this move is the reviewer's own line, and roughness/steps there are their call.
+        _et = p_all.get("edit_transform")
+        if isinstance(_et, dict) and _et.get("shift"):
+            _before = corrected
+            corrected, _eti = apply_edit_transform(corrected, _et, params)
+            info["edit_transform"] = _eti
+            if _eti.get("applied"):
+                try:
+                    _tmp: dict = {"edit_transform": {}}
+                    _reject_if_stepped(_before, corrected, "edit_transform", _tmp,
+                                       {**(params or {}), "drawn_edge_step_guard": True})
+                    _ts = (_tmp.get("edit_transform") or {}).get("tissue_step")
+                    if _ts:
+                        info["edit_transform"]["tissue_step"] = _ts      # measured, never acted on here
+                except Exception:  # noqa: BLE001
+                    pass
         ms = p_all.get("manual_shifts")
         if ms:
             corrected, n_ms = apply_manual_shifts(corrected, ms)

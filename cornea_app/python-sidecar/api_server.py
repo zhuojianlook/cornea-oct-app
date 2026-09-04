@@ -2199,7 +2199,7 @@ class OctPreprocessRequest(BaseModel):
 _CORRECTION_PARAM_FIELDS = (
     "border_anchors", "border_generalize", "border_guided", "parabola", "parabola_slices",  # anterior edge / quadratic
     "manual_shifts", "manual_patch",                                                          # legacy per-frame nudges
-    "corrected_edge_anchors", "corrected_trusted_laterals",                                   # corrected-result edge / trusted
+    "corrected_edge_anchors", "corrected_trusted_laterals", "edit_transform",                 # corrected-result edge / trusted / transform
     "axial_anchors",                                                                          # axial fix-tool
     "crop_bands", "crop_region", "crop_lateral", "crop_post_anchors",                          # artifact / box / bottom-line crops
     "surface_crop_frames", "surface_crop_mode", "auto_surface_crop",                          # surface crop (manual + auto flag)
@@ -2725,9 +2725,35 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
     if ((req.use_redetect or req.corrected_smooth_align)
             and (req.corrected_edit_feedback or bool(eff_params.get("corrected_edit_feedback")))):
         try:
-            _folded_corrected = _fold_corrected_edits_into_border_anchors(
-                case_id, m, eff_params, req.corrected_trusted_laterals)
-        except Exception:  # noqa: BLE001 — never fail the re-run over the fold-back; fall through to a plain re-run
+            # corrected_edit_mode="transform" (default, reviewer 2026-09-04): the corrected-pane edits MODIFY THE
+            # TRANSFORM — one rigid shift+tilt per frame fitted to the edit deltas, accumulated on the case and
+            # applied to the original as the last rigid move of every run. "fold" = the 2026-09-02 surface-GT
+            # mechanism (write the depths into border_anchors), measured to change the per-frame move by ~0 px at
+            # 8 edited slices because they are ~6% of the flatten's joint fit.
+            _mode = str(eff_params.get("corrected_edit_mode",
+                                       oct_mod.DEFAULT_PARAMS.get("corrected_edit_mode", "transform"))).lower()
+            if _mode == "fold":
+                _folded_corrected = _fold_corrected_edits_into_border_anchors(
+                    case_id, m, eff_params, req.corrected_trusted_laterals)
+            else:
+                # transform mode: the TRANSFORM carries the correction; the fold still records the accurate lines
+                # into the raw GT so the served surface (and the pane line drawn from it) is right where they drew.
+                # The transform is fitted from the pane edits BEFORE the fold clears them.
+                _cea_keep = dict(eff_params.get("corrected_edge_anchors") or {})
+                _tr = _fit_corrected_edits_into_transform(case_id, m, eff_params, req.corrected_trusted_laterals)
+                if _tr:
+                    eff_params["corrected_edge_anchors"] = _cea_keep
+                    try:
+                        _fd = _fold_corrected_edits_into_border_anchors(case_id, m, eff_params, req.corrected_trusted_laterals)
+                    except Exception as _fe:  # noqa: BLE001
+                        print(f"[corrected-edit] fold after transform failed: {type(_fe).__name__}", file=sys.stderr); _fd = None
+                    eff_params.pop("corrected_edge_anchors", None); eff_params.pop("corrected_accurate", None)
+                    eff_params["edit_transform"] = (m.get("oct_params") or {}).get("edit_transform") or eff_params.get("edit_transform")
+                    if isinstance(_fd, dict):
+                        _tr["fold"] = {k: _fd.get(k) for k in ("anchors_before", "anchors_after", "generalized", "backup")}
+                _folded_corrected = _tr
+        except Exception as _fexc:  # noqa: BLE001 — never fail the re-run over the fold-back; fall through to a plain re-run
+            print(f"[corrected-edit] fold/transform failed for {case_id}: {type(_fexc).__name__}: {_fexc}", file=sys.stderr)
             _folded_corrected = False
     # Sanitize the EFFECTIVE set (request-provided OR carried-through from persisted oct_params): drop any
     # zero / NaN / Infinity / malformed entry so the manifest never accumulates no-op garbage and always
@@ -5124,6 +5150,23 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape):
         return None, f"provided_edges unreadable: {exc}"
     if surf0.shape != (L, F):
         return None, f"provided_edges shape {surf0.shape} != corrected {(L, F)}"
+    # CANVAS PAD (bug found 2026-09-04 on cs048_od_v1_3). provided_edges.npz is in RAW-canvas rows, but when the
+    # pipeline extends the canvas for an above-window apex it pads the volume at the TOP and shifts the provided
+    # edges by the same amount (preprocess_oct_to_nifti: `provided_edges = _pe + float(_ext_pad)`). The move below
+    # is measured against the raw padded the same way, so it is in PADDED rows too — carrying an UNPADDED surface
+    # by it left the corrected-pane line exactly `pad` rows above the tissue (measured: the carried line sat 6 px
+    # ABOVE the dark->bright crossing where the reviewer's own convention is 5 px below it; +9 brought it to -3),
+    # and the fold-back of corrected-pane edits (new_GT = served + edit - carried) then wrote the reviewer's redrawn
+    # depths `pad` rows too DEEP into border_anchors (measured -13 px vs -5 px for their own raw-pane anchors).
+    # Offset the surface into the corrected canvas here, once, for both the cached and the measured branch.
+    try:
+        import nibabel as _nib
+        _raw_depth = int(_nib.load(str(raw)).shape[1])
+    except Exception:  # noqa: BLE001
+        _raw_depth = D
+    _canvas_pad = int(D - _raw_depth) if D > _raw_depth else 0
+    if _canvas_pad > 0:
+        surf0 = surf0 + float(_canvas_pad)
     key = f"{raw.stat().st_mtime_ns}:{work.stat().st_mtime_ns}:{p.get('corrected_prior_max_lag')}:{p.get('corrected_prior_min_cols')}"
     mv_path = bc / "applied_move.npz"
     move = None
@@ -5171,6 +5214,7 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape):
     # The carry itself lives in oct_preprocess so the PIPELINE can build the identical prior at its own warp
     # sites (oct_preprocess.carry_correction_curve). Everything above is case-store I/O the worker has no access
     # to; the arithmetic is the part that has to be shared.
+    meta["canvas_pad"] = _canvas_pad
     return oct_mod.carry_correction_curve(surf0, move, D), meta
 
 
@@ -5295,6 +5339,132 @@ def _axial_surface_cached(case_id: str, work: Path, p: dict):
     # (surf) is drawn alongside it in its own colour instead of silently replacing it.
     _AXIAL_SURF_CACHE[case_id] = (mt, sig, surf, shape, _gap.astype(np.float32), _pre_gen)
     return surf, shape
+
+
+def _fit_corrected_edits_into_transform(case_id: str, m: dict, eff_params: dict, trusted_laterals=None):
+    """The reviewer's CORRECTED-pane edits → the case's sticky per-frame TRANSFORM (reviewer, 2026-09-04: the
+    corrections to the corrected edge inform the axial shifts/tilts applied to the original; the regenerate button
+    modifies the transform; iterate until the corrected slice is right).
+
+    delta[l, f] = depth the reviewer DREW − where the tissue edge sits on the current corrected result (the pane's
+    own constrained line, i.e. the served surface carried by the measured move, canvas pad included). A slice
+    MARKED accurate contributes delta 0 at every frame (the current edge is right there — it anchors the fit so
+    the tilt does not swing those slices). fit_edit_transform turns the deltas into one (shift, tilt) per frame;
+    the result is ADDED to oct_params.edit_transform (rounds accumulate), the pane verifications are cleared (they
+    described the previous result), and the run applies the accumulated transform as its last rigid move. Returns
+    the record for oct_iter.corrected_fold (folded=True so the UI flow is unchanged) or False if nothing to do."""
+    import numpy as np
+    import nibabel as nib
+    cea = eff_params.get("corrected_edge_anchors") or {}
+    trusted = {int(x) for x in (trusted_laterals or []) if isinstance(x, (int, float))}
+    for _k in ((m.get("oct_params") or {}).get("corrected_accurate") or {}):
+        try:
+            trusted.add(int(_k))
+        except (TypeError, ValueError):
+            continue
+    if not cea and not trusted:
+        return False
+    op = dict(m.get("oct_params") or {})
+    p = {**oct_mod.DEFAULT_PARAMS, **op}
+    try:
+        _work = _oct_corrected_vol_path(case_id, m)
+        _cvol = np.asarray(nib.load(str(_work)).dataobj)               # (lateral, depth, frame)
+        L, depth, F = int(_cvol.shape[0]), int(_cvol.shape[1]), int(_cvol.shape[2])
+        cdet = np.asarray(_corrected_detected_surface(case_id, _work, p, _cvol.astype(np.float32)),
+                          dtype=np.float64)                            # the pane's line on THIS result
+    except Exception as exc:  # noqa: BLE001
+        print(f"[corrected-edit] no current corrected line for {case_id}: {type(exc).__name__}", file=sys.stderr)
+        return False
+    if cdet.shape != (L, F):
+        return False
+    # THE REVIEWER'S SEMANTICS (2026-09-03, verbatim): "A slice marked as accurate ... merely means that the edge
+    # that is detected/edited is CORRECT and this edge can then be used to be PULLED TOWARDS A BETTER FIT TOWARDS A
+    # QUADRATIC." So a verified edge (drawn, or marked = the pane's own line) is WHERE THE EDGE IS, and the move it
+    # asks for is the one that makes it quadratic: delta[l,f] = (its own deg-2 across frames) - edge[l,f]. NOT
+    # "drawn minus the pane line": that mistakes a wrong pane line for a requested move (measured on cs048: it
+    # moved the last frames 40 px, stepped 116/128 laterals at 96->97 and raised waviness 0.89 -> 1.24 px).
+    deltas: dict = {}
+    n_edit = 0
+    def _line_to_quad(fr_list, dep_list):
+        fr = np.asarray(fr_list, dtype=np.float64); dep = np.asarray(dep_list, dtype=np.float64)
+        if fr.size < 8:
+            return None
+        c = np.polyfit(fr, dep, 2)
+        return {int(f): float(qv - dv) for f, qv, dv in zip(fr, np.polyval(c, fr), dep)}
+    for l_str, fm in cea.items():
+        try:
+            l = int(l_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= l < L) or not isinstance(fm, dict):
+            continue
+        pts = []
+        for f_str, d_new in fm.items():
+            try:
+                f = int(f_str); dn = float(d_new)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < F and np.isfinite(dn):
+                pts.append((f, dn))
+        pts.sort()
+        dl = _line_to_quad([q[0] for q in pts], [q[1] for q in pts])
+        if dl:
+            deltas[l] = dl; n_edit += len(dl)
+    for l in sorted(trusted):                                          # marked accurate = the pane's own line is the edge
+        if 0 <= l < L and l not in deltas:
+            fr = [f for f in range(F) if np.isfinite(cdet[l, f])]
+            dl = _line_to_quad(fr, [float(cdet[l, f]) for f in fr])
+            if dl:
+                deltas[l] = dl
+    if not deltas:
+        return False
+    fit = oct_mod.fit_edit_transform(deltas, L, F, p)
+    prev = op.get("edit_transform") if isinstance(op.get("edit_transform"), dict) else None
+    shift = np.asarray(fit["shift"], dtype=np.float64); tilt = np.asarray(fit["tilt"], dtype=np.float64)
+    rounds = 1
+    if prev and isinstance(prev.get("shift"), list) and len(prev["shift"]) == F:
+        shift = shift + np.asarray(prev["shift"], dtype=np.float64)
+        tilt = tilt + np.asarray(prev.get("tilt") or [0.0] * F, dtype=np.float64)
+        rounds = int(prev.get("rounds", 1) or 1) + 1
+    hist = list((prev or {}).get("history") or [])[-9:]
+    hist.append({"at": int(time.time()), "laterals": sorted(int(k) for k in cea), "marked": sorted(trusted),
+                 "n_points": int(n_edit), "fit": {k: fit[k] for k in ("fitted_frames", "resid_px", "shift_range", "tilt_max_px")}})
+    et = {"shift": [round(float(v), 3) for v in shift], "tilt": [round(float(v), 3) for v in tilt],
+          "rounds": rounds, "history": hist}
+    # backup of the previous state (same place the fold keeps its snapshots), then persist
+    _bak_rel = None
+    try:
+        _bdir = orch.case_root(case_id) / "fold_backup"
+        _bdir.mkdir(parents=True, exist_ok=True)
+        _bak = _bdir / f"pretransform_{int(time.time())}.json"
+        _bak.write_text(json.dumps({"saved_at": int(time.time()), "edit_transform": prev,
+                                    "corrected_edge_anchors": cea, "trusted_laterals": sorted(trusted)}), encoding="utf-8")
+        _bak_rel = _bak.name
+        for _o in sorted(_bdir.glob("pretransform_*.json"))[:-10]:
+            try:
+                _o.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        return False
+    _verified_cleared = dict(op.get("corrected_accurate") or {})
+    op["edit_transform"] = et
+    op.pop("corrected_edge_anchors", None)
+    op.pop("corrected_accurate", None)
+    orch.write_manifest_value(case_id, {"oct_params": op})
+    m["oct_params"] = op
+    eff_params["edit_transform"] = et
+    eff_params.pop("corrected_edge_anchors", None)
+    eff_params.pop("corrected_accurate", None)
+    return {"folded": True, "mode": "transform", "n_points": int(n_edit),
+            "laterals": sorted(int(k) for k in cea), "pinned_laterals": sorted(trusted),
+            "verified_cleared": {k: {"baseline_px": (v or {}).get("baseline_px"),
+                                     "current_px": (v or {}).get("current_px")}
+                                 for k, v in _verified_cleared.items()},
+            "transform": {"rounds": rounds, "fitted_frames": fit["fitted_frames"], "resid_px": fit["resid_px"],
+                          "shift_range": fit["shift_range"], "tilt_max_px": fit["tilt_max_px"],
+                          "total_shift_range": [round(float(shift.min()), 1), round(float(shift.max()), 1)]},
+            "backup": _bak_rel}
 
 
 def _fold_corrected_edits_into_border_anchors(case_id: str, m: dict, eff_params: dict,

@@ -1134,3 +1134,42 @@ class TestTissueStepGuard:
         assert info["s"]["rougher_note"].startswith("measured on the discarded move")
         assert info["s"]["roughness_veto"].endswith("discarded by the tissue-step guard")
         assert "_surface_before" not in info["s"]
+
+
+# ───────────────────────── corrected-pane edit transform (regenerate modifies the transform) ─────────────
+class TestEditTransform:
+    def test_fit_recovers_known_shift_and_tilt(self):
+        L, F = 513, 101
+        xc = (np.arange(L) - (L - 1) / 2.0) / ((L - 1) / 2.0)
+        a_true = np.linspace(-3.0, 5.0, F); b_true = np.linspace(2.0, -1.0, F)
+        lats = [60, 150, 240, 330, 420, 500]
+        deltas = {l: {f: float(a_true[f] + b_true[f] * xc[l]) for f in range(0, F, 5)} for l in lats}
+        et = M.fit_edit_transform(deltas, L, F)
+        assert et["fitted_frames"] == len(range(0, F, 5))
+        assert np.allclose(et["shift"], a_true, atol=0.05) and np.allclose(et["tilt"], b_true, atol=0.05)
+
+    def test_fit_shift_only_with_few_laterals_and_outlier_drop(self):
+        L, F = 513, 20
+        deltas = {100: {f: 4.0 for f in range(F)}, 300: {f: 4.0 for f in range(F)}}     # 2 laterals -> shift only
+        et = M.fit_edit_transform(deltas, L, F)
+        assert np.allclose(et["shift"], 4.0) and np.allclose(et["tilt"], 0.0)
+        deltas = {l: {5: 2.0} for l in (50, 150, 250, 350, 450)}; deltas[450][5] = 60.0   # one eyelid-corner outlier
+        et = M.fit_edit_transform(deltas, L, F)
+        assert abs(et["shift"][5] - 2.0) < 0.3 and abs(et["tilt"][5]) < 0.3
+
+    def test_apply_moves_content_deeper_by_the_shift(self):
+        F, D, L = 6, 80, 64
+        vol = np.zeros((F, D, L), np.float32); vol[:, 30, :] = 1.0          # a bright row at depth 30 in every frame
+        et = {"shift": [0, 0, 5, 5, 0, 0], "tilt": [0] * F}
+        out, info = M.apply_edit_transform(vol, et)
+        assert info["applied"] and info["frames_moved"] == 2
+        assert int(np.argmax(out[2, :, 10])) == 35 and int(np.argmax(out[0, :, 10])) == 30
+        # a tilt: + at the right edge, - at the left (half-span 4 px)
+        et = {"shift": [0] * F, "tilt": [0, 0, 4, 0, 0, 0]}
+        out, _i = M.apply_edit_transform(vol, et)
+        assert int(np.argmax(out[2, :, L - 1])) == 34 and int(np.argmax(out[2, :, 0])) == 26
+
+    def test_apply_rejects_wrong_length(self):
+        vol = np.zeros((6, 40, 8), np.float32)
+        out, info = M.apply_edit_transform(vol, {"shift": [1, 2, 3]})
+        assert out is vol and info["applied"] is False
