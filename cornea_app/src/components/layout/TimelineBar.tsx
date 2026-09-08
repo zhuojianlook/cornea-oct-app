@@ -127,7 +127,8 @@ export function TimelineBar() {
   // VERIFIED slices on the corrected scan. The reviewer's loop (2026-09-02) treats a DRAWN edge and a slice
   // MARKED accurate as the same thing — "in either case those slices are verified as accurate" — so both feed
   // the regenerate. Sources: persisted drawings, persisted marks, and anything still dirty in the panel.
-  const verifiedDrawn = Object.keys((octParams?.corrected_edge_anchors ?? {}) as Record<string, unknown>);
+  const verifiedDrawn = [...Object.keys((octParams?.corrected_edge_anchors ?? {}) as Record<string, unknown>),
+                         ...Object.keys((octParams?.corrected_post_anchors ?? {}) as Record<string, unknown>)];
   const verifiedMarked = Object.keys((octParams?.corrected_accurate ?? {}) as Record<string, unknown>);
   // Marks the reviewer has just made live in pendingEditStore until the POST round-trips, so include them too:
   // otherwise the button flickers out between the click and the manifest mirror, and a mark made while the
@@ -151,6 +152,8 @@ export function TimelineBar() {
   const applyCorrections = useCaseStore((s) => s.applyCorrections);
   const approveRaw = useCaseStore((s) => s.approveRaw);
   const caseBusy = useCaseStore((s) => s.busy);
+  // Stale-pipeline auto re-run notice (caseStore.openCase): why this scan is re-running on open, then the outcome.
+  const autoRerunNote = useCaseStore((s) => s.autoRerunNote);
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const resetStep = useCaseStore((s) => s.resetStep);
   const confirmSubgroup = useCaseStore((s) => s.confirmSubgroup);
@@ -865,11 +868,12 @@ export function TimelineBar() {
           REPLACES the raw anchor at the same (lateral, frame). Corrected mode only, and only when there is
           something to fold. Green — it is a "promote my better observation" action, not a destructive one from
           the reviewer's point of view, though it does rewrite border_anchors (backed up server-side first). */}
-      {editTarget === "corrected" && foldableLats > 0 && !rawDirty && (
+      {editTarget === "corrected" && foldableLats > 0 && (
         <Button size="small" variant="outlined" color="success" disabled={busy || navigating}
           onClick={() => void foldToOriginalAndRerun()}
           startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title={"REGENERATE the corrected scan from every slice you have verified on it (~2 min).\n\n"
+          title={(rawDirty ? "NOTE: you have unconfirmed edits on the ORIGINAL pane — they are not part of this regenerate. Confirm them first if you want them in.\n\n" : "")
+            + "REGENERATE the corrected scan from every slice you have verified on it (~2 min).\n\n"
             + "Both kinds of verification count and are treated the same way:\n"
             + "  \u2022 slices you DREW on — those depths are written into the original scan's edge, replacing the\n"
             + "    earlier raw anchor wherever they disagree;\n"
@@ -877,6 +881,9 @@ export function TimelineBar() {
             + "    new scan has to reproduce them.\n\n"
             + "The whole correction is then re-run from that improved ground truth, so the defect is not\n"
             + "re-created — nothing is warped after the fact.\n\n"
+            + "Your drawings set the EDGE LINE the scan is flattened to; they do not by themselves move frames\n"
+            + "(a per-frame move fitted from a few hand-drawn lines measured worse than none — cs002, 2026-09-05).\n"
+            + "The per-frame move itself is measured from the tissue (adjacent-frame correlation of the whole B-scan).\n\n"
             + "Your verifications are CLEARED afterwards: they described the previous corrected scan, and the next\n"
             + "round starts on the one just produced. Their readings are kept in oct_iter.corrected_fold, and the\n"
             + "pre-run anchors are snapshotted to cases/<id>/fold_backup/prefold_<ts>.json."}
@@ -919,6 +926,15 @@ export function TimelineBar() {
         </span>
       )}
       {queueNote && <span className="text-[11px]" style={{ color: "var(--c-amber, #d9a441)" }}>{queueNote}</span>}
+      {/* Stale-pipeline auto re-run (openCase): the scan opened with a result from an older pipeline version and
+          is being re-run through the current one — the same call as ↻ Re-run with corrections. While it runs the
+          global status line (right) carries the same text; this one stays after it finishes with the outcome. */}
+      {autoRerunNote && (
+        <span className="text-[11px]" data-testid="auto-rerun-note" title={autoRerunNote}
+              style={{ color: "var(--c-amber, #d9a441)", maxWidth: 420, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          {autoRerunNote}
+        </span>
+      )}
     </span>
   );
 
@@ -992,20 +1008,20 @@ export function TimelineBar() {
             opens straight away. Working through the backlog is the dominant activity at this step, and the
             old single "✓ Approve preprocessing" left the reviewer to find the next row themselves. */}
         {ReviewLoop}
-        {/* Full AUTO re-run from the raw .OCT (fresh surface detect + surface-crop detect + warp). Keeps sticky
-            manual surface-crop / crop params; DISCARDS Fix-columns border corrections, so it is guarded by a confirm
-            when the scan has any. Useful to un-stick a scan (e.g. one left in a bad manual state) or pick up an
-            improved detector without hunting through Fix-columns → Run. */}
+        {/* FULL reset to automatic preprocessing from the raw .OCT (reviewer 2026-09-04): discards EVERY manual
+            correction and mark and re-runs fresh surface detect + surface-crop detect + warp. It used to keep the
+            sticky crop / surface-crop marks and drop only border corrections, so a scan could never be brought back
+            to a pure auto state from here. Always confirms (destructive of all edits). */}
         <Button size="small" variant="outlined" color="warning" disabled={busy} sx={ACT_SX}
           onClick={() => {
-            if (hasBorderCorrection && armed !== "reprocess") { arm("reprocess"); return; }
+            if (armed !== "reprocess") { arm("reprocess"); return; }   // always confirm: it discards everything
             setArmed(null);
             setBusyAction("rerun"); void rerunPreprocess();
           }}
           startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
-          title="Re-preprocess from the raw .OCT — fresh corneal-surface detection, surface-crop detection and warp. DISCARDS your manual border corrections (edge drags / shaped curve; asks first if any exist); KEEPS surface-crop frames, crop region and classification. Resets to Preprocessed — re-inspect, then Approve.">
+          title="Reset this scan to AUTOMATIC preprocessing from the raw .OCT: discards EVERY manual correction and mark (border / corrected-edge / axial anchors, bottom lines, artifact + surface crops, marks, force/good columns, manual patch/shifts, edit transform) and re-runs fresh surface detection, surface-crop detection and warp. Same as ⟲ Clear all corrections. Confirms on a second click.">
           {busyAction === "rerun" && caseBusy ? "Re-preprocessing…"
-            : armed === "reprocess" ? "↻ Discards border corrections — click again" : "↻ Re-preprocess"}
+            : armed === "reprocess" ? "↻ Resets EVERYTHING to auto — click again" : "↻ Re-preprocess"}
         </Button>
         {/* FULL reset — the superset of Re-preprocess. Discards EVERY manual correction (border + corrected-edge +
             axial anchors, artifact/surface crops, marks, force/good columns, manual patch/shifts) and re-runs pure

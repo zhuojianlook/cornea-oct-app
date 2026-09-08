@@ -28,6 +28,15 @@ import zipfile
 from pathlib import Path
 from typing import List
 
+# FORK SAFETY (2026-09-07) — must precede the numpy import. This server is multi-threaded (uvicorn) and forks
+# worker processes for the per-slice detectors (oct_preprocess._map_slices / detect_surface_all). OpenBLAS
+# starts one thread per core (24 here); a fork taken while those threads hold its internal locks leaves the
+# CHILD deadlocked before it runs, and the parent then waits on it forever — two requests wedged for 11 h and
+# 22 h on 2026-09-06, ~3.2 GB leaked, the reviewer's re-preprocess spinner never finishing. The parallelism in
+# this process is by PROCESS, so BLAS threads in the parent buy nothing. setdefault: a launcher can override.
+for _blas_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_blas_var, "1")
+
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -251,15 +260,71 @@ class CasePayload(BaseModel):
     case_id: str
 
 
+def run_is_current(manifest: dict | None) -> tuple[bool, str]:
+    """PURE: is this case's last preprocessing run the product of the pipeline that is running now?
+
+    True iff manifest.oct_iter.pipeline_version == oct_preprocess.PIPELINE_VERSION. Every other state is
+    STALE and the app re-runs the scan on open when it is not yet approved (preproc_vetted falsy) — that is
+    the whole point: the reviewer opened case_cs011_od_v3 via the approve queue, saw an old-flatten result
+    and reported it as a regression. The reason string is for the UI / bulk tool, never branched on.
+
+    Reasons:  "current"           stamped with the running version
+              "kept_raw"         reviewer chose "Use original" — nothing to be stale; reported CURRENT so
+                                 an auto re-run never silently overrides that decision
+              "not_preprocessed" no run has ever been made (oct_preprocessed falsy AND no oct_iter);
+                                 reported STALE — the app's queue rule (oct_preprocessed && !vetted) is
+                                 what keeps raw-only scans out of the auto re-run, not this helper
+              "no_oct_iter"      preprocessed but no run record at all (cohort load-dir import)
+              "unstamped"        a run record from before PIPELINE_VERSION existed (every pre-2026-09-07 run)
+              "mismatch"         stamped by an older (or newer) pipeline than the one running now
+    """
+    m = manifest or {}
+    it = m.get("oct_iter")
+    if not isinstance(it, dict) or not it:
+        if not m.get("oct_preprocessed"):
+            return False, "not_preprocessed"
+        return False, "no_oct_iter"
+    if it.get("stopped") == "kept_raw" or m.get("oct_kept_raw"):
+        return True, "kept_raw"
+    ver = it.get("pipeline_version")
+    if not ver:
+        return False, "unstamped"
+    if str(ver) != str(oct_mod.PIPELINE_VERSION):
+        return False, "mismatch"
+    return True, "current"
+
+
+def _pipeline_fields(manifest: dict | None) -> dict:
+    """The four pipeline_* keys the frontend reads on case open (top level of the /api/case response)."""
+    cur, why = run_is_current(manifest)
+    run_ver = ((manifest or {}).get("oct_iter") or {}).get("pipeline_version") if isinstance(
+        (manifest or {}).get("oct_iter"), dict) else None
+    return {
+        "pipeline_current": bool(cur),
+        "pipeline_version_run": (str(run_ver) if run_ver else None),
+        "pipeline_version_now": str(oct_mod.PIPELINE_VERSION),
+        "pipeline_reason": why,
+    }
+
+
+def _case_info_with_pipeline(case_id: str) -> dict:
+    info = orch.current_case_info(case_id)
+    info.update(_pipeline_fields(info.get("manifest") or {}))
+    return info
+
+
 @app.post("/api/case")
 def create_case(payload: CasePayload) -> dict:
+    """The response every case OPEN reads (caseStore.openCase → CaseInfo). Carries pipeline_current /
+    pipeline_version_run / pipeline_version_now / pipeline_reason at top level so the app can decide, from
+    the same round trip, whether to auto re-run an un-approved scan made by an older pipeline."""
     orch.ensure_case_dirs(payload.case_id)
-    return orch.current_case_info(payload.case_id)
+    return _case_info_with_pipeline(payload.case_id)
 
 
 @app.get("/api/case/{case_id}")
 def get_case(case_id: str) -> dict:
-    return orch.current_case_info(case_id)
+    return _case_info_with_pipeline(case_id)
 
 
 # ── Volume registration / upload / conversion ──────────────────────────────
@@ -2092,6 +2157,23 @@ def consensus_build(req: ConsensusBuildRequest) -> dict:
             "images": orch.preview_images_from_dir("Segmentation", _preview_group_dir(ccid, "segmentation"))}
 
 
+# ── Steps v2: run-provenance tree + publication export (run_provenance.py) ──
+class RunGraphRequest(BaseModel):
+    slice_index: int | None = None   # render node images at this lateral only (default: central + most-edited)
+    want_images: bool = True         # False → every node's images == [] (fast path for the tree list)
+    thumb_h: int = 300               # thumbnail height, clamped 120..600
+
+
+class RunReportRequest(BaseModel):
+    slice_index: int | None = None
+    dpi: int = 300                   # clamped 72..600 by run_provenance.clamp_dpi (a 10 000-dpi request must not exhaust memory)
+    include_filmstrip: bool = False  # also copy previews/oct_steps/*.png when that dir exists (never re-runs the worker)
+
+
+class RunReportSaveRequest(BaseModel):
+    dest: str
+
+
 # ── .OCT preprocessing (Optovue Avanti): inspect → correct → register case ──
 # Pipeline (oct_preprocess.py, ported from the user's OCT_Extraction scripts):
 #   upload .OCT (+ companion .txt) → raw z-stack NIfTI for scrubbing → on Run, the
@@ -2151,6 +2233,8 @@ class OctPreprocessRequest(BaseModel):
                                               # a tilt-aware re-detection of the whole RAW volume seeded by these.
     axial_anchors: dict | None = None         # AXIAL fix-tool "Confirm": {str(frame): {str(lateral): true_depth}}
     corrected_edge_anchors: dict | None = None  # CORRECTED-result sagittal fix-tool: {str(lateral): {str(frame): corrected_depth}}
+    corrected_post_anchors: dict | None = None  # CORRECTED-result BOTTOM (posterior) line edits, same shape; verified bottom
+                                                # edges feed the transform like top ones and fold into crop_post_anchors
                                               # anterior-surface depths (CORRECTED-output depth space, 0 = TOP) drawn on
                                               # an axial B-scan across laterals. STICKY like manual_shifts: applied as a
                                               # post-hoc additive per-frame warp (apply_axial_surface_gt); {} clears.
@@ -2199,11 +2283,12 @@ class OctPreprocessRequest(BaseModel):
 _CORRECTION_PARAM_FIELDS = (
     "border_anchors", "border_generalize", "border_guided", "parabola", "parabola_slices",  # anterior edge / quadratic
     "manual_shifts", "manual_patch",                                                          # legacy per-frame nudges
-    "corrected_edge_anchors", "corrected_trusted_laterals", "edit_transform",                 # corrected-result edge / trusted / transform
+    "corrected_edge_anchors", "corrected_trusted_laterals", "edit_transform", "corrected_post_anchors",   # corrected-result edge / bottom / trusted / transform
     "axial_anchors",                                                                          # axial fix-tool
     "crop_bands", "crop_region", "crop_lateral", "crop_post_anchors",                          # artifact / box / bottom-line crops
     "surface_crop_frames", "surface_crop_mode", "auto_surface_crop",                          # surface crop (manual + auto flag)
     "surface_cut", "zero_cols",                                                                # cut / zeroed frames
+    "flatten_exclude_laterals",                                                                # folded laterals kept out of the flatten
     "force_columns", "good_columns",                                                           # fix-columns force / good
     "detilt",                                                                                  # applied de-tilt
     "redetect_seed_window", "redetect_seed_window_slices",                                     # seed windows tied to anchors
@@ -2731,10 +2816,16 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
             # mechanism (write the depths into border_anchors), measured to change the per-frame move by ~0 px at
             # 8 edited slices because they are ~6% of the flatten's joint fit.
             _mode = str(eff_params.get("corrected_edit_mode",
-                                       oct_mod.DEFAULT_PARAMS.get("corrected_edit_mode", "transform"))).lower()
+                                       oct_mod.DEFAULT_PARAMS.get("corrected_edit_mode", "line"))).lower()
             if _mode == "fold":
                 _folded_corrected = _fold_corrected_edits_into_border_anchors(
                     case_id, m, eff_params, req.corrected_trusted_laterals)
+            elif _mode != "transform":
+                # "line" (DEFAULT 2026-09-05): the pane drawings are LINE ground truth. Fold them into the raw
+                # edge so the served/pane line sits where they drew, keep those laterals OUT of the per-frame
+                # move, fit no transform. Measured on cs002_os_v1: a transform from 9 hand-drawn lines and the
+                # same lines driving the flatten both made the tissue LESS quadratic (3.71 → 4.66 / 4.53 px).
+                _folded_corrected = _fold_corrected_edits_as_line_gt(case_id, m, eff_params, req.corrected_trusted_laterals)
             else:
                 # transform mode: the TRANSFORM carries the correction; the fold still records the accurate lines
                 # into the raw GT so the served surface (and the pane line drawn from it) is right where they drew.
@@ -2743,10 +2834,16 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
                 _tr = _fit_corrected_edits_into_transform(case_id, m, eff_params, req.corrected_trusted_laterals)
                 if _tr:
                     eff_params["corrected_edge_anchors"] = _cea_keep
+                    _ba_before = {str(k) for k in (eff_params.get("border_anchors") or {})}
                     try:
                         _fd = _fold_corrected_edits_into_border_anchors(case_id, m, eff_params, req.corrected_trusted_laterals)
                     except Exception as _fe:  # noqa: BLE001
                         print(f"[corrected-edit] fold after transform failed: {type(_fe).__name__}", file=sys.stderr); _fd = None
+                    # The folded laterals repair the SERVED surface (pane line right where they drew) but must not
+                    # re-shape the flatten the transform was fitted for — see DEFAULT_PARAMS flatten_exclude_laterals.
+                    # (cs042_os_v1_3: fold-driven flatten changes of up to 8.9 px under a transform fitted for the
+                    # old move; plus the stroke gaps were chord-bridged. Sticky so every later re-run agrees.)
+                    _exclude_folded_from_flatten(case_id, m, eff_params, _ba_before)
                     eff_params.pop("corrected_edge_anchors", None); eff_params.pop("corrected_accurate", None)
                     eff_params["edit_transform"] = (m.get("oct_params") or {}).get("edit_transform") or eff_params.get("edit_transform")
                     if isinstance(_fd, dict):
@@ -2785,9 +2882,21 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
     # genuinely nothing to do.
     _has_sticky_crop = bool(eff_params.get("crop_bands") or eff_params.get("crop_region")
                             or eff_params.get("surface_crop_frames") or eff_params.get("crop_lateral"))
-    if req.use_redetect and not _want_redetect and not req.corrected_smooth_align and not _has_sticky_crop:
+    # NO DRAWN LINE IS NEEDED ANY MORE (2026-09-07). Since the per-frame move is MEASURED FROM THE TISSUE
+    # (oct_preprocess.tissue_motion_move) the corrections path no longer depends on the reviewer having drawn
+    # anything — the served edge can be the automatic detection. Requiring a line before a fresh scan could
+    # reach the better pipeline was an artificial gate: the reviewer hit it on case_cs010_os_v3 and again on
+    # cs011_od_v3, whose delivered volumes still came from the old flatten. So use_redetect with no anchors now
+    # runs the corrections path against the AUTO baseline surface. corrections_need_anchors=True restores the error.
+    # A sticky crop is NOT a reason to fall back to the old flatten (review 2026-09-07 H1): the corrections path
+    # applies crop_bands / crop_region / surface_crop_frames itself, so a stale scan carrying a crop mark and no
+    # drawn line must reach the tissue-move path too — otherwise it would be auto re-run through the OLD flatten
+    # and then stamped as current.
+    _seed_auto = (req.use_redetect and not _want_redetect and not req.corrected_smooth_align
+                  and not bool(eff_params.get("corrections_need_anchors", False)))
+    if req.use_redetect and not _want_redetect and not req.corrected_smooth_align and not _has_sticky_crop and not _seed_auto:
         raise HTTPException(400, "No confirmed border anchors to apply — drag the border and Confirm first.")
-    if _want_redetect:
+    if _want_redetect or _seed_auto:
         anchors = (m.get("oct_params") or {}).get("border_anchors") or {}
         # ensure a FRESH cache for the persisted anchors (recompute if missing/stale incl. an algorithm
         # upgrade), then feed it to the worker — same surface the scrub display uses (preview == result).
@@ -2796,6 +2905,15 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
         # redetect.npz: on a border_guided scan those differ, so the old code showed one edge and warped to
         # another. Persist the returned surface to its own npz so the worker flattens to what the reviewer saw.
         surf_for_warp = _redetect_surface_cached(case_id, m, anchors)
+        if surf_for_warp is None and _seed_auto:
+            # no anchors: the AUTO detection is the served edge. Same surface the fix-columns pane already
+            # draws on an untouched scan, so preview == result still holds.
+            try:
+                _arr0 = _load_border_vol(_ensure_raw_border_nifti(case_id))
+                surf_for_warp = _baseline_surface(case_id, _arr0, {**oct_mod.DEFAULT_PARAMS, **eff_params})
+            except Exception as _sexc:  # noqa: BLE001
+                print(f"[preprocess] auto-seed failed for {case_id}: {type(_sexc).__name__}", file=sys.stderr)
+                surf_for_warp = None
         if surf_for_warp is None:
             raise HTTPException(400, "No re-detected surface to apply — drag the border and Confirm first.")
         # LIMBUS/edge-band smoothing of the warp TARGET so the corrected tissue ascends smoothly onto the faint
@@ -2821,9 +2939,23 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
             _det_rep = oct_mod.determinism_report(anchors, _det_base, surf_for_warp,
                                                   {**_det_p, **{k: v for k, v in eff_params.items()
                                                                 if str(k).startswith("determinism_")}})
+            # With flatten_motion_source="tissue" the per-frame MOVE is measured from the tissue, so the report's
+            # shift gains describe the served EDGE (display / GT / crop placement), not a delivered move.
+            if isinstance(_det_rep, dict) and str(_det_p.get("flatten_motion_source", "tissue")).lower() == "tissue":
+                _det_rep["move_source"] = "tissue"
         except Exception:  # noqa: BLE001 — advisory; never fail a preprocessing run over it
             _det_rep = None
         eff_params["border_anchors"] = anchors        # keep them persisted on the case
+        # SHAPED-PARABOLA TARGETS for the drawn flatten (see oct_preprocess._drawn_frame_rigid): a drawn line that
+        # is itself a parabola (Quadratic tool: deg-2 RMS < shaped_line_max_rms over >= shaped_line_min_frames)
+        # means "the edge SHOULD be here", so its target is parabola − the auto edge, de-meaned per lateral.
+        try:
+            _st = _shaped_line_targets(anchors, _det_base, {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})},
+                                       (m.get("oct_params") or {}).get("surface_crop_frames") or [])
+            if _st:
+                eff_params["_shaped_line_targets"] = _st
+        except Exception as _sexc:  # noqa: BLE001 — advisory input; never fail the run over it
+            print(f"[flatten] shaped-line targets skipped: {type(_sexc).__name__}", file=sys.stderr)
         # the re-detect warp flattens to EXACTLY the previewed surface — legacy per-frame manual_shifts (which
         # the scrub preview does NOT show) would break preview==result, so they're superseded here.
         eff_params.pop("manual_shifts", None)
@@ -2832,6 +2964,7 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
         # the cached surface so a later fix-columns scrub/Run can't show/apply a stale re-detected border.
         eff_params.pop("border_anchors", None)
         eff_params.pop("border_generalize", None)   # whole-volume-generalize flag (its cache is in border_cache)
+        eff_params.pop("flatten_exclude_laterals", None)   # described folded anchors that are gone with them (review 2026-09-05)
         # ...and the per-lateral artifact bands. "↻ Re-preprocess" means "start this scan again from the raw
         # .OCT", and the reviewer reasonably expects their ⊟ Crop artifact marks to go with the rest of the
         # manual state (2026-09-02). They were being kept as "sticky geometry", which left a re-preprocessed
@@ -2872,6 +3005,13 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
     # persisted to oct_params), so they don't stick like a sticky correction. apply_proposals bakes the auto
     # crop; corrected_smooth_align is the corrected pane's "use the detected edge" smooth-fit rigid align.
     _wparams = dict(eff_params)
+    if not _folded_corrected:
+        # PANE EDITS ONLY ACT THROUGH REGENERATE (reviewer 2026-09-05, cs002_os_v1): a plain "Re-run with corrections"
+        # used to hand the sticky corrected-pane lines to the worker, whose OLD post-hoc edge warp then applied them
+        # on top of the flatten — pipeline dev 3.53 → 7.52, "a worse corrected scan edge". They stay pending in the
+        # manifest (the regenerate button reads them); the worker never sees them on a plain re-run.
+        for _k in ("corrected_edge_anchors", "corrected_accurate", "corrected_post_anchors"):
+            _wparams.pop(_k, None)
     if _apply_prop:
         _wparams["apply_proposals"] = True
     if req.corrected_smooth_align and not _folded_corrected:
@@ -2932,7 +3072,10 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
         _sh.rmtree(_preview_group_dir(case_id, grp), ignore_errors=True)
     labels.corrected_path(case_id).unlink(missing_ok=True)
     orch.case_qa_json(case_id).unlink(missing_ok=True)
-    extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None,
+    extra = {"oct_volume_index": vi, "oct_kept_raw": False,   # a fresh run supersedes any earlier "Use original" (review 2026-09-07 M3)
+             # transient run inputs (keys starting with "_", e.g. _shaped_line_targets, _canvas_pad) are recomputed
+             # every run and must not be persisted as if they were the scan's own parameters
+             "oct_params": {k: v for k, v in eff_params.items() if not str(k).startswith("_")}, "scar_metrics": None,
              "oct_max_iterations": max_it, "oct_iter": iter_info,
              # Crop-approval workflow: the auto de-tilt / crop-region / surface-crop the preprocessing DETECTED
              # but did NOT apply (unless apply_proposals). The UI shows these (pink + glowing fix-cols/crop
@@ -3049,7 +3192,10 @@ def keep_raw_case(case_id: str) -> dict:
     _sh.rmtree(orch.case_root(case_id) / "passes", ignore_errors=True)
     labels.corrected_path(case_id).unlink(missing_ok=True)
     orch.case_qa_json(case_id).unlink(missing_ok=True)
-    extra = {"oct_volume_index": vi, "oct_params": eff_params, "scar_metrics": None,
+    extra = {"oct_volume_index": vi,
+             # transient run inputs (keys starting with "_", e.g. _shaped_line_targets, _canvas_pad) are recomputed
+             # every run and must not be persisted as if they were the scan's own parameters
+             "oct_params": {k: v for k, v in eff_params.items() if not str(k).startswith("_")}, "scar_metrics": None,
              # 0 passes / best_pass 0 = raw kept (BeforeAfterViewer reads this; passCount is Math.max(1,…)-guarded).
              "oct_iter": {"passes": 0, "best_pass": 0, "metrics": [], "stopped": "kept_raw"},
              "oct_kept_raw": True,
@@ -4184,6 +4330,121 @@ def download_correction_mp4(case_id: str) -> FileResponse:
     return FileResponse(str(files[0]), media_type="video/mp4", filename=files[0].name)
 
 
+# ── Steps v2: run-provenance tree (GET/POST oct-run-graph) + publication export ──────────────────────────
+# A READ of the last run's record (manifest.oct_params / oct_iter + border_cache + the volumes) rendered as a
+# provenance graph; nothing is re-run (see run_provenance.py). Read-only on the case: the export only ADDS to
+# cases/<id>/exports/. Same download conventions as the correction MP4 above.
+def _run_graph(case_id: str, slice_index, want_images: bool, thumb_h: int) -> dict:
+    import run_provenance
+    cid = orch.safe_case_id(case_id)
+    if not orch.case_root(cid).exists():
+        raise HTTPException(404, "Unknown case.")
+    try:
+        return run_provenance.build_run_graph(cid, slice_index=slice_index, want_images=bool(want_images), thumb_h=int(thumb_h))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — programming error only; missing data degrades into node statuses
+        raise HTTPException(500, f"run graph failed: {type(exc).__name__}: {exc}")
+
+
+@app.get("/api/case/{case_id}/oct-run-graph")
+def oct_run_graph_get(case_id: str, slice_index: int | None = None, want_images: int = 1, thumb_h: int = 300) -> dict:
+    """The run-provenance graph (Steps v2 'Run tree'): every stage the last run executed, every reviewer input
+    and every decision with its recorded reason, each with annotated thumbnails. GET for curl/tests."""
+    return _run_graph(case_id, slice_index, bool(int(want_images)), thumb_h)
+
+
+@app.post("/api/case/{case_id}/oct-run-graph")
+def oct_run_graph_post(case_id: str, req: RunGraphRequest) -> dict:
+    """Same as the GET, with a JSON body (the frontend's api.json convention)."""
+    return _run_graph(case_id, req.slice_index, req.want_images, req.thumb_h)
+
+
+_RUN_REPORT_KEEP = 3   # newest run_report_* folders + zips kept per case
+
+
+def _run_report_zip_name(cid: str, zip_path: Path) -> str:
+    """Download filename for a stored exports/run_report_<ts>.zip: PID_EYE_<cid>_run_report_<ts>.zip (mp4 stem rule)."""
+    pid, eye, _ = _case_identity(cid)
+    return f"{(pid or 'scan').upper()}_{(eye or '').upper()}_{cid}_{zip_path.stem}.zip".replace(" ", "_").replace("/", "-")
+
+
+def _newest_run_report_zip(cid: str) -> Path | None:
+    exp = orch.case_root(cid) / "exports"
+    files = sorted(exp.glob("run_report_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True) if exp.exists() else []
+    return files[0] if files else None
+
+
+@app.post("/api/case/{case_id}/export-run-report")
+def export_run_report_endpoint(case_id: str, req: RunReportRequest) -> dict:
+    """Publication export of the run tree: cases/<id>/exports/run_report_<ts>/ (figure.png 300 dpi + figure.svg,
+    diagram.svg, methods.md, nodes.json, per-node PNGs, self-contained report.html) + a zip; keeps the 3 newest."""
+    import run_provenance
+    cid = orch.safe_case_id(case_id)
+    root = orch.case_root(cid)
+    if not root.exists():
+        raise HTTPException(404, "Unknown case.")
+    if not run_provenance._HAVE_MPL:
+        raise HTTPException(400, "matplotlib is required for the publication export (pip install matplotlib)")
+    m = orch.read_manifest(cid)
+    if run_provenance._mode(m.get("oct_iter"), m.get("oct_params"), root) == "none":
+        raise HTTPException(409, "Preprocess the scan first — nothing to report.")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = root / "exports" / f"run_report_{ts}"
+    n = 0
+    while out_dir.exists():   # two exports within one second
+        n += 1
+        out_dir = root / "exports" / f"run_report_{ts}_{n}"
+    try:
+        info = run_provenance.export_run_report(cid, out_dir, slice_index=req.slice_index, dpi=run_provenance.clamp_dpi(req.dpi),
+                                                include_filmstrip=bool(req.include_filmstrip))
+        zp = run_provenance.zip_report(out_dir, out_dir.with_suffix(".zip"))
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"run report export failed: {type(exc).__name__}: {exc}")
+    # prune: keep the newest _RUN_REPORT_KEEP folders / zips (the timestamp in the name sorts chronologically)
+    exp = root / "exports"
+    for kind, items in (("dir", sorted([p for p in exp.glob("run_report_*") if p.is_dir()], key=lambda p: p.name)),
+                        ("zip", sorted(exp.glob("run_report_*.zip"), key=lambda p: p.name))):
+        for old in items[:-_RUN_REPORT_KEEP]:
+            try:
+                shutil.rmtree(old) if kind == "dir" else old.unlink()
+            except OSError:
+                pass
+    return {"folder": str(out_dir), "zip": str(zp), "zip_name": _run_report_zip_name(cid, zp),
+            "download_url": f"/api/case/{cid}/run-report.zip", "files": info["files"], "n_nodes": info["n_nodes"],
+            "mode": info["mode"], "bytes": int(zp.stat().st_size)}
+
+
+@app.get("/api/case/{case_id}/run-report.zip")
+def download_run_report(case_id: str) -> FileResponse:
+    """Serve the most-recent exported run report zip (see export-run-report)."""
+    cid = orch.safe_case_id(case_id)
+    zp = _newest_run_report_zip(cid)
+    if zp is None:
+        raise HTTPException(404, "No exported run report — export it first.")
+    return FileResponse(str(zp), media_type="application/zip", filename=_run_report_zip_name(cid, zp))
+
+
+@app.post("/api/case/{case_id}/run-report-save")
+def save_run_report(case_id: str, req: RunReportSaveRequest) -> dict:
+    """Native-save (Tauri shell): copy the newest run-report zip to a user-chosen path (mirrors save-preprocessed)."""
+    cid = orch.safe_case_id(case_id)
+    zp = _newest_run_report_zip(cid)
+    if zp is None:
+        raise HTTPException(404, "No exported run report — export it first.")
+    dest = Path(req.dest).expanduser()
+    _reject_protected_dest(dest)
+    try:
+        if dest.parent:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(zp), str(dest))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Save failed: {exc}")
+    return {"ok": True, "dest": str(dest), "bytes": int(dest.stat().st_size)}
+
+
 _BORDER_VOL_CACHE: dict = {}  # path -> (mtime, ndarray) — last border-input volume, so SCRUBBING a pass's
                               # slices doesn't re-decompress the .nii.gz every request (smooth scrolling).
 _BORDER_VOL_CACHE_LOCK = threading.Lock()  # concurrent scrub requests run on FastAPI's threadpool — guard get/clear/set
@@ -4220,6 +4481,97 @@ def _ensure_raw_border_nifti(case_id: str) -> Path:
     return raw
 
 
+def _served_edge_map(case_id: str, m: dict, arr, p: dict, pass_n: int = 1):
+    """THE served anterior edge for every slice — the exact (L, F) array the fix-columns pane draws as the red
+    line, plus its cosmetic quadratic and the per-lateral artifact bands.
+
+    Extracted out of oct_border_curves_all so the EDGE-GAIN QUEUE (oct-edge-suggest) reasons about the very
+    curve the reviewer is looking at. With two copies of this routing the banner would eventually talk about a
+    different line than the pane shows, and the queue would be lying. Do NOT substitute
+    border_cache/provided_edges.npz here: that file exists only on the ~8 scans in the store that have had a
+    corrections run, so the queue would be unavailable on every auto-only scan.
+
+    Routing (unchanged): a CONFIRMED re-detection (pass 1 + anchors) wins; else the cached ROBUST BASELINE
+    (the same _merged_side_edge surface Confirm uses — with two different detectors the preview would not
+    equal the Confirm result); else the fast gradient detector (pass > 1 only). Then #9 crop_region
+    interpolates the edge across the cropped frame columns so the preview reflects the truncated volume.
+
+    Returns (edges (L,F) float64, fits (L,F) float64, art_bands) — `fits` is returned rather than recomputed
+    by the caller because the crop_region branch writes the fit INTO the edge."""
+    import numpy as np
+    n = int(arr.shape[0]); n_frames = int(arr.shape[2])
+    sigma = float(p["sigma"]); max_jump = float(p["max_jump"]); mfs = int(p["median_filter_size"])
+    xs = np.arange(n_frames, dtype=np.float64)
+    anc = (m.get("oct_params") or {}).get("border_anchors") or {}
+    surf = _redetect_surface_cached(case_id, m, anc) if (pass_n <= 1 and anc) else None
+    use_surf = surf is not None and surf.shape[0] == n and surf.shape[1] == n_frames
+    base_surf = None
+    if not use_surf and pass_n <= 1:
+        try:
+            base_surf = _baseline_surface(case_id, arr, p)         # cached robust = Confirm's baseline
+            if base_surf is None or base_surf.shape[0] != n or base_surf.shape[1] != n_frames:
+                base_surf = None
+        except Exception:  # noqa: BLE001 — fall back to the fast detector if the baseline can't be built
+            base_surf = None
+    # #9 crop_region: make the previewed edge/curve reflect the TRUNCATED volume — for slices INSIDE the
+    # cropped lateral range, exclude the cropped frame-columns from the quadratic fit and interpolate the
+    # edge across them (matches the re-detected corrected volume; without this the overlay never changes).
+    _crop_box = oct_mod._crop_region_box(p, n_frames, n)
+    _crop_lo, _crop_hi, _crop_fs = _crop_box if _crop_box else (0, -1, [])
+    _crop_keep = (np.array([j not in set(int(f) for f in _crop_fs) for j in range(n_frames)])
+                  if _crop_fs else None)
+    _art_bands = oct_mod._artifact_bands(p, n_frames, n)   # #9 v3 per-lateral artifact band → exclude from the fit
+    edges = np.empty((n, n_frames), dtype=np.float64)
+    fits = np.empty((n, n_frames), dtype=np.float64)
+    for i in range(n):
+        if use_surf:
+            e = np.asarray(surf[i], dtype=np.float64)
+        elif base_surf is not None:
+            e = np.asarray(base_surf[i], dtype=np.float64)
+        else:
+            sl = np.ascontiguousarray(arr[i]).astype(np.float32)
+            raw = oct_mod._detect_surface_gradient(sl, sigma)  # fast, no prior, no bilateral (pass>1 only)
+            e = oct_mod._smooth_median(oct_mod._correct_surface(raw, max_jump), mfs).astype(np.float64)
+        in_crop = (_crop_box is not None and _crop_lo <= i <= _crop_hi
+                   and _crop_keep is not None and int(_crop_keep.sum()) >= 3)
+        # frames EXCLUDED from the cyan fit for THIS lateral: crop_region box cols (when in range) + this
+        # lateral's artifact band — so the flat-held band can't drag the parabola off the cornea (#9 v3).
+        _fitkeep = (_crop_keep.copy() if in_crop else np.ones(n_frames, dtype=bool))
+        _ab = _art_bands[i] if (_art_bands is not None and i < len(_art_bands)) else None
+        if _ab is not None and _ab.size:
+            _fitkeep[_ab[(_ab >= 0) & (_ab < n_frames)]] = False
+        try:
+            if int(_fitkeep.sum()) >= 3 and not bool(_fitkeep.all()):
+                f = np.polyval(np.polyfit(xs[_fitkeep], e[_fitkeep], 2), xs)   # fit cornea frames, extrapolate
+                if in_crop:
+                    e = e.copy(); e[~_crop_keep] = f[~_crop_keep]              # crop_region interpolates the EDGE too
+            else:
+                f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
+        except Exception:  # noqa: BLE001
+            f = e
+        edges[i] = e
+        fits[i] = f
+    # DOME SIGN GUARD for the scrub preview too (2026-09-08): the single-slice endpoint already guards its cyan
+    # fit; without this the scrub line drew the old sign and JUMPED on settle. Same shape, same refit, per lateral.
+    try:
+        if int(pass_n) <= 1 and bool(p.get("tissue_motion_shape_sign_guard", True)):
+            _shape = _bscan_shape_cached(case_id, m, _ensure_raw_border_nifti(case_id), arr)
+            if _shape is not None:
+                for i in range(n):
+                    _keep = None
+                    try:
+                        _bd = _art_bands[i] if (_art_bands is not None and i < len(_art_bands)) else None
+                        if _bd is not None and np.asarray(_bd).size:
+                            _keep = np.ones(n_frames, dtype=bool)
+                            _bd = np.asarray(_bd); _keep[_bd[(_bd >= 0) & (_bd < n_frames)]] = False
+                    except Exception:  # noqa: BLE001
+                        _keep = None
+                    _g, _ = oct_mod.sign_guarded_quadratic(edges[i], fits[i], _shape, valid=_keep, min_fraction=float(p.get("tissue_motion_shape_min_fraction", 0.5)))
+                    fits[i] = np.asarray(_g, dtype=np.float64)
+    except Exception:  # noqa: BLE001 — the preview must never fail over the guard
+        pass
+    return edges, fits, _art_bands
+
 @app.post("/api/case/{case_id}/oct-border-curves-all")
 def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
     """ALL per-slice detected borders for a pass in ONE call, computed with a FAST detector (gradient
@@ -4241,63 +4593,11 @@ def oct_border_curves_all(case_id: str, req: OctPreprocessRequest) -> dict:
         arr = _load_border_vol(inp)                                # (lateral, depth, frames), cached
         n = int(arr.shape[0]); depth_vox = int(arr.shape[1]); n_frames = int(arr.shape[2])
         p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
-        sigma = float(p["sigma"]); max_jump = float(p["max_jump"]); mfs = int(p["median_filter_size"])
-        xs = np.arange(n_frames, dtype=np.float64)
-        # If the user has CONFIRMED a re-detection (pass 1), serve the cached re-detected surface for EVERY
-        # slice (so scrubbing shows the confirmed border). Otherwise, on pass 1, serve the cached ROBUST
-        # BASELINE (the SAME _merged_side_edge surface Confirm uses) — NOT a separate fast detector. This is
-        # what makes the scrub preview == the Confirm result: with two different detectors, Confirm replaced
-        # the whole surface with the robust one and un-edited slices visibly changed. First call computes the
-        # baseline (~6s, cached as baseline.npz); later scrubs load it instantly. (pass>1 keeps the fast
-        # detector — no per-pass baseline cache.)
-        anc = (m.get("oct_params") or {}).get("border_anchors") or {}
-        surf = _redetect_surface_cached(case_id, m, anc) if (pass_n <= 1 and anc) else None
-        use_surf = surf is not None and surf.shape[0] == n and surf.shape[1] == n_frames
-        base_surf = None
-        if not use_surf and pass_n <= 1:
-            try:
-                base_surf = _baseline_surface(case_id, arr, p)         # cached robust = Confirm's baseline
-                if base_surf is None or base_surf.shape[0] != n or base_surf.shape[1] != n_frames:
-                    base_surf = None
-            except Exception:  # noqa: BLE001 — fall back to the fast detector if the baseline can't be built
-                base_surf = None
-        # #9 crop_region: make the previewed edge/curve reflect the TRUNCATED volume — for slices INSIDE the
-        # cropped lateral range, exclude the cropped frame-columns from the quadratic fit and interpolate the
-        # edge across them (matches the re-detected corrected volume; without this the overlay never changes).
-        _crop_box = oct_mod._crop_region_box(p, n_frames, n)
-        _crop_lo, _crop_hi, _crop_fs = _crop_box if _crop_box else (0, -1, [])
-        _crop_keep = (np.array([j not in set(int(f) for f in _crop_fs) for j in range(n_frames)])
-                      if _crop_fs else None)
-        _art_bands = oct_mod._artifact_bands(p, n_frames, n)   # #9 v3 per-lateral artifact band → exclude from the fit
-        edges: list = []; fits: list = []
-        for i in range(n):
-            if use_surf:
-                e = np.asarray(surf[i], dtype=np.float64)
-            elif base_surf is not None:
-                e = np.asarray(base_surf[i], dtype=np.float64)
-            else:
-                sl = np.ascontiguousarray(arr[i]).astype(np.float32)
-                raw = oct_mod._detect_surface_gradient(sl, sigma)  # fast, no prior, no bilateral (pass>1 only)
-                e = oct_mod._smooth_median(oct_mod._correct_surface(raw, max_jump), mfs).astype(np.float64)
-            in_crop = (_crop_box is not None and _crop_lo <= i <= _crop_hi
-                       and _crop_keep is not None and int(_crop_keep.sum()) >= 3)
-            # frames EXCLUDED from the cyan fit for THIS lateral: crop_region box cols (when in range) + this
-            # lateral's artifact band — so the flat-held band can't drag the parabola off the cornea (#9 v3).
-            _fitkeep = (_crop_keep.copy() if in_crop else np.ones(n_frames, dtype=bool))
-            _ab = _art_bands[i] if (_art_bands is not None and i < len(_art_bands)) else None
-            if _ab is not None and _ab.size:
-                _fitkeep[_ab[(_ab >= 0) & (_ab < n_frames)]] = False
-            try:
-                if int(_fitkeep.sum()) >= 3 and not bool(_fitkeep.all()):
-                    f = np.polyval(np.polyfit(xs[_fitkeep], e[_fitkeep], 2), xs)   # fit cornea frames, extrapolate
-                    if in_crop:
-                        e = e.copy(); e[~_crop_keep] = f[~_crop_keep]              # crop_region interpolates the EDGE too
-                else:
-                    f = np.polyval(np.polyfit(xs, e, 2), xs)           # quick quadratic fit (cosmetic blue line)
-            except Exception:  # noqa: BLE001
-                f = e
-            edges.append([round(float(v), 1) for v in e])
-            fits.append([round(float(v), 1) for v in f])
+        # The served edge (and its cosmetic quadratic) for EVERY slice, via the shared helper the edge-gain
+        # queue also calls — one routing, so the banner and the pane can never talk about different curves.
+        _edges, _fits, _ = _served_edge_map(case_id, m, arr, p, pass_n)
+        edges = [[round(float(v), 1) for v in row] for row in _edges]
+        fits = [[round(float(v), 1) for v in row] for row in _fits]
         out = {"slices": n, "n_frames": n_frames, "depth_vox": depth_vox, "pass": pass_n,
                "edges": edges, "fits": fits}
         # Per-(slice,frame) confidence over the SERVED edge (the array actually displayed) — the fix-columns
@@ -4408,8 +4708,36 @@ def oct_surface_crop_preview(case_id: str, req: OctPreprocessRequest) -> dict:
         recon, bottom, adopted = oct_mod._crop_reconstruct_slice(
             sl, top, frames, {**p, "_post_anchor_row": _row, "_post_row_detected": _post_row})
         r1 = lambda a: [round(float(v), 1) for v in np.asarray(a)]
+        # PLACED TOP PREVIEW (reviewer 2026-09-04): the same bottom − T rule the run applies
+        # (oct_mod.place_top_from_thickness) on this one slice — top = the SERVED edge slice where the reviewer
+        # drew, bottom = this endpoint's bottom, absence from the tissue's top band. None where nothing is placed.
+        _placed_row = None
+        try:
+            if frames and bool(p.get("crop_place_top_from_thickness", True)):
+                _anc = (m.get("oct_params") or {}).get("border_anchors") or {}
+                _srv = np.asarray(top, np.float64)
+                if _anc:
+                    try:
+                        _srv = np.asarray(_redetect_surface_cached(case_id, m, _anc)[si], np.float64)
+                    except Exception:  # noqa: BLE001
+                        pass
+                _dens = bool(p.get("densify_drawn_polylines", True))
+                _dt = oct_mod.densify_anchor_polylines({si: (_anc.get(str(si)) or _anc.get(si) or {})}, None, _dens)
+                _db = oct_mod.densify_anchor_polylines({si: (_row or {})}, depth_vox, _dens)
+                _db = {_l: {_f: _v for _f, _v in _r.items() if _v < depth_vox - 1} for _l, _r in _db.items()}
+                _dt = {0: _dt.get(si, {})} if _dt else {}
+                _db = {0: _db.get(si, {})} if _db else {}
+                _cs = oct_mod._top_band_bright(sl, p)[None, :]
+                _tr, _te = oct_mod._first_bright_run(
+                    np.ascontiguousarray(arr[max(0, si - 2):si + 3]).astype(np.float32).mean(axis=0), p)
+                _pl, _T, _pinfo = oct_mod.place_top_from_thickness(
+                    _srv[None, :], np.asarray(bottom, np.float64)[None, :], frames, p, _dt, _db, _cs,
+                    top_row=_tr[None, :], top_run_end=_te[None, :])
+                _placed_row = [(round(float(v), 1) if np.isfinite(v) else None) for v in _pl[0]]
+        except Exception:  # noqa: BLE001 — a preview extra must never fail the preview
+            _placed_row = None
         return {"slice_index": si, "n_frames": n_frames, "depth_vox": depth_vox,
-                "top": r1(top), "bottom": r1(bottom), "recon": r1(recon),
+                "top": r1(top), "bottom": r1(bottom), "recon": r1(recon), "placed": _placed_row,
                 "adopted": [int(f) for f in np.where(np.asarray(adopted))[0]]}
     except HTTPException:
         raise
@@ -4447,6 +4775,37 @@ def oct_motion_analyze(case_id: str, req: OctPreprocessRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT motion analysis failed: {exc}")
+
+
+_BSCAN_SHAPE_CACHE: dict = {}
+
+
+def _bscan_shape_cached(case_id: str, m: dict, raw_path, arr) -> float | None:
+    """The motion-free across-frame dome curvature (px/frame²) implied by the B-scan plane and the voxel spacing,
+    cached per (case, raw mtime). ~1-2 s cold. None when it cannot be measured (the guard then stays inert)."""
+    try:
+        key = (case_id, int(Path(raw_path).stat().st_mtime_ns))
+    except Exception:  # noqa: BLE001
+        key = (case_id, 0)
+    if key in _BSCAN_SHAPE_CACHE:
+        return _BSCAN_SHAPE_CACHE[key]
+    val = None
+    try:
+        sp = m.get("oct_spacing") or []
+        s_lat, s_fr = float(sp[0]), float(sp[2])
+        bp = oct_mod.bscan_plane_curvature(np.transpose(np.asarray(arr), (2, 1, 0)))
+        c = float(bp.get("curv_px_per_lat2", float("nan")))
+        if np.isfinite(c) and s_lat > 0 and s_fr > 0:
+            val = c * (s_fr / s_lat) ** 2
+    except Exception:  # noqa: BLE001
+        val = None
+    if val is None:
+        # the preview must enforce the sign whenever the run does: same population fallback as the worker
+        val = float({**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}.get("tissue_motion_shape_default", 0.02))
+    _BSCAN_SHAPE_CACHE[key] = val
+    while len(_BSCAN_SHAPE_CACHE) > 64:
+        _BSCAN_SHAPE_CACHE.pop(next(iter(_BSCAN_SHAPE_CACHE)), None)
+    return val
 
 
 @app.post("/api/case/{case_id}/oct-border-curve")
@@ -4504,8 +4863,28 @@ def oct_border_curve(case_id: str, req: OctPreprocessRequest) -> dict:
             edge = oct_mod._merged_side_edge(sl, p)
         # cyan fit EXCLUDES this lateral's artifact band (else the flat-held band drags the parabola off the cornea).
         fit = oct_mod.fit_quadratic_excluding_bands(edge, p, idx, n)
+        # DOME SIGN GUARD IN THE PREVIEW (2026-09-08): the run no longer flattens onto a parabola whose sign
+        # contradicts the motion-free B-scan plane (tissue_motion_move), so the cyan line must not show one either
+        # — on cs017_od_v1 it drew apex-down (−53 ×1e-3) while the run delivered apex-up. Same shape number, same
+        # refit rule (quadratic coefficient fixed, linear + constant free), so preview == result.
+        _sg = {"applied": False}
+        try:
+            if pass_n <= 1 and bool(p.get("tissue_motion_shape_sign_guard", True)):
+                _shape = _bscan_shape_cached(case_id, m, inp, arr)
+                _keep = None
+                try:
+                    _bands = oct_mod._artifact_bands(p, int(sl.shape[1]), n)
+                    _bd = _bands[idx] if (_bands is not None and 0 <= idx < len(_bands)) else None
+                    if _bd is not None and np.asarray(_bd).size:
+                        _keep = np.ones(int(sl.shape[1]), dtype=bool); _keep[np.asarray(_bd)[(np.asarray(_bd) >= 0) & (np.asarray(_bd) < int(sl.shape[1]))]] = False
+                except Exception:  # noqa: BLE001
+                    _keep = None
+                fit, _sg = oct_mod.sign_guarded_quadratic(edge, fit, _shape, valid=_keep, min_fraction=float(p.get("tissue_motion_shape_min_fraction", 0.5)))
+        except Exception:  # noqa: BLE001 — the preview line must never fail over the guard
+            _sg = {"applied": False}
         return {"slices": n, "index": int(idx), "n_frames": int(sl.shape[1]), "depth_vox": int(sl.shape[0]),
-                "pass": pass_n, "edge": [float(v) for v in edge], "fit": [float(v) for v in fit]}
+                "pass": pass_n, "edge": [float(v) for v in edge], "fit": [float(v) for v in fit],
+                "fit_sign_guard": _sg}
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -4574,7 +4953,8 @@ def _border_anchors_sig(anchors: dict) -> str:
 
 # Detection-relevant params: a baseline/redetect surface cache must invalidate if ANY of these change.
 # Today every param change already rmtrees border_cache, so this is defence-in-depth against a future writer.
-_DETECT_PARAM_KEYS = ("sigma", "max_jump", "median_filter_size", "d", "sigmaColor", "sigmaSpace",
+_DETECT_PARAM_KEYS = ("flatten_exclude_laterals",   # chord-guarded (folded) laterals shape the served surface → part of the sig (review 2026-09-05)
+                      "sigma", "max_jump", "median_filter_size", "d", "sigmaColor", "sigmaSpace",
                       "side_window", "side_threshold_factor", "residual_threshold", "active_threshold",
                       "detect_window", "detect_seed_window", "redetect_frame_margin", "redetect_slice_band",
                       "redetect_seed_window", "redetect_seed_window_slices", "redetect_interp_window",
@@ -4755,7 +5135,7 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     # PIN the reviewer's drawn frames to their exact value: the local-band march snaps to within a couple of
     # px of the drawn line (redetect_seed_window), which drifts a correction off where it was drawn. Ground
     # truth wins at the frames the reviewer actually touched; the march still governs the propagated band.
-    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)))
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff))
     # DENSE (only): light across-FRAME smoothing to remove the pinned hand-drawn jitter that would otherwise
     # STEP the rigid warp (bumpy, un-curved B-scan). Confined to cornea frames (below the earliest crop-band lo),
     # so the artifact-band reconstruction can't be blurred into the cornea. Applied AFTER pin so it smooths the
@@ -4805,7 +5185,7 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     # (gap-bounded, so interpolation never spans a huge un-marked gap). See interpolate_anchors_surface.
     if p.get("dense_pure_interp", True) and _anchors_are_dense(anchors, int(arr.shape[0]), p):
         surface = oct_mod.interpolate_anchors_surface(anchors, baseline, p)
-        oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)))
+        oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff))
     cp = _redetect_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     # tmp MUST end in .npz — np.savez_compressed appends '.npz' to any path that doesn't, which would make
@@ -4861,7 +5241,7 @@ def _compute_generalize_cache(case_id: str, m: dict, anchors: dict):
     surface = oct_mod.generalize_surface(arr, anchors, p, baseline=baseline)
     # PIN drawn frames exact: the residual field is interpolated across the volume, so at the drawn frames it
     # should reproduce the drawn line exactly, not a smoothed approximation of it.
-    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)))
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p))
     cp = _generalize_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     tmp = cp.with_name("generalize.tmp.npz")
@@ -4908,7 +5288,13 @@ def _anchors_are_dense(anchors: dict, n_lateral, p: dict) -> bool:
     if max_gap > int(p.get("dense_max_gap", 2 * band)):
         return False
     if n_lateral and int(n_lateral) > 1:               # the anchored span must reach both ends, else the ends taper
-        if sl[0] > band or sl[-1] < int(n_lateral) - 1 - band:   # to auto and generalize reaches more of those laterals
+        # ENDS TOLERANCE (2026-09-08, cs020_os_v2): the last drawn lateral sat at 491, ONE lateral short of the
+        # 512−1−band rule, and the whole volume fell back to the generalize field — whose drawn residual has zero
+        # lateral reach (170 px at the drawn lateral, 38 px one lateral away), leaving the served line 100-180 px
+        # off the tissue at the reviewer's marks. A short un-anchored margin tapers to auto either way; that is not
+        # worth losing the tight interpolation everywhere else. dense_ends_tolerance defaults to 2×band.
+        _ends = int(p.get("dense_ends_tolerance", 2 * band) or (2 * band))
+        if sl[0] > _ends or sl[-1] < int(n_lateral) - 1 - _ends:   # to auto and generalize reaches more of those laterals
             return False
     return True
 
@@ -5106,9 +5492,10 @@ def _oct_corrected_vol_path(case_id: str, m: dict) -> Path:
 
 
 _AXIAL_SURF_CACHE: dict = {}   # case_id -> (work_mtime, params_sig, surf(lateral,frames), (L, D, nF))
+_AXIAL_SURF_CACHE_MAX = 8      # bounded (2026-09-08): one entry per case opened, never evicted, grew all session
 
 
-def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape):
+def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape, which: str = "anterior"):
     """The reviewer's CORRECTION CURVE, carried into CORRECTED depth space. Returns (prior(lateral,frames), meta)
     or (None, reason).
 
@@ -5137,10 +5524,24 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape):
     Everything degrades to (None, reason) → the caller keeps today's free detection."""
     import numpy as np
     bc = orch.case_root(case_id) / "border_cache"
-    pe = bc / "provided_edges.npz"
+    # which="posterior": the served BOTTOM edge cached by the run (posterior_edges.npz, raw rows) carried by the
+    # SAME measured move — the corrected pane's bottom line on a surface-cropped scan.
+    pe = bc / ("posterior_edges.npz" if which == "posterior" else "provided_edges.npz")
+    # PLACED TOP (reviewer 2026-09-04): on a surface-cropped corrections run the worker writes the served anterior
+    # AFTER the bottom − T placement (border_cache/placed_edges.npz, raw rows) — the top the flatten actually
+    # used, so the corrected pane's red line shows it instead of the drawn estimate. Preferred only when it is
+    # not older than provided_edges.npz (a stale file from an earlier crop is ignored).
+    _placed = bc / "placed_edges.npz"
+    if which != "posterior" and _placed.exists() and pe.exists():
+        try:
+            if _placed.stat().st_mtime_ns >= pe.stat().st_mtime_ns:
+                pe = _placed
+        except OSError:
+            pass
     raw = orch.case_root(case_id) / "input" / "_raw_border.nii.gz"
     if not pe.exists():
-        return None, "no provided_edges.npz (scan has no correction curve)"
+        return None, ("no posterior_edges.npz (not a surface-cropped run)" if which == "posterior"
+                      else "no provided_edges.npz (scan has no correction curve)")
     if not raw.exists():
         return None, "no input/_raw_border.nii.gz"          # deliberately NOT regenerated: that re-reads the .OCT
     L, D, F = int(vol_shape[0]), int(vol_shape[1]), int(vol_shape[2])
@@ -5197,7 +5598,21 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape):
                 else:
                     return None, (f"raw {rv.shape} != corrected {cv.shape} "
                                   f"(canvas changed in lateral/frame — move is not rigid)")
-            r = oct_mod.measure_applied_move(rv, cv, p)
+            # the lag search must cover the canvas pad: with an 80-row pad the default 48 px measured 0 frames on
+            # cs002_os_v1 (2026-09-05) while 64 measured all 101 — the pane line and bottom line then vanished
+            _lag = max(int(p.get("corrected_prior_max_lag", oct_mod.DEFAULT_PARAMS.get("corrected_prior_max_lag", 48)) or 48),
+                       int(_canvas_pad) + 16)
+            # a frame the tissue-measured move pushed DEEPER by `a` has `a` vacated (zero) rows inside the correlation
+            # window; measure_applied_move's zero gate (5%) trips past ~44 px. Widen the window by the run's
+            # deepest move so the gate never sees them (review 2026-09-05).
+            try:
+                _tmrec = ((orch.read_manifest(case_id) or {}).get("oct_iter") or {}).get("tissue_motion") or {}
+                _sr = _tmrec.get("shift_range") if _tmrec.get("applied") else None
+                if _sr and len(_sr) == 2 and float(_sr[1]) > 0:
+                    _lag = max(_lag, int(_canvas_pad) + 16 + int(np.ceil(float(_sr[1]))))
+            except Exception:  # noqa: BLE001
+                pass
+            r = oct_mod.measure_applied_move(rv, cv, {**p, "corrected_prior_max_lag": _lag})
         except Exception as exc:  # noqa: BLE001
             return None, f"applied-move measurement failed: {exc}"
         move = np.asarray(r["move"], dtype=np.float64)
@@ -5271,6 +5686,9 @@ def _axial_surface_cached(case_id: str, work: Path, p: dict):
     # of their mtimes join the signature — re-confirming the border rewrites provided_edges and MUST re-serve.
     _bc = orch.case_root(case_id) / "border_cache"
     _pe_mt = _bc.joinpath("provided_edges.npz").stat().st_mtime_ns if _bc.joinpath("provided_edges.npz").exists() else 0
+    # ...and on placed_edges.npz (the run's placed top, preferred by _corrected_prior_surface when newer)
+    _pe_mt = (_pe_mt, _bc.joinpath("placed_edges.npz").stat().st_mtime_ns
+              if _bc.joinpath("placed_edges.npz").exists() else 0)
     _raw_p = orch.case_root(case_id) / "input" / "_raw_border.nii.gz"
     _raw_mt = _raw_p.stat().st_mtime_ns if _raw_p.exists() else 0
     _cpw = float(p.get("corrected_prior_window", oct_mod.DEFAULT_PARAMS.get("corrected_prior_window", 0.0)) or 0.0)
@@ -5338,7 +5756,53 @@ def _axial_surface_cached(case_id: str, work: Path, p: dict):
     # draws in red so "the line you approve" and "the line Run uses" are the same object. The reviewer's target
     # (surf) is drawn alongside it in its own colour instead of silently replacing it.
     _AXIAL_SURF_CACHE[case_id] = (mt, sig, surf, shape, _gap.astype(np.float32), _pre_gen)
+    while len(_AXIAL_SURF_CACHE) > _AXIAL_SURF_CACHE_MAX:            # drop the oldest entries (dicts keep insertion order)
+        _AXIAL_SURF_CACHE.pop(next(iter(_AXIAL_SURF_CACHE)), None)
     return surf, shape
+
+
+def _shaped_line_targets(anchors, baseline, p: dict, crop_frames) -> dict:
+    """{lateral: {frame: delta_px}} for every drawn line that is a SHAPED PARABOLA (deg-2 RMS < shaped_line_max_rms
+    over >= shaped_line_min_frames): delta = parabola − auto baseline edge, with the per-lateral median removed
+    (the detector's constant layer offset is not motion). Frames that are surface-cropped, above the floor, or
+    where the baseline is not finite contribute nothing. Pad-independent (a difference of two raw-row surfaces)."""
+    import numpy as np
+    base = np.asarray(baseline, dtype=np.float64)
+    if base.ndim != 2:
+        return {}
+    L, F = base.shape
+    min_n = int(p.get("shaped_line_min_frames", 40)); max_rms = float(p.get("shaped_line_max_rms", 0.6))
+    floor = float(p.get("clip_edge_floor", 8.0))
+    crop = {int(f) for f in (crop_frames or []) if 0 <= int(f) < F}
+    out: dict = {}
+    for l_str, fm in (anchors or {}).items():
+        try:
+            l = int(l_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= l < L) or not isinstance(fm, dict):
+            continue
+        pts = []
+        for f_str, d in fm.items():
+            try:
+                f = int(f_str); dd = float(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < F and np.isfinite(dd):
+                pts.append((f, dd))
+        if len(pts) < min_n:
+            continue
+        pts.sort(); fr = np.array([q[0] for q in pts], dtype=np.float64); dep = np.array([q[1] for q in pts])
+        c = np.polyfit(fr, dep, 2); par = np.polyval(c, fr)
+        if float(np.sqrt(np.mean((dep - par) ** 2))) >= max_rms:
+            continue                                   # a traced line, not a shaped one
+        ok = np.array([(int(f) not in crop) and np.isfinite(base[l, int(f)]) and base[l, int(f)] >= floor for f in fr])
+        if int(ok.sum()) < 10:
+            continue
+        g = par[ok] - base[l, fr[ok].astype(int)]
+        g = g - float(np.median(g))
+        out[str(l)] = {str(int(f)): round(float(v), 2) for f, v in zip(fr[ok], g)}
+    return out
 
 
 def _fit_corrected_edits_into_transform(case_id: str, m: dict, eff_params: dict, trusted_laterals=None):
@@ -5377,6 +5841,8 @@ def _fit_corrected_edits_into_transform(case_id: str, m: dict, eff_params: dict,
         return False
     if cdet.shape != (L, F):
         return False
+    crop_frames = {int(f) for f in (op.get("surface_crop_frames") or []) if 0 <= int(f) < F}
+    post_deltas_src: dict = {}          # {lateral: {frame}} cells whose delta came from a drawn BOTTOM line (band-valid)
     # THE REVIEWER'S SEMANTICS (2026-09-03, verbatim): "A slice marked as accurate ... merely means that the edge
     # that is detected/edited is CORRECT and this edge can then be used to be PULLED TOWARDS A BETTER FIT TOWARDS A
     # QUADRATIC." So a verified edge (drawn, or marked = the pane's own line) is WHERE THE EDGE IS, and the move it
@@ -5416,8 +5882,71 @@ def _fit_corrected_edits_into_transform(case_id: str, m: dict, eff_params: dict,
             dl = _line_to_quad(fr, [float(cdet[l, f]) for f in fr])
             if dl:
                 deltas[l] = dl
+    # BOTTOM-LINE EDITS on the corrected pane (surface-cropped scans): a verified bottom edge is pulled to ITS OWN
+    # deg-2 exactly like a top one; in a cropped frame the bottom's target REPLACES the top's (the top there is an
+    # estimate). Both edges move rigidly with the frame, so the delta is the same per-frame move.
+    cpa = eff_params.get("corrected_post_anchors") or {}
+    n_post = 0
+    post_raw_updates: dict = {}
+    if cpa:
+        _post_carried, _pmeta = _corrected_prior_surface(case_id, _work, p, (L, depth, F), which="posterior")
+        _post_raw = None
+        try:
+            _post_raw = np.asarray(np.load(str(orch.case_root(case_id) / "border_cache" / "posterior_edges.npz"))["surface"],
+                                   dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            _post_raw = None
+        for l_str, fm in cpa.items():
+            try:
+                l = int(l_str)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= l < L) or not isinstance(fm, dict):
+                continue
+            pts = []
+            for f_str, d_new in fm.items():
+                try:
+                    f = int(f_str); dn = float(d_new)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= f < F and np.isfinite(dn):
+                    pts.append((f, dn))
+            pts.sort()
+            dl = _line_to_quad([q[0] for q in pts], [q[1] for q in pts])
+            if dl:
+                cur = deltas.setdefault(l, {})
+                for f, dv in dl.items():
+                    if f in crop_frames or f not in cur:
+                        cur[f] = dv
+                        post_deltas_src.setdefault(int(l), set()).add(int(f))     # band-valid: from a drawn bottom line
+                n_post += len(dl)
+            # fold the corrected-pane bottom points back into the RAW bottom anchors (crop_post_anchors) so the
+            # next run's posterior-continuity reconstruction follows what the reviewer drew: raw = drawn − (carried − raw)
+            if _post_carried is not None and _post_raw is not None and _post_carried.shape == _post_raw.shape:
+                for f, dn in pts:
+                    _c = float(_post_carried[l, f]); _r = float(_post_raw[l, f])
+                    if np.isfinite(_c) and np.isfinite(_r):
+                        post_raw_updates.setdefault(str(l), {})[str(f)] = int(round(dn - (_c - _r)))
     if not deltas:
         return False
+    # IN THE SURFACE-CROP BAND THE PANE'S TOP LINE IS AN ESTIMATE, NOT TISSUE (reviewer 2026-09-05, sagittal 226:
+    # "the bottom edge is not smooth"): its deltas carried no information there yet fitted band shifts of up to
+    # 7 px / tilt 9 px, adding a 2.3 px frame-common wobble to the band's bottom. Band frames keep only deltas that
+    # came from a drawn corrected-pane BOTTOM line; with none, fit_edit_transform interpolates the neighbours' move
+    # across the band (held at the volume edge), so the band moves with its flank and the flatten's bottom-driven
+    # move is left intact.
+    _bottom_cells = {(int(l_), int(f_)) for l_, fm_ in post_deltas_src.items() for f_ in fm_} if post_deltas_src else set()
+    _n_dropped = 0
+    _band_rule = bool(p.get("edit_transform_band_from_bottom_only", oct_mod.DEFAULT_PARAMS.get("edit_transform_band_from_bottom_only", True)))
+    for l_ in (list(deltas.keys()) if (_band_rule and crop_frames) else []):
+        keep = {f_: v_ for f_, v_ in deltas[l_].items() if (int(f_) not in crop_frames) or ((int(l_), int(f_)) in _bottom_cells)}
+        _n_dropped += len(deltas[l_]) - len(keep)
+        if keep:
+            deltas[l_] = keep
+        else:
+            deltas.pop(l_, None)
+    if _n_dropped:
+        print(f"[corrected-edit] {_n_dropped} band-frame top-line deltas left to the flatten's bottom-driven move", file=sys.stderr)
     fit = oct_mod.fit_edit_transform(deltas, L, F, p)
     prev = op.get("edit_transform") if isinstance(op.get("edit_transform"), dict) else None
     shift = np.asarray(fit["shift"], dtype=np.float64); tilt = np.asarray(fit["tilt"], dtype=np.float64)
@@ -5451,12 +5980,21 @@ def _fit_corrected_edits_into_transform(case_id: str, m: dict, eff_params: dict,
     op["edit_transform"] = et
     op.pop("corrected_edge_anchors", None)
     op.pop("corrected_accurate", None)
+    if post_raw_updates:
+        _cpa_raw = {str(k): dict(v) for k, v in (op.get("crop_post_anchors") or {}).items() if isinstance(v, dict)}
+        for l_str, fm in post_raw_updates.items():
+            _cpa_raw.setdefault(l_str, {}).update(fm)
+        op["crop_post_anchors"] = _cpa_raw
+        eff_params["crop_post_anchors"] = _cpa_raw
+    op.pop("corrected_post_anchors", None)
+    eff_params.pop("corrected_post_anchors", None)
     orch.write_manifest_value(case_id, {"oct_params": op})
     m["oct_params"] = op
     eff_params["edit_transform"] = et
     eff_params.pop("corrected_edge_anchors", None)
     eff_params.pop("corrected_accurate", None)
-    return {"folded": True, "mode": "transform", "n_points": int(n_edit),
+    return {"folded": True, "mode": "transform", "n_points": int(n_edit), "n_bottom_points": int(n_post),
+            "bottom_folded_slices": sorted(int(k) for k in post_raw_updates),
             "laterals": sorted(int(k) for k in cea), "pinned_laterals": sorted(trusted),
             "verified_cleared": {k: {"baseline_px": (v or {}).get("baseline_px"),
                                      "current_px": (v or {}).get("current_px")}
@@ -5465,6 +6003,163 @@ def _fit_corrected_edits_into_transform(case_id: str, m: dict, eff_params: dict,
                           "shift_range": fit["shift_range"], "tilt_max_px": fit["tilt_max_px"],
                           "total_shift_range": [round(float(shift.min()), 1), round(float(shift.max()), 1)]},
             "backup": _bak_rel}
+
+
+def _exclude_laterals_from_flatten(case_id: str, m: dict, eff_params: dict, laterals) -> list:
+    """Add `laterals` to the sticky flatten_exclude_laterals (eff_params + persisted oct_params). Returns the
+    laterals that were newly added."""
+    _prev = set()
+    for _x in (eff_params.get("flatten_exclude_laterals") or []):
+        try:
+            _prev.add(int(_x))
+        except (TypeError, ValueError):
+            continue
+    _new = sorted(int(l) for l in (laterals or []) if int(l) not in _prev)
+    if not _new:
+        return []
+    eff_params["flatten_exclude_laterals"] = sorted(_prev | set(_new))
+    try:
+        orch.write_manifest_value(case_id, {"oct_params": {**(m.get("oct_params") or {}),
+                                                            "flatten_exclude_laterals": eff_params["flatten_exclude_laterals"]}})
+        m["oct_params"] = {**(m.get("oct_params") or {}), "flatten_exclude_laterals": eff_params["flatten_exclude_laterals"]}
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[corrected-edit] laterals kept out of the flatten's per-frame fit: {eff_params['flatten_exclude_laterals']}", file=sys.stderr)
+    return _new
+
+
+def _exclude_folded_from_flatten(case_id: str, m: dict, eff_params: dict, ba_before) -> list:
+    """Laterals the fold just ADDED to border_anchors are line ground truth for the served surface, not motion
+    evidence: add them to the sticky flatten_exclude_laterals (persisted, so every later re-run agrees) and
+    return the newly excluded laterals. Measured on cs042/cs002: folded pane strokes driving the per-frame fit
+    re-shaped it by up to 8.9 px / made the tissue less quadratic (3.71 → 4.53 px)."""
+    _ba_after = (eff_params.get("border_anchors") or {})
+    _before = {str(k) for k in (ba_before or set())}
+    _new_folded = sorted(int(k) for k in _ba_after if str(k) not in _before and str(k).lstrip("-").isdigit())
+    if not _new_folded:
+        return []
+    _prev_excl = set()
+    for _x in (eff_params.get("flatten_exclude_laterals") or []):
+        try:
+            _prev_excl.add(int(_x))
+        except (TypeError, ValueError):
+            continue
+    eff_params["flatten_exclude_laterals"] = sorted(_prev_excl | set(_new_folded))
+    try:
+        orch.write_manifest_value(case_id, {"oct_params": {**(m.get("oct_params") or {}),
+                                                            "flatten_exclude_laterals": eff_params["flatten_exclude_laterals"]}})
+        m["oct_params"] = {**(m.get("oct_params") or {}), "flatten_exclude_laterals": eff_params["flatten_exclude_laterals"]}
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[corrected-edit] folded laterals kept out of the flatten: {eff_params['flatten_exclude_laterals']}", file=sys.stderr)
+    return _new_folded
+
+
+def _fold_corrected_bottom_lines(case_id: str, m: dict, eff_params: dict) -> dict:
+    """Corrected-pane BOTTOM lines → the RAW bottom anchors (crop_post_anchors): raw = drawn − (carried − raw),
+    where `carried` is the served posterior moved by the measured move (the line the pane drew from). Returns
+    {lateral: {frame: raw_depth}} — empty when there is nothing to fold or the carried posterior is unavailable.
+    (Extracted from the transform-mode fit so line mode consumes bottom lines too — review 2026-09-05.)"""
+    import numpy as np
+    import nibabel as nib
+    cpa = eff_params.get("corrected_post_anchors") or {}
+    if not cpa:
+        return {}
+    op = dict(m.get("oct_params") or {})
+    p = {**oct_mod.DEFAULT_PARAMS, **op}
+    try:
+        _work = _oct_corrected_vol_path(case_id, m)
+        _cvol = np.asarray(nib.load(str(_work)).dataobj)
+        L, depth, F = int(_cvol.shape[0]), int(_cvol.shape[1]), int(_cvol.shape[2])
+        _post_carried, _pmeta = _corrected_prior_surface(case_id, _work, p, (L, depth, F), which="posterior")
+        _post_raw = np.asarray(np.load(str(orch.case_root(case_id) / "border_cache" / "posterior_edges.npz"))["surface"],
+                               dtype=np.float64)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[corrected-edit] bottom-line fold skipped for {case_id}: {type(exc).__name__}", file=sys.stderr)
+        return {}
+    if _post_carried is None or _post_raw is None or np.shape(_post_carried) != np.shape(_post_raw):
+        return {}
+    _post_carried = np.asarray(_post_carried, dtype=np.float64)
+    updates: dict = {}
+    for l_str, fm in cpa.items():
+        try:
+            l = int(l_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= l < L) or not isinstance(fm, dict):
+            continue
+        for f_str, d_new in fm.items():
+            try:
+                f = int(f_str); dn = float(d_new)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= f < F) or not np.isfinite(dn):
+                continue
+            _c = float(_post_carried[l, f]); _r = float(_post_raw[l, f])
+            if np.isfinite(_c) and np.isfinite(_r):
+                updates.setdefault(str(l), {})[str(f)] = int(round(dn - (_c - _r)))
+    return updates
+
+
+def _fold_corrected_edits_as_line_gt(case_id: str, m: dict, eff_params: dict, trusted_laterals=None):
+    """corrected_edit_mode="line" (DEFAULT 2026-09-05): the reviewer's corrected-pane drawings, accurate marks
+    and bottom lines are LINE ground truth. Top drawings/marks fold into the ORIGINAL edge exactly as the fold
+    does (served line + pane line right where they drew, caches dropped); bottom lines fold into the raw bottom
+    anchors (crop_post_anchors); the laterals the top fold ADDS are kept out of the flatten's per-frame fit; every
+    pane verification is CLEARED from the persisted params (they described the previous corrected scan). No
+    transform is fitted; one already stored stays on record and is not applied (oct_preprocess.edit_transform_active).
+    Returns a FLAT run record (the fold's own keys + mode/excluded/bottom) or False if there was nothing to do."""
+    _ba_before = {str(k) for k in (eff_params.get("border_anchors") or {})}
+    _had_bottom = bool(eff_params.get("corrected_post_anchors"))
+    # EXCLUDE EVERY PANE-EDITED LATERAL BEFORE THE FOLD (review 2026-09-05): the fold rebuilds the served-surface
+    # cache (generalize.npz) on the spot, and the chord guard inside it covers folded_laterals(p) — so the laterals
+    # must already be on the sticky list when the fold runs, whether the fold ADDS them or REPLACES points on a
+    # lateral the reviewer also drew on the original pane. (The list is in the cache signature, so a stale surface
+    # cannot be served afterwards.)
+    _pane_lats = sorted(int(k) for k in (eff_params.get("corrected_edge_anchors") or {}) if str(k).lstrip("-").isdigit())
+    _pre_excluded = _exclude_laterals_from_flatten(case_id, m, eff_params, _pane_lats) if _pane_lats else []
+    _fd = _fold_corrected_edits_into_border_anchors(case_id, m, eff_params, trusted_laterals)
+    if not _fd and not _had_bottom:
+        return False
+    _rec: dict = dict(_fd) if isinstance(_fd, dict) else {"folded": True, "n_points": 0, "laterals": [], "pinned_laterals": []}
+    _rec["folded"] = True
+    _rec["mode"] = "line"
+    _rec["excluded_laterals"] = sorted(set(_pre_excluded) | set(_exclude_folded_from_flatten(case_id, m, eff_params, _ba_before) if _fd else []))
+    _rec["note"] = "pane drawings are line ground truth; no per-frame transform fitted or applied"
+    # BOTTOM lines → raw crop_post_anchors (the transform mode did this inside its fit; line mode must too)
+    _bottom_updates = _fold_corrected_bottom_lines(case_id, m, eff_params) if _had_bottom else {}
+    op = dict(m.get("oct_params") or {})
+    if _bottom_updates:
+        _cpa_raw = {str(k): dict(v) for k, v in (op.get("crop_post_anchors") or {}).items() if isinstance(v, dict)}
+        for l_str, fm in _bottom_updates.items():
+            _cpa_raw.setdefault(l_str, {}).update(fm)
+        op["crop_post_anchors"] = _cpa_raw
+        eff_params["crop_post_anchors"] = _cpa_raw
+        _bc = orch.case_root(case_id) / "border_cache"                 # served posterior changed → drop its caches
+        for _nm in ("posterior_edges.npz", "placed_edges.npz"):
+            try:
+                (_bc / _nm).unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+    _rec["bottom_folded_slices"] = sorted(int(k) for k in _bottom_updates)
+    _rec["n_bottom_points"] = int(sum(len(v) for v in _bottom_updates.values()))
+    # CLEAR every pane verification from the persisted params — they described the previous corrected scan.
+    # (The fold keeps corrected_accurate on eff_params "for this run"; the end-of-run write persists eff_params
+    # wholesale, so without this pop the marks came back — review 2026-09-05.)
+    for _k in ("corrected_edge_anchors", "corrected_accurate", "corrected_post_anchors"):
+        op.pop(_k, None)
+        eff_params.pop(_k, None)
+    try:
+        orch.write_manifest_value(case_id, {"oct_params": op})
+    except Exception:  # noqa: BLE001
+        pass
+    m["oct_params"] = op
+    _et = op.get("edit_transform")
+    if isinstance(_et, dict) and _et.get("shift"):
+        _rec["stored_transform_ignored"] = {"rounds": _et.get("rounds")}
+    return _rec
 
 
 def _fold_corrected_edits_into_border_anchors(case_id: str, m: dict, eff_params: dict,
@@ -5812,7 +6507,38 @@ def oct_corrected_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         surf, (L, D, nF) = _axial_surface_cached(case_id, work, p)   # (lateral, frames)
         idx = L // 2 if req.slice_index is None else max(0, min(L - 1, int(req.slice_index)))
         edge = np.asarray(surf[idx, :], dtype=np.float32)            # across FRAMES for this lateral slice
-        fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
+        # LIVE FRAMES ONLY for the guide (2026-09-08, reviewer: "the blue guide on the corrected slice still
+        # appears inverted"). Frames the move could not place (dead / decorrelated, black in the corrected
+        # volume) carry detector junk — on cs017_od_v1 a 283→169 ramp over 28 black frames dragged the fit to
+        # −52 ×1e-3 while the live edge is +19. Fit over the run's live segments (else the non-black columns),
+        # then hold the fit to the same dome sign/floor the run and the original pane use.
+        _live = np.ones(int(nF), dtype=bool)
+        try:
+            _segs = (((m.get("oct_iter") or {}).get("tissue_motion") or {}).get("segments")) or []
+            if _segs:
+                _live[:] = False
+                for _f0, _f1 in _segs:
+                    _live[max(0, int(_f0)):min(int(nF), int(_f1) + 1)] = True
+            else:
+                _col = np.asarray(nib.load(str(work)).dataobj[idx:idx + 1, :, :])[0]        # (depth, frames)
+                _live = (np.asarray(_col) > 0).mean(axis=0) > 0.05
+        except Exception:  # noqa: BLE001
+            _live = np.ones(int(nF), dtype=bool)
+        _live &= np.isfinite(edge) & (edge > 0.5) & (edge < D - 1.5)
+        if int(_live.sum()) >= 8:
+            _xs = np.arange(int(nF), dtype=np.float64)
+            fit = np.polyval(np.polyfit(_xs[_live], edge[_live].astype(np.float64), 2), _xs)
+        else:
+            fit = oct_mod._fit_quadratic_ransac(edge, float(p["residual_threshold"]))
+        _sg = {"applied": False}
+        try:
+            if bool(p.get("tissue_motion_shape_sign_guard", True)):
+                _rawp = _ensure_raw_border_nifti(case_id)
+                _shape = _bscan_shape_cached(case_id, m, _rawp, _load_border_vol(_rawp))
+                fit, _sg = oct_mod.sign_guarded_quadratic(edge, fit, _shape, valid=_live,
+                                                          min_fraction=float(p.get("tissue_motion_shape_min_fraction", 0.5)))
+        except Exception:  # noqa: BLE001
+            _sg = {"applied": False}
         # NOTE: no pin. The corrected surface shown is the REAL re-detected surface of the (guarded) rigid axial
         # correction applied inside preprocess (apply_sagittal_surface_gt). The reviewer sees the true result —
         # fixed where a rigid move helped, honestly unchanged where it was declined — never a painted line.
@@ -5830,10 +6556,25 @@ def oct_corrected_curve(case_id: str, req: OctPreprocessRequest) -> dict:
         _res = {"slices": int(L), "index": int(idx), "depth_vox": int(D), "n_frames": int(nF),
                 "edge": [float(v) for v in (edge if _det is None else _det)],
                 "fit": [float(v) for v in fit],
+                "fit_live_frames": int(_live.sum()), "fit_sign_guard": _sg,
+                # the pane fits its own blue quadratic client-side from the DISPLAYED edge (so drags update it);
+                # give it the live-frame mask and the dome shape so it can apply the same rule as the run
+                "live_frames": [bool(v) for v in _live],
+                "shape_curv": (float(_shape) if ('_shape' in locals() and _shape is not None and np.isfinite(float(_shape))) else None),
+                "shape_min_fraction": float(p.get("tissue_motion_shape_min_fraction", 0.5)),
                 "warp_gap": (None if _gp is None else
                              {"median": round(float(np.median(_gp)), 3), "max": round(float(np.max(_gp)), 3)})}
         if _det is not None and _gp is not None and float(np.max(_gp)) > 1e-6:
             _res["target"] = [float(v) for v in edge]     # the generalize + anchor-pinned line
+        # BOTTOM (posterior) line on the corrected result, detector-free: the served posterior carried by the
+        # measured move (only on a surface-cropped run, which caches posterior_edges.npz). null where absent.
+        try:
+            _pb, _pmeta = _corrected_prior_surface(case_id, work, p, (L, D, nF), which="posterior")
+            if _pb is not None:
+                _row = np.asarray(_pb[idx, :], dtype=np.float64)
+                _res["bottom"] = [(None if not np.isfinite(v) or v <= 0.5 or v >= D - 1.5 else float(v)) for v in _row]
+        except Exception:  # noqa: BLE001
+            pass
         return _res
     except HTTPException:
         raise
@@ -5958,6 +6699,460 @@ def oct_corrected_accurate(case_id: str, req: OctPreprocessRequest) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"OCT corrected accurate-mark failed: {exc}")
 
+
+@app.post("/api/case/{case_id}/oct-bottom-suggest")
+def oct_bottom_suggest(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Slices that still need a BOTTOM-line determination on a surface-cropped scan (reviewer 2026-09-05: "have the
+    app surface slices that require bottom surface determination on the original and corrected scans").
+
+    params.target = "original" (default) | "corrected"; params.n picks (8), params.near (10) laterals around a slice
+    that already carries a bottom line are not suggested again.
+    ORIGINAL: inside the surface-crop band the served raw bottom (the reviewer's lines, interpolated across slices,
+    the detector elsewhere) is compared, trace-free, with the raw posterior: the last bright row within ±25 px of
+    the served bottom on a 5-lateral band-mean column. dev_px = RMS of that gap over the band frames; gap = distance
+    to the nearest drawn bottom slice. Picks are stratified across the central 10-90 % of laterals, best dev_px per
+    bin, never within `near` of a drawn slice. With no band there is nothing to determine → no picks.
+    CORRECTED: the band bottom the pane shows (the served bottom carried by the measured move) and the corrected
+    tissue's posterior (same trace-free crossing) are each scored by RMS from their own deg-2 across the band frames;
+    rank on the tissue value, fall back to the line. Slices already carrying a corrected-pane bottom line are skipped.
+    A WHERE-TO-LOOK ranking, like oct-corrected-suggest: only the reviewer's drawn line adjudicates the bottom."""
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    op = m.get("oct_params") or {}
+    _rp = (req.params or {}) if isinstance(req.params, dict) else {}
+    target = str(_rp.get("target", "original")).lower()
+    n_pick = max(1, min(24, int(_rp.get("n", 8)))); near = max(0, int(_rp.get("near", 10)))
+    band = sorted({int(f) for f in (op.get("surface_crop_frames") or [])})
+    if not band:
+        return {"target": target, "band_frames": [], "picks": [], "drawn": [], "reason": "no surface-crop band on this scan"}
+    p = {**oct_mod.DEFAULT_PARAMS, **op}
+    try:
+        def _cross_last(col: np.ndarray, g: float, win: float = 25.0, thr: float = 1000.0) -> float:
+            if not np.isfinite(g):
+                return float("nan")
+            lo_ = int(max(0, g - win)); hi_ = int(min(col.size - 1, g + win))
+            idx = np.where(col[lo_:hi_ + 1] > thr)[0]
+            return float(lo_ + idx.max()) if idx.size else float("nan")
+        def _rms_dev(fr, y):
+            y = np.asarray(y, dtype=np.float64); ok = np.isfinite(y)
+            if ok.sum() < 6:
+                return float("nan")
+            fr_ = np.asarray(fr, dtype=np.float64)[ok]
+            return float(np.sqrt(np.mean((y[ok] - np.polyval(np.polyfit(fr_, y[ok], 2), fr_)) ** 2)))
+        if target == "corrected":
+            work = _oct_corrected_vol_path(case_id, m)
+            if not work.exists():
+                raise HTTPException(400, f"Case {case_id} is not preprocessed yet.")
+            import nibabel as nib
+            vol = np.asarray(nib.load(str(work)).dataobj).astype(np.float32)       # (lateral, depth, frames)
+            L, depth, F = int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2])
+            carried, _meta = _corrected_prior_surface(case_id, work, p, (L, depth, F), which="posterior")
+            if carried is None:
+                return {"target": target, "band_frames": band, "picks": [], "drawn": [], "reason": "no carried bottom line yet (re-run first)"}
+            carried = np.asarray(carried, dtype=np.float64)
+            drawn = sorted(int(k) for k in (op.get("corrected_post_anchors") or {}))
+            line_px = np.full(L, np.nan); tis_px = np.full(L, np.nan)
+            fr = np.asarray(band, dtype=np.float64)
+            for s_ in range(L):
+                row = carried[s_, band]
+                if not np.isfinite(row).any():
+                    continue
+                line_px[s_] = _rms_dev(fr, row)
+                col = vol[max(0, s_ - 2):s_ + 3].mean(axis=0)                     # (depth, frames)
+                tis = np.array([_cross_last(col[:, f], row[k]) for k, f in enumerate(band)])
+                tis_px[s_] = _rms_dev(fr, tis)
+            score = np.where(np.isfinite(tis_px), tis_px, line_px)
+        else:
+            raw_path = _ensure_raw_border_nifti(case_id)
+            arr = _load_border_vol(raw_path)                                       # (lateral, depth, frames)
+            L, depth, F = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+            drawn = sorted(int(k) for k in (op.get("crop_post_anchors") or {}))
+            pe_path = orch.case_root(case_id) / "border_cache" / "posterior_edges.npz"
+            served = np.asarray(np.load(str(pe_path))["surface"], dtype=np.float64) if pe_path.exists() else None
+            line_px = np.full(L, np.nan); tis_px = np.full(L, np.nan)
+            if served is not None and served.shape == (L, F):
+                for s_ in range(L):
+                    row = served[s_, band]
+                    if not np.isfinite(row).any():
+                        continue
+                    col = np.asarray(arr[max(0, s_ - 2):s_ + 3], dtype=np.float32).mean(axis=0)
+                    tis = np.array([_cross_last(col[:, f], row[k]) for k, f in enumerate(band)])
+                    d = tis - row
+                    ok = np.isfinite(d)
+                    tis_px[s_] = float(np.sqrt(np.mean(d[ok] ** 2))) if ok.sum() >= 6 else float("nan")
+            score = tis_px.copy()
+        gap = np.full(L, float(L))
+        if drawn:
+            dd = np.asarray(drawn, dtype=np.float64)
+            gap = np.abs(np.arange(L, dtype=np.float64)[:, None] - dd[None, :]).min(axis=1)
+        lo, hi = int(0.1 * L), int(0.9 * L)
+        elig = np.zeros(L, bool); elig[lo:hi] = True
+        for d in drawn:
+            elig[max(0, d - near):min(L, d + near + 1)] = False
+        # no witness at all (fresh scan, no posterior cache): rank purely on coverage — the biggest gaps first
+        has_score = np.isfinite(score).any()
+        rank = np.where(np.isfinite(score), score, 0.0) + (0.0 if has_score else 1.0) * gap / 40.0
+        # REGIONS THAT STILL NEED A BOTTOM LINE (reviewer 2026-09-05: "the counter does not change ... stuck at 8"):
+        # a slice needs one when its witness exceeds need_px (or, with no witness, when it is > 2·near from any
+        # drawn line); contiguous needy laterals (gaps of <= 4 bridged) form ONE region, one pick per region (its
+        # worst slice), regions ordered worst first. n_left = number of regions — it drops as lines land.
+        need_px = float(_rp.get("need_px", 5.0))
+        needy = elig & ((score > need_px) if has_score else (gap > 2 * near))
+        regions: list[dict] = []
+        if needy.any():
+            from scipy.ndimage import binary_closing, label as _label
+            closed = binary_closing(needy, structure=np.ones(5, dtype=bool)) | needy
+            closed &= elig
+            lab, nlab = _label(closed)
+            for k in range(1, nlab + 1):
+                idx = np.where(lab == k)[0]
+                if idx.size == 0:
+                    continue
+                best = int(idx[int(np.argmax(rank[idx]))])
+                regions.append({"lo": int(idx.min()), "hi": int(idx.max()), "lateral": best,
+                                "dev_px": (round(float(score[best]), 2) if np.isfinite(score[best]) else None),
+                                "line_px": (round(float(line_px[best]), 2) if np.isfinite(line_px[best]) else None),
+                                "gap": int(gap[best]) if np.isfinite(gap[best]) else None})
+            regions.sort(key=lambda q: -(q["dev_px"] if q["dev_px"] is not None else float(q["gap"] or 0)))
+        picks = [{k: v for k, v in r.items() if k in ("lateral", "dev_px", "line_px", "gap")} for r in regions[:n_pick]]
+        fin = score[np.isfinite(score)]
+        return {"target": target, "band_frames": band, "slices": int(L), "picks": picks, "regions": regions,
+                "n_left": len(regions), "need_px": need_px, "near": near, "drawn": drawn,
+                "median_px": (round(float(np.median(fin)), 2) if fin.size else None),
+                "witness": ("tissue" if has_score else "coverage only")}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"OCT bottom suggest failed: {exc}")
+
+
+@app.post("/api/case/{case_id}/oct-edge-suggest")
+def oct_edge_suggest(case_id: str, req: OctPreprocessRequest) -> dict:
+    """Slices where correcting the drawn ANTERIOR line measurably SMOOTHS THE DELIVERED EDGE (reviewer
+    2026-09-06: "the program should highlight slices were if the edges were corrected, a much smoother result
+    would occur"). Sibling of oct-bottom-suggest, for the ORIGINAL pane's top line.
+
+    WHAT THIS CAN AND CANNOT CHANGE — the caveat every string ships. Since 2026-09-05 the per-frame rigid move
+    that flattens the scan is MEASURED FROM THE TISSUE (oct_preprocess.tissue_motion_move, cross-correlation of
+    adjacent B-scans; oct_iter.determinism.move_source == "tissue"); the reviewer's lines do not drive it. So a
+    correction here CANNOT move tissue and CANNOT change the volume's geometric smoothness. It changes the
+    SERVED EDGE — the red line both panes draw — and the training GT exported from it. This endpoint therefore
+    ranks slices where the SERVED edge departs from the surface its own neighbours trace, never the image.
+
+    METRIC (oct_preprocess._edge_gain_map, measured on cs009_os_v3 / _v1 / cs002_os_v1 / cs008_od_v2):
+    frame-common motion removed (mandatory — without it every lateral scores equally rough), a leave-one-out
+    cross-lateral reference (GUARD=2, because the real findings are one lateral wide), then two ANDed witnesses
+    — |S - ref| >= tau AND surface_confidence < 0.35, i.e. the line both disagrees with its neighbours and sits
+    on no boundary. gain = RMS deviation removed by replacing ONLY the flagged cells by the reference.
+
+    FOUR RULES THIS ENDPOINT MAY NOT BEND (each one was a shipped defect, fixed 2026-09-07):
+      1. NO CONTRAST WITNESS ⇒ NO SMOOTHING FINDINGS. If surface_confidence_map fails, W2 is UNEVALUABLE, not
+         satisfied: conf_ok comes back False, every `gain`-kind finding is withheld and `reason` says why.
+         (Treating it as satisfied collapsed the AND onto the cross-lateral witness alone, which this very
+         docstring says fires on the legitimate steep limbus — a clean scan came back as false findings.)
+      2. TWO BARS, and the honest-silence sentence quotes BOTH. A lateral surfaces on gain_px >= need_px (8.0)
+         OR dev_px >= dev_need_px (16.0, chosen from the four design scans' measured departures — see
+         oct_preprocess.EDGE_GAIN_DEFAULTS["edge_dev_need_px"]). Gating on gain alone dropped a uniformly-off,
+         partly-flagged lateral and then reassured the reviewer with "already at the measured floor (max gain
+         N px < 8)": the miss reported as reassurance.
+      3. `gain` IS NOT A DISTANCE. Any sentence saying "off" / "departs by" quotes off_px (RMS |S - ref|
+         over the frames it names, or dev_px for a whole-line finding); `gain` appears only in the clause
+         about what correcting it RECOVERS. The two differ by up to 2x in both directions.
+      4. AN UNSCORABLE CELL IS NEVER FLAGGED. The air-above witness needs rows [S-30, S-10] to fit above the
+         line; where the line is shallower than 30 they do not, and those cells are skipped and counted
+         (`air_skipped`) rather than scored against fixed rows 0..20 that sit BELOW the line.
+
+    ORDER (decision 2026-09-07, KEPT AS IS): gain-qualified regions first, largest GAIN first; departure-
+    qualified ones follow, ordered by departure. NOT a ranking by smoothness against a quadratic — ranking by
+    the reduction in each lateral's own off-deg-2 was measured NEGATIVE on four of the seven cs009_os_v3 picks
+    (a straight chord through the stroma is artificially smooth against a quadratic), so the reviewer must
+    never be told the row means that.
+    The `order` STRING names the GAIN, not the departure, because the key is the gain. Calling this order
+    "worst departure from the neighbouring slices first" was measurably FALSE on the acceptance scan:
+    gain-descending puts cs009_os_v3 l303 (departure 18.71, gain 14.52) AHEAD of l183 (departure 20.80, gain
+    10.46), so the banner's chip row — which quotes the departure, as M3 requires — read 39, 39, 31, 22, 22,
+    19, 21 px under a label promising a descending departure. Say what the key is: the part of the departure
+    that redrawing actually removes.
+
+    TWO FINDING KINDS, and the split is required, not cosmetic:
+      "gain"          — carries a px number. Correcting it demonstrably smooths the delivered edge.
+      "unverifiable"  — the line crosses a SPECULAR FLARE (bloom bright above and below, so the confidence map
+                        is blind to it). Carries NO px number: at the flare the served edge is already smooth
+                        across laterals (median |dS| 0.05 px), so correcting it improves ACCURACY, not
+                        smoothness — quoting a smoothing gain there would be a lie. Same precedent as the
+                        determinism report's UNSPANNED finding (oct_preprocess.py, "no px number").
+
+    DRAWN LATERALS ARE SCORED LIKE ANY OTHER — deliberately NOT oct-bottom-suggest's `near` exclusion. Measured
+    on cs009_os_v3: all seven findings above 8 px are AT reviewer-drawn laterals (23, 44, 103, 145, 183, 303,
+    450); a near=10 exclusion would suppress every one. A drawn slice is not re-suggested unless it STILL
+    deviates. The queue says CHECK, never WRONG: it reports that the line disagrees with its neighbours and the
+    local tissue; the reviewer decides.
+
+    params: target ("original", reserved), n (8, 1..24), need_px (8.0), dev_need_px (16.0), k_air (2.5),
+    min_run (5), near (0)."""
+    import numpy as np
+    m = orch.read_manifest(case_id)
+    op = m.get("oct_params") or {}
+    _rp = (req.params or {}) if isinstance(req.params, dict) else {}
+    target = str(_rp.get("target", "original")).lower()
+    n_pick = max(1, min(24, int(_rp.get("n", 8))))
+    near = max(0, int(_rp.get("near", 0)))
+    drawn = sorted(int(k) for k in (op.get("border_anchors") or {}))
+    move_source = None
+    _det = (m.get("oct_iter") or {}).get("determinism")
+    if isinstance(_det, dict):
+        move_source = _det.get("move_source")
+
+    def _early(reason: str, **extra) -> dict:
+        out = {"target": target, "slices": 0, "picks": [], "regions": [], "drawn": drawn,
+               "n_left": 0, "reason": reason, "reason_kind": "early", "move_source": move_source}
+        out.update(extra)
+        return out
+
+    if not (m.get("input_volume") or m.get("corrected_volume")):
+        return _early("not preprocessed")
+    try:
+        arr = _load_border_vol(_ensure_raw_border_nifti(case_id))    # (lateral, depth, frames), cached
+        L, F = int(arr.shape[0]), int(arr.shape[2])
+        if L < 3 or F < 3:
+            return _early("fewer than 3 laterals", slices=L, n_frames=F)
+        p = {**oct_mod.DEFAULT_PARAMS, **op}
+        # The SERVED edge, via the same helper oct-border-curves-all uses — the queue must reason about the
+        # curve the pane draws. NOT border_cache/provided_edges.npz: that exists only on the handful of scans
+        # that have had a corrections run, so the queue would be dead on every auto-only scan.
+        S, _fits, _bands = _served_edge_map(case_id, m, arr, p, 1)
+        if S is None or np.asarray(S).shape != (L, F) or not np.isfinite(S).any():
+            return _early("no served edge", slices=L, n_frames=F)
+        elig, excluded = oct_mod._edge_eligibility(p, L, F)
+        if near:                                   # off by default; kept so the reviewer can mute drawn slices
+            for d in drawn:
+                elig[max(0, d - near):min(L, d + near + 1), :] = False
+        try:
+            conf = oct_mod.surface_confidence_map(arr, np.asarray(S, dtype=np.float64), p)
+        except Exception:  # noqa: BLE001 — advisory, but NOT waivable: see conf_ok below
+            conf = None
+        mp = oct_mod._edge_gain_map(S, arr, conf, elig, {
+            "edge_need_px": float(_rp.get("need_px", 8.0)),
+            "edge_k_air": float(_rp.get("k_air", 2.5)),
+            "edge_min_run": int(_rp.get("min_run", 5)),
+            "edge_dev_need_px": float(_rp.get("dev_need_px", 16.0)),
+        })
+        if mp.get("reason"):
+            return _early(str(mp["reason"]), slices=L, n_frames=F)
+        gain = np.asarray(mp["gain"], dtype=np.float64)
+        dev = np.asarray(mp["dev"], dtype=np.float64)
+        flag_gain = np.asarray(mp["flag_gain"], bool)
+        flag_dev = np.asarray(mp["flag_dev"], bool)
+        flag_unv = np.asarray(mp["flag_unv"], bool)
+        Dd = np.asarray(mp["Dd"], dtype=np.float64)
+        need_px = float(mp["need_px"])
+        dev_need_px = float(mp["dev_need_px"])
+        # W2 (contrast) UNEVALUABLE ⇒ no smoothing findings at all, and the response says why. A witness the
+        # queue cannot evaluate is never treated as satisfied: with conf missing, W2 used to be true at every
+        # cell and the AND collapsed onto the cross-lateral witness alone, which fires on the legitimate steep
+        # limbus — a clean scan came back as a list of false "redraw here" findings. The air-above witness is
+        # independent of conf, so `unverifiable` findings still ship.
+        conf_ok = bool(mp.get("conf_ok"))
+        air_skipped = mp.get("air_skipped")
+        elig_n = elig.sum(axis=1)
+        drawn_set = set(drawn)
+
+        def _regions(needy) -> list:
+            """Contiguous needy laterals (gaps <= 4 bridged) -> one region each. Mirrors oct-bottom-suggest:
+            n_left counts REGIONS, so the counter drops as areas get covered, not as picks get consumed."""
+            needy = np.asarray(needy, bool)
+            if not needy.any():
+                return []
+            from scipy.ndimage import binary_closing, label as _label
+            closed = binary_closing(needy, structure=np.ones(5, dtype=bool)) | needy
+            lab, nlab = _label(closed)
+            outr = []
+            for k in range(1, nlab + 1):
+                idx = np.where(lab == k)[0]
+                if idx.size:
+                    outr.append((int(idx.min()), int(idx.max()), idx))
+            return outr
+
+        def _frames_field(mask1d, weight1d) -> tuple[list, int]:
+            """Up to 4 flagged frame runs, worst (largest mean |weight|) first, + the total flagged count."""
+            runs = oct_mod._mask_runs(mask1d, 1)
+            if not runs:
+                return [], 0
+            def _w(r):
+                seg = np.abs(np.asarray(weight1d, dtype=np.float64)[r[0]:r[1] + 1])
+                seg = seg[np.isfinite(seg)]
+                return float(seg.mean()) if seg.size else 0.0
+            runs_sorted = sorted(runs, key=lambda r: -_w(r))[:4]
+            return [[int(a), int(b)] for a, b in runs_sorted], int(np.asarray(mask1d, bool).sum())
+
+        def _ranges_text(fr: list) -> str:
+            # `frames` rides back worst-first (the UI shows the worst run), but a SENTENCE reads in frame
+            # order — so the reason string sorts them ascending.
+            return ", ".join((f"{a}" if a == b else f"{a}-{b}") for a, b in sorted(fr)) or "-"
+
+        def _side_text(fr: list) -> str:
+            """WHERE TO LOOK, in the reviewer's own frame of reference. The numbers `_ranges_text` prints are
+            ARRAY frame indices, but the sagittal border panel is scaleX(-1): display-LEFT = HIGH frame index.
+            Bare indices therefore name a place the reviewer cannot find on screen — which is exactly why the
+            under-determination prompt already ships a `sideOf()` hint beside its frame ranges (SliceGallery.tsx,
+            COV_EDGE_BAND = 12). Same rule and same band here, so the two prompts never disagree about which
+            edge of the B-scan they mean."""
+            if not fr or F <= 0:
+                return ""
+            # The DOMINANT run decides where to look. `fr` is ordered worst-first, so taking min/max over ALL
+            # runs sent the reviewer to "the middle" whenever a small second run sat at the other end
+            # (2026-09-07). Use the first run only.
+            lo2 = int(fr[0][0]); hi2 = int(fr[0][1])
+            eb = min(12, F // 3)
+            if lo2 >= F - eb:
+                return " (display-LEFT edge of the B-scan)"
+            if hi2 < eb:
+                return " (display-RIGHT edge of the B-scan)"
+            return " (middle of the B-scan)"
+
+        # ── kind "gain" ────────────────────────────────────────────────────────────────────────────────
+        # TWO WAYS IN, because the two numbers mean different things:
+        #   gain_px — the RMS reduction achievable by replacing the DOUBLY-flagged cells. Only the cells that
+        #             clear both witnesses count, so a line that is uniformly off but only partly flagged
+        #             scores far below its own departure (cs008_od_v2 l51: departure 12.78, gain 1.74).
+        #   dev_px  — the departure itself, the quantity the reviewer sees on screen.
+        # Gating on gain alone dropped such a lateral AND told the reviewer "already at the measured floor
+        # (max gain N px < 8)" — the miss reported as reassurance. A lateral now surfaces on EITHER bar; the
+        # `qualified` field says which, and the sentence quotes the quantity it actually gated on.
+        if conf_ok:
+            needy_gain = np.isfinite(gain) & (gain >= need_px) & (elig_n > 0)
+            needy_dev = np.isfinite(dev) & (dev >= dev_need_px) & (elig_n > 0)
+        else:
+            needy_gain = np.zeros(L, bool)
+            needy_dev = np.zeros(L, bool)          # the departure witness alone is not a finding (H1)
+        gain_regions: list[dict] = []
+        for lo_, hi_, idx in _regions(needy_gain | needy_dev):
+            qual = "gain" if bool(needy_gain[idx].any()) else "departure"
+            if qual == "gain":                     # ORDERING UNCHANGED: the gain-qualified best is the max gain
+                sub = np.where(needy_gain[idx] & np.isfinite(gain[idx]), gain[idx], -np.inf)
+                best = int(idx[int(np.argmax(sub))])
+                mask = flag_gain[best]
+            else:
+                sub = np.where(np.isfinite(dev[idx]), dev[idx], -np.inf)
+                best = int(idx[int(np.argmax(sub))])
+                mask = flag_dev[best]              # describe it with the witness that actually fired
+            frames, nfr = _frames_field(mask, Dd[best])
+            n_elig = int(elig_n[best])
+            g = float(gain[best]) if np.isfinite(gain[best]) else None
+            d_lat = float(dev[best]) if np.isfinite(dev[best]) else None
+            whole = bool(n_elig and nfr >= 0.5 * n_elig)
+            # THE DISTANCE THE SENTENCE QUOTES. `gain` is a reduction, not a distance — quoting it after "off"
+            # or "departs by" was wrong by up to 2x in both directions. Use the median |Dd| over the frames the
+            # sentence names (or the whole-line departure when it names the whole line), and keep `gain` for
+            # the clause about what correcting it recovers.
+            seg = np.abs(Dd[best][np.asarray(mask, bool)])
+            seg = seg[np.isfinite(seg)]
+            # RMS, not the median, over the flagged cells: the sentence names those frames and asserts a
+            # distance there, and a median hides the outliers that drove the finding (measured 2026-09-07: the
+            # median understated the named frames by up to 9.6x and could read SMALLER than the recovery quoted
+            # in the same sentence, which is incoherent).
+            off = (d_lat if (whole or not seg.size) else float(np.sqrt(np.mean(np.square(seg)))))
+            if off is None:
+                off = float(np.nanmax(np.abs(Dd[best]))) if np.isfinite(Dd[best]).any() else 0.0
+            recov = f"; redrawing it recovers about {g:.1f} px" if g is not None else ""
+            where = f" over frames {_ranges_text(frames)}{_side_text(frames)}"
+            if qual == "gain":
+                reason = ((f"the whole line on this slice sits ~{off:.1f} px off the surface its neighbours "
+                           f"trace, with no boundary contrast under it") if whole else
+                          (f"the line sits ~{off:.1f} px off the surface its neighbours trace{where} and has "
+                           f"no boundary contrast there")) + recov
+            else:
+                reason = ((f"the whole line on this slice sits ~{off:.1f} px off the surface its neighbours "
+                           f"trace") if whole else
+                          (f"the line sits ~{off:.1f} px off the surface its neighbours trace{where}")) + \
+                         ("; only part of that lacks boundary contrast, so the measured recovery is smaller"
+                          + (f" (~{g:.1f} px)" if g is not None else ""))
+            gain_regions.append({"lateral": best, "lo": lo_, "hi": hi_, "kind": "gain",
+                                 "qualified": qual,
+                                 "gain_px": (round(g, 2) if g is not None else None),
+                                 "dev_px": (round(d_lat, 2) if d_lat is not None else None),
+                                 "off_px": round(float(off), 2),
+                                 "n_frames": nfr, "frames": frames,
+                                 "drawn": best in drawn_set, "reason": reason})
+        # ORDER — DECISION 2026-09-07, recorded here because the banner now states it. The ranking key stays
+        # the gain (largest first) for gain-qualified regions; the alternative the verifier measured (rank by
+        # the reduction in the lateral's OWN off-deg-2 roughness) went NEGATIVE on four of seven cs009_os_v3
+        # picks, because a straight chord through the stroma is artificially smooth against a quadratic. Since
+        # gain is the departure that redrawing removes, the honest description of this order is "worst
+        # departure from the neighbouring slices first" — NOT "ranked by smoothness gain", which is what the
+        # banner used to imply. Departure-qualified regions cannot promise a removal, so they follow, ordered
+        # among themselves by departure.
+        gain_regions.sort(key=lambda q: (0 if q["qualified"] == "gain" else 1,
+                                         -((q["gain_px"] if q["qualified"] == "gain" else q["dev_px"]) or 0.0)))
+
+        # ── kind "unverifiable" (specular flare — no px number, ever) ──────────────────────────────────
+        needy_unv = flag_unv.any(axis=1)
+        unv_regions: list[dict] = []
+        for lo_, hi_, idx in _regions(needy_unv):
+            cnt = flag_unv[idx].sum(axis=1)
+            best = int(idx[int(np.argmax(cnt))])
+            frames, nfr = _frames_field(flag_unv[best], np.ones(F))
+            unv_regions.append({"lateral": best, "lo": lo_, "hi": hi_, "kind": "unverifiable",
+                                "qualified": "flare", "gain_px": None, "off_px": None,
+                                "dev_px": (round(float(dev[best]), 2) if np.isfinite(dev[best]) else None),
+                                "n_frames": nfr, "frames": frames,
+                                "drawn": best in drawn_set,
+                                "reason": ("the line crosses a specular flare - no dark background above it at "
+                                           f"frames {_ranges_text(frames)}{_side_text(frames)}; the image "
+                                           "cannot confirm the line there")})
+        unv_regions.sort(key=lambda q: -q["n_frames"])
+
+        regions = gain_regions + unv_regions
+        picks = regions[:n_pick]
+        fin_dev = dev[np.isfinite(dev)]
+        fin_gain = gain[np.isfinite(gain)]
+        reason = None
+        reason_kind = None
+        if not gain_regions:
+            # HONEST SILENCE quoting the measured floor (mirrors the determinism report's floor.quotable):
+            # say what the biggest available gain actually was, never imply it is zero. With nothing scorable
+            # at all (every frame excluded, or too few finite frames), say THAT instead of quoting a floor
+            # that was never measured. Since a lateral can now qualify on EITHER bar, the sentence quotes
+            # BOTH — a sentence may only reassure about the quantities it actually gated on.
+            if not conf_ok:
+                reason_kind = "no_contrast_witness"
+                reason = ("the contrast witness (surface confidence) could not be computed on this scan, so "
+                          "no smoothing findings are reported — a witness that cannot be evaluated is never "
+                          "treated as satisfied; the cross-lateral witness alone fires on the steep limbus")
+            elif fin_gain.size or fin_dev.size:
+                reason_kind = "floor"
+                _g = f"{float(fin_gain.max()):.1f}" if fin_gain.size else "n/a"
+                _d = f"{float(fin_dev.max()):.1f}" if fin_dev.size else "n/a"
+                reason = (f"already at the measured floor (max gain {_g} px < {need_px:.1f} px, "
+                          f"max departure {_d} px < {dev_need_px:.1f} px)")
+            else:
+                reason_kind = "unscorable"
+                reason = "no scorable laterals on this scan"
+        return {"target": target, "slices": L, "n_frames": F,
+                "witness": ("cross-lateral + contrast + air-above" if conf_ok
+                            else "air-above only (contrast witness unavailable)"),
+                "conf_ok": conf_ok,
+                "air_skipped": (int(air_skipped) if air_skipped is not None else None),
+                "move_source": move_source,
+                "need_px": round(need_px, 2),
+                "dev_need_px": round(dev_need_px, 2),
+                # Names the actual sort key. "worst departure first" would be false here — see the ORDER
+                # paragraph in the docstring for the cs009_os_v3 l303/l183 inversion that proves it.
+                "order": "most correctable first: the departure from the neighbouring slices that redrawing "
+                         "removes, largest first; slices whose departure redrawing cannot remove follow",
+                "sigma_lat_px": round(float(mp["sigma_lat_px"]), 2),
+                "tau_lat_px": round(float(mp["tau_lat_px"]), 2),
+                "air_ref": (round(float(mp["air_ref"]), 1) if mp.get("air_ref") is not None else None),
+                "k_air": float(_rp.get("k_air", 2.5)), "min_run": int(_rp.get("min_run", 5)),
+                "median_dev_px": (round(float(np.median(fin_dev)), 2) if fin_dev.size else None),
+                "p90_dev_px": (round(float(np.percentile(fin_dev, 90)), 2) if fin_dev.size else None),
+                "excluded_frames": excluded, "drawn": drawn,
+                "picks": picks, "regions": regions, "n_left": len(regions),
+                "reason": reason, "reason_kind": reason_kind}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"edge suggest failed: {exc}")
 
 @app.post("/api/case/{case_id}/oct-corrected-suggest")
 def oct_corrected_suggest(case_id: str, req: OctPreprocessRequest) -> dict:
@@ -6085,6 +7280,17 @@ def oct_corrected_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
             op["corrected_edge_anchors"] = anchors
         else:
             op.pop("corrected_edge_anchors", None)
+        # BOTTOM-LINE edits on the corrected pane (surface-cropped scans). Only touched when the request carries
+        # the field, so a top-only commit (e.g. the regenerate button's flush) never wipes a saved bottom line.
+        if req.corrected_post_anchors is not None:
+            _cpa = req.corrected_post_anchors if isinstance(req.corrected_post_anchors, dict) else {}
+            _cpa = {str(k): {str(f): float(d) for f, d in v.items()} for k, v in _cpa.items()
+                    if isinstance(v, dict) and len(v)}
+            if _cpa:
+                op["corrected_post_anchors"] = _cpa
+            else:
+                op.pop("corrected_post_anchors", None)
+        _post_lats = set(str(k) for k in (op.get("corrected_post_anchors") or {}))
         # DRAWING A CORRECTED EDGE IS ALSO VOUCHING FOR IT (reviewer, 2026-09-03: "corrected edge corrections
         # should automatically be considered as marked accurate"). A slice the reviewer has just drawn is, by
         # definition, one whose surface they have decided — so it joins corrected_accurate without them having
@@ -6093,11 +7299,12 @@ def oct_corrected_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         # baseline_px is left null here — this endpoint is the ~900 ms autosave and must not trigger a cold
         # surface detection; /oct-corrected-accurate and /oct-corrected-suggest fill the reading in later.
         _acc = dict(op.get("corrected_accurate") or {})
-        for _k in anchors:
+        for _k in list(anchors) + sorted(_post_lats):
             if str(_k) not in _acc:
                 _acc[str(_k)] = {"baseline_px": None, "current_px": None, "at": int(time.time()),
                                  "from": "drawn"}
-        for _k in [k for k in _acc if (_acc[k] or {}).get("from") == "drawn" and str(k) not in anchors]:
+        for _k in [k for k in _acc if (_acc[k] or {}).get("from") == "drawn"
+                   and str(k) not in anchors and str(k) not in _post_lats]:
             _acc.pop(_k, None)          # a cleared drawing withdraws the mark it implied
         if _acc:
             op["corrected_accurate"] = _acc
@@ -6203,7 +7410,7 @@ def oct_border_guided(case_id: str) -> dict:
             # guided (a fair test of whether the detector's own search found the drawn edge); but what gets
             # delivered must honor the anchors exactly at the frames drawn — guided's 40 px search otherwise
             # lands well off a manifestly-correct line. Non-drawn frames keep guided's from-image detection.
-            oct_mod.pin_anchors(guided, anchors, depth, float(p.get("crop_max_pad", 120)))
+            oct_mod.pin_anchors(guided, anchors, depth, float(p.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p))
             cp = _guided_cache_path(case_id)
             cp.parent.mkdir(parents=True, exist_ok=True)
             tmp = cp.with_name("guided.tmp.npz")
@@ -6494,6 +7701,41 @@ def cases_list() -> dict:
             },
         })
     return {"cases": out}
+
+
+@app.get("/api/cases/pipeline-status")
+def cases_pipeline_status() -> dict:
+    """Bulk view of run_is_current over every OCT case (same enumeration rule as /api/cases/list): which
+    scans were made by the pipeline running now, and which of the stale ones are still un-approved (those
+    are the ones the app re-runs on open). For a bulk re-run tool; reads manifests only."""
+    root = settings.CASES_ROOT
+    out: list[dict] = []
+    if not root.exists():
+        return {"pipeline_version_now": str(oct_mod.PIPELINE_VERSION), "cases": [], "n_stale_unvetted": 0}
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        cid = child.name
+        try:
+            m = orch.read_manifest(cid)
+        except Exception:  # noqa: BLE001 — skip an unreadable case, keep the rest
+            continue
+        if not m or m.get("consensus_cases"):
+            continue
+        if not (m.get("oct_source") or m.get("companion_txt")):
+            continue  # not an OCT-loader case
+        cur, why = run_is_current(m)
+        it = m.get("oct_iter") if isinstance(m.get("oct_iter"), dict) else {}
+        out.append({
+            "case_id": cid,
+            "current": bool(cur),
+            "vetted": bool(m.get("preproc_vetted")),
+            "preprocessed": bool(m.get("oct_preprocessed")),
+            "version_run": (str(it.get("pipeline_version")) if it.get("pipeline_version") else None),
+            "reason": why,
+        })
+    n_stale = sum(1 for c in out if c["preprocessed"] and not c["current"] and not c["vetted"])
+    return {"pipeline_version_now": str(oct_mod.PIPELINE_VERSION), "cases": out, "n_stale_unvetted": n_stale}
 
 
 @app.post("/api/cases/wipe")

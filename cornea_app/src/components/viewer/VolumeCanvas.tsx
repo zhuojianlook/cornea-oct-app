@@ -616,7 +616,7 @@ export function VolumeCanvas() {
             selected={stepsView}
             onChange={() => { setStepsView((v) => !v); setCompareView(false); setFixColsView(false); setFixAxialView(false); }}
             sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
-            title="Preview every preprocessing step (hist-eq → edge → quadratic fit → 3D active → warp) for the central slice"
+            title="Every step of the last preprocessing run, including your inputs, as a tree — plus the detector filmstrip"
           >
             ⚙ Steps
           </ToggleButton>

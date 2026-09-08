@@ -14,6 +14,13 @@ export interface CaseInfo {
   segmentation_dir: string;
   qa_json: string;
   manifest: Record<string, unknown>;
+  // PIPELINE CURRENCY of the scan's last preprocessing run (api_server.run_is_current): true iff
+  // manifest.oct_iter.pipeline_version == oct_preprocess.PIPELINE_VERSION. All four are absent on an older
+  // sidecar — readers must treat "absent" as "unknown", never as "stale" (see store/autoRerun.ts).
+  pipeline_current?: boolean;
+  pipeline_version_run?: string | null;   // the version stamped on the run, null when unstamped / no run
+  pipeline_version_now?: string;          // the sidecar's current PIPELINE_VERSION
+  pipeline_reason?: string;               // human-readable why (e.g. "run unstamped", "1.2 != 1.3")
 }
 
 export interface PreviewImage {

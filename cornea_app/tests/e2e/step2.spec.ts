@@ -80,32 +80,58 @@ test.describe("step 2 — preprocessing approval + display modes", () => {
     expect(unexpected).toEqual([]);
   });
 
-  test('"Steps" opens an inline preprocessing-steps panel that can be closed', async ({ page, consoleErrors }) => {
+  test('"Steps" opens an inline preprocessing-steps panel (Run tree tab) that can be closed', async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.auto);
 
-    // Track failing (>=400) responses (the consoleErrors fixture only records >=500) so the expected
-    // Steps 400 below is verified, not blindly tolerated.
+    // Track failing (>=400) responses (the consoleErrors fixture only records >=500): the Run tree tab
+    // reads the run record (POST oct-run-graph → 200 even without a .OCT), so NOTHING may fail here.
     const failed: string[] = [];
     page.on("response", (r) => { if (r.status() >= 400) failed.push(`${r.status()} ${r.url()}`); });
 
     await mainBtn(page, /Steps/).click();
 
     // The Steps surface is an INLINE panel (StepsViewer mounted in VolumeCanvas), NOT a role=dialog/modal.
-    // Its defining header is "Preprocessing decision tree …" plus a "← 3D view" close control.
+    // Its defining header is "Preprocessing decision tree …" plus a "← 3D view" close control, and the
+    // "Run tree" tab is selected by default (MUI ToggleButton → aria-pressed).
     const main = page.locator("main");
     await expect(main.getByText(/preprocessing decision tree/i).first()).toBeVisible();
     const close = main.getByRole("button", { name: /3D view/i });
     await expect(close).toBeVisible();
+    await expect(main.getByRole("button", { name: /Run tree/i })).toHaveAttribute("aria-pressed", "true");
+    // The synthetic fixture has no oct_iter, so the tree renders in mode "none" (every node "not run") with
+    // the "Preprocess the scan first" note + the "Click a node" hint; while loading it says "Building…".
+    await expect(main.getByText(/Click a node|Preprocess the scan first|Building the run tree/i).first()).toBeVisible();
+    // the export button is present (disabled in mode "none")
+    await expect(mainBtn(page, /Export for publication/)).toBeVisible();
 
     // Close it → the panel tears down (its header is gone).
     await close.click();
     await expect(main.getByText(/preprocessing decision tree/i)).toHaveCount(0, { timeout: 5_000 });
 
-    // The synthetic fixture has no real .OCT source, so the panel's POST oct-preprocess-steps CORRECTLY
-    // returns 400 (the panel shows "Couldn't render steps … no .OCT source") → a benign "Failed to load
-    // resource … 400" console line. Confirm via the network that every >=400 is that one request, then
-    // tolerate the matching console line; any other console error still fails the test.
+    expect(failed).toEqual([]);
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('"Steps" → "Detector filmstrip" tab replays the default path (400 without a .OCT source)', async ({ page, consoleErrors }) => {
+    await gotoApp(page);
+    await openCase(page, FIX.auto);
+
+    const failed: string[] = [];
+    page.on("response", (r) => { if (r.status() >= 400) failed.push(`${r.status()} ${r.url()}`); });
+
+    await mainBtn(page, /Steps/).click();
+    const main = page.locator("main");
+    await expect(main.getByText(/preprocessing decision tree/i).first()).toBeVisible();
+
+    // The filmstrip is mounted LAZILY — only once its tab is picked does POST oct-preprocess-steps fire.
+    await main.getByRole("button", { name: /Detector filmstrip/i }).click();
+    await expect(main.getByText(/Couldn't render steps|Rendering steps|No steps/i).first()).toBeVisible();
+
+    // The synthetic fixture has no real .OCT source, so POST oct-preprocess-steps CORRECTLY returns 400
+    // (the panel shows "Couldn't render steps … no .OCT source") → a benign "Failed to load resource … 400"
+    // console line. Confirm via the network that every >=400 is that one request, then tolerate the
+    // matching console line; any other console error still fails the test.
     const benign400 = /Failed to load resource: the server responded with a status of 400/;
     expect(failed.every((f) => /oct-preprocess-steps/.test(f))).toBe(true);
     const unexpected = consoleErrors.filter((e) => !benign400.test(e));

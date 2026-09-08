@@ -6,10 +6,17 @@ import { octProposals } from "../api/lifecycle";
 import { useWorkflowStore } from "./workflowStore";
 import { describeSmoothAlign, type SmoothAlignInfo } from "./smoothAlign";
 import { usePendingEditStore } from "./pendingEditStore";
+import { RERUN_WITH_CORRECTIONS_BODY, autoRerunNotice, shouldAutoRerun } from "./autoRerun";
 
 // The last case openCase() actually switched to — so we only reset the per-case
 // workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
 let _lastOpenedCase: string | null = null;
+
+// Cases whose stale-pipeline AUTO re-run has already been dispatched during the current open (see openCase).
+// Cleared on a genuine case switch (and clearCase), so a scan re-opened later gets one more attempt — but a
+// same-case reload after the run (rerunWithCorrections → openCase) or after a failure never fires again.
+const _autoRerunAttempted = new Set<string>();
+const AUTO_RERUN_DONE_NOTE = "Re-ran this scan through the current pipeline — inspect it, then Approve or correct.";
 
 // Audible "process done" chime — the reviewer asked to be alerted when a ~2-min re-run finishes so they don't
 // have to sit watching it. Web Audio (no asset); best-effort resume() past autoplay-suspension (a prior click
@@ -66,6 +73,10 @@ interface CaseState {
   caseInfo: CaseInfo | null;
   volumeUrl: string | null;
   busy: boolean;
+  // One-line notice for the stale-pipeline AUTO re-run that openCase dispatches ("processed with an older
+  // pipeline — re-running…", then the outcome). Rendered by TimelineBar beside the running state. Null when
+  // the open scan needed no automatic run. Cleared on a genuine case switch.
+  autoRerunNote: string | null;
 
   fetchConfig: () => Promise<void>;
   setApiError: (msg: string | null) => void;
@@ -119,7 +130,7 @@ interface CaseState {
    *  edited slices feed align_corrected_to_smooth (the "Smooth to trusted slices" action) or, on their own,
    *  apply_sagittal_surface_gt — a guarded per-frame depth shift (+ tilt) that moves the tissue onto the drawn
    *  curve. So a correction the DP detector would smooth away actually sticks. Empty {} clears. */
-  commitCorrectedEdgeAnchors: (anchors: Record<string, Record<string, number>>) => Promise<void>;
+  commitCorrectedEdgeAnchors: (anchors: Record<string, Record<string, number>>, postAnchors?: Record<string, Record<string, number>>) => Promise<void>;
   commitCorrectedAccurate: (laterals: number[]) => Promise<Record<string, { baseline_px: number | null; current_px: number | null }>>;
   /** Persist crop marks (surface-crop frames / crop region) WITHOUT re-running the pipeline — the cheap
    *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
@@ -138,7 +149,10 @@ interface CaseState {
                                  /** Reviewer directive 2026-09-01: corrected-pane edits are the more accurate
                                   *  observation, so fold them into the ORIGINAL scan's border_anchors and re-run
                                   *  from the improved GT (corrected_edit_feedback) instead of the post-hoc warp. */
-                                 foldToOriginal?: boolean }) => Promise<boolean>;
+                                 foldToOriginal?: boolean;
+                                 /** Override the "working" status line (title + detail) shown while the run is
+                                  *  live — the stale-pipeline auto re-run explains WHY it is running. */
+                                 status?: { title: string; detail: string } }) => Promise<boolean>;
   // "Surface-crop" manual mark → manifest.surface_crop_manual (human review of the auto-detected clipped-cornea set).
   setSurfaceCrop: (surfaceCrop: boolean) => Promise<void>;
   scheduleTraining: (scheduled: boolean) => Promise<void>;
@@ -219,6 +233,7 @@ export const useCaseStore = create<CaseState>()(
     caseInfo: null,
     volumeUrl: null,
     busy: false,
+    autoRerunNote: null,
     editorResetNonce: 0,
     exportInfo: null,
     preprocessed: false,
@@ -372,8 +387,9 @@ export const useCaseStore = create<CaseState>()(
       const id = get().caseId;
       if (!id) return false;
       set((s) => { s.busy = true; s.apiError = null; });
-      useWorkflowStore.getState().set("status", { kind: "working", title: "Re-running with your corrections",
-        detail: "Flattening this scan to the surface you drew — about two minutes." });
+      useWorkflowStore.getState().set("status", { kind: "working",
+        title: opts?.status?.title ?? "Re-running with your corrections",
+        detail: opts?.status?.detail ?? "Flattening this scan to the surface you drew — about two minutes." });
       try {
         // GENERALIZE FIRST, then warp. This is the difference between a correction reaching the output and
         // being outvoted by it.
@@ -419,7 +435,9 @@ export const useCaseStore = create<CaseState>()(
           // FOLD and SMOOTH-ALIGN are mutually exclusive by construction: a successful fold rewrites the raw GT,
           // so the backend skips the post-hoc warp (api_server.py `if req.corrected_smooth_align and not
           // _folded_corrected`). Sending both would just mean "fold, and warp if the fold found nothing".
-          JSON.stringify({ use_redetect: true,
+          // With no opts this is exactly RERUN_WITH_CORRECTIONS_BODY — the stale-pipeline auto re-run on open
+          // (openCase) relies on that identity: it must dispatch the same call as this button.
+          JSON.stringify({ ...RERUN_WITH_CORRECTIONS_BODY,
                            corrected_edit_feedback: opts?.foldToOriginal ?? false,
                            corrected_smooth_align: opts?.smoothAlign ?? false,
                            corrected_trusted_laterals: (opts?.smoothAlign || opts?.foldToOriginal)
@@ -525,15 +543,19 @@ export const useCaseStore = create<CaseState>()(
                          parabola_slices: parabolaSlices ?? null }));
     },
 
-    commitCorrectedEdgeAnchors: async (anchors) => {
+    commitCorrectedEdgeAnchors: async (anchors, postAnchors) => {
       const id = get().caseId;
       if (!id) return;
       // Persist the drawn corrected-edge anchors as sticky GT (oct_params.corrected_edge_anchors). The next re-run
       // consumes them as a RIGID per-frame axial move (the "Smooth to trusted slices" align, or
       // apply_sagittal_surface_gt on their own), so a correction the DP detector would smooth away actually sticks.
       // No warp happens here — only on the following preprocess Run. Empty {} clears.
+      // postAnchors === undefined → leave the persisted bottom line alone (the endpoint only touches the field when
+      // it is sent); {} → clear it. Surface-cropped scans only.
       await api.json(`/api/case/${id}/oct-corrected-redetect`, "POST",
-        JSON.stringify({ corrected_edge_anchors: anchors ?? {} }));
+        JSON.stringify(postAnchors === undefined
+          ? { corrected_edge_anchors: anchors ?? {} }
+          : { corrected_edge_anchors: anchors ?? {}, corrected_post_anchors: postAnchors ?? {} }));
       // Reflect the write back into the in-memory manifest. Without this, oct_params still holds the OLD set, so
       // the panel keeps reporting the drawing as unsaved and a later re-seed would restore the stale anchors over
       // the ones just written. Mirrors the persisted state rather than re-fetching the case (a full openCase()
@@ -544,6 +566,10 @@ export const useCaseStore = create<CaseState>()(
         const op = { ...((m.oct_params as Record<string, unknown>) ?? {}) };
         if (anchors && Object.keys(anchors).length) op.corrected_edge_anchors = anchors;
         else delete op.corrected_edge_anchors;
+        if (postAnchors !== undefined) {
+          if (postAnchors && Object.keys(postAnchors).length) op.corrected_post_anchors = postAnchors;
+          else delete op.corrected_post_anchors;
+        }
         m.oct_params = op;
       });
     },
@@ -691,24 +717,30 @@ export const useCaseStore = create<CaseState>()(
     },
 
     rerunPreprocess: async () => {
+      // "↻ Re-preprocess" IS the full reset (reviewer 2026-09-04: "reset entirely — all marks and user edits gone,
+      // just automatic preprocessing — and ensure the re-preprocess button performs this reset function properly").
+      // It used to keep the sticky crop / surface-crop marks and drop only border corrections, so a scan could never
+      // be brought back to a pure auto state from this button. Same request as clearAllCorrections; pending edits
+      // and the editors' local state go too.
       const id = get().caseId;
       if (!id) return;
+      const pe = usePendingEditStore.getState();
+      pe.setPending(null); pe.setCorrectedEdge(null); pe.clearTrustedSlices(id); pe.setEditTarget("original");
       set((s) => { s.busy = true; s.apiError = null; });
-      useWorkflowStore.getState().set("status", { kind: "working", title: "Re-running preprocessing",
-        detail: "Re-detecting the corneal surface and re-warping from the raw .OCT — this can take a minute." });
+      useWorkflowStore.getState().set("status", { kind: "working", title: "Resetting to automatic preprocessing",
+        detail: "Dropping every manual correction and mark, then re-detecting and re-warping from the raw .OCT — this can take a minute." });
       try {
-        // Empty params → a NORMAL auto preprocess from the raw .OCT (drops stale border anchors/cache;
-        // keeps the scan's persisted params + classification + any sticky manual corrections). The endpoint
-        // also drops the segmentation + resets preproc_vetted, so the timeline falls back to Auto (red).
-        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ params: {} }));
-        await get().openCase();                 // reload the re-corrected working volume (cache-busted URL)
+        await api.json(`/api/case/${id}/oct-preprocess`, "POST", JSON.stringify({ params: {}, clear_all_corrections: true }));
+        await get().openCase();                 // reload the fresh working volume + clean manifest (cache-busted URL)
         const wf = useWorkflowStore.getState();  // refresh previews + reflect the dropped segmentation
         wf.set("segVersion", wf.segVersion + 1);
-        wf.set("status", { kind: "done", title: "Preprocessing re-run", detail: "Fresh auto correction applied — review (Before/after · Fix-columns), then Approve." });
+        set((s) => { s.editorResetNonce = s.editorResetNonce + 1; });   // remount the editors: no stale drags
+        wf.set("status", { kind: "done", title: "Reset to automatic preprocessing",
+          detail: "Every correction and mark dropped, fresh auto result applied — review (Before/after · Fix-columns), then Approve." });
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         set((s) => { s.apiError = m; });
-        useWorkflowStore.getState().set("status", { kind: "error", title: "Re-run failed", detail: m });
+        useWorkflowStore.getState().set("status", { kind: "error", title: "Reset failed", detail: m });
       } finally {
         set((s) => { s.busy = false; });
       }
@@ -768,10 +800,16 @@ export const useCaseStore = create<CaseState>()(
         const config = await api.getConfig();
         set((s) => {
           s.config = config;
-          // Start blank on (re)load: do NOT adopt the persisted last case, so a refresh
-          // shows no volume/segmentation until the user loads or opens one.
           s.apiError = null;
         });
+        // REOPEN THE LAST CASE ON (RE)LOAD (reviewer 2026-09-05: "pressing F5 does not load the scan"). openCase
+        // already records default_case_id on every open; a refresh used to start blank on purpose, which cost the
+        // reviewer a sidebar search after every build reload. Failures are silent: a missing case just starts blank.
+        const last = (config as { default_case_id?: string | null } | null)?.default_case_id;
+        if (last && !get().caseId) {
+          set((s) => { s.caseId = last; });
+          try { await get().openCase(); } catch { /* start blank */ }
+        }
       } catch (e) {
         set((s) => {
           s.apiError = e instanceof Error ? e.message : String(e);
@@ -795,16 +833,31 @@ export const useCaseStore = create<CaseState>()(
       // Forget the last-opened case so the next openCase of ANY id (including the same one) is treated as a
       // genuine switch and runs the full reset + ascanRateHz re-seed (otherwise a re-opened case inherits stale state).
       _lastOpenedCase = null;
-      set((s) => { s.caseId = null; s.caseInfo = null; s.volumeUrl = null; });
+      _autoRerunAttempted.clear();
+      set((s) => { s.caseId = null; s.caseInfo = null; s.volumeUrl = null; s.autoRerunNote = null; });
     },
 
     openCase: async () => {
       const id = get().caseId;
       if (!id) return;
+      // H2 (review 2026-09-07): openCase is also called DURING a run (the post-run reload, or a sidebar click while a
+      // re-run is live). Its finally used to force busy=false, which released Approve mid-run and made the auto-run
+      // guard below read a cleared flag. Restore whatever busy was, so a live run keeps holding it.
+      const _prevBusy = get().busy;
       set((s) => {
         s.busy = true;
         s.apiError = null;
+        // Switching scans: drop the previous scan's auto re-run note NOW, before the fetch — otherwise "Re-ran
+        // this scan…" sits under the NEW case id for the seconds the open takes (seen live 2026-09-07).
+        if (id !== _lastOpenedCase) s.autoRerunNote = null;
       });
+      // STALE-PIPELINE AUTO RE-RUN (reviewer 2026-09-07: "make sure that scans that are open through the approve
+      // queue open through the new pipeline"). Decided here, INSIDE the one function every open path ends in —
+      // launch (fetchConfig → default_case_id), a sidebar row click (OctLoader.preview), Approve/Skip/Difficult →
+      // next (reviewQueueStore.open → preview) and the open-by-id box all call openCase — so no path can show an
+      // old-pipeline result without kicking off the current one. Dispatched AFTER `finally` clears busy, so the
+      // run's own busy/status lifecycle is the ordinary rerunWithCorrections one.
+      let autoRerun: string | null = null;
       try {
         const info = await api.json<CaseInfo>("/api/case", "POST", JSON.stringify({ case_id: id }));
         if (info.case_id !== _lastOpenedCase) {
@@ -818,22 +871,62 @@ export const useCaseStore = create<CaseState>()(
             useWorkflowStore.getState().set("ascanRateHz", rate);
           }
           _lastOpenedCase = info.case_id;
+          // A genuine (re)open gets one fresh auto re-run attempt; the note belongs to the previous scan.
+          _autoRerunAttempted.clear();
+          set((s) => { s.autoRerunNote = null; });
         }
         set((s) => {
           s.caseInfo = info;
           s.caseId = info.case_id;
           s.volumeUrl = hasVolume(info) ? volumeUrlFor(info.case_id) : null;
+          // The reload rerunWithCorrections performs after the auto re-run: the served record is now current, so
+          // the note flips to the outcome HERE, on the response that proves it — not after the trailing
+          // corrected-curve warm-up, during which the buttons are already live but the line still said
+          // "re-running…" (seen live 2026-09-07). The .then below re-asserts the same text (or FAILED).
+          if (info.pipeline_current === true && _autoRerunAttempted.has(info.case_id) && s.autoRerunNote
+              && s.autoRerunNote !== AUTO_RERUN_DONE_NOTE) s.autoRerunNote = AUTO_RERUN_DONE_NOTE;
         });
         // Remember this case so the app reopens to it across restarts.
         api.putConfig({ default_case_id: info.case_id }).catch(() => {});
+        // Claim the once-per-open attempt NOW (before any await) so a concurrent open of the same case — a
+        // StrictMode double effect, a double click, the reload rerunWithCorrections itself performs — cannot
+        // dispatch a second run.
+        if (shouldAutoRerun(info, _autoRerunAttempted).run) {
+          _autoRerunAttempted.add(info.case_id);
+          autoRerun = autoRerunNotice(info);
+        }
       } catch (e) {
         set((s) => {
           s.apiError = e instanceof Error ? e.message : String(e);
         });
       } finally {
         set((s) => {
-          s.busy = false;
+          s.busy = _prevBusy;
         });
+      }
+      if (autoRerun) {
+        // Never start a second run on top of a live one (a batch preprocess, SAM2, a scar run …): the sidecar
+        // would refuse it with 409 anyway, and the reviewer would read the error as a broken scan.
+        const wf = useWorkflowStore.getState();
+        if (get().busy || wf.segBusy || wf.scarBusy || wf.motionBusy) {
+          set((s) => { s.autoRerunNote = "This scan was processed with an older pipeline — not re-run because another run is in progress. Use ↻ Re-run with corrections when it finishes."; });
+          return;
+        }
+        set((s) => { s.autoRerunNote = autoRerun; });
+        // NOT awaited: openCase's callers (the sidebar opener, the review-queue advance race) must resolve as
+        // soon as the scan is open. The run reports through the ordinary busy + status channels and reloads
+        // the case itself when done; a failure surfaces once via apiError + the note and is not retried.
+        void get().rerunWithCorrections({ status: { title: "Re-running through the current pipeline", detail: autoRerun } })
+          .then((ok) => {
+            // Only annotate if the reviewer is still on this scan (rerunWithCorrections runs on the case that was
+            // open when it started; the note is per open scan).
+            if (get().caseId !== id) return;
+            set((s) => {
+              s.autoRerunNote = ok
+                ? AUTO_RERUN_DONE_NOTE
+                : "Automatic re-run through the current pipeline FAILED (see the error above) — the result shown is the OLD one. Use ↻ Re-run with corrections to retry.";
+            });
+          });
       }
     },
 

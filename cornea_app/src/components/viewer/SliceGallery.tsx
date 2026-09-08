@@ -60,6 +60,7 @@ type DeterminismReport = {
   floor: { quotable: boolean; n_points: number; rms_px?: number; rms_rot_px?: number;
            off_quad_px?: number; pct_removed?: number; anatomy_px?: number };
   missed_below_T: number; interp_min_slices: number; band: number[];
+  move_source?: string;      // "tissue": the per-frame move is measured from the tissue; E_px then describes the served EDGE only
   blind_frames?: { driven?: number; too_sparse?: number; why?: string };
 };
 
@@ -398,6 +399,153 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
       .finally(() => { if (!cancelled) setCorrQueueBusy(false); });
     return () => { cancelled = true; };
   }, [caseId, editTarget, segSig]);
+  // BOTTOM-LINE QUEUES (reviewer 2026-09-05: "surface slices that require bottom surface determination on the
+  // original and corrected scans"). One endpoint, two targets: on the original pane the band slices whose served
+  // bottom sits farthest off the raw posterior (or, with no witness yet, the biggest gaps between drawn bottom
+  // lines); on the corrected pane the band slices whose bottom is least smooth after correction.
+  type BottomPick = { lateral: number; dev_px: number | null; line_px: number | null; gap: number | null };
+  type BottomRegion = BottomPick & { lo: number; hi: number };
+  type BottomQueue = { picks: BottomPick[]; regions?: BottomRegion[]; n_left?: number; need_px?: number; near?: number;
+                       drawn: number[]; band_frames: number[]; median_px: number | null; witness?: string; reason?: string };
+  const [bottomQueueOrig, setBottomQueueOrig] = useState<BottomQueue | null>(null);
+  const [bottomQueueCorr, setBottomQueueCorr] = useState<BottomQueue | null>(null);
+  const [bottomEditNonce, setBottomEditNonce] = useState(0);
+  const persistedPostSig = JSON.stringify(Object.keys(
+    ((((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.crop_post_anchors) ?? {}) as Record<string, unknown>).sort());
+  const persistedCorrPostSig = JSON.stringify(Object.keys(
+    ((((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.corrected_post_anchors) ?? {}) as Record<string, unknown>).sort());
+  useEffect(() => {
+    if (!caseId) { setBottomQueueOrig(null); setBottomQueueCorr(null); return; }
+    let cancelled = false;
+    const target = editTarget === "corrected" ? "corrected" : "original";
+    api.json<BottomQueue>(`/api/case/${caseId}/oct-bottom-suggest`, "POST", JSON.stringify({ params: { target, n: 8 } }))
+      .then((r) => { if (cancelled) return; if (target === "corrected") setBottomQueueCorr(r); else setBottomQueueOrig(r); })
+      .catch(() => { if (!cancelled) { if (target === "corrected") setBottomQueueCorr(null); else setBottomQueueOrig(null); } });
+    return () => { cancelled = true; };
+  }, [caseId, editTarget, segSig, persistedPostSig, persistedCorrPostSig]);
+  // REGIONS STILL UNCOVERED: a region counts as done as soon as ANY bottom line — persisted (q.drawn) or still
+  // pending in this pane (postAnchors) — lies within `near` of it, so the count drops as the reviewer draws,
+  // before Confirm (reviewer 2026-09-05: "the counter does not change ... stuck at 8").
+  const bottomOpen = (q: BottomQueue | null, corrected: boolean): BottomRegion[] => {
+    if (!q) return [];
+    const near = q.near ?? 10;
+    const lines = new Set<number>(q.drawn ?? []);
+    if (!corrected) postAnchors.forEach((fm, sl) => { if (fm.size) lines.add(sl); });
+    const regs: BottomRegion[] = (q.regions ?? q.picks.map((c) => ({ ...c, lo: c.lateral, hi: c.lateral })));
+    return regs.filter((r) => ![...lines].some((l) => l >= r.lo - near && l <= r.hi + near));
+  };
+  const jumpBottomNext = (q: BottomQueue | null, corrected: boolean) => {
+    const open = bottomOpen(q, corrected);
+    if (!q || !open.length) return;
+    // Step RELATIVE TO THE CURRENT SLICE (same walk as jumpNextMark): the first suggested slice after the one on
+    // screen in display order, wrapping round. A counter reset by a list refresh could otherwise point at the slice
+    // already shown, which reads as the button doing nothing (reviewer 2026-09-05).
+    const cur0 = borderSliceIdx != null ? dispSlice(borderSliceIdx) : -1;
+    const ordered = [...open].sort((a, b) => dispSlice(a.lateral) - dispSlice(b.lateral));
+    const pick = ordered.find((c) => dispSlice(c.lateral) > cur0 + 0.5) ?? ordered[0];
+    jumpToSlice(pick.lateral);
+    if (corrected) {
+      setBottomEditNonce((n) => n + 1);                       // the corrected pane switches to its bottom line
+    } else {
+      setCropMode(true); setCropSub("line"); setCutMode(false); setLatCropMode(false); setMarkMode(false);   // bottom-line sub-mode
+    }
+  };
+  // EDGE-GAIN QUEUE, ORIGINAL pane (reviewer 2026-09-07: "the program should highlight slices were if the edges
+  // were corrected, a much smoother result would occur"). Backend-ranked laterals (/oct-edge-suggest) where the
+  // SERVED anterior edge departs from the surface its neighbouring laterals trace AND has no boundary contrast
+  // under it — so redrawing it measurably smooths the DELIVERED EDGE and fixes the exported ground truth.
+  //
+  // WHAT IT CANNOT DO, and every string here must say so: since 2026-09-05 the per-frame rigid move that
+  // flattens the scan is measured from the TISSUE (oct_preprocess.tissue_motion_move, cross-correlation of
+  // adjacent B-scans), not from the reviewer's drawn lines — oct_iter.determinism.move_source === "tissue".
+  // Correcting a line therefore CANNOT move tissue and CANNOT change the geometric smoothness of the volume.
+  // It changes the served edge line (drawn on both panes) and the exported border GT. The caveat sentence is
+  // the same one detAdvice already ships (see the edgeOnly string above) — reused verbatim, not reworded.
+  //
+  // TWO KINDS, deliberately split. "gain" carries a px figure: the line disagrees with its cross-lateral
+  // reference and has no contrast under it, so correcting it demonstrably smooths the delivered edge.
+  // "unverifiable" carries NO px number: the line sits inside a specular flare where there is no dark
+  // background above it, so the image cannot adjudicate it — correcting it there makes the edge more ACCURATE
+  // but not measurably SMOOTHER, and quoting a smoothing gain would be a lie. (Same precedent as the
+  // determinism report's UNSPANNED finding, which also reports a finding with no px number.)
+  //
+  // TWO NUMBERS, and they are NOT interchangeable (the banner quoted the wrong one until 2026-09-07):
+  //   off_px  — how far the line sits from the surface its neighbours trace. A DISTANCE; the only number that
+  //             may follow the word "off", and the one the reviewer can see on screen.
+  //   gain_px — how much of that departure redrawing actually removes (only the doubly-witnessed cells count).
+  //             A REDUCTION; it belongs in "recovers about N px" and nowhere else. The two differ by up to 2x.
+  // `qualified` says which bar surfaced the slice: "gain" (redrawing demonstrably smooths it), "departure"
+  // (the line is far off but only part of it also lacks contrast, so the measured recovery is smaller — the
+  // class the gain-only bar used to drop while REASSURING the reviewer), or "flare" for the unverifiable kind.
+  type EdgePick = { lateral: number; lo: number; hi: number; kind: "gain" | "unverifiable";
+                    qualified?: "gain" | "departure" | "flare";
+                    gain_px: number | null; dev_px: number | null; off_px?: number | null; n_frames: number;
+                    frames: number[][]; drawn: boolean; reason: string };
+  type EdgeQueue = { slices: number; n_frames?: number; picks: EdgePick[]; regions?: EdgePick[]; n_left?: number;
+                     need_px?: number; dev_need_px?: number; drawn: number[]; move_source?: string;
+                     witness?: string; conf_ok?: boolean; air_skipped?: number | null; order?: string;
+                     reason_kind?: string;
+                     median_dev_px?: number | null; p90_dev_px?: number | null; reason?: string };
+  const [edgeQueue, setEdgeQueue] = useState<EdgeQueue | null>(null);
+  // KEYS ONLY, exactly like persistedPostSig: re-drawing on a lateral that already carries a line must not
+  // trigger a refetch storm. (persistedAnchorsSig stringifies full values and is for re-seeding, not fetching.)
+  const persistedAnchorKeysSig = JSON.stringify(Object.keys(
+    ((((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
+      ?.border_anchors) ?? {}) as Record<string, unknown>).sort());
+  useEffect(() => {
+    if (!caseId || editTarget === "corrected") { setEdgeQueue(null); return; }
+    let cancelled = false;
+    api.json<EdgeQueue>(`/api/case/${caseId}/oct-edge-suggest`, "POST",
+                        JSON.stringify({ params: { target: "original", n: 8 } }))
+      .then((r) => { if (!cancelled) setEdgeQueue(r); })
+      .catch(() => { if (!cancelled) setEdgeQueue(null); });   // guidance only — a missing queue never blocks editing
+    return () => { cancelled = true; };
+  }, [caseId, editTarget, segSig, persistedAnchorKeysSig]);
+  // Drop the previous scan's ranking against the MANIFEST's own id, never against a signature: two consecutive
+  // scans with no corrections both hash to "{}" (see openCaseKey).
+  useEffect(() => { setEdgeQueue(null); }, [openCaseKey]);
+  // REGIONS STILL OPEN — recomputed client-side, never read from the backend's n_left, so the counter drops the
+  // instant the reviewer draws rather than waiting on the ~900 ms autosave + refetch ("stuck at 8").
+  const edgeOpen = (q: EdgeQueue | null): EdgePick[] => {
+    if (!q) return [];
+    const regs: EdgePick[] = q.regions ?? q.picks;
+    // The clearing test is INSIDE the region (l >= lo && l <= hi) with NO `near` slop — unlike bottomOpen —
+    // and it tests for a line EDITED THIS SESSION, not merely for a line existing. The findings here sit AT
+    // laterals that already carry a saved line (a one-lateral pin its neighbours don't share), and the backend
+    // has already applied "a drawn slice is not re-suggested unless it still deviates". A near-padded test, or
+    // a plain "is drawn" test, would clear every real finding the moment the queue loaded.
+    const edited: number[] = [];
+    borderAnchors.forEach((fm, sl) => {
+      if (!fm.size) return;
+      const p = persistedAnchors.get(sl);
+      let changed = !p || p.size !== fm.size;
+      if (!changed && p) fm.forEach((d, f) => { if (Math.round(p.get(f) ?? Number.NaN) !== Math.round(d)) changed = true; });
+      if (changed) edited.push(sl);
+    });
+    return regs.filter((r) => !edited.some((l) => l >= r.lo && l <= r.hi));
+  };
+  // The ORIGINAL pane's anterior EDGE tool — the `else` branch of the fix-cols ToggleButtonGroup, not the
+  // crop/bottom sub-mode the orange queue enters. Reveal the original pane first if the corrected-only view
+  // is showing, or the drag would land on pan-only and the tool would read as doing nothing.
+  const enterEdgeTool = () => {
+    if (editTarget !== "original") { setEditTarget("original"); onNeedOriginalPane?.(); }
+    setCutMode(false); setCropMode(false); setLatCropMode(false); setMarkMode(false);
+    setBorderMode("edge");
+  };
+  // Same wrapping display-order walk as jumpBottomNext / jumpNextMark: the first open slice AFTER the one on
+  // screen, wrapping. Relative to the view, never an index counter — a counter reset by a refresh points at the
+  // slice already shown and reads as a dead button.
+  const jumpEdgeNext = () => {
+    const open = edgeOpen(edgeQueue);
+    if (!open.length || !orientImgs.length) return;
+    const cur0 = borderSliceIdx != null ? dispSlice(borderSliceIdx) : -1;
+    const ordered = [...open].sort((a, b) => dispSlice(a.lateral) - dispSlice(b.lateral));
+    const pick = ordered.find((c) => dispSlice(c.lateral) > cur0 + 0.5) ?? ordered[0];
+    jumpToSlice(pick.lateral);
+    enterEdgeTool();
+  };
   // Parabola points (2c): sliceIdx → frame → depth the quadratic must pass through. The displayed parabola
   // re-fits through (detected edge with these points overriding); Confirm sends it as the EXACT surface.
   const [paraAnchors, setParaAnchors] = useState<Map<number, Map<number, number>>>(new Map());
@@ -958,9 +1106,11 @@ const PROP_SLICE_BAND = 20;
           : (f.frames && (f.frames.length > 1 || f.frames[0][0] !== f.frames[0][1])
               ? `frames ${fr} rest on one drawn line’s end`
               : `frame ${fr} rests on one drawn line’s end`);
+      const edgeOnly = d.move_source === "tissue"
+        ? " (this changes the served edge line only — the per-frame move is measured from the tissue, not from your lines)" : "";
       out.push({ kind: f.kind, E: f.E_px ?? null, Emax: f.E_max_px ?? f.E_px ?? null,
                  Etyp: f.E_typ_px ?? null,
-                 picks, frames: f.frames, label, side: sideOf(f.frames),
+                 picks, frames: f.frames, label: label + edgeOnly, side: sideOf(f.frames),
                  extend: (f.picks_are_existing || []).some(Boolean) });
     }
     return out;
@@ -2536,10 +2686,24 @@ const PROP_SLICE_BAND = 20;
               {/* the ESTIMATED bottom (corrected top edge + measured thickness), dashed, shown only while the
                   bottom-line tool is active — so the reviewer can see what the drag will snap to rather than
                   discovering the detent by feel */}
-              {cropSub === "line" && postThickness != null && segPts((f) => edgeY(f) + postThickness).map((p, i) => (
-                <polyline key={`es${i}`} fill="none" stroke="#ffaa28" vectorEffect="non-scaling-stroke" strokeWidth={0.8}
-                  strokeDasharray="5 4" opacity={0.5} points={p} />
-              ))}
+              {/* STAIRSTEP applies to the BOTTOM surface too (reviewer, 2026-09-04: on a surface-cropped scan the
+                  bottom edge is the one that is real in the cropped frames — the top there is an estimate — so it
+                  needs the same per-column exact-depth view to be drawn precisely). Same construction as the red
+                  edge: a horizontal step over [f, f+1] at that column's depth when stairEdge is on. */}
+              {cropSub === "line" && postThickness != null && (() => {
+                const segs: string[][] = []; let cur: string[] = [];
+                for (let f = 0; f < nFrames; f++) {
+                  const y = inBand(f) ? NaN : edgeY(f) + postThickness;
+                  if (Number.isFinite(y)) {
+                    if (stairEdge) cur.push(`${f},${y}`, `${f + 1},${y}`); else cur.push(`${f + 0.5},${y}`);
+                  } else if (cur.length) { segs.push(cur); cur = []; }
+                }
+                if (cur.length) segs.push(cur);
+                return segs.filter((sg) => sg.length > 1).map((sg, i) => (
+                  <polyline key={`es${i}`} fill="none" stroke="#ffaa28" vectorEffect="non-scaling-stroke" strokeWidth={0.8}
+                    strokeDasharray="5 4" opacity={0.5} points={sg.join(" ")} />
+                ));
+              })()}
               {/* Drawn as SEGMENTS, split wherever the reviewer marked the bottom edge absent. A single
                   polyline would bridge the gap with a straight run — exactly the phantom flat edge that
                   dragging off the floor is meant to remove. */}
@@ -2547,8 +2711,9 @@ const PROP_SLICE_BAND = 20;
                 const segs: string[][] = []; let cur: string[] = [];
                 for (let f = 0; f < nFrames; f++) {
                   const y = postY(f);
-                  if (Number.isFinite(y)) cur.push(`${f + 0.5},${y}`);
-                  else if (cur.length) { segs.push(cur); cur = []; }
+                  if (Number.isFinite(y)) {
+                    if (stairEdge) cur.push(`${f},${y}`, `${f + 1},${y}`); else cur.push(`${f + 0.5},${y}`);
+                  } else if (cur.length) { segs.push(cur); cur = []; }
                 }
                 if (cur.length) segs.push(cur);
                 return segs.filter((sg) => sg.length > 1).map((sg, i) => (
@@ -2884,7 +3049,7 @@ const PROP_SLICE_BAND = 20;
                       <button key={t} onClick={() => setEditTarget(t)}
                         title={t === "original"
                           ? "Edit the ORIGINAL (left) red line — fixes detection + reshapes the base surface."
-                          : "Edit the CORRECTED-result (right) red line — fixes residual inter-frame drift via a post-hoc rigid per-frame warp."}
+                          : "Edit the CORRECTED-result (right) red line — your drawing becomes the edge line the scan is flattened to (folded into the original scan on Regenerate); frames are not moved by the drawing itself."}
                         style={{ background: editTarget === t ? (t === "corrected" ? "rgba(34,211,238,0.18)" : "var(--c-surface2)") : "none",
                                  border: "1px solid", borderColor: editTarget === t ? (t === "corrected" ? "#22d3ee" : "var(--c-accent)") : "var(--c-border)",
                                  borderRadius: 4, color: editTarget === t ? (t === "corrected" ? "#22d3ee" : "var(--c-text)") : "var(--c-text-dim)",
@@ -2997,6 +3162,172 @@ const PROP_SLICE_BAND = 20;
                     ))}
                   </div>
                 )}
+                {/* EDGE-GAIN QUEUE, ORIGINAL pane (RED — the anterior edge line's own colour; none of the other
+                    banners owns red). Slices where the SERVED edge departs from the surface its neighbouring
+                    laterals trace with no boundary contrast under it, so redrawing it measurably smooths the
+                    DELIVERED edge and fixes the exported ground truth. Placed ABOVE the orange bottom prompt: an
+                    anterior-edge error outranks a posterior-line prompt. Gated off the corrected pane so it does
+                    not fight the violet banner for this row.
+                    Wording is "check", never "wrong", and NOTHING here may imply the image geometry changes —
+                    the per-frame move is measured from the tissue, not from the reviewer's lines. */}
+                {editTarget !== "corrected" && edgeQueue && edgeOpen(edgeQueue).length > 0 && (() => {
+                  const open = edgeOpen(edgeQueue);
+                  const gains = open.filter((q) => q.kind === "gain");
+                  // Jump-to-worst = the head of the backend's own ranking, which already puts the worst
+                  // departure first (gain-qualified regions by the departure redrawing removes, then the
+                  // departure-only ones). Re-sorting here by gain_px would have silently disagreed with the
+                  // chip row beside it, and would rank a "departure" pick by a number it does not promise.
+                  const worst = open[0];
+                  // The DISTANCE for a pick — never gain_px, which is a reduction (see the type above).
+                  // A flare ("unverifiable") finding has NO measured distance by design — the backend nulls off_px and gain_px
+  // for it. Falling through to dev_px printed a number the finding is not entitled to (2026-09-07).
+  const offOf = (q: EdgePick): number | null => (q.kind === "unverifiable" ? null : (q.off_px ?? null));
+                  // VERBATIM from detAdvice's edgeOnly string — the house-approved way to say "this cannot move
+                  // the image". Gated on the same flag (oct_iter.determinism.move_source).
+                  const caveat = edgeQueue.move_source === "tissue"
+                    ? " (this changes the served edge line only — the per-frame move is measured from the tissue, not from your lines)" : "";
+                  // CHIPS: the backend orders every "gain" region before every "unverifiable" one, so a scan
+                  // with 8+ gain regions would push the specular-flare findings off the end of the row — and
+                  // the flare is the case that started this feature (cs009_os_v3, the apex column at display
+                  // ~298). Reserve the last chip for the first unverifiable finding whenever one exists and the
+                  // head of the list is all gains, so "the image cannot confirm the line here" is never the
+                  // thing that gets truncated away. Ordering within each kind is untouched.
+                  const head = open.slice(0, 8);
+                  const chips = (open.length > 8 && !head.some((q) => q.kind === "unverifiable")
+                                 && open.some((q) => q.kind === "unverifiable"))
+                    ? [...head.slice(0, 7), open.find((q) => q.kind === "unverifiable") as EdgePick]
+                    : head;
+                  return (
+                    <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+                                  marginTop: 3, padding: "3px 8px", borderRadius: 4,
+                                  background: "rgba(255,77,77,0.10)", border: "1px solid rgba(255,77,77,0.45)" }}>
+                      {/* ORDER, said plainly — and said as the KEY ACTUALLY IS. The backend ranks gain-qualified
+                          regions by the part of the departure redrawing removes (gain_px), so "worst departure
+                          first" is not true of this row: on cs009_os_v3 it puts l303 (19 px off, gain 14.5)
+                          ahead of l183 (21 px off, gain 10.5), and the chips — which quote the departure, as
+                          they must — then read 39, 39, 31, 22, 22, 19, 21 px under that label. It is also NOT a
+                          smoothness score: ranking by the reduction in each lateral's own quadratic fit was
+                          measured NEGATIVE on four of the seven real picks (a straight chord through the stroma
+                          is artificially smooth against a quadratic), so the reviewer must not be told that
+                          either. "Most correctable first" is the one description that matches the key. */}
+                      <span style={{ fontSize: 11, color: "#ff9d9d", whiteSpace: "nowrap" }}>
+                        ✎ Edge line — {open.length} slice(s) where {gains.length
+                          ? "the line departs from the neighbouring slices"
+                          : "the image cannot confirm the line"}
+                        {gains.length ? ", most correctable first" : ""}
+                      </span>
+                      <button onClick={jumpEdgeNext}
+                        title={`Step to the next of ${open.length} slice(s) whose served edge disagrees with both its neighbouring `
+                          + `laterals and the local tissue, ranked by how much of that departure redrawing removes (largest `
+                          + `first), so the chip numbers — which are the departure itself — are not in strict order. `
+                          + `The tool switches to the red Edge line on the original pane; draw the `
+                          + `surface where it really is, then click again for the next — the count drops as you draw. `
+                          + `This is a CHECK, not a verdict: only your drawn line adjudicates where the edge is.`
+                          + caveat}
+                        style={{ border: "1px solid #ff4d4d", background: "rgba(255,77,77,0.22)", color: "#ffc9c9",
+                                 borderRadius: 4, fontSize: 11, fontWeight: 600, padding: "2px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                        → Next slice ({open.length} left)
+                      </button>
+                      {/* "off" quotes the DEPARTURE; the gain only ever appears as what redrawing RECOVERS
+                          (it is a reduction, and on a partly-witnessed line it is a fraction of the departure
+                          — quoting it after "off" overstated or understated the distance by up to 2x). A
+                          "departure"-qualified pick promises no recovery figure at all. */}
+                      <button onClick={() => { jumpToSlice(worst.lateral); enterEdgeTool(); }}
+                        title={`Jump to slice ${dispSlice(worst.lateral)} — ${worst.reason}.`
+                          + (offOf(worst) != null ? ` The line sits ~${(offOf(worst) as number).toFixed(1)} px off the surface its neighbours trace.` : "")
+                          + (worst.qualified === "gain" && worst.gain_px != null
+                             ? ` Redrawing it recovers about ${worst.gain_px.toFixed(1)} px of that.` : "")
+                          + caveat}
+                        style={{ border: "1px solid #ff4d4d", background: "rgba(255,77,77,0.16)", color: "#ff9d9d",
+                                 borderRadius: 4, fontSize: 11, padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                        Jump to worst (slice {dispSlice(worst.lateral)})
+                      </button>
+                      {/* Key is kind+lateral, not lateral: one lateral can be the worst of BOTH a gain region
+                          and an unverifiable region (the two are scored independently), and duplicate React
+                          keys make the row drop or mis-associate a chip. */}
+                      {chips.map((q) => (
+                        <button key={`${q.kind}-${q.lateral}`} onClick={() => { jumpToSlice(q.lateral); enterEdgeTool(); }}
+                          title={`Slice ${dispSlice(q.lateral)} — ${q.reason}`
+                            + (q.drawn ? ". You have already drawn here; it is listed because the served line still deviates." : "")
+                            + caveat}
+                          style={{ border: "1px solid rgba(255,77,77,0.5)", background: "rgba(255,77,77,0.10)", color: "#ff8f8f",
+                                   borderRadius: 4, fontSize: 11, padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          {/* The chip's number is the DEPARTURE — the thing the reviewer can see on screen and
+                              the thing the row is ordered by. It used to be the gain, a reduction, which read
+                              as a distance and was wrong by up to 2x. An "unverifiable" pick carries no px at
+                              all: the offered action cannot deliver a quoted px there, so it says "check". */}
+                          {dispSlice(q.lateral)}{offOf(q) != null ? ` (${(offOf(q) as number).toFixed(0)}px off)` : " (check)"}
+                        </button>
+                      ))}
+                      <span style={{ fontSize: 11, color: "var(--c-text-dim)" }}>
+                        Corrects the served edge line and the exported ground truth — it does not move the tissue.
+                      </span>
+                    </div>
+                  );
+                })()}
+                {/* HONEST SILENCE for the edge queue — and there are TWO kinds of silence, which must never
+                    look alike:
+                      floor               — both bars were measured and both were cleared. Quote BOTH numbers:
+                                            the gain alone once hid a departure twice its size, so a slice that
+                                            was missed came back to the reviewer as reassurance.
+                      no_contrast_witness — the contrast map could not be computed, so the smoothing findings
+                                            were WITHHELD. That is not a clean bill of health and must not be
+                                            phrased like one.
+                    The WITHHELD line is NOT gated on an empty queue, unlike the floor line. The air-above
+                    witness is independent of the contrast map, so a scan whose smoothing findings were all
+                    withheld can still show one "specular flare" pick — and on real data it does (cs009_os_v3
+                    with the contrast map failing keeps its apex-flare pick at lateral 214 while all SEVEN
+                    gain findings are suppressed; cs009_os_v1 likewise keeps lateral 248). Gating this line on
+                    an empty list therefore hid the disclosure in exactly the case it exists for, leaving a red
+                    banner reading "1 slice where the image cannot confirm the line" as the only thing on
+                    screen — a near-clean bill of health for a scan the queue could not judge at all. */}
+                {editTarget !== "corrected" && edgeQueue
+                  && (edgeQueue.reason_kind === "no_contrast_witness"
+                      || (edgeOpen(edgeQueue).length === 0
+                          && (edgeQueue.reason_kind === "floor"
+                              || (edgeQueue.reason ?? "").startsWith("already at the measured floor")))) && (
+                  <div style={{ flexBasis: "100%", marginTop: 3, fontSize: 11, color: "var(--c-text-dim)" }}>
+                    <span style={{ color: "#ff9d9d" }}>✎ Edge line —</span>{" "}
+                    {edgeQueue.reason_kind === "no_contrast_witness"
+                      ? <>the contrast witness could not be measured on this scan, so every smoothing finding is
+                         <b> withheld</b>{edgeOpen(edgeQueue).length
+                           ? " — anything listed above comes from the air-above witness alone" : ""}. This is
+                         <b> not</b> a clean bill of health: the queue is quiet because it could not judge, so
+                         check the edge yourself.</>
+                      : (() => {
+                          const m = /max gain ([\d.]+) px < ([\d.]+) px, max departure ([\d.]+) px < ([\d.]+) px/
+                            .exec(edgeQueue.reason ?? "");
+                          return (m
+                            ? `already at the measured floor (biggest departure from the neighbouring slices `
+                              + `${m[3]} px, under the ${m[4]} px bar; biggest recoverable ${m[1]} px, under `
+                              + `the ${m[2]} px bar)`
+                            : edgeQueue.reason) + "; nothing on this scan clears those bars.";
+                        })()}
+                  </div>
+                )}
+                {/* BOTTOM-LINE QUEUE, ORIGINAL pane (orange): band slices whose bottom still needs the reviewer. */}
+                {editTarget !== "corrected" && bottomOpen(bottomQueueOrig, false).length > 0 && (
+                  <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+                                marginTop: 3, padding: "3px 8px", borderRadius: 4,
+                                background: "rgba(255,170,40,0.10)", border: "1px solid rgba(255,170,40,0.5)" }}>
+                    <span style={{ fontSize: 11, color: "#ffcc66", whiteSpace: "nowrap" }}>◔ Bottom edge — slices needing a bottom line in the surface-crop band</span>
+                    <button onClick={() => jumpBottomNext(bottomQueueOrig, false)}
+                      title={`Step through the ${bottomQueueOrig!.picks.length} band slice(s) whose bottom is least determined${bottomQueueOrig!.witness === "tissue" ? " (served bottom farthest off the raw posterior)" : " (biggest gaps between your bottom lines)"}. The tool switches to the bottom line; draw it inside the band, Confirm, and the list refreshes.`}
+                      style={{ border: "1px solid #ffcc66", background: "rgba(255,204,102,0.22)", color: "#ffe0a3",
+                               borderRadius: 4, fontSize: 11, fontWeight: 600, padding: "2px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                      → Next slice ({bottomOpen(bottomQueueOrig, false).length} left)
+                    </button>
+                    {bottomOpen(bottomQueueOrig, false).slice(0, 8).map((q) => (
+                      <button key={q.lateral} onClick={() => { jumpToSlice(q.lateral); setCropMode(true); setCropSub("line"); setCutMode(false); setLatCropMode(false); setMarkMode(false); }}
+                        title={`Slice ${dispSlice(q.lateral)}${q.dev_px != null ? ` — served bottom ${q.dev_px} px off the raw posterior (RMS over the band)` : ""}${q.gap != null ? `, ${q.gap} slices from the nearest drawn bottom line` : ""}`}
+                        style={{ border: "1px solid rgba(255,170,40,0.5)", background: "rgba(255,170,40,0.10)", color: "#ffcc66",
+                                 borderRadius: 4, fontSize: 11, padding: "1px 7px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                        {dispSlice(q.lateral)}{q.dev_px != null ? ` (${q.dev_px}px)` : ""}
+                      </button>
+                    ))}
+                    <span style={{ fontSize: 11, color: "var(--c-text-dim)" }}>{bottomQueueOrig!.drawn.length} bottom line(s) drawn · a region counts as done once a bottom line lies within {bottomQueueOrig!.near ?? 10} slices of it</span>
+                  </div>
+                )}
                 {/* CORRECTED-MODE QUEUE (violet). Replaces the cyan determinism prompt while the corrected line is
                     the edit target — that one measures the ORIGINAL drawn line and answers a different question.
                     Each pick is the lateral, inside the central band, furthest from its OWN quadratic best fit.
@@ -3012,6 +3343,25 @@ const PROP_SLICE_BAND = 20;
                     </span>
                     {corrQueueBusy && (
                       <span style={{ fontSize: 11, color: "var(--c-text-dim)" }}>ranking…</span>
+                    )}
+                    {bottomOpen(bottomQueueCorr, true).length > 0 && (
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexBasis: "100%", fontSize: 11, color: "var(--c-text-dim)", marginTop: 2 }}>
+                        <b style={{ color: "#ffcc66" }}>◔ Bottom edge — band slices to check</b>
+                        <button onClick={() => jumpBottomNext(bottomQueueCorr, true)}
+                          title={`Step through the ${bottomQueueCorr!.picks.length} band slice(s) whose corrected bottom is least smooth. The corrected pane switches to its bottom line; draw where the bottom really is, then Regenerate.`}
+                          style={{ border: "1px solid #ffcc66", background: "rgba(255,204,102,0.22)", color: "#ffe0a3",
+                                   borderRadius: 4, fontSize: 11, fontWeight: 600, padding: "1px 8px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          → Next slice ({bottomOpen(bottomQueueCorr, true).length} left)
+                        </button>
+                        {bottomOpen(bottomQueueCorr, true).slice(0, 8).map((q) => (
+                          <button key={q.lateral} onClick={() => { jumpToSlice(q.lateral); setBottomEditNonce((n) => n + 1); }}
+                            title={`Slice ${dispSlice(q.lateral)} — corrected bottom ${q.dev_px ?? q.line_px ?? "?"} px from its own quadratic over the band`}
+                            style={{ border: "1px solid rgba(255,170,40,0.5)", background: "rgba(255,170,40,0.10)", color: "#ffcc66",
+                                     borderRadius: 4, fontSize: 11, padding: "0px 6px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                            {dispSlice(q.lateral)}{q.dev_px != null ? ` (${q.dev_px}px)` : ""}
+                          </button>
+                        ))}
+                      </span>
                     )}
                     {(() => {
                       // VERIFIED-SLICE TRACKING. The reviewer certified the DETECTED edge on these slices as true
@@ -3640,8 +3990,9 @@ const PROP_SLICE_BAND = 20;
               <div style={showOriginal
                 ? { display: "contents" }
                 : { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 5 }}>
-                <CorrectedEdgePanel key={`ce-${corrResetNonce}`}
+                <CorrectedEdgePanel bottomEditNonce={bottomEditNonce} key={`ce-${corrResetNonce}`}
                                     sliceIndex={cur.slice_index ?? 0} bDispW={bDispW} bDispH={bDispH} bSized={bSized}
+                                    origDepthVox={depthVox}
                                     bZoom={bZoom} bPan={bPan} filterCss={enhanceFilter} readOnly={readOnly}
                                     stairEdge={stairEdge} markMode={markMode && editTarget === "corrected"}
                                     onPan={(dx, dy) => setBPan((q) => ({ x: q.x + dx, y: q.y + dy }))}

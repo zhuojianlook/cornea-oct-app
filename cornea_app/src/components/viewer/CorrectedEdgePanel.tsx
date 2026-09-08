@@ -46,7 +46,7 @@ function anchorsToApi(m: CeMap): Record<string, Record<string, number>> {
   return o;
 }
 
-export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, bPan, filterCss, readOnly = false, stairEdge = false, markMode = false, onPan, onZoomWheel }: {
+export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, bPan, filterCss, readOnly = false, stairEdge = false, markMode = false, onPan, onZoomWheel, origDepthVox, bottomEditNonce }: {
   sliceIndex: number;
   bDispW: number; bDispH: number; bSized: boolean; bZoom: number; bPan: { x: number; y: number };
   filterCss?: string; readOnly?: boolean;
@@ -58,6 +58,13 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
    *  Marks nothing in the pipeline — it is how the reviewer points at something on the picture they are
    *  actually judging, instead of describing it in words. */
   markMode?: boolean;
+  /** depth (rows) of the ORIGINAL pane's image. A surface-cropped run extends the canvas, so the corrected volume is
+   *  TALLER; the pane used to be forced into the original's box, squashing the extra rows away (reviewer 2026-09-04:
+   *  "the image height of the corrected slice appears to be the same"). With this the box grows by depthVox/origDepthVox
+   *  so one row here is one row there and the raised columns are visibly higher. */
+  origDepthVox?: number;
+  /** bumped by the gallery's bottom-line queue: switch this pane to editing its BOTTOM line (reviewer 2026-09-05) */
+  bottomEditNonce?: number;
   /** Middle/right-drag pan, delegated to the parent (which owns bPan). The corrected pane had NO pan handler
    *  of its own — the original pane's lives on a different SVG — so a middle-drag here did nothing useful and,
    *  before the button guard, dragged the surface instead. */
@@ -89,12 +96,44 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
   const [nFrames, setNFrames] = useState(0);
   const [depthVox, setDepthVox] = useState(0);
   const [edge, setEdge] = useState<number[] | null>(null);
+  // Frames the run treated as LIVE (dead / decorrelated frames are black in the corrected volume and carry
+  // detector junk), plus the dome shape the run enforces — both from oct-corrected-curve — so the blue quadratic
+  // below follows the same rule as the run and the original pane (reviewer 2026-09-08: "the blue guide on the
+  // corrected slice still appears inverted").
+  const [liveMask, setLiveMask] = useState<boolean[] | null>(null);
+  const [shapeCurv, setShapeCurv] = useState<number | null>(null);
+  const [shapeMinFrac, setShapeMinFrac] = useState<number>(0.5);
   // The reviewer's TARGET line: the served surface after generalize_corrected_surface + their drawn-anchor re-pin.
   // `edge` (red) is the constrained DETECTION, which is the array the corrections-path warp stages actually diff
   // against — so drawing both is the only honest way to show "where it reads" vs "where you said it should be".
   // Absent (null) whenever the two coincide, i.e. on any scan with no corrected_edge_anchors.
   const [target, setTarget] = useState<number[] | null>(null);
   const [anchors, setAnchors] = useState<CeMap>(new Map());
+  // BOTTOM (posterior) surface on the corrected result — surface-cropped scans only (the run caches the served
+  // posterior; the endpoint carries it by the measured move). In the cropped frames the bottom edge is the real one
+  // and the top is an estimate, so the reviewer verifies / redraws the bottom there (2026-09-04). Drawn orange,
+  // stairstepped with the same toggle, edited when `editBottom` is on, autosaved as corrected_post_anchors.
+  const [bottom, setBottom] = useState<(number | null)[] | null>(null);
+  const [postAnchors, setPostAnchors] = useState<CeMap>(new Map());
+  const [editBottom, setEditBottom] = useState(false);
+  useEffect(() => { if (bottomEditNonce) setEditBottom(true); }, [bottomEditNonce]);
+  const persistedPostSig = JSON.stringify(ocParams(caseInfo).corrected_post_anchors ?? {});
+  const persistedPost = useMemo(() => {
+    const o: CeMap = new Map();
+    try {
+      for (const [l, frames] of Object.entries(JSON.parse(persistedPostSig) as Record<string, Record<string, number>>)) {
+        const inner = new Map<number, number>();
+        for (const [f, d] of Object.entries(frames)) inner.set(Number(f), Number(d));
+        if (inner.size) o.set(Number(l), inner);
+      }
+    } catch { /* ignore malformed */ }
+    return o;
+  }, [persistedPostSig]);
+  const savedPostSigRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (persistedPostSig === savedPostSigRef.current) return;
+    setPostAnchors(cloneMap(persistedPost));
+  }, [persistedPostSig]);
 
   // AUTOSAVE state. savedSigRef holds the anchor signature this panel last successfully wrote, so the re-seed
   // below can tell "the manifest changed because WE just saved" from "the manifest changed because the case
@@ -114,10 +153,14 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     if (!caseId) { setEdge(null); setTarget(null); return; }
     let cancel = false;
     api.json<{ slices: number; depth_vox: number; n_frames: number; index: number; edge: number[]; fit: number[];
-               target?: number[] }>(
+               target?: number[]; bottom?: (number | null)[]; live_frames?: boolean[]; shape_curv?: number | null;
+               shape_min_fraction?: number }>(
       `/api/case/${caseId}/oct-corrected-curve`, "POST", JSON.stringify({ slice_index: sliceIndex }))
-      .then((r) => { if (cancel) return; setEdge(r.edge); setTarget(r.target ?? null);
-                     setNFrames(r.n_frames); setDepthVox(r.depth_vox); })
+      .then((r) => { if (cancel) return; setEdge(r.edge); setTarget(r.target ?? null); setBottom(r.bottom ?? null);
+                     setNFrames(r.n_frames); setDepthVox(r.depth_vox);
+                     setLiveMask(Array.isArray(r.live_frames) ? r.live_frames : null);
+                     setShapeCurv(typeof r.shape_curv === "number" && Number.isFinite(r.shape_curv) ? r.shape_curv : null);
+                     setShapeMinFrac(typeof r.shape_min_fraction === "number" ? r.shape_min_fraction : 0.5); })
       .catch(() => { if (!cancel) { setEdge(null); setTarget(null); } });
     return () => { cancel = true; };
   }, [caseId, sliceIndex, segVersion]);
@@ -126,14 +169,15 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
   const anchorCount = useMemo(() => { let n = 0; anchors.forEach((m) => { n += m.size; }); return n; }, [anchors]);
   const editedSlices = useMemo(() => [...anchors.keys()].filter((l) => (anchors.get(l)?.size ?? 0) > 0)
     .sort((a, b) => a - b), [anchors]);
-  const dirty = sig(anchors) !== sig(persisted);
+  const postDirty = sig(postAnchors) !== sig(persistedPost);
+  const dirty = sig(anchors) !== sig(persisted) || postDirty;
 
   // PUBLISH the drawn anchors to the shared store, so the single "Correct & re-run" (TimelineBar) commits them
   // alongside any raw edits. Keyed by case so a stale corrected-edge edit can never land on the next scan.
   useEffect(() => {
     if (!caseId) return;
-    setCorrectedEdge({ caseId, anchors: anchorsToApi(anchors), nPoints: anchorCount, dirty });
-  }, [caseId, anchors, anchorCount, dirty, setCorrectedEdge]);
+    setCorrectedEdge({ caseId, anchors: anchorsToApi(anchors), postAnchors: anchorsToApi(postAnchors), nPoints: anchorCount, dirty });
+  }, [caseId, anchors, postAnchors, anchorCount, dirty, setCorrectedEdge]);
 
   // AUTOSAVE the drawn corrected-edge anchors. Previously a drawing lived ONLY in this component's state until
   // the reviewer pressed "Run with corrections" or a verdict button (TimelineBar takeCorrectedEdge →
@@ -145,11 +189,13 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
   // That is the point (it is ground truth), and "Clear slice" / "Clear all corrections" still remove it.
   const commitCorrectedEdgeAnchors = useCaseStore((s) => s.commitCorrectedEdgeAnchors);
   const anchorsSig = useMemo(() => sig(anchors), [anchors]);
+  const postSig = useMemo(() => sig(postAnchors), [postAnchors]);
   useEffect(() => {
     if (!caseId || readOnly || !dirty) return;
     const t = setTimeout(() => {
       if (dragRef.current) return;                       // still drawing — the next change reschedules this
       const payload = anchorsToApi(anchors);
+      const postPayload = anchorsToApi(postAnchors);
       const myCase = caseId;
       setSaveState("saving");
       void (async () => {
@@ -157,8 +203,9 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
           // Guard against a case switch landing between the debounce firing and the request going out: the store's
           // commit targets whatever case is CURRENT, so writing case A's anchors while B is open would corrupt B.
           if (useCaseStore.getState().caseId !== myCase) return;
-          await commitCorrectedEdgeAnchors(payload);
+          await commitCorrectedEdgeAnchors(payload, postPayload);
           savedSigRef.current = JSON.stringify(payload);   // matches how persistedSig is built
+          savedPostSigRef.current = JSON.stringify(postPayload);
           setSaveState("saved");
         } catch {
           setSaveState("error");                           // local state is untouched → the next change retries
@@ -166,8 +213,15 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
       })();
     }, 900);
     return () => clearTimeout(t);
-  }, [caseId, readOnly, dirty, anchorsSig, anchors, commitCorrectedEdgeAnchors]);
+  }, [caseId, readOnly, dirty, anchorsSig, postSig, anchors, postAnchors, commitCorrectedEdgeAnchors]);
 
+  const curPostAnchors = postAnchors.get(sliceIndex);
+  const postY = (f: number): number => {
+    const a = curPostAnchors?.get(f);
+    if (a != null) return a;
+    const b = bottom ? bottom[f] : null;
+    return b == null ? NaN : b;
+  };
   const edgeY = (f: number): number => {
     const a = curAnchors?.get(f);
     if (a != null) return a;                       // un-confirmed drag → WYSIWYG (the line you're moving is visible)
@@ -187,9 +241,12 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
   const quadPts = (): string | null => {
     if (!edge || nFrames < 3) return null;
     let n = 0, Sx = 0, Sx2 = 0, Sx3 = 0, Sx4 = 0, Sy = 0, Sxy = 0, Sx2y = 0;
+    const isLive = (f: number) => !liveMask || liveMask.length !== nFrames || liveMask[f];
+    let fLo = -1, fHi = -1;
     for (let f = 0; f < nFrames; f++) {
-      const y = inBand(f) ? NaN : edgeY(f);
+      const y = inBand(f) || !isLive(f) ? NaN : edgeY(f);          // dead frames carry no surface: excluded
       if (!Number.isFinite(y)) continue;
+      if (fLo < 0) fLo = f; fHi = f;
       const x = f, x2 = x * x;
       n += 1; Sx += x; Sx2 += x2; Sx3 += x2 * x; Sx4 += x2 * x2;
       Sy += y; Sxy += x * y; Sx2y += x2 * y;
@@ -205,7 +262,21 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     const D = det3(m);
     if (!Number.isFinite(D) || Math.abs(D) < 1e-9) return null;   // degenerate (e.g. all points on one frame)
     const sub = (col: number) => det3(m.map((row, r) => row.map((val, c) => (c === col ? v[r] : val))));
-    const a = sub(0) / D, b = sub(1) / D, c = sub(2) / D;
+    let a = sub(0) / D, b = sub(1) / D, c = sub(2) / D;
+    // THE DOME RULE, same as the run and the original pane: a fit that is sign-wrong or flatter than
+    // shapeMinFrac × the B-scan-plane dome is motion-dominated — impose the dome, apex at the middle of the
+    // live frames, only the level fitted.
+    if (shapeCurv != null && shapeCurv > 0 && a < shapeMinFrac * shapeCurv && fHi > fLo) {
+      const fmid = 0.5 * (fLo + fHi);
+      a = shapeCurv; b = -2 * a * fmid;
+      let sum = 0, cnt = 0;
+      for (let f = 0; f < nFrames; f++) {
+        const y = inBand(f) || !isLive(f) ? NaN : edgeY(f);
+        if (!Number.isFinite(y)) continue;
+        sum += y - a * f * f - b * f; cnt += 1;
+      }
+      c = cnt ? sum / cnt : c;
+    }
     const pts: string[] = [];
     for (let f = 0; f < nFrames; f++) {
       const y = a * f * f + b * f + c;
@@ -258,6 +329,18 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     const frame = Math.round((1 - (clientX - r.left) / r.width) * nFrames - 0.5);
     if (frame < 0 || frame >= nFrames || frame >= edge.length) return;
     const depth = Math.round(Math.max(0, Math.min(depthVox - 1, ((clientY - r.top) / r.height) * depthVox)));
+    if (editBottom) {                                   // the BOTTOM line: same gesture, its own anchor set
+      const ref = bottom ? bottom[frame] : null;
+      setPostAnchors((prev) => {
+        const o = cloneMap(prev);
+        let inner = o.get(sliceIndex); if (!inner) { inner = new Map(); o.set(sliceIndex, inner); }
+        if (ref != null && Math.abs(depth - ref) <= 1) inner.delete(frame);   // back on the carried line → clear
+        else inner.set(frame, depth);
+        if (inner.size === 0) o.delete(sliceIndex);
+        return o;
+      });
+      return;
+    }
     setAnchors((prev) => {
       const o = cloneMap(prev);
       let inner = o.get(sliceIndex); if (!inner) { inner = new Map(); o.set(sliceIndex, inner); }
@@ -333,14 +416,17 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     }
     dragRef.current = false;
   };
-  const clearSlice = () => setAnchors((prev) => { const o = cloneMap(prev); o.delete(sliceIndex); return o; });
+  const clearSlice = () => {
+    setAnchors((prev) => { const o = cloneMap(prev); o.delete(sliceIndex); return o; });
+    setPostAnchors((prev) => { const o = cloneMap(prev); o.delete(sliceIndex); return o; });
+  };
 
   return (
     <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", flexDirection: "column",
                   alignItems: "center", justifyContent: "center", gap: 0, position: "relative" }}>
       <span className="text-[11px]" style={{ color: edit ? "#22d3ee" : "var(--c-green)", position: "absolute", top: 0, right: 0,
                                              zIndex: 4, pointerEvents: "none", background: "var(--c-bg)", padding: "0 4px" }}>
-        corrected (result){edit ? " — drag to fix inter-frame drift" : ""}</span>
+        corrected (result){edit ? " — drag the line onto the true edge" : ""}</span>
       {edit && (
         <div style={{ position: "absolute", top: 0, left: 0, zIndex: 5, display: "flex", gap: 4, alignItems: "center",
                       background: "var(--c-bg)", padding: "1px 3px", flexWrap: "wrap", maxWidth: "70%" }}>
@@ -351,7 +437,17 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
                              border: "1px solid #ff5db0", background: "rgba(255,93,176,0.14)", color: "#ffc2e0" }}>
               Clear ⚑ ({curMarks.length})</button>
           )}
-          <button onClick={clearSlice} disabled={!(curAnchors?.size)}
+          {bottom && (
+            <button onClick={() => setEditBottom((v) => !v)}
+                    title={editBottom
+                      ? "Editing the BOTTOM (posterior) line. Click to go back to the top edge."
+                      : "Edit the BOTTOM (posterior) line — on a surface-cropped scan the bottom edge is the real one in the cropped frames (the top there is an estimate). Drag the orange line onto the true bottom edge; it saves as ground truth for the bottom edge (folded into the original scan's bottom anchors on Regenerate)."}
+                    style={{ padding: "2px 8px", borderRadius: 6, fontSize: 11, lineHeight: 1.4, cursor: "pointer",
+                             border: "1px solid #ffaa28", background: editBottom ? "#ffaa28" : "rgba(255,170,40,0.14)",
+                             color: editBottom ? "#0b0f14" : "#ffd28a" }}>
+              {editBottom ? "● bottom line" : "○ bottom line"}</button>
+          )}
+          <button onClick={clearSlice} disabled={!(curAnchors?.size) && !(curPostAnchors?.size)}
                   style={{ padding: "2px 8px", borderRadius: 6, fontSize: 11, lineHeight: 1.4, cursor: "pointer",
                            border: "1px solid var(--c-border)", background: "var(--c-surface)", color: "var(--c-text)" }}>Clear slice</button>
           {editedSlices.length > 0 && <span style={{ fontSize: 10, opacity: 0.7 }}>edited: {editedSlices.slice(0, 10).join(", ")}{editedSlices.length > 10 ? "…" : ""}</span>}
@@ -375,7 +471,9 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
            onWheel={onZoomWheel ? (e) => { e.preventDefault(); onZoomWheel(e.clientX, e.clientY, e.deltaY, hostRef.current?.getBoundingClientRect()); } : undefined}
            style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
         <div style={{ position: "relative",
-                      ...(bSized ? { width: bDispW, height: bDispH } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
+                      ...(bSized ? { width: bDispW,
+                            // same rows-per-pixel as the original pane: a taller corrected canvas shows as a taller image
+                            height: Math.round(bDispH * ((origDepthVox && origDepthVox > 1 && depthVox > 1) ? depthVox / origDepthVox : 1)) } : { display: "inline-block", maxHeight: "100%", maxWidth: "100%" }),
                       transform: `translate(${bPan.x}px, ${bPan.y}px) scale(${bZoom}) scaleX(-1)`, transformOrigin: "center center" }}>
           {caseId && <img src={resourceUrl(`/api/case/${caseId}/oct-corrected-slice?slice_index=${sliceIndex}&t=${segVersion}`)}
             alt="corrected" draggable={false}
@@ -421,6 +519,26 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
               {(() => { const q = quadPts(); return q ? (
                 <polyline key="quad" fill="none" stroke="#22d3ee" vectorEffect="non-scaling-stroke"
                           strokeWidth={0.9} opacity={0.75} points={q} />) : null; })()}
+              {/* BOTTOM (posterior) line, orange — the served posterior carried onto this result, or the reviewer's
+                  own bottom drawing where they redrew it. Same stairstep geometry as the red edge. Only on
+                  surface-cropped scans (no `bottom` otherwise). */}
+              {bottom && (() => {
+                const segs: string[][] = []; let cur: string[] = [];
+                for (let f = 0; f < nFrames; f++) {
+                  const y = inBand(f) ? NaN : postY(f);
+                  if (Number.isFinite(y)) { if (stairEdge) cur.push(`${f},${y}`, `${f + 1},${y}`); else cur.push(`${f + 0.5},${y}`); }
+                  else if (cur.length) { segs.push(cur); cur = []; }
+                }
+                if (cur.length) segs.push(cur);
+                return segs.filter((s) => s.length > 1).map((s, i) => (
+                  <polyline key={`pb${i}`} fill="none" stroke="#ffaa28" vectorEffect="non-scaling-stroke"
+                            strokeWidth={editBottom ? 1.5 : 1.1} opacity={editBottom ? 0.95 : 0.7} points={s.join(" ")} />
+                ));
+              })()}
+              {edit && editBottom && curPostAnchors && [...curPostAnchors.entries()].map(([f, d], i) => (
+                <line key={`pa${i}`} x1={f + 0.5} y1={d - depthVox / 50} x2={f + 0.5} y2={d + depthVox / 50}
+                      stroke="#ffaa28" strokeWidth={1.6} vectorEffect="non-scaling-stroke" opacity={0.95} />
+              ))}
               {/* detected / dragged corrected surface (red) — broken over the cropped (zeroed) artifact band */}
               {segPts().map((sg, i) => (
                 <polyline key={`ce${i}`} fill="none" stroke="#ff4d4d" vectorEffect="non-scaling-stroke"

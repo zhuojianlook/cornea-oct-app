@@ -13,3 +13,4 @@ oct-converter>=0.5        # POCT reader for .OCT files
 pydicom>=2.4              # OCT->DICOM (and DICOM I/O)
 opencv-python>=4.8,<4.12  # bilateral/histeq in the smoother; 4.12+ requires numpy>=2
 scikit-learn>=1.3         # RANSAC quadratic edge fit
+matplotlib>=3.7           # run-provenance tree thumbnails + publication figure (run_provenance.py)

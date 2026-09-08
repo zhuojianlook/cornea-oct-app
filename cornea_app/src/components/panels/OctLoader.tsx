@@ -332,6 +332,9 @@ export function OctLoader() {
   const setCaseId = useCaseStore((s) => s.setCaseId);
   const clearCase = useCaseStore((s) => s.clearCase);
   const openCase = useCaseStore((s) => s.openCase);
+  // A run in flight on the open case (auto re-run or the button) — rows stay unclickable so a second full run
+  // cannot be started on top of it (review 2026-09-07 H2).
+  const caseBusy = useCaseStore((s) => s.busy);
   const setStage = useWorkflowStore((s) => s.setStage);
   const initTabs = useWorkflowStore((s) => s.initTabs);
   const segSig = useWorkflowStore((s) => s.segVersion); // bumps on a re-preprocess (incl. Fix-columns)
@@ -1309,7 +1312,7 @@ export function OctLoader() {
                     const active = !!s.caseId && s.caseId === activeId;
                     // #1: a FINISHED (done) scan stays clickable WHILE a batch runs, so the user can open it
                     // for manual correction; still-preprocessing/queued scans stay locked (no half-written volume).
-                    const clickable = !!s.caseId && s.status !== "error" && (!busy || s.status === "done");
+                    const clickable = !!s.caseId && s.status !== "error" && (!busy || s.status === "done") && !caseBusy;
                     const done = s.status === "done";
                     // Per-scan lifecycle colour (red→orange→yellow→light blue→dark blue→green) from the
                     // timeline step; only from step 2 (preprocessed-auto) onward. The actively-viewed scan

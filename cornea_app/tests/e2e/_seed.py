@@ -37,6 +37,25 @@ import labels
 import postprocess
 import api_server
 
+# The sidecar stamps every preprocessing run with oct_preprocess.PIPELINE_VERSION and reports a run as stale
+# (case-open response `pipeline_current: false`) when the stamp differs. The frontend then AUTO re-runs an
+# unapproved stale scan on open. Step-2 fixtures that must open QUIETLY are stamped current here; the one
+# fixture that must trigger the auto re-run (case_zz_stale) is left unstamped. None (older sidecar without
+# the constant) leaves the fixtures unstamped, which such a sidecar does not flag either.
+try:
+    from oct_preprocess import PIPELINE_VERSION
+except ImportError:  # pragma: no cover — sidecar predates pipeline stamping
+    PIPELINE_VERSION = None
+
+
+def _run(**extra):
+    """An oct_iter run record stamped as CURRENT (when the sidecar stamps runs at all)."""
+    rec = {"passes": 1}
+    if PIPELINE_VERSION is not None:
+        rec["pipeline_version"] = PIPELINE_VERSION
+    rec.update(extra)
+    return rec
+
 # Small anisotropic OCT-ish grid (frames, depth, lateral). Diagonal RAS affine — the consensus
 # cons_native geometry fix (v0.0.92+) makes the native-frame consensus survive regardless.
 NF, ND, NL = 24, 64, 48
@@ -110,7 +129,7 @@ def main():
     # 1) Raw
     make("case_zz_raw", {"oct_preprocessed": None}, vol=_vol(scar=False))
     # 2) Preprocessed (auto, unvetted) — before/after + fix-columns need context previews + a pass count
-    make("case_zz_auto", {"oct_preprocessed": True, "oct_iter": {"passes": 1}}, vol=_vol(scar=False), ctx=True)
+    make("case_zz_auto", {"oct_preprocessed": True, "oct_iter": _run()}, vol=_vol(scar=False), ctx=True)
     # 4) Classified (scar)
     make("case_zz_classified", {"oct_preprocessed": True, "preproc_vetted": True,
                                 "scar_classification": "scar"}, ctx=True)
@@ -136,7 +155,10 @@ def main():
     # Dedicated MUTABLE cases for the progression spec (so mutation tests don't couple to read-only ones):
     #   case_zz_vet       step 2 — Approve preprocessing -> classify
     #   case_zz_corrected step 11 — Schedule / Unschedule
-    make("case_zz_vet", {"oct_preprocessed": True, "oct_iter": {"passes": 1}}, vol=_vol(scar=False), ctx=True)
+    make("case_zz_vet", {"oct_preprocessed": True, "oct_iter": _run()}, vol=_vol(scar=False), ctx=True)
+    # STALE step-2 case: preprocessed + unapproved, but its run record carries NO pipeline_version → the
+    # sidecar reports pipeline_current:false and the app auto re-runs it on open (pipeline-stale.spec.ts).
+    make("case_zz_stale", {"oct_preprocessed": True, "oct_iter": {"passes": 1}}, vol=_vol(scar=False), ctx=True)
     make("case_zz_corrected", {"oct_preprocessed": True, "preproc_vetted": True, "scar_classification": "scar",
                                "sam2_meta": {"ok": True}, "cornea_vetted": True, "subgroup_confirmed": True,
                                "scar_subgroup": "1", "scar_done": True, "corrected_labelmap": True},

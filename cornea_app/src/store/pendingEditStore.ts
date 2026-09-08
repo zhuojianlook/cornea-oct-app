@@ -51,6 +51,8 @@ export interface PendingCorrectedEdge {
   anchors: Record<string, Record<string, number>>;
   nPoints: number;
   dirty: boolean;
+  /** corrected-pane BOTTOM (posterior) line edits, same shape as anchors (surface-cropped scans). */
+  postAnchors?: Record<string, Record<string, number>>;
 }
 
 interface PendingEditState {

@@ -23,8 +23,8 @@ export function AppShell() {
   const debugOpen = useWorkflowStore((s) => s.debugOpen);
 
   useEffect(() => {
-    // Connect to the sidecar but start blank — don't auto-open the last case or show
-    // its segmentation on refresh.
+    // Connect to the sidecar and reopen the last case (fetchConfig adopts config.default_case_id), so a page
+    // reload lands the reviewer back on the scan they were working on.
     fetchConfig();
     checkUpdates(false); // silent launch check; the banner only shows if an update exists
   }, [fetchConfig, checkUpdates]);

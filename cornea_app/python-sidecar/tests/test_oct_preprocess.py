@@ -1173,3 +1173,930 @@ class TestEditTransform:
         vol = np.zeros((6, 40, 8), np.float32)
         out, info = M.apply_edit_transform(vol, {"shift": [1, 2, 3]})
         assert out is vol and info["applied"] is False
+
+    def test_default_mode_is_line_and_a_stored_transform_is_not_active(self):
+        # 2026-09-05 (cs002_os_v1): a transform fitted from a few hand-drawn pane lines made the tissue LESS
+        # quadratic (3.71 → 4.66 px). The default keeps any stored transform on record and never applies it.
+        assert M.DEFAULT_PARAMS["corrected_edit_mode"] == "line"
+        et = {"shift": [1.0, 2.0], "tilt": [0.0, 0.0], "rounds": 2}
+        assert M.edit_transform_active({"edit_transform": et}) is False
+        assert M.edit_transform_active({"edit_transform": et, "corrected_edit_mode": "line"}) is False
+        assert M.edit_transform_active({"edit_transform": et, "corrected_edit_mode": "fold"}) is False
+        assert M.edit_transform_active({"edit_transform": et, "corrected_edit_mode": "transform"}) is True
+        assert M.edit_transform_active({"corrected_edit_mode": "transform"}) is False          # nothing stored
+        assert M.edit_transform_active({"edit_transform": {"shift": []}, "corrected_edit_mode": "transform"}) is False
+
+
+# ───────────────────────── drawn-laterals-only per-frame rigid fit (surface-crop aware) ─────────────────
+class TestDrawnFrameRigid:
+    def test_recovers_the_per_frame_jitter_from_drawn_lines(self):
+        L, F = 513, 101; fr = np.arange(F)
+        true_curve = 60 + 0.02 * (fr - 50) ** 2                      # a quadratic across frames
+        jitter = np.zeros(F); jitter[10:20] = -8.0; jitter[70] = 5.0  # what the frames need
+        edges = np.tile(true_curve - jitter, (L, 1)) + 30.0           # served surface = curve minus the jitter (+pad 30)
+        quad = np.tile(true_curve + 30.0, (L, 1))
+        lats = [40, 120, 200, 300, 400, 480]
+        # the reviewer drew full lines on 6 laterals (raw rows = served - pad)
+        anchors = {str(l): {str(int(f)): float(edges[l, f] - 30.0) for f in fr} for l in lats}
+        a, b, used = M._drawn_frame_rigid(edges, quad, {"border_anchors": anchors, "_canvas_pad": 30})
+        assert used.all()
+        # a line's own deg-2 absorbs part of a 10-frame jitter (the parabola is pulled ~2.5 px), so the fit
+        # recovers the SHAPE and sign, not the full 8 px: the jittered frames must read strongly negative
+        # against their neighbours, the single-frame jitter positive, and no tilt may appear.
+        assert a[10:20].mean() < -4.0 and (a[8] - a[12]) > 6.0 and a[70] > 3.0 and np.abs(b).max() < 0.5
+
+    def test_cropped_frames_follow_the_bottom_line(self):
+        L, F = 513, 60; fr = np.arange(F)
+        edges = np.tile(100.0 + 0.0 * fr, (L, 1)); quad = edges.copy()   # top: flat, says "no move"
+        # bottom line drawn on 5 laterals over frames 0..29: a quadratic except frames 10..14 sit 6 px too deep
+        bot_true = 300 + 0.05 * (fr[:30] - 15) ** 2; bot = bot_true.copy(); bot[10:15] += 6.0
+        lats = [100, 200, 256, 300, 400]
+        anchors = {str(l): {str(int(f)): 100.0 for f in fr} for l in lats}
+        post = {str(l): {str(int(f)): float(bot[f]) for f in range(30)} for l in lats}
+        a, b, used = M._drawn_frame_rigid(edges, quad, {"border_anchors": anchors, "crop_post_anchors": post,
+                                                        "surface_crop_frames": list(range(5, 25)), "_canvas_pad": 0})
+        assert used.all()
+        assert np.all(a[10:15] < -3.0) and abs(a[30]) < 0.5 and abs(a[3]) < 1.0
+
+    def test_no_anchors_means_nothing_used(self):
+        edges = np.zeros((64, 20)) + 50; quad = edges.copy()
+        a, b, used = M._drawn_frame_rigid(edges, quad, {})
+        assert not used.any()
+
+
+class TestDensifyPolylines:
+    """A drawn line is the polyline through its points: gaps along frames are filled linearly (cs002 bug 1)."""
+
+    def test_fills_gaps_linearly_and_keeps_points(self):
+        import oct_preprocess as op
+        out = op.densify_anchor_polylines({"5": {"0": 10.0, "4": 18.0, "5": 20.0}})
+        assert out == {5: {0: 10.0, 1: 12.0, 2: 14.0, 3: 16.0, 4: 18.0, 5: 20.0}}
+
+    def test_outside_span_untouched_and_sentinel_gap_skipped(self):
+        import oct_preprocess as op
+        out = op.densify_anchor_polylines({3: {2: 100.0, 6: 639.0, 8: 120.0}}, depth=640)
+        assert 0 not in out[3] and 1 not in out[3] and 9 not in out[3]
+        assert 3 not in out[3] and 7 not in out[3]          # both gaps touch the ABSENT sentinel
+        assert out[3][6] == 639.0
+
+    def test_disabled_or_single_point_is_identity(self):
+        import oct_preprocess as op
+        assert op.densify_anchor_polylines({1: {0: 5.0, 9: 9.0}}, enabled=False) == {1: {0: 5.0, 9: 9.0}}
+        assert op.densify_anchor_polylines({1: {4: 5.0}}) == {1: {4: 5.0}}
+
+    def test_pin_anchors_pins_the_segment(self):
+        import numpy as np, oct_preprocess as op
+        surf = np.full((3, 10), 14.0)                       # the chord 10..18 stays within the chord guard of this surface
+        op.pin_anchors(surf, {1: {2: 10.0, 6: 18.0}}, depth=100)
+        assert np.allclose(surf[1, 2:7], [10, 12, 14, 16, 18]) and surf[1, 1] == 14 and surf[1, 7] == 14
+
+
+class TestJsonSafeRecord:
+    """The worker's final ITER line must never die on a record detail (cs002_os_v3 clear-all, 2026-09-04)."""
+
+    def test_drops_private_keys_and_converts_numpy(self):
+        import json, numpy as np, oct_preprocess as op
+        rec = {"rigid_frame_refine": {"applied": np.bool_(True), "rough": np.float32(1.5), "_surface_before": np.zeros((2, 3)),
+                                      "nested": [np.int64(3), (1, 2), {"_private": np.ones(2), "keep": np.arange(2)}]}}
+        out = op._json_safe(rec)
+        assert out == {"rigid_frame_refine": {"applied": True, "rough": 1.5, "nested": [3, [1, 2], {"keep": [0, 1]}]}}
+        json.dumps(out)   # must not raise
+
+
+# ── "bottom − interpolated thickness" placement of the cropped-frame top (reviewer design, 2026-09-04) ──
+def _thickness_case(L=9, F=40, T_extra=None):
+    """Synthetic (L, F) surfaces in RAW rows: a dome whose apex sits 10 px ABOVE the window (top_true < 0 on
+    the central frames = the crop band), a thickness that trends linearly across frames like cs002 (F3), a
+    served top pinned at 5 px (< clip_edge_floor) with the clip symptom on inside the band."""
+    fr = np.arange(F, dtype=float)
+    top_true = 0.1 * (fr - 20) ** 2 - 10.0
+    T_true = 150.0 + 0.5 * fr
+    if T_extra is not None:
+        T_true = T_true + T_extra
+    bottom = np.tile(top_true + T_true, (L, 1))
+    crop = [int(f) for f in range(F) if top_true[f] < 0]
+    served = np.tile(np.where(top_true < 0, 5.0, top_true), (L, 1))
+    clip = np.tile(top_true < 0, (L, 1))
+    c0, c1 = crop[0], crop[-1]
+    flank = [f for f in range(c0 - 4, c0)] + [f for f in range(c1 + 1, c1 + 5)]
+    return fr, top_true, T_true, bottom, crop, served, clip, flank
+
+
+
+
+
+
+
+
+
+
+
+
+class TestDensifyChordGuard:
+    """Separate strokes on one slice must not be bridged by a chord far from the surface (cs042_os_v1_3)."""
+
+    def test_chord_along_surface_bridged_far_chord_left_open(self):
+        import numpy as np, oct_preprocess as op
+        ref = np.zeros((2, 60)); ref[1] = 100.0 + 0.05 * (np.arange(60) - 30) ** 2     # a dome on slice 1
+        near = {0: {0: 0.0, 10: 0.0}}                                                    # chord on the flat surface
+        far = {1: {0: float(ref[1, 0]), 59: float(ref[1, 59])}}                           # chord across the dome
+        out = op.densify_anchor_polylines({**near, **far}, reference=ref, guarded_slices={0, 1})
+        assert set(out[0]) == set(range(0, 11))
+        assert set(out[1]) == {0, 59}                                                    # left to the interpolation
+        assert set(op.densify_anchor_polylines(far)[1]) == set(range(0, 60))             # no reference → old behaviour
+        assert set(op.densify_anchor_polylines(far, reference=ref)[1]) == set(range(0, 60))   # not a folded lateral → a drag: bridged
+
+    def test_pin_anchors_does_not_pin_a_far_chord(self):
+        import numpy as np, oct_preprocess as op
+        surf = 100.0 + 0.05 * (np.arange(60) - 30) ** 2; S = np.tile(surf, (1, 1))
+        before = S.copy()
+        op.pin_anchors(S, {0: {0: float(surf[0]), 59: float(surf[59])}}, depth=640, guarded_slices={0})
+        assert np.allclose(S, before)                                                    # nothing between the strokes moved
+        op.pin_anchors(S, {0: {0: float(surf[0]), 59: float(surf[59])}}, depth=640)     # a reviewer drag: the chord is pinned
+        assert abs(S[0, 30] - (surf[0] + (surf[59] - surf[0]) * 30 / 59)) < 1e-6
+
+
+class TestFlattenExcludeLaterals:
+    """Folded laterals are served-surface GT only: they must not drive the drawn-frame rigid fit."""
+
+    def test_excluded_lateral_does_not_drive_the_move(self):
+        import numpy as np, oct_preprocess as op
+        L, F = 9, 40
+        fr = np.arange(F, dtype=float); quad = 50 + 0.02 * (fr - 20) ** 2
+        edges = np.tile(quad, (L, 1)).astype(np.float64)
+        jitter = np.zeros(F); jitter[10] = 6.0                                       # one jittered frame
+        edges += jitter[None, :]
+        anchors = {"4": {str(f): float(edges[4, f]) for f in range(F)},               # honest line: asks to undo the jitter
+                   "2": {str(f): float(edges[2, f] + (30.0 if f == 25 else 0.0)) for f in range(F)}}   # a folded line with a spike
+        p = {**op.DEFAULT_PARAMS, "border_anchors": anchors, "surface_crop_frames": [], "flatten_drawn_min_line": 5}
+        a_all, _, used_all = op._drawn_frame_rigid(edges, np.tile(quad, (L, 1)), p)
+        a_ex, _, used_ex = op._drawn_frame_rigid(edges, np.tile(quad, (L, 1)), {**p, "flatten_exclude_laterals": [2]})
+        assert used_ex.any()
+        assert abs(a_ex[25]) < abs(a_all[25]) - 5                                   # the spike no longer pulls frame 25
+
+
+class TestPlaceTopFromThickness:
+    def test_two_flanks_drawn_and_bracketed_slices(self):
+        import json
+        L = 9
+        fr, top_true, T_true, bottom, crop, served, clip, flank = _thickness_case(L=L)
+        dt = {s: {f: float(top_true[f]) for f in flank} for s in (0, 8)}
+        db = {s: {f: float(bottom[s, f]) for f in flank} for s in (0, 8)}
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, {}, dt, db, clip)
+        assert np.abs(placed[[0, 8]][:, crop] - top_true[crop][None, :]).max() < 0.5
+        assert np.abs(placed[1:8][:, crop] - top_true[crop][None, :]).max() < 1.5
+        outside = [f for f in range(len(fr)) if f not in crop]
+        assert np.isnan(placed[:, outside]).all() and np.isnan(T[:, outside]).all()
+        assert info["n_slices_drawn_left"] == 2 and info["n_slices_drawn_right"] == 2
+        assert info["n_placed"] == L * len(crop) and info["n_bands"] == 1
+        json.dumps(info)                                         # every value is a python scalar
+        for v in info.values():
+            assert not isinstance(v, np.generic)
+
+    def test_one_flank_holds_and_none_falls_back(self):
+        L = 9
+        fr, top_true, T_true, bottom, crop, served, clip, flank = _thickness_case(L=L)
+        c0, c1 = crop[0], crop[-1]
+        right = [f for f in flank if f > c1]
+        bot1 = bottom.copy(); bot1[:, right] = np.nan                  # right flank unavailable
+        dt = {s: {f: float(top_true[f]) for f in flank if f < c0} for s in (0, 8)}
+        db = {s: {f: float(bottom[s, f]) for f in flank if f < c0} for s in (0, 8)}
+        placed, T, info = M.place_top_from_thickness(served, bot1, crop, {}, dt, db, clip)
+        assert np.isfinite(placed[:, crop]).all()
+        assert np.allclose(T[:, crop], T_true[c0 - 1])               # held at the left boundary value
+        worst = float(np.abs(T_true[crop] - T_true[c0 - 1]).max())
+        assert np.abs(placed[:, crop] - top_true[crop][None, :]).max() <= worst + 1e-6
+        assert info["n_slices_drawn_left"] == 2 and info["n_slices_drawn_right"] == 0
+        assert info["n_slices_served"] == L - 2 and info["n_slices_fallback"] == 0
+        bot2 = bottom.copy(); bot2[:, flank] = np.nan                  # no flank at all
+        placed2, T2, info2 = M.place_top_from_thickness(served, bot2, crop, {}, None, None, clip)
+        assert np.isnan(placed2).all() and np.isnan(T2).all() and info2["n_slices_fallback"] == L
+
+    def test_drawn_valid_with_late_start_and_mixed_sources(self):
+        # refuter high #2: a slice whose drawn line starts one frame into the flank (2 drawn-both frames per
+        # side) is DRAWN-valid on that side and its OWN thickness is used, not the interpolation from the
+        # neighbouring drawn slices — which here are 30 px thinner.
+        L = 9
+        fr, top_true, T_true, bottom, crop, served, clip, flank = _thickness_case(L=L)
+        c0, c1 = crop[0], crop[-1]
+        bottom4 = bottom.copy(); bottom4[4] += 30.0                    # slice 4 is a 30 px thicker cornea
+        dt = {s: {f: float(top_true[f]) for f in flank} for s in (0, 8)}
+        db = {s: {f: float(bottom[s, f]) for f in flank} for s in (0, 8)}
+        late = [c0 - 2, c0 - 1, c1 + 1, c1 + 2]                          # 2 per side
+        dt[4] = {f: float(top_true[f]) for f in late}
+        db[4] = {f: float(bottom4[4, f]) for f in late}
+        placed, T, info = M.place_top_from_thickness(served, bottom4, crop, {}, dt, db, clip)
+        assert info["n_slices_drawn_left"] == 3 and info["n_slices_drawn_right"] == 3
+        assert np.abs(placed[4, crop] - top_true[crop]).max() < 1.0    # own thickness (T_true + 30)
+        assert np.abs(T[4, crop] - (T_true[crop] + 30.0)).max() < 1.0
+        assert np.abs(placed[0, crop] - top_true[crop]).max() < 0.5    # neighbours untouched
+
+    def test_top_present_kept_and_clamp(self):
+        L = 9
+        fr, top_true, T_true, bottom, crop, served, clip, flank = _thickness_case(L=L)
+        c0 = crop[0]
+        served2 = served.copy(); clip2 = clip.copy()
+        served2[2, crop] = 10.0; clip2[2, crop] = False                # slice 2: a real in-frame top (>= floor)
+        dt = {s: {f: float(top_true[f]) for f in flank} for s in (0, 8)}
+        db = {s: {f: float(bottom[s, f]) for f in flank} for s in (0, 8)}
+        db[0][c0 - 4] = float(top_true[c0 - 4]) + 900.0                # an implausible flank candidate
+        placed, T, info = M.place_top_from_thickness(served2, bottom, crop, {}, dt, db, clip2)
+        assert np.isnan(placed[2, crop]).all() and info["n_top_present_kept"] == len(crop)
+        assert np.isfinite(T[2, crop]).all()                            # T exists there (unified rule applies)
+        assert info["n_candidates_rejected"] == 1
+        assert np.abs(placed[0, crop] - top_true[crop]).max() < 0.5    # the rejected point moved nothing
+
+    def test_boundary_value_is_at_the_boundary_frame(self):
+        # refuter high #1: a flank ramping 3 px/frame like cs002 slice 152 (231,228,226,222) → the value AT
+        # c0−1 is the ramp continued (222), NOT the flank mean (227).
+        L, F = 1, 30
+        crop = list(range(4, 21))
+        served = np.full((L, F), 5.0); served[0, :4] = 20.0
+        bottom = np.full((L, F), 240.0); clip = np.zeros((L, F), bool); clip[0, 4:21] = True
+        dt = {0: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}}
+        db = {0: {0: 231.0, 1: 228.0, 2: 226.0, 3: 222.0}}
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, {}, dt, db, clip)
+        assert abs(T[0, 4] - 222.0) <= 1.0 and abs(T[0, 4] - 227.0) > 3.0
+        # a 33 px drawing ramp in 4 frames (cs002 slice 192: 195,210,220,228) is NOT extrapolated: the two
+        # candidates nearest the boundary decide (median 224), and the gate is counted.
+        db2 = {0: {0: 195.0, 1: 210.0, 2: 220.0, 3: 228.0}}
+        placed2, T2, info2 = M.place_top_from_thickness(served, bottom, crop, {}, dt, db2, clip)
+        assert abs(T2[0, 4] - 224.0) <= 1.0 and info2["n_slope_gated"] == 1
+
+    def test_clip_ceiling_and_shaped_laterals_are_not_knots(self):
+        # physical guard: on a bright-top cell the apex cannot sit INSIDE the frame — an under-measured T that
+        # would place the top at +12 is clamped to the ceiling (0) and counted; a shaped lateral's drawn lines
+        # are never a drawn candidate/knot (its top does not track the tissue frame-by-frame).
+        L, F = 3, 30
+        crop = list(range(4, 21))
+        served = np.full((L, F), 5.0); served[:, :4] = 20.0; served[:, 21:] = 20.0
+        bottom = np.full((L, F), 230.0); clip = np.zeros((L, F), bool); clip[:, 4:21] = True
+        dt = {s: {f: 20.0 for f in list(range(4)) + list(range(21, 25))} for s in range(L)}
+        db = {s: {f: 230.0 for f in list(range(4)) + list(range(21, 25))} for s in range(L)}
+        db[1] = {f: 218.0 for f in db[1]}                              # slice 1 drawn 12 px too thin
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, {}, dt, db, clip)
+        assert np.allclose(placed[0, crop], 20.0) is False              # slice 0 placed at 230-210 = 20 → ceiling
+        assert np.all(placed[:, crop] <= 0.0) and info["n_ceiling_clamped"] > 0
+        p2, T2, i2 = M.place_top_from_thickness(served, bottom, crop, {}, dt, db, clip, shaped_laterals=[1])
+        assert i2["n_slices_drawn_left"] == 2 and abs(T2[1, 10] - 210.0) < 1e-6   # interpolated from 0 and 2
+
+
+class TestDrawnFrameRigidUnified:
+    def test_unified_top_recovers_jitter_in_cropped_frames(self):
+        L, F = 513, 101; fr = np.arange(F)
+        true_curve = 60 + 0.02 * (fr - 50) ** 2
+        jitter = np.zeros(F); jitter[10:20] = -8.0; jitter[70] = 5.0
+        crop = list(range(15, 26))                                       # the −8 block runs INTO the crop
+        edges = np.tile(true_curve - jitter, (L, 1)) + 30.0
+        quad = np.tile(true_curve + 30.0, (L, 1))
+        lats = [40, 120, 200, 300, 400, 480]
+        anchors = {str(l): {str(int(f)): float(edges[l, f] - 30.0) for f in fr if f not in crop} for l in lats}
+        post = {str(l): {str(int(f)): float(true_curve[f] - jitter[f] + 200.0) for f in fr} for l in lats}
+        placed = {l: {int(f): float(true_curve[f] - jitter[f]) for f in crop} for l in lats}
+        tok = {l: list(crop) for l in lats}
+        p = {"border_anchors": anchors, "crop_post_anchors": post, "surface_crop_frames": crop,
+             "_canvas_pad": 30, "_raw_depth": 640, "_crop_top_placed": placed, "_crop_thickness_ok": tok,
+             "flatten_crop_unified_top": True}
+        a, b, used = M._drawn_frame_rigid(edges, quad, p)
+        assert used.all()
+        assert a[10:20].mean() < -4.0 and a[15:20].mean() < -4.0 and a[70] > 3.0 and np.abs(b).max() < 0.5
+        assert M._LAST_DRAWN_FIT["n_placed_targets"] == len(lats) * len(crop)
+        rec = M._drawn_fit_record(a, p)
+        assert rec["unified_top"] and rec["n_placed_targets"] > 0 and len(rec["boundary_jump_px"]) == 1
+
+    def test_robust_fit_ignores_an_outlying_line(self):
+        L, F = 513, 60; fr = np.arange(F)
+        edges = np.tile(100.0 + 0.0 * fr, (L, 1)); quad = edges.copy()
+        lats = [40, 120, 200, 300, 400, 480]
+        anchors = {str(l): {str(int(f)): 100.0 for f in fr} for l in lats}
+        anchors["300"]["15"] = 70.0                                       # one line asks for +30 at frame 15
+        base = {"border_anchors": anchors, "_canvas_pad": 0}
+        a_r, _, _ = M._drawn_frame_rigid(edges, quad, {**base, "flatten_drawn_robust_fit": True})
+        a_p, _, _ = M._drawn_frame_rigid(edges, quad, {**base, "flatten_drawn_robust_fit": False})
+        assert abs(a_r[15] - a_r[14]) < 1.5
+        assert abs(a_p[15] - a_p[14]) > 4.0
+
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_cropped_frames_follow_the_bottom_line_fallback(self, unified):
+        # with no `_crop_top_placed` (no T could be measured) the unified path falls back to the old rule
+        L, F = 513, 60; fr = np.arange(F)
+        edges = np.tile(100.0 + 0.0 * fr, (L, 1)); quad = edges.copy()
+        bot_true = 300 + 0.05 * (fr[:30] - 15) ** 2; bot = bot_true.copy(); bot[10:15] += 6.0
+        lats = [100, 200, 256, 300, 400]
+        anchors = {str(l): {str(int(f)): 100.0 for f in fr} for l in lats}
+        post = {str(l): {str(int(f)): float(bot[f]) for f in range(30)} for l in lats}
+        a, b, used = M._drawn_frame_rigid(edges, quad, {"border_anchors": anchors, "crop_post_anchors": post,
+                                                        "surface_crop_frames": list(range(5, 25)), "_canvas_pad": 0,
+                                                        "flatten_crop_unified_top": unified})
+        assert used.all()
+        assert np.all(a[10:15] < -3.0) and abs(a[30]) < 0.5 and abs(a[3]) < 1.0
+
+    def test_bottom_sentinel_dropped_from_bottom_fit(self):
+        L, F = 513, 60; fr = np.arange(F)
+        edges = np.tile(100.0 + 0.0 * fr, (L, 1)); quad = edges.copy()
+        bot = 300 + 0.05 * (fr[:30] - 15) ** 2
+        lats = [100, 200, 256, 300, 400]
+        anchors = {str(l): {str(int(f)): 100.0 for f in fr} for l in lats}
+        post = {str(l): {str(int(f)): float(bot[f]) for f in range(30)} for l in lats}
+        for l in lats:
+            post[str(l)]["2"] = 639.0                                     # ABSENT sentinel at raw depth 640
+        p = {"border_anchors": anchors, "crop_post_anchors": post, "surface_crop_frames": list(range(5, 25)),
+             "_canvas_pad": 0, "_raw_depth": 640}
+        a_u, _, _ = M._drawn_frame_rigid(edges, quad, {**p, "flatten_crop_unified_top": True})
+        a_o, _, _ = M._drawn_frame_rigid(edges, quad, {**p, "flatten_crop_unified_top": False})
+        assert np.abs(a_u[5:25]).max() < 0.5                             # a clean parabola asks for no move
+        assert np.abs(a_o[5:25]).max() > 2.0                             # the sentinel bent the old fit
+
+
+def test_repin_drawn_points_adds_pad_and_skips_placed():
+    L, F, pad = 40, 20, 10
+    E = np.full((L, F), 50.0 + pad, dtype=np.float32)
+    anchors = {"5": {str(f): 50.0 for f in range(F)}}
+    E1 = E.copy(); M._repin_drawn_points(E1, anchors, pad=0.0)              # today's raw re-pin
+    assert np.allclose(E1[5] - E1[6], -pad)
+    E2 = E.copy(); E2[5, 3] = 12.5                                          # a placed cell
+    M._repin_drawn_points(E2, anchors, pad=float(pad), skip={5: {3: 12.5}})
+    assert np.allclose(E2[5, [0, 1, 2, 4]] - E2[6, [0, 1, 2, 4]], 0.0) and E2[5, 3] == 12.5
+    # through smooth_volume's use_provided branch the flag selects the behaviour (measured on a tiny volume)
+    rng = np.random.RandomState(0)
+    sag = (rng.rand(L, 120 + pad, F) * 30).astype(np.float32); sag[:, :pad, :] = 0
+    for f in range(F):
+        sag[:, pad + 50:pad + 90, f] += 1500.0
+    vol = M.revert_sagittal(sag)
+    pe = np.full((L, F), 50.0 + pad)
+    for flag in (True, False):
+        p = {"border_anchors": anchors, "_canvas_pad": pad, "_raw_depth": 120, "provided_repin_add_pad": flag}
+        out = M.smooth_volume(vol, p, provided_edges=pe, workers=1)
+        assert out.shape == vol.shape and np.isfinite(out).all()
+
+
+def test_drawn_flatten_synthetic_bottom_parabola():
+    """End-to-end through smooth_volume: a surface-cropped dome with per-frame axial jitter (a smooth bump
+    inside the crop band), drawn top on the un-cropped frames + drawn bottom everywhere at 5 laterals, the
+    cropped-frame top placed at bottom − T. Trace-free on the delivered tissue: the bottom crossing in the
+    cropped frames lies on its own deg-2, is continuous across the band boundary, the column is not deformed
+    (top−bottom gap preserved), nothing is truncated (energy), and the pad was zeros BEFORE the warp."""
+    L, D0, F, pad = 40, 200, 40, 30
+    fr = np.arange(F, dtype=float)
+    top_true = 0.06 * (fr - 20) ** 2 - 10.0                                   # apex 10 px above the window
+    T_true = 130.0 + 0.4 * fr
+    jit = 4.0 * np.sin(2 * np.pi * fr / 25.0) - 8.0 * np.exp(-((fr - 20) / 4.0) ** 2)
+    top_obs = top_true + jit; bot_obs = top_true + T_true + jit
+    crop = [int(f) for f in range(F) if top_true[f] < 0]
+    c0, c1 = crop[0], crop[-1]
+    rng = np.random.RandomState(1)
+    raw = (rng.rand(L, D0, F) * 40).astype(np.float32)
+    for f in range(F):
+        t0 = int(max(0, round(top_obs[f]))); b0 = int(round(bot_obs[f]))
+        raw[:, t0:min(D0, b0), f] += 1500.0
+    sag = np.zeros((L, D0 + pad, F), np.float32); sag[:, pad:, :] = raw
+    assert float(sag[:, :pad, :].max()) == 0.0                                # never manufacture data
+    vol = M.revert_sagittal(sag)
+    lats = [4, 12, 20, 28, 36]
+    served = np.tile(np.where(top_true < 0, 3.0, top_obs), (L, 1))
+    bottom = np.tile(bot_obs, (L, 1)); clip = np.tile(top_true < 0, (L, 1))
+    anchors = {str(l): {str(f): float(top_obs[f]) for f in range(F) if f not in crop} for l in lats}
+    post = {str(l): {str(f): float(bot_obs[f]) for f in range(F)} for l in lats}
+    dt = M.densify_anchor_polylines(anchors, None, True); db = M.densify_anchor_polylines(post, D0, True)
+    placed, T, info = M.place_top_from_thickness(served, bottom, crop, {}, dt, db, clip)
+    assert info["n_placed"] == L * len(crop)
+    pe = served.copy(); ok = np.isfinite(placed); pe[ok] = placed[ok]
+    ctp = {l: {int(f): float(placed[l, f]) for f in crop if np.isfinite(placed[l, f])} for l in lats}
+    tok = {l: [int(f) for f in crop if np.isfinite(T[l, f])] for l in lats}
+    params = {"border_anchors": anchors, "crop_post_anchors": post, "surface_crop_frames": crop,
+              "_canvas_pad": pad, "_raw_depth": D0, "_crop_top_placed": ctp, "_crop_thickness_ok": tok}
+    M._LAST_FLATTEN_INFO.clear()
+    out = M.smooth_volume(vol, params, provided_edges=pe + pad, workers=1)
+    fl = dict(M._LAST_FLATTEN_INFO)
+    assert fl["unified_top"] and fl["n_placed_targets"] == len(lats) * len(crop) and fl["min_target_row"] >= 0.0
+    osag = M.reformat_to_sagittal(out)
+    assert float(osag.sum()) >= 0.999 * float(sag.sum())                     # nothing truncated
+    thr = 0.5 * float(np.percentile(raw, 99))
+    unc = [f for f in range(F) if f not in crop]
+    for l in lats:
+        col = osag[l]
+        bc = np.array([np.where(col[:, f] > thr)[0].max() for f in range(F)], float)
+        tc = np.array([np.where(col[:, f] > thr)[0].min() for f in range(F)], float)
+        cf = np.array(crop, float)
+        c = np.polyfit(cf, bc[crop], 2); par = np.polyval(c, fr)
+        assert float(np.sqrt(np.mean((bc[crop] - par[crop]) ** 2))) < 1.5        # bottom smooth / quadratic
+        assert abs((bc[c0] - bc[c0 - 1]) - (par[c0] - par[c0 - 1])) <= 2.0        # continuous at the boundary
+        assert abs((bc[c1 + 1] - bc[c1]) - (par[c1 + 1] - par[c1])) <= 2.0
+        gap_in = bot_obs - np.maximum(top_obs, 0.0)
+        assert np.abs((bc - tc)[unc] - gap_in[unc]).max() <= 2.0                  # rigid: no column deformed
+        ct = np.polyfit(np.array(unc, float), tc[unc], 2)
+        assert float(np.sqrt(np.mean((tc[unc] - np.polyval(ct, np.array(unc, float))) ** 2))) < 1.5
+
+
+class TestFirstBrightRunWitness:
+    """The placement rule's trace-free absence witness (cs002 2026-09-04): a claimed top INSIDE the first bright
+    run that starts at the frame top is clipped; a bright band that ends above the claimed top is a separate
+    structure (eyelid at the periphery) and the top stands."""
+
+    def _slice(self, D=120, F=4):
+        sl = np.full((D, F), 20.0)
+        sl[2:90, 0] = 1000.0                            # frame 0: tissue from row 2 to 90 (clipped apex)
+        sl[0:7, 1] = 1000.0; sl[30:100, 1] = 1000.0     # frame 1: bright band 0-6, dark gap, cornea from 30
+        sl[40:110, 2] = 1000.0                          # frame 2: in-frame top at 40
+        return sl                                       # frame 3: no tissue
+
+    def test_first_bright_run(self):
+        st, en = M._first_bright_run(self._slice(), {})
+        assert st[0] == 2 and en[0] == 90 and st[1] == 0 and en[1] == 7 and st[2] == 40 and np.isnan(st[3])
+
+    def test_absence_needs_the_claim_inside_the_run(self):
+        sl = self._slice(); st, en = M._first_bright_run(sl, {})
+        FF = 12; c = list(range(4, 8))                                   # crop in the middle, flanks on both sides
+        top = np.full((1, FF), 30.0); bot = np.full((1, FF), 230.0)
+        top[0, 4] = 18.0; top[0, 5] = 30.0; top[0, 6] = 40.0; top[0, 7] = 30.0
+        tr = np.full((1, FF), np.nan); te = np.full((1, FF), np.nan)
+        tr[0, 4:8] = st; te[0, 4:8] = en
+        clip = np.zeros((1, FF), bool)
+        placed, T, info = M.place_top_from_thickness(top, bot, c, {}, None, None, clip, top_row=tr, top_run_end=te)
+        assert np.isfinite(placed[0, 4]) and placed[0, 4] <= 2.0        # inside the run → placed, ceiling = row 2
+        assert np.isnan(placed[0, 5]) and np.isnan(placed[0, 6])         # eyelid band above a gap / in-frame → kept
+        assert info["n_top_present_kept"] >= 2
+
+
+class TestPlaceTopEstimateFallback:
+    """A clipped cell whose bottom − T lands inside the image takes the reviewer's estimate, not the ceiling."""
+
+    def _setup(self):
+        import numpy as np
+        L, F = 3, 40; crop = list(range(0, 10))
+        top = np.full((L, F), 60.0); bottom = np.full((L, F), 260.0)          # flank thickness 200
+        top[:, :10] = -8.0                                                      # served value in the band (ignored by the estimate)
+        bottom[:, :10] = 250.0                                                  # band bottom shallower than 200 below the top → bottom − T = 50 (inside)
+        clip = np.zeros((L, F), dtype=bool); clip[:, :10] = True                 # the tissue says: clipped
+        return L, F, crop, top, bottom, clip
+
+    def test_estimate_used_instead_of_ceiling(self):
+        import numpy as np, oct_preprocess as op
+        L, F, crop, top, bottom, clip = self._setup()
+        p = {**op.DEFAULT_PARAMS, "crop_place_clip_ceiling": 0.0, "crop_estimate_source": "drawn"}
+        raw = {}
+        drawn = {0: {f: -8.0 for f in range(10)}, 2: {f: -8.0 for f in range(10)}}       # their estimate on two slices → interpolated to slice 1
+        placed, T, info = op.place_top_from_thickness(top, bottom, crop, p, drawn, {}, clip, out_raw=raw)
+        assert info["n_estimate_fallback"] > 0 and info["n_ceiling_clamped"] == 0
+        assert np.allclose(placed[:, :10][np.isfinite(placed[:, :10])], -8.0)
+        pr = raw["placed_raw"][:, :10]; assert np.allclose(pr[np.isfinite(pr)], 50.0)      # the motion keeps the unclamped value
+
+    def test_flag_off_keeps_the_ceiling(self):
+        import numpy as np, oct_preprocess as op
+        L, F, crop, top, bottom, clip = self._setup()
+        p = {**op.DEFAULT_PARAMS, "crop_place_clip_ceiling": 0.0, "crop_place_estimate_fallback": False, "crop_estimate_source": "drawn"}
+        drawn = {0: {f: -8.0 for f in range(10)}, 2: {f: -8.0 for f in range(10)}}
+        placed, T, info = op.place_top_from_thickness(top, bottom, crop, p, drawn, {}, clip)
+        assert info["n_ceiling_clamped"] > 0 and info["n_estimate_fallback"] == 0
+        assert np.allclose(placed[:, :10][np.isfinite(placed[:, :10])], 0.0)
+
+
+class TestDrawnFitRefinement:
+    """A slow drift common to every lateral must end up in the per-frame move, not in the lines' parabolas."""
+
+    def test_common_drift_migrates_into_the_move(self):
+        import numpy as np, oct_preprocess as op
+        L, F = 513, 101; fr = np.arange(F)
+        dome = 60 + 0.02 * (fr - 50) ** 2
+        drift = 6.0 * np.sin(2 * np.pi * fr / 45.0)                              # slow, frame-common, not a parabola
+        lats = [40, 120, 200, 300, 400, 480]
+        edges = np.tile(dome + drift, (L, 1)); quad = np.tile(dome, (L, 1))
+        anchors = {str(l): {str(int(f)): float(edges[l, f]) for f in fr} for l in lats}
+        base = {"border_anchors": anchors, "_canvas_pad": 0, "surface_crop_frames": [], "flatten_crop_unified_top": True}
+        a1, _, _ = op._drawn_frame_rigid(edges, quad, {**base, "flatten_drawn_iters": 1})
+        a3, _, _ = op._drawn_frame_rigid(edges, quad, {**base, "flatten_drawn_iters": 4})
+        def left(a): return float(np.sqrt(np.mean((drift + a - np.mean(drift + a)) ** 2)))   # drift still in the surface after the move
+        # one pass already removes all but the parabola-shaped part of the drift; the alternation is a fixed point
+        # on identical lines — it must never be worse than the single pass, and the record must say it ran
+        assert left(a1) < 0.4 * float(np.std(drift))
+        assert left(a3) <= left(a1) + 1e-6
+        rec = op._drawn_fit_record(a3, {**base, "flatten_drawn_iters": 4}); assert rec["refine_iters"] == 4
+
+
+# ───────────────────────── tissue-motion stage (shape from lines, motion from tissue) ─────────────────────
+class TestTissueMotionMove:
+    @staticmethod
+    def _synth(F=60, D=200, L=96, jitter=None, tilt=None, seed=0):
+        """A bright tissue band whose depth follows a parabola across frames (the dome) plus a per-frame
+        rigid jitter (+ optional half-span tilt), on a background of speckle so the correlation has texture."""
+        rng = np.random.default_rng(seed)
+        fr = np.arange(F); dome = 80.0 + 0.02 * (fr - F / 2.0) ** 2
+        jitter = np.zeros(F) if jitter is None else np.asarray(jitter, float)
+        tilt = np.zeros(F) if tilt is None else np.asarray(tilt, float)
+        x = (np.arange(L) - (L - 1) / 2.0) / ((L - 1) / 2.0)
+        tex = rng.uniform(0.0, 1.0, size=(D,))                    # the same depth texture in every frame/lateral
+        vol = np.zeros((F, D, L), np.float32)
+        rows = np.arange(D, dtype=float)
+        for f in range(F):
+            for l in range(L):
+                top = dome[f] + jitter[f] + tilt[f] * x[l]
+                prof = 30.0 + 20.0 * rng.uniform(0, 1, size=D) + np.where((rows >= top) & (rows < top + 60), 800.0 + 400.0 * tex, 0.0)
+                vol[f, :, l] = prof
+        return vol, jitter, tilt
+
+    def test_recovers_rigid_jitter_and_tilt(self):
+        F = 60
+        rng = np.random.default_rng(1)
+        jit = np.cumsum(rng.normal(0, 1.5, F)); jit -= np.polyval(np.polyfit(np.arange(F), jit, 2), np.arange(F))   # off-parabola part only
+        tl = 3.0 * np.sin(np.arange(F) / 6.0)
+        vol, jit, tl = self._synth(F=F, jitter=jit, tilt=tl)
+        a, b, info = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        assert info["applied"] and info["pairs_measured"] == F - 1
+        # the move undoes the jitter (up to the parabola the fit keeps) and the non-linear tilt
+        fr = np.arange(F)
+        resid = (a + jit); resid -= np.polyval(np.polyfit(fr, resid, 2), fr)
+        assert np.sqrt(np.mean(resid ** 2)) < 1.0, np.sqrt(np.mean(resid ** 2))     # sub-pixel on speckle (~0.6 px measured)
+        tres = (b + tl); tres -= np.polyval(np.polyfit(fr, tres, 1), fr)
+        assert np.sqrt(np.mean(tres ** 2)) < 1.2, np.sqrt(np.mean(tres ** 2))     # ~0.9 px measured: lag quantisation across bands, integrated
+
+    def test_pad_invariance_and_zero_rows(self):
+        vol, jit, tl = self._synth(F=30, jitter=np.r_[np.zeros(10), 6.0 * np.ones(10), np.zeros(10)])
+        a, b, _ = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        pad = np.zeros((vol.shape[0], vol.shape[1] + 50, vol.shape[2]), vol.dtype); pad[:, 50:, :] = vol
+        a2, b2, _ = M.tissue_motion_move(pad, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        assert np.max(np.abs(a - a2)) < 0.05 and np.max(np.abs(b - b2)) < 0.05      # a zero canvas pad must not bias the lags
+        # the move undoes the 6 px block UP TO the parabola the flatten keeps (a block a third of the volume long
+        # bends the best-fit parabola, so the expected move is the block minus that parabola, not the whole block)
+        fr = np.arange(vol.shape[0]); a_exp = np.polyval(np.polyfit(fr, jit, 2), fr) - jit
+        assert np.max(np.abs(a - a_exp)) < 1.0, np.max(np.abs(a - a_exp))
+
+    def test_motion_free_dome_gets_no_move(self):
+        # the sub-pixel refinement must cover lag 0 / -1 (a wrapped lag table quantised exactly the small lags a smooth
+        # dome produces and integrated them into a 2-3 px spurious move — review 2026-09-05)
+        vol, _j, _t = self._synth(F=80, D=200, L=64)
+        a, b, info = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        assert info["applied"] and np.max(np.abs(a)) < 1.0, np.max(np.abs(a))       # 0.67 measured (white texture is the worst case)
+
+    def test_dead_frame_block_does_not_bend_the_live_move(self):
+        vol, jit, _t = self._synth(F=60, D=200, L=64, jitter=np.r_[np.zeros(25), 5.0 * np.ones(6), np.zeros(29)])
+        a0, _b0, _i0 = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        dead = vol.copy(); dead[:12] = 0.0                                       # a zeroed leading block (crop_region / blink)
+        a1, _b1, i1 = M.tissue_motion_move(dead, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        assert i1["applied"] and np.all(a1[:12] == 0.0) and i1["segments"][0][0] >= 11
+        live = np.arange(12, 60)
+        # live frames: same move up to the parabola difference between the two fits
+        d = a1[live] - a0[live]; d -= np.polyval(np.polyfit(live, d, 2), live)
+        assert np.max(np.abs(d)) < 0.5, np.max(np.abs(d))
+        a, b, info = M.tissue_motion_move(vol, {"tissue_motion_max_lag": -3})     # a bad per-case param must not raise
+        assert a.shape == (60,) and np.all(np.isfinite(a))
+
+    def test_cut_columns_do_not_bias_the_boundary_pair(self):
+        # a MOTION-FREE dome whose apex rises above the window: frames 0..23 are cut at the canvas edge (tissue at
+        # row 0), the rest are not. The correct move is ~0 everywhere; without the cut guard the pair straddling the
+        # boundary matched the cut edge instead of the stroma and integrated a step into the band.
+        F, D, L = 60, 400, 48; rng = np.random.default_rng(3); fr = np.arange(F)
+        top = -50.0 + 0.03 * fr ** 2                                  # smooth; negative (cut) until frame ~41; stays in the canvas
+        tex = rng.uniform(0, 1, D + 100); rows = np.arange(D, dtype=float); vol = np.zeros((F, D, L), np.float32)
+        for f in range(F):
+            for l in range(L):
+                idx = np.clip((rows - top[f]).astype(int), 0, D + 99)   # the tissue texture is anchored to the tissue, not the canvas
+                prof = 30.0 + 20.0 * rng.uniform(0, 1, D) + np.where((rows >= top[f]) & (rows < top[f] + 200), 800.0 + 400.0 * tex[idx], 0.0)
+                vol[f, :, l] = prof
+        a, b, info = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        assert info["applied"]
+        bnd = int(np.argmax(top >= 0))                                # first un-cut frame
+        assert abs(a[bnd] - a[bnd - 1]) < 1.0, (a[bnd - 3:bnd + 3])   # no step at the boundary pair
+        assert np.max(np.abs(a[3:-3])) < 2.0 and np.max(np.abs(a)) < 3.0, (np.max(np.abs(a[3:-3])), a[:5], a[-5:])   # white-texture floor ~1.6
+        a0, _b0, _i = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_cut_guard": 0})
+        assert np.sqrt(np.mean(a0 ** 2)) >= np.sqrt(np.mean(a ** 2)) - 0.3   # the guard never makes it worse
+
+    def test_degenerate_inputs(self):
+        a, b, info = M.tissue_motion_move(np.zeros((2, 40, 8), np.float32), {})
+        assert not info["applied"] and a.shape == (2,) and b.shape == (2,)
+        a, b, info = M.tissue_motion_move(np.zeros((10, 40, 16), np.float32), {})   # all-zero: no band passes min_fill
+        assert not info["applied"] and np.all(a == 0)
+
+
+# ───────────────────────── surface-crop band: bottom-edge guide ─────────────────────────
+class TestBandBottomGuide:
+    def _posterior(self, F=80, L=64, band_off=None, noise=0.0, seed=0):
+        fr = np.arange(F); dome = 300.0 + 0.03 * (fr - F / 2.0) ** 2
+        P = np.tile(dome, (L, 1)).astype(float)
+        if band_off is not None:
+            P[:, :len(band_off)] += np.asarray(band_off, float)[None, :]      # the band's posterior is off its parabola
+        if noise > 0:
+            P += np.random.default_rng(seed).normal(0.0, noise, P.shape)
+        return P
+
+    def test_posterior_source_refines_every_band_frame_and_fades_outward(self):
+        F, L = 80, 64; band = list(range(0, 20)); off = np.linspace(11.0, 2.0, 20); P = self._posterior(F, L, off)
+        da, db, info = M.band_bottom_guide(P, {}, np.zeros(F), np.zeros(F), band, L,
+                                           {"band_bottom_guide_min_laterals": 8, "band_bottom_guide_source": "posterior",
+                                            "band_bottom_guide_fit_frames": "uncropped", "band_bottom_guide_tilt": True})
+        assert info["applied"] and info["band"] == [0, 19] and info["refined_frames"] == band
+        assert np.allclose(da[:20], -off, atol=0.3), da[:20]                 # every band frame lands on its parabola
+        assert np.allclose(da[20:23], -off[19] * np.array([0.75, 0.5, 0.25]), atol=0.3) and np.all(da[23:] == 0.0)
+        assert np.allclose(db, 0.0, atol=1e-6)
+        assert info["posterior_off_parabola_px"]["after"] < info["posterior_off_parabola_px"]["before"]
+
+    def test_drawn_bottom_lines_decide_the_shift_and_a_stroke_end_never_steps(self):
+        F, L = 80, 64; band = list(range(0, 20)); P = self._posterior(F, L, np.full(20, 6.0))
+        drawn = {5: {f: 0 for f in range(0, 10)}, 40: {f: 0 for f in range(0, 10)}}
+        P[5, :10] += 3.0; P[40, :10] += 3.0                                   # the reviewer's laterals say 9 px, the detector 6 px
+        da, db, info = M.band_bottom_guide(P, drawn, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert info["applied"] and info["drawn_driven_frames"] == list(range(0, 10)) and info["rejected_laterals"] == []
+        assert np.allclose(da[:10], -9.0, atol=0.5), da[:10]                # the drawn laterals decide, fully
+        assert np.allclose(da[10:13], -9.0 * np.array([0.75, 0.5, 0.25]), atol=0.5) and np.all(da[13:] == 0.0)   # fades, no step
+        assert np.max(np.abs(np.diff(da))) <= 9.0 / 4.0 + 0.5 and np.allclose(db, 0.0)
+        da2, db2, info2 = M.band_bottom_guide(P, {}, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert not info2["applied"] and "drawn" in info2["reason"]            # no lines → idle by default
+        da3, _b, info3 = M.band_bottom_guide(P, drawn, np.zeros(F), np.zeros(F), band, L,
+                                             {"band_bottom_guide_min_laterals": 8, "band_bottom_guide_source": "posterior"})
+        assert info3["applied"] and abs(da3[15] + 6.0) < 0.5                 # "posterior" source: the detector fills the rest
+        # a LONG line (drawn across the un-cropped frames too): its own un-cropped curvature is carried into the band,
+        # whatever the detector's posterior does there
+        Pl = self._posterior(F, L, np.full(20, 40.0))
+        long = {20: {f: 0 for f in range(F)}, 44: {f: 0 for f in range(F)}}
+        fr = np.arange(F); dome = 300.0 + 0.03 * (fr - F / 2.0) ** 2
+        for l in long: Pl[l] = dome; Pl[l, :20] += 5.0
+        da4, _b, info4 = M.band_bottom_guide(Pl, long, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert info4["applied"] and info4["rejected_laterals"] == []
+        assert np.allclose(da4[:16], -5.0, atol=0.6), da4[:20]
+
+    def test_drawn_line_is_honoured_under_posterior_noise_and_mislocks(self):
+        F, L = 80, 64; band = list(range(0, 20)); drawn = {32: {f: 0 for f in range(0, 20)}, 40: {f: 0 for f in range(0, 20)}}
+        for off in (3.0, 5.0):
+            got = []
+            for seed in range(6):
+                P = self._posterior(F, L, np.full(20, off), noise=1.5, seed=seed)
+                da, _b, info = M.band_bottom_guide(P, drawn, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+                got.append(float(np.mean(da[3:14])))
+            assert abs(np.mean(got) + off) < 1.2, (off, got)                  # the line's disagreement is delivered, not absorbed
+        P = self._posterior(F, L, np.full(20, 6.0)); P[:, 72:] += 40.0         # a run of detector mis-locks in un-cropped frames
+        da, _b, info = M.band_bottom_guide(P, drawn, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert abs(da[5] + 6.0) < 1.5, da[5]                                  # the robust parabola ignores them
+        P = self._posterior(F, L, np.full(20, 6.0)); P[:, 20:28] += 40.0       # mis-locks right next to the band
+        da, _b, info = M.band_bottom_guide(P, drawn, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert abs(da[5] + 6.0) < 1.5, da[5]
+
+    def test_safety_rules(self):
+        F, L = 80, 64; band = list(range(0, 20)); P = self._posterior(F, L, np.full(20, 6.0))
+        da, _b, info = M.band_bottom_guide(P, {32: {f: 0 for f in range(0, 20)}}, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert not info["applied"] and "agreeing" in info["reason"]          # one line alone moves nothing
+        drawn = {32: {f: 0 for f in range(20)}, 40: {f: 0 for f in range(20)}, 10: {f: 0 for f in range(20)}}
+        P2 = P.copy(); P2[10, :20] -= 250.0                                    # a line hundreds of px off is ignored; the sane two drive
+        da, _b, info = M.band_bottom_guide(P2, drawn, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert info["applied"] and info["rejected_laterals"] == [10] and abs(da[5] + 6.0) < 0.5
+        P3 = P.copy(); P3[40, :20] -= 9.0                                      # 32 asks −6, 40 asks +3: spread 9 > 8 → skipped
+        da, _b, info = M.band_bottom_guide(P3, {32: drawn[32], 40: drawn[40]}, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert not info["applied"] and info["disagreeing_frames"] == band and info["rejected_laterals"] == []
+        P4 = P.copy(); P4[:, :20] += 30.0                                      # everyone asks for 36 px: beyond the cap → ignored
+        da, _b, info = M.band_bottom_guide(P4, {32: drawn[32], 40: drawn[40]}, np.zeros(F), np.zeros(F), band, L, {"band_bottom_guide_min_laterals": 8})
+        assert (not info["applied"]) or np.max(np.abs(da)) <= 12.0 + 1e-6
+        da, _b, info = M.band_bottom_guide(P, {32: drawn[32], 40: drawn[40]}, np.zeros(F), np.zeros(F), list(range(0, 45)), L, {"band_bottom_guide_min_laterals": 8})
+        assert not info["applied"] and "extrapolated" in info["reason"]      # a band over half the volume is refused
+
+    def test_degenerate_and_input_coercion(self):
+        F = 30; P = self._posterior(F, 16)
+        da, db, info = M.band_bottom_guide(None, {}, np.zeros(F), np.zeros(F), [0, 1, 2], 16)
+        assert not info["applied"] and da.shape == (F,)
+        da, db, info = M.band_bottom_guide(np.full((16, F), np.nan), {}, np.zeros(F), np.zeros(F), [0, 1, 2], 16)
+        assert not info["applied"]
+        da, db, info = M.band_bottom_guide(P, {3: {0: 0}}, np.zeros(F), np.zeros(F), np.arange(3), 16,
+                                           {"band_bottom_guide_min_laterals": 8, "band_bottom_guide_min_uncropped": 0})
+        assert da.shape == (F,) and np.all(np.isfinite(da))                   # ndarray crop frames + a silly param: no raise
+
+
+# ───────────────────────── fork watchdog: a wedged child must never hang the caller ─────────────────────────
+def _pw_double(x):
+    return x * 2
+
+
+def _pw_slow_double(x):
+    import time as _t
+    _t.sleep(3.0)
+    return x * 2
+
+
+class TestSecondMotionPass:
+    def test_scratch_warp_matches_the_flatten_convention(self):
+        # target row = surface + a + b·x: a positive shift moves content DEEPER, a positive tilt deepens the
+        # RIGHT (high-lateral) end. Used only to re-measure the residual motion; must not change the sign.
+        F, D, L = 4, 60, 33
+        vol = np.zeros((F, D, L), np.float32); vol[:, 20, :] = 1000.0
+        out = M._rigid_scratch_warp(vol, np.array([0.0, 3.0, 0.0, 0.0]), np.zeros(F))
+        assert int(np.argmax(out[1, :, L // 2])) == 23 and int(np.argmax(out[0, :, L // 2])) == 20
+        out = M._rigid_scratch_warp(vol, np.zeros(F), np.array([0.0, 4.0, 0.0, 0.0]))
+        assert int(np.argmax(out[1, :, L - 1])) == 24 and int(np.argmax(out[1, :, 0])) == 16
+        assert out.shape == vol.shape and out.dtype == vol.dtype
+
+    def test_second_pass_thresholds_exist_and_are_ordered(self):
+        p = M.DEFAULT_PARAMS
+        assert p["tissue_motion_second_pass"] is True
+        assert 0.0 < p["tissue_motion_second_pass_min_px"] < p["tissue_motion_second_pass_max_px"]
+
+    def test_a_converged_volume_measures_near_zero_so_the_guard_skips_it(self):
+        # the guard reads tissue_motion_move(...)['residual_rms_px'] on the once-moved volume; a volume whose
+        # trajectory is already its own parabola must measure below the threshold (cs008_od_v2: 0.71 px).
+        F, D, L = 40, 200, 48; rng = np.random.default_rng(5); fr = np.arange(F)
+        dome = 70.0 + 0.03 * (fr - F / 2.0) ** 2; tex = rng.uniform(0, 1, D + 60); rows = np.arange(D, dtype=float)
+        vol = np.zeros((F, D, L), np.float32)
+        for f in range(F):
+            for l in range(L):
+                idx = np.clip((rows - dome[f]).astype(int), 0, D + 59)
+                vol[f, :, l] = 30.0 + 20.0 * rng.uniform(0, 1, D) + np.where((rows >= dome[f]) & (rows < dome[f] + 90), 800.0 + 400.0 * tex[idx], 0.0)
+        a, b, info = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1})
+        assert info["applied"] and float(info["residual_rms_px"]) < M.DEFAULT_PARAMS["tissue_motion_second_pass_min_px"]
+
+
+def _pw_sleeper(x):
+    import time as _t
+    _t.sleep(30)
+    return x
+
+
+class TestPoolTeardown:
+    def test_stuck_workers_are_killed_not_leaked(self):
+        # a worker that never returns must not survive the pool (2026-09-08: two orphans held 7.3 GB and the
+        # reviewer's machine went into swap while they worked the queue)
+        import concurrent.futures
+        import multiprocessing as mp
+        import time as _t
+        ex = concurrent.futures.ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("fork"))
+        [ex.submit(_pw_sleeper, i) for i in range(2)]
+        _t.sleep(1.0)
+        procs = list(ex._processes.values())
+        assert sum(p.is_alive() for p in procs) == 2
+        killed = M._close_pool(ex, grace=1.0)
+        _t.sleep(0.5)
+        assert killed == 2 and sum(p.is_alive() for p in procs) == 0
+
+    def test_clean_pool_closes_without_killing(self):
+        import concurrent.futures
+        import multiprocessing as mp
+        ex = concurrent.futures.ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("fork"))
+        assert list(ex.map(abs, [-1, -2, -3])) == [1, 2, 3]
+        assert M._close_pool(ex, grace=20.0) == 0
+
+    def test_grace_zero_is_immediate(self):
+        import concurrent.futures
+        import multiprocessing as mp
+        ex = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("fork"))
+        ex.submit(_pw_sleeper, 1)
+        import time as _t
+        _t.sleep(1.0)
+        t0 = _t.monotonic()
+        M._close_pool(ex, grace=0.0)
+        assert _t.monotonic() - t0 < 5.0
+
+
+class TestPoolWatchdog:
+    def test_normal_pool_still_maps(self):
+        assert M._map_slices(_pw_double, [1, 2, 3, 4], None, 0.0, 1.0, 2) == [2, 4, 6, 8]
+
+    def test_stalled_pool_falls_back_to_serial_within_the_deadline(self, monkeypatch):
+        # A fork that deadlocks yields NO results; before 2026-09-07 ex.map (and shutdown) waited forever and the
+        # request thread wedged in waitpid. With the deadline the children are killed and the serial fallback
+        # returns the same answer. Simulated here with a worker slower than the deadline.
+        import time as _t
+        monkeypatch.setattr(M, "_POOL_TIMEOUT_S", 0.4)
+        t0 = _t.monotonic()
+        out = M._map_slices(_pw_slow_double, [3, 4], None, 0.0, 1.0, 2)
+        dt = _t.monotonic() - t0
+        assert out == [6, 8]                     # correct result, via the serial path
+        assert dt < 30.0, dt                     # bounded: deadline + 2 serial items, never unbounded
+
+    def test_kill_pool_is_safe_on_a_live_and_on_a_dead_executor(self):
+        import concurrent.futures
+        import multiprocessing as mp
+        ex = concurrent.futures.ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("fork"))
+        assert list(ex.map(_pw_double, [1, 2])) == [2, 4]
+        M._kill_pool(ex)
+        M._kill_pool(ex)                          # idempotent
+        M._kill_pool(object())                    # never raises on a non-executor
+
+    def test_timeout_is_configurable_and_positive(self):
+        assert M._POOL_TIMEOUT_S > 0
+
+
+# ───────────────────────── dome sign guard: the B-scan plane decides the sign of the across-frame dome ─────────────────────────
+def _synth_moving_dome(F=60, D=220, L=64, frame_curv=0.03, motion=None, seed=3):
+    """tissue band whose anterior is a dome across laterals AND across frames, plus optional per-frame motion"""
+    rng = np.random.default_rng(seed); fr = np.arange(F, dtype=float); x = np.arange(L, dtype=float)
+    lat_dome = 0.02 * (x - L / 2.0) ** 2                       # positive: apex up across laterals
+    base = 60.0 + frame_curv * (fr - F / 2.0) ** 2             # across frames
+    mv = np.zeros(F) if motion is None else motion
+    vol = np.zeros((F, D, L), np.float32); rows = np.arange(D, dtype=float)
+    for f in range(F):
+        for l in range(L):
+            top = base[f] + lat_dome[l] + mv[f]
+            vol[f, :, l] = 30.0 + 20.0 * rng.uniform(0, 1, D) + np.where((rows >= top) & (rows < top + 70), 900.0 + 300.0 * rng.uniform(0, 1, D), 0.0)
+    return vol
+
+
+class TestEndPairGuard:
+    def test_garbage_terminal_pair_is_replaced_by_the_trend(self):
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=0.4 * fr)                  # clean linear drift
+        vol[-1] = np.roll(vol[-1], 25, axis=0)                                    # last frame jumps 25 px: a garbage terminal pair
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1}
+        a_off, _, i_off = M.tissue_motion_move(vol, {**p, "tissue_motion_end_pairs": 0})
+        a_on, _, i_on = M.tissue_motion_move(vol, {**p, "tissue_motion_end_pairs": 3})   # opt-in: OFF by default
+        assert i_on.get("end_pairs_replaced"), "the terminal pair must be flagged"
+        assert any(r["pair"] == F - 2 for r in i_on["end_pairs_replaced"])
+        # the delivered last frame follows its neighbours' trend instead of the 25 px jump
+        assert abs((a_on[-1] - a_on[-2]) - (a_on[-2] - a_on[-3])) < 3.0
+        assert abs((a_off[-1] - a_off[-2]) - (a_off[-2] - a_off[-3])) > 10.0
+
+    def test_clean_segment_is_untouched(self):
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=0.4 * fr + 2.0 * np.sin(fr / 5.0))
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1}
+        a0, b0, i0 = M.tissue_motion_move(vol, {**p, "tissue_motion_end_pairs": 0})
+        a1, b1, i1 = M.tissue_motion_move(vol, {**p, "tissue_motion_end_pairs": 3})
+        assert not i1.get("end_pairs_replaced") and np.allclose(a0, a1) and np.allclose(b0, b1)
+        a2, b2, i2 = M.tissue_motion_move(vol, p)                                          # default: guard off, identical
+        assert not i2.get("end_pairs_replaced") and np.allclose(a0, a2)
+
+
+class TestInteriorPairGuard:
+    def _vol_with_streak(self, streak=True):
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=0.3 * fr)              # smooth drift
+        if streak:
+            # ONE pair with a split vote: from frame 30 on, the LEFT half of every frame is shifted 8 px deeper, so
+            # pair 29→30 measures +8 on the left bands and 0 on the right (a blunder-shaped disagreement) while
+            # pairs 28→29 and 30→31 stay consistent on both halves (the neighbours agree)
+            # (a left/right split reads as a TILT to the linear fit and never trips the spread; the MIDDLE third
+            # displaced cannot be absorbed by a line, which is what a streak-biased vote looks like)
+            L = vol.shape[2]; vol[30:, :, L // 3: 2 * L // 3] = np.roll(vol[30:, :, L // 3: 2 * L // 3], 8, axis=1)
+        return vol
+
+    def test_split_vote_pair_takes_its_neighbours(self):
+        vol = self._vol_with_streak(True); p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1}
+        a0, _, i0 = M.tissue_motion_move(vol, {**p, "tissue_motion_interior_pair_guard": False})
+        a1, _, i1 = M.tissue_motion_move(vol, {**p, "tissue_motion_interior_pair_guard": True})
+        assert i1.get("interior_pairs_replaced"), i1.get("pair_spread")
+        assert any(r["pair"] in (29, 30) for r in i1["interior_pairs_replaced"])
+        # the delivered step at the streak frame shrinks
+        step0 = abs((a0[30] - a0[29]) - (a0[29] - a0[28])); step1 = abs((a1[30] - a1[29]) - (a1[29] - a1[28]))
+        assert step1 <= step0
+
+    def test_clean_volume_untouched(self):
+        vol = self._vol_with_streak(False); p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1}
+        a0, b0, i0 = M.tissue_motion_move(vol, {**p, "tissue_motion_interior_pair_guard": False})
+        a1, b1, i1 = M.tissue_motion_move(vol, p)
+        assert not i1.get("interior_pairs_replaced") and np.allclose(a0, a1) and np.allclose(b0, b1)
+
+
+class TestDomeSignGuard:
+    def test_bscan_plane_curvature_is_positive_and_motion_free(self):
+        vol = _synth_moving_dome(motion=np.linspace(-40, 40, 60) ** 1)   # a huge linear drift across frames
+        r = M.bscan_plane_curvature(vol)
+        assert r["n_good"] >= 8 and 0.015 < r["curv_px_per_lat2"] < 0.025   # ≈ the 0.02 built in, drift ignored
+
+    def test_guard_fixes_an_inverted_trajectory_first_pass_only(self):
+        F = 60; fr = np.arange(F, dtype=float)
+        valley = -0.05 * (fr - F / 2.0) ** 2 + 0.05 * (fr - F / 2.0) ** 2   # cancel the built-in dome …
+        motion = -0.08 * (fr - F / 2.0) ** 2                                # … and impose a VALLEY through motion
+        vol = _synth_moving_dome(frame_curv=0.03, motion=motion)
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1}
+        a_own, _, i_own = M.tissue_motion_move(vol, {**p, "tissue_motion_shape_curv": None})
+        assert "shape_guard" not in i_own                                   # no shape → own parabola (inverted, kept)
+        a_g, _, i_g = M.tissue_motion_move(vol, {**p, "tissue_motion_shape_curv": 0.03})
+        assert i_g.get("shape_guard"), "the guard must fire when the own parabola is sign-wrong"
+        assert i_g["shape_guard"][0]["own_curv"] < 0 < i_g["shape_guard"][0]["used_curv"]
+        # the delivered trajectory (pos + a) must now bend upward with the requested curvature
+        c_own = np.polyfit(fr, a_own, 2)[0]; c_g = np.polyfit(fr, a_g, 2)[0]
+        assert c_g - c_own > 0.05                                           # the guard added a positive dome
+        # a normal dome is left alone even with a shape given
+        vol2 = _synth_moving_dome(frame_curv=0.03, motion=np.zeros(F))
+        _, _, i2 = M.tissue_motion_move(vol2, {**p, "tissue_motion_shape_curv": 0.03})
+        assert "shape_guard" not in i2
+
+    def test_preview_fit_follows_the_guard(self):
+        fr = np.arange(101, dtype=float)
+        edge = -0.05 * (fr - 50) ** 2 + 300 + np.random.default_rng(0).normal(0, 1.0, 101)   # inverted served edge
+        fit = np.polyval(np.polyfit(fr, edge, 2), fr)
+        out, info = M.sign_guarded_quadratic(edge, fit, 0.02)
+        assert info["applied"] and info["own_curv"] < 0 and np.polyfit(fr, out, 2)[0] > 0.019
+        # a correct dome is untouched, and no shape means untouched
+        good = 0.03 * (fr - 50) ** 2 + 200; gf = np.polyval(np.polyfit(fr, good, 2), fr)
+        o2, i2 = M.sign_guarded_quadratic(good, gf, 0.02); assert not i2["applied"] and np.allclose(o2, gf)
+        o3, i3 = M.sign_guarded_quadratic(edge, fit, None); assert not i3["applied"] and np.allclose(o3, fit)
+
+    def test_guard_centres_the_dome_in_the_segment(self):
+        # a sign-wrong trajectory's linear term is drift, not geometry: the DELIVERED dome's vertex must sit at the
+        # middle of the live segment (cs017: vertex at frame −25 before, a ramp on screen). Judge the delivered
+        # geometry itself: warp the synthetic volume by the move and read the anterior edge across frames.
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=-0.08 * (fr - F / 2.0) ** 2 + 2.0 * fr)   # valley + strong drift
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_shape_curv": 0.03}
+        a, b, i = M.tissue_motion_move(vol, p)
+        assert i.get("shape_guard")
+        f0, f1 = i["shape_guard"][0]["segment"]
+        moved = M._rigid_scratch_warp(np.pad(vol, ((0, 0), (200, 200), (0, 0))), a, b)
+        L = vol.shape[2]; g = M.ndimage.gaussian_filter1d(moved[:, :, L // 2].astype(float), 1.5, axis=1)
+        hit = g >= 500; ok = hit.any(axis=1); y = np.where(ok, np.argmax(hit, axis=1), np.nan).astype(float)
+        k = np.isfinite(y) & (fr >= f0) & (fr <= f1)
+        c = np.polyfit(fr[k], y[k], 2)
+        assert c[0] > 0, "delivered dome must be apex-up"
+        vtx = -c[1] / (2 * c[0])
+        assert abs(vtx - 0.5 * (f0 + f1)) < 6.0, (vtx, (f0, f1))
+
+    def test_guard_can_be_switched_off(self):
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=-0.08 * (fr - F / 2.0) ** 2)
+        _, _, i = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_shape_curv": 0.03, "tissue_motion_shape_sign_guard": False})
+        assert "shape_guard" not in i
+

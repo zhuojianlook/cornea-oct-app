@@ -11,6 +11,7 @@ export const FIX = {
   subgroup: "case_zz_subgroup",       // step 7 (subgroup assigned)
   scar: "case_zz_scar",               // step 8 (scar segmented)
   vet: "case_zz_vet",                 // step 2 (MUTABLE — Approve preprocessing -> classify)
+  stale: "case_zz_stale",             // step 2, run UNSTAMPED with a pipeline_version → auto re-run on open
   corrected: "case_zz_corrected",     // step 11 (MUTABLE — Schedule / Unschedule)
   members: ["case_zz_od_v1", "case_zz_od_v2", "case_zz_od_v3"],
   consensus: "case_zzod_od_consensus", // step 9 (replicates aligned)
