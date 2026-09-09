@@ -2279,6 +2279,49 @@ class TestInteriorPairGuard:
         step0 = abs((a0[30] - a0[29]) - (a0[29] - a0[28])); step1 = abs((a1[30] - a1[29]) - (a1[29] - a1[28]))
         assert step1 <= step0
 
+    def test_real_move_with_a_split_vote_is_kept(self):
+        # cs020_od_v1 pair 67: the WHOLE tissue steps 8 px deeper at one pair AND a middle-third block votes wrong; the raw
+        # anterior witness says 8 → the measured lag stands, the neighbours' mean (≈0) is not substituted
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=0.3 * fr)
+        vol[30:] = np.roll(vol[30:], 8, axis=1)                                                     # real 8 px step at pair 29
+        L = vol.shape[2]; D = vol.shape[1]; x = np.arange(L, dtype=float)
+        # + a split vote from a STREAK block: from frame 30 on, the block's anterior 30 rows are blacked out (a bright/dark
+        # streak hides the surface) and its deep stroma sits 6 px further, so those bands vote +14 while the rest vote +8
+        # and the anterior edge itself (the witness) still says +8 everywhere it is visible
+        blk = slice(L // 3, 2 * L // 3); rolled = np.roll(vol[30:, :, blk], 6, axis=1)
+        for k, f in enumerate(range(30, F)):
+            top = 60.0 + 0.03 * (f - 30.0) ** 2 + 0.3 * f + 0.02 * (x[blk] - L / 2.0) ** 2 + 8.0
+            rows = np.arange(D)[:, None]
+            vol[f, :, blk] = np.where(rows >= top[None, :] + 30.0, rolled[k], np.where(rows >= top[None, :], 35.0, vol[f, :, blk]))
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": True,
+             "tissue_motion_pair_witness_min_laterals": 20}
+        a, _, i = M.tissue_motion_move(vol, p)
+        rec = [r for r in (i.get("interior_pairs_replaced") or []) if r["pair"] in (29, 30)]
+        assert rec and rec[0]["kept"] is True and rec[0]["witness"] is not None, i.get("interior_pairs_replaced")
+        assert abs((a[29] - a[30]) - 8.0) < 2.0, (a[28:32])                                   # the step is delivered (trajectory falls by the lag)
+
+    def test_tilted_real_move_with_a_split_vote_takes_the_witness_line(self):
+        # the whole tissue steps deeper by 10 px on the left edge and 2 px on the right (a tilted rigid move) while a block
+        # of bands votes wrong: the delivered pair carries the witness's shift AND tilt
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=0.3 * fr); L = vol.shape[2]
+        x = np.arange(L); shift = np.round(10.0 - 8.0 * x / (L - 1)).astype(int)               # +10 → +2 across laterals
+        for l in range(L):
+            vol[30:, :, l] = np.roll(vol[30:, :, l], int(shift[l]), axis=1)
+        D = vol.shape[1]; blk = slice(L // 3, 2 * L // 3); rolled = np.roll(vol[30:, :, blk], 7, axis=1)   # streak block (see above)
+        for k, f in enumerate(range(30, F)):
+            top = 60.0 + 0.03 * (f - 30.0) ** 2 + 0.3 * f + 0.02 * (x[blk] - L / 2.0) ** 2 + shift[blk]
+            rows = np.arange(D)[:, None]
+            vol[f, :, blk] = np.where(rows >= top[None, :] + 30.0, rolled[k], np.where(rows >= top[None, :], 35.0, vol[f, :, blk]))
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": True,
+             "tissue_motion_pair_witness_min_laterals": 20}
+        a, b, i = M.tissue_motion_move(vol, p)
+        rec = [r for r in (i.get("interior_pairs_replaced") or []) if r["pair"] in (29, 30)]
+        assert rec and rec[0]["kept"] is True, i.get("interior_pairs_replaced")
+        assert abs((a[29] - a[30]) - 6.0) < 2.0, a[28:32]                                     # centre shift ≈ 6
+        assert abs((b[29] - b[30]) - (-4.0)) < 2.0, b[28:32]                                  # half-span tilt ≈ −4 (left deeper)
+
     def test_clean_volume_untouched(self):
         vol = self._vol_with_streak(False); p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1}
         a0, b0, i0 = M.tissue_motion_move(vol, {**p, "tissue_motion_interior_pair_guard": False})
@@ -2312,6 +2355,179 @@ class TestCutMaskPairSymmetric:
         assert max(abs(-(a[f + 1] - a[f])) for f in (12, 13, 16, 17)) < 1.5
 
 
+class TestAdaptiveLagWindow:
+    """cs020_os_v2 (2026-09-09): a blink moved the eye 85 px between two frames, beyond the ±40 px lag window; the votes pinned
+    at the boundary and a 23 px spike was delivered. A pair whose votes pin at the boundary is re-read with a wider window."""
+
+    def test_move_beyond_the_window_is_measured(self):
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(D=300, frame_curv=0.03, motion=0.3 * fr)
+        vol[30:] = np.roll(vol[30:], 60, axis=1)                                 # a 60 px jump at pair 29 (window is ±40)
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_max_lag": 40, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False}
+        a_off, _, i_off = M.tissue_motion_move(vol, {**p, "tissue_motion_widen_window": False})
+        a_on, _, i_on = M.tissue_motion_move(vol, p)
+        assert 29 in (i_on.get("widened_pairs") or []), i_on.get("widened_pairs")
+        assert abs((a_on[29] - a_on[30]) - 60.0) < 3.0, a_on[28:32]             # the full jump is delivered
+        assert abs((a_off[29] - a_off[30]) - 60.0) > 15.0, a_off[28:32]         # without widening it is clipped near the window
+
+
+class TestBridgedDome:
+    """cs020_os_v4 (2026-09-09): a reviewer's artifact band zeroes frames 40-49; the two live halves must land on ONE dome,
+    not two parabolas with an arbitrary offset."""
+
+    def test_two_halves_share_one_dome_across_a_short_dead_gap(self):
+        F = 100; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(F=F, frame_curv=0.03, motion=0.3 * fr)
+        vol[60:] = np.roll(vol[60:], 15, axis=1)                                   # a rigid 15 px offset of the second half (what a blink leaves)
+        vol[40:50] = 0.0                                                            # the marked artifact: dead frames
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+             "tissue_motion_shape_sign_guard": False}
+        a, b, i = M.tissue_motion_move(vol, p)
+        assert i.get("bridged_segments"), i.get("segments")
+        # the delivered surface: true top + move; both halves must lie on one parabola
+        top = 60.0 + 0.03 * (fr - 50.0) ** 2 + 0.3 * fr + np.where(fr >= 60, 15.0, 0.0)
+        delivered = top + a; live = np.ones(F, bool); live[40:50] = False; live[:8] = live[-8:] = False   # ends carry the fit's own edge error
+        c = np.polyfit(fr[live], delivered[live], 2); res = delivered[live] - np.polyval(c, fr[live])
+        assert np.sqrt(np.mean(res ** 2)) < 1.5, (np.sqrt(np.mean(res ** 2)), c)
+        a_sep, _, i_sep = M.tissue_motion_move(vol, {**p, "tissue_motion_bridge_max_gap": 0})   # independent domes: not on one curve
+        d_sep = top + a_sep; c2 = np.polyfit(fr[live], d_sep[live], 2); res2 = d_sep[live] - np.polyval(c2, fr[live])
+        assert np.sqrt(np.mean(res2 ** 2)) > np.sqrt(np.mean(res ** 2))
+
+
+class TestGapEdgeOffset:
+    """p1_od_v1_3 (2026-09-10): across a dead artifact gap the tissue cannot measure the rigid shift; the served edge
+    sets the height of each bridged segment on the dome the tissue delivered."""
+
+    def _vol(self, jump, F=70, D=300, L=48, gap=(30, 39), seed=5):
+        rng = np.random.default_rng(seed); fr = np.arange(F, dtype=float); x = np.arange(L, dtype=float)
+        vol = np.zeros((F, D, L), np.float32); rows = np.arange(D, dtype=float); edge = np.full((L, F), np.nan)
+        for f in range(F):
+            top = 90.0 + 0.02 * (fr[f] - 35.0) ** 2 + 0.01 * (x - L / 2.0) ** 2 + (jump if f > gap[1] else 0.0)
+            vol[f] = (30.0 + 20.0 * rng.uniform(0, 1, (D, L)) + np.where((rows[:, None] >= top[None, :]) & (rows[:, None] < top[None, :] + 60), 900.0 + 300.0 * rng.uniform(0, 1, (D, L)), 0.0)).astype(np.float32)
+            edge[:, f] = top
+        vol[gap[0]:gap[1] + 1] = 0.0
+        return vol, edge
+
+    def _p(self):
+        return {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+                "tissue_motion_shape_sign_guard": False, "tissue_motion_bridge_max_gap": 20, "tissue_motion_tilt_witness": False}
+
+    def test_edge_sets_the_offset_across_the_gap(self):
+        vol, edge = self._vol(jump=60.0)
+        a, b, i = M.tissue_motion_move(vol, {**self._p(), "_gap_edge": edge})
+        assert i.get("bridged_segments") and i.get("gap_edge_offset"), i.get("gap_edge_offset")
+        rec = i["gap_edge_offset"][0]; assert abs(rec["shift_px"][1] + 60.0) < 4.0 or abs(rec["shift_px"][0] - 60.0) < 4.0, rec   # the jump is removed
+        deliv = np.nanmedian(edge, axis=0) + a; live = vol.reshape(vol.shape[0], -1).max(axis=1) > 0
+        fr = np.arange(vol.shape[0], dtype=float); res = deliv[live] - np.polyval(np.polyfit(fr[live], deliv[live], 2), fr[live])
+        assert np.max(np.abs(res)) < 4.0, np.max(np.abs(res))                                  # one curve, one height
+        a0, b0, i0 = M.tissue_motion_move(vol, self._p())                                       # no edge: the jump stays
+        d0 = np.nanmedian(edge, axis=0) + a0; assert abs(d0[45] - d0[25]) > 30.0, (d0[45], d0[25])
+
+    def test_rolled_segment_gets_shift_and_tilt(self):
+        # after the gap the tissue is 40 px lower at the centre and rolled by 30 px half-span (60 px across the width)
+        F, D, L = 70, 320, 48; rng = np.random.default_rng(9); fr = np.arange(F, dtype=float); xs = (np.arange(L) - (L - 1) / 2) / ((L - 1) / 2)
+        vol = np.zeros((F, D, L), np.float32); rows = np.arange(D, dtype=float); edge = np.full((L, F), np.nan)
+        for f in range(F):
+            top = 110.0 + 0.02 * (fr[f] - 35.0) ** 2 + 0.01 * ((np.arange(L) - L / 2.0) ** 2) + ((40.0 + 30.0 * xs) if f > 39 else 0.0)
+            vol[f] = (30.0 + 20.0 * rng.uniform(0, 1, (D, L)) + np.where((rows[:, None] >= top[None, :]) & (rows[:, None] < top[None, :] + 60), 900.0 + 300.0 * rng.uniform(0, 1, (D, L)), 0.0)).astype(np.float32)
+            edge[:, f] = top
+        vol[30:40] = 0.0
+        a, b, i = M.tissue_motion_move(vol, {**self._p(), "_gap_edge": edge})
+        rec = i["gap_edge_offset"][0]; assert abs(rec["shift_px"][1] + 40.0) < 5.0 and abs(rec["tilt_px"][1] + 30.0) < 6.0, rec
+        live = vol.reshape(F, -1).max(axis=1) > 0
+        for lat in (4, L // 2, L - 5):
+            deliv = edge[lat] + a + b * xs[lat]; res = deliv[live] - np.polyval(np.polyfit(fr[live], deliv[live], 2), fr[live])
+            assert np.max(np.abs(res)) < 5.0, (lat, np.max(np.abs(res)))                        # one curve at every lateral
+
+    def test_no_jump_is_left_alone_and_unwitnessed_edge_is_skipped(self):
+        vol, edge = self._vol(jump=0.0)
+        a, b, i = M.tissue_motion_move(vol, {**self._p(), "_gap_edge": edge})
+        rec = (i.get("gap_edge_offset") or [{}])[0]; assert all(abs(v) < 2.5 for v in rec.get("shift_px", [0.0])), rec
+        a2, b2, i2 = M.tissue_motion_move(vol, {**self._p(), "_gap_edge": edge + 120.0})       # an edge 120 px off the tissue is no witness
+        rec2 = (i2.get("gap_edge_offset") or [{}])[0]; assert all(v is None for v in rec2.get("gap_steps_px", [None])), rec2
+        assert np.allclose(a2, a, atol=1e-6)
+
+
+class TestNoisySecondarySegment:
+    """cs025_os_v4 (2026-09-09): a short secondary segment whose band lags scatter far more than the main segment's is
+    unmeasurable; its move is held from the main segment instead of following whatever the correlation locked onto."""
+
+    def _vol(self, F=60, D=260, L=48, gap=(36, 43), seed=11, noisy_tail=True):
+        rng = np.random.default_rng(seed); x = np.arange(L, dtype=float); rows = np.arange(D, dtype=float)
+        vol = np.zeros((F, D, L), np.float32)
+        for f in range(F):
+            top = 70.0 + 0.02 * (f - 30.0) ** 2 + 0.01 * (x - L / 2.0) ** 2
+            if f > gap[1] and noisy_tail:
+                # faint cornea + a bright blob per lateral that jumps randomly from frame to frame: nothing rigid to measure
+                tissue = np.where((rows[:, None] >= top[None, :]) & (rows[:, None] < top[None, :] + 50), 120.0 + 60.0 * rng.uniform(0, 1, (D, L)), 0.0)
+                bl = rng.integers(150, 220, size=L); blob = np.where((rows[:, None] >= bl[None, :]) & (rows[:, None] < bl[None, :] + 25), 1500.0 + 300.0 * rng.uniform(0, 1, (D, L)), 0.0)
+                vol[f] = (30.0 + 20.0 * rng.uniform(0, 1, (D, L)) + tissue + blob).astype(np.float32)
+            else:
+                vol[f] = (30.0 + 20.0 * rng.uniform(0, 1, (D, L)) + np.where((rows[:, None] >= top[None, :]) & (rows[:, None] < top[None, :] + 60), 900.0 + 300.0 * rng.uniform(0, 1, (D, L)), 0.0)).astype(np.float32)
+        vol[gap[0]:gap[1] + 1] = 0.0
+        return vol
+
+    def test_noisy_tail_is_held_from_the_main_segment(self):
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+             "tissue_motion_shape_sign_guard": False, "tissue_motion_bridge_max_gap": 20, "tissue_motion_tilt_witness": False}
+        a, b, i = M.tissue_motion_move(self._vol(), p)
+        assert i.get("noisy_segments") and i["noisy_segments"][0]["segment"] == [44, 59], i.get("noisy_segments")
+        assert np.allclose(a[44:], a[35]) and np.allclose(b[44:], b[35]), (a[35], a[44:])                # held from the main segment's end
+        assert i["segments"] == [[0, 35]]
+        a2, b2, i2 = M.tissue_motion_move(self._vol(noisy_tail=False), p)                                   # a clean tail is measured, not held
+        assert not i2.get("noisy_segments") and i2["segments"] == [[0, 35], [44, 59]], i2.get("segments")
+
+    def test_held_tail_is_placed_on_the_dome_by_its_line(self):
+        # the tail's true top continues the dome but its tissue cannot be measured (blob); the served line is the top
+        F = 60; fr = np.arange(F, dtype=float); vol = self._vol(); L = vol.shape[2]
+        top = 70.0 + 0.02 * (fr - 30.0) ** 2; edge = np.tile(top[None, :], (L, 1)) + 0.01 * ((np.arange(L) - L / 2.0) ** 2)[:, None]
+        edge[:, 44:] += 40.0                                                                     # the raw tail sits 40 px low (eye moved during the gap)
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+             "tissue_motion_shape_sign_guard": False, "tissue_motion_bridge_max_gap": 20, "tissue_motion_tilt_witness": False, "tissue_motion_gap_edge_offset": False}
+        a, b, i = M.tissue_motion_move(vol, {**p, "_gap_edge": edge})
+        ns = (i.get("noisy_segments") or [{}])[0]; assert ns.get("line_placed") is True, ns
+        deliv = np.nanmedian(edge, axis=0) + a; live = vol.reshape(F, -1).max(axis=1) > 0
+        res = deliv[live] - np.polyval(np.polyfit(fr[live][:30], deliv[live][:30], 2), fr[live])     # the main segment's own parabola, extrapolated
+        assert np.max(np.abs(res[-16:])) < 4.0, res[-16:]                                        # the tail lies on it
+
+    def test_fill_holds_ends_and_interpolates_inside(self):
+        a = np.array([1.0, 2.0, 0.0, 0.0, 5.0, 0.0]); b = np.array([0.5, 0.5, 0.0, 0.0, -0.5, 0.0]); dead = np.array([False, False, True, True, False, True])
+        fa, fb = M.fill_unmeasured_move(a, b, dead)
+        assert np.allclose(fa, [1.0, 2.0, 3.0, 4.0, 5.0, 5.0]) and np.allclose(fb, [0.5, 0.5, 0.1667, -0.1667, -0.5, -0.5], atol=1e-3), (fa, fb)
+
+
+class TestTiltShapeWitness:
+    """cs024_os_v4 (2026-09-09): a spurious U-shaped tilt trajectory in the correlation flattened one lateral edge of the
+    delivered cornea. The non-linear part of the tilt correction must follow the raw anterior edge's own tilt trajectory."""
+
+    def _dome(self, F=60, D=220, L=64, roll=None, seed=3):
+        rng = np.random.default_rng(seed); fr = np.arange(F, dtype=float); x = np.arange(L, dtype=float); xn = (x - (L - 1) / 2) / ((L - 1) / 2)
+        vol = np.zeros((F, D, L), np.float32); rows = np.arange(D, dtype=float)
+        for f in range(F):
+            top = 60.0 + 0.03 * (fr[f] - 30.0) ** 2 + 0.02 * (x - L / 2.0) ** 2 + (roll[f] * xn if roll is not None else 0.0)
+            vol[f] = (30.0 + 20.0 * rng.uniform(0, 1, (D, L)) + np.where((rows[:, None] >= top[None, :]) & (rows[:, None] < top[None, :] + 70), 900.0 + 300.0 * rng.uniform(0, 1, (D, L)), 0.0)).astype(np.float32)
+        return vol
+
+    def test_curvature_slope_of_a_pure_dome_is_zero_and_a_real_roll_is_seen(self):
+        vol = self._dome(); p = {**M.DEFAULT_PARAMS}
+        k0 = M._anterior_curvature_slope(vol, p); assert np.isfinite(k0) and abs(k0) < 0.003, k0
+        F = 60; fr = np.arange(F, dtype=float); roll = 0.01 * (fr - 30.0) ** 2 - 9.0            # a U-shaped roll: ±9 px half-span
+        k1 = M._anterior_curvature_slope(self._dome(roll=roll), p)
+        assert abs(k1 - 0.01) < 0.004, k1                                                      # the raw curvature slope across laterals IS the roll's curvature
+
+    def test_real_roll_is_still_removed_and_a_pure_dome_untouched(self):
+        F = 60; fr = np.arange(F, dtype=float); roll = 0.01 * (fr - 30.0) ** 2 - 9.0
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+             "tissue_motion_shape_sign_guard": False, "tissue_motion_pair_witness_min_laterals": 20}
+        a, b, i = M.tissue_motion_move(self._dome(roll=roll), p)
+        assert i.get("tilt_witness") and i["tilt_witness"][0]["used_quad_px"] > 5
+        # the delivered tilt (roll + b) must be close to linear: the real U is removed, witness or not
+        deliv = roll + b; res = deliv - np.polyval(np.polyfit(fr, deliv, 1), fr)
+        assert np.max(np.abs(res)) < 3.0, np.max(np.abs(res))
+        a0, b0, i0 = M.tissue_motion_move(self._dome(), p)
+        assert np.max(np.abs(b0)) < 2.0, np.max(np.abs(b0))                                    # a pure dome gets no tilt correction
+
+
 class TestCutBandVote:
     """p1_od_v1_2 (2026-09-09): laterals whose cornea is cut by the frame top lock their correlation to lag 0 and
     out-vote a real move; with the rule they vote only when they agree with the un-cut fit."""
@@ -2320,10 +2536,12 @@ class TestCutBandVote:
         F = 60; fr = np.arange(F, dtype=float)
         vol = _synth_moving_dome(frame_curv=0.03, motion=0.3 * fr)
         vol[30:] = np.roll(vol[30:], 12, axis=1)                                     # one real 12 px step at pair 29
-        # the LEFT quarter of every frame is cut by the frame top: tissue-bright from row 0 down to the posterior
+        # the LEFT quarter of every frame is cut by the frame top: the whole visible tissue of those columns is a
+        # STATIC bright block from row 0 (the cut edge stays at row 0 in every frame → the correlation locks at lag 0)
         L = vol.shape[2]; D = vol.shape[1]; rows = np.arange(D)[:, None]
         lo = L // 4
-        vol[:, :, :lo] = np.where(rows < 110, 900.0 + 300.0 * np.random.default_rng(1).uniform(0, 1, (F, D, lo)), vol[:, :, :lo])
+        block = 900.0 + 300.0 * np.random.default_rng(1).uniform(0, 1, (D, lo))
+        vol[:, :, :lo] = np.where(rows < 200, block[None, :, :], 30.0 + 20.0 * np.random.default_rng(3).uniform(0, 1, (F, D, lo)))
         return vol
 
     def test_cut_bands_no_longer_outvote_a_real_move(self):
@@ -2341,6 +2559,22 @@ class TestCutBandVote:
         a_new, _, i_new = M.tissue_motion_move(vol, {**p, "tissue_motion_cut_vote": True})
         assert not any(r["pair"] == 29 for r in (i_new.get("interior_pairs_replaced") or [])), i_new.get("interior_pairs_replaced")
         assert abs((a_new[30] - a_new[29]) - (a_new[29] - a_new[28]) + 12.0) < 2.5
+
+    def test_cut_bands_that_carry_the_move_keep_voting(self):
+        # cs040_os_v1: a bright strip in the top rows marks the left third as "cut", but those bands follow the tissue;
+        # a real TILT step at pair 29 (a roll: +12 px on the left, 0 on the right) must survive the vote
+        F = 60; fr = np.arange(F, dtype=float); vol = _synth_moving_dome(frame_curv=0.03, motion=0.3 * fr); D = vol.shape[1]; L = vol.shape[2]
+        xs = (np.arange(L) - (L - 1) / 2) / ((L - 1) / 2)
+        for f in range(30, F):
+            for l in range(L):
+                vol[f, :, l] = np.roll(vol[f, :, l], int(round(6.0 * (1.0 - xs[l]))))     # +12 px at x=−1, 0 at x=+1
+        vol[:, :10, : L // 3] = 1500.0                                                     # the bright top strip (not tissue)
+        p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+             "tissue_motion_shape_sign_guard": False, "tissue_motion_tilt_witness": False}
+        a, b, i = M.tissue_motion_move(vol, {**p, "tissue_motion_cut_vote": True})
+        assert max(i["cut_bands_per_pair"]) > 0                                            # the strip IS seen as cut
+        tilt_step = (b[30] - b[29]) - (b[29] - b[28])
+        assert abs(abs(tilt_step) - 6.0) < 2.0, (tilt_step, i.get("cut_demoted_pairs"))    # the half-span tilt step is measured, not flattened
 
     def test_all_cut_frame_still_votes(self):
         # a surface-crop band frame: nearly every band cut → no demotion, the old vote stands
@@ -2618,3 +2852,272 @@ class TestCorrectedPriorRunMove:
         self._write_run_move(bc, work, np.zeros((L, F), np.float32), pad)
         prior3, meta3 = api._corrected_prior_surface("case_am_stale", work, {}, (L, D + pad, F))
         assert meta3["source"] == "run" and len(calls) == 1 and np.allclose(prior3, surf0 + pad)
+
+
+class TestArtifactCellsDead:
+    """2026-09-10 (p5_os_v1_2 / p5_os_v1_3): the reviewer's PARTIAL artifact band is dead to the tissue-motion
+    measurement per CELL (tissue_motion_artifact_cells_dead), kept only when the run's own never-worse judge agrees.
+    The descending eyelid on half the width was still being correlated (the 2026-09-09 rule honoured whole-frame
+    bands only), dragging the global dome/tilt fits into a -200 px roll and a +-40 px tilt hump on the CLEAN frames."""
+
+    def test_measurement_volume_helper_rules(self):
+        rng = np.random.default_rng(0)
+        F, D, L = 30, 50, 64
+        vol = rng.uniform(100, 3000, (F, D, L)).astype(np.float32)
+        am = np.zeros((L, F), bool)
+        am[:32, 0:6] = True          # half the width, frames 0-5  -> cell-zeroed
+        am[:, 10:12] = True          # whole width, frames 10-11   -> whole-frame dead (today's rule)
+        am[:52, 20] = True           # 81% of the width, frame 20  -> live 19% < 0.25 -> left in (today's rule)
+        p = {}
+        v, nd, nc = M._tissue_measurement_volume(vol, am, p)
+        assert nd == 2 and nc == 32 * 6, (nd, nc)
+        assert (v[10:12] == 0).all() and (v[0:6, :, :32] == 0).all() and (v[0:6, :, 32:] == vol[0:6, :, 32:]).all()
+        assert (v[20] == vol[20]).all() and (v[6:10] == vol[6:10]).all() and (v[12:20] == vol[12:20]).all() and (v[21:] == vol[21:]).all()
+        # flag off == today's rule verbatim
+        v0, nd0, nc0 = M._tissue_measurement_volume(vol, am, {"tissue_motion_artifact_cells_dead": False})
+        assert nd0 == 2 and nc0 == 0 and (v0[10:12] == 0).all() and (v0[0:6] == vol[0:6]).all()
+        # no marks -> the very same array object (no copy)
+        v1, nd1, nc1 = M._tissue_measurement_volume(vol, np.zeros((L, F), bool), p)
+        assert v1 is vol and nd1 == 0 and nc1 == 0
+        v2, _, _ = M._tissue_measurement_volume(vol, None, p); assert v2 is vol
+        # a frame that is only whole-dead is not double counted as cells
+        am2 = np.zeros((L, F), bool); am2[:, 3] = True
+        v3, nd3, nc3 = M._tissue_measurement_volume(vol, am2, p); assert nd3 == 1 and nc3 == 0 and (v3[3] == 0).all()
+        assert M.DEFAULT_PARAMS["tissue_motion_artifact_cells_dead"] is True
+        assert M.DEFAULT_PARAMS["tissue_motion_artifact_min_live_frac"] == 0.25
+        assert M.DEFAULT_PARAMS["tissue_motion_artifact_cells_tol_px"] == 0.25
+
+    # -- synthetic helpers --------------------------------------------------------------------------------------
+    @staticmethod
+    def _synth(F, D, L, base, motion, lat_curv=0.02, seed=3):
+        """tissue band 70 rows deep whose anterior is base[f] + a lateral dome + a per-frame RIGID shift motion[f];
+        returns (vol (F, D, L), true top (L, F)). A negative top = the apex left the frame (surface crop)."""
+        rng = np.random.default_rng(seed); x = np.arange(L, dtype=float)
+        lat_dome = lat_curv * (x - L / 2.0) ** 2
+        vol = np.zeros((F, D, L), np.float32); rows = np.arange(D, dtype=float)
+        top = np.zeros((L, F), np.float32)
+        for f in range(F):
+            for l in range(L):
+                t = base[f] + lat_dome[l] + motion[f]; top[l, f] = t
+                vol[f, :, l] = 30.0 + 20.0 * rng.uniform(0, 1, D) + np.where((rows >= t) & (rows < t + 70), 900.0 + 300.0 * rng.uniform(0, 1, D), 0.0)
+        return vol, top
+
+    @staticmethod
+    def _fit_move(mv, am=None):
+        """per-frame (shift, half-span tilt) of the DELIVERED move over the un-marked laterals"""
+        L, F = mv.shape; x = (np.arange(L) - (L - 1) / 2.0) / ((L - 1) / 2.0)
+        a = np.full(F, np.nan); b = np.full(F, np.nan)
+        for f in range(F):
+            ok = np.isfinite(mv[:, f]) & (~am[:, f] if am is not None else np.ones(L, bool))
+            if ok.sum() >= 8:
+                c = np.polyfit(x[ok], mv[ok, f], 1); b[f] = c[0]; a[f] = c[1]
+        return a, b
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path, name, vol, top, params, calls=None):
+        monkeypatch.setattr(M, "read_oct_zstack", lambda p, i=0: vol)
+        if calls is not None:
+            # the second run of a test must wrap the ORIGINAL stage, not the previous run's recorder (monkeypatch
+            # is still active): a nested wrapper would append the second run's calls to the first run's list
+            orig = getattr(M.tissue_motion_move, "_artifact_test_orig", M.tissue_motion_move)
+            def _rec(v, p=None):
+                r = orig(v, p); calls.append(r); return r
+            _rec._artifact_test_orig = orig
+            monkeypatch.setattr(M, "tissue_motion_move", _rec)
+        out = tmp_path / name / "input" / "vol.nii.gz"
+        info = M.preprocess_oct_to_nifti("fake.OCT", out, params=params, provided_edges=top, workers=1)
+        z = np.load(tmp_path / name / "border_cache" / "applied_move.npz", allow_pickle=True)
+        return info, z["move"].astype(float)
+
+    def test_partial_lid_band_is_dead_to_the_measurement_and_judged(self, tmp_path, monkeypatch):
+        """A bright 'eyelid' descends 10 px/frame over a TRIANGULAR band (64 % of the width at frame 0, gone by
+        frame 12 — the p5_os_v1_2 mark's shape) while the tissue moves by a shift-only motion. Flag off: the lid is
+        correlated and the delivered shift/tilt carry it. Flag on: the marked cells are zeroed for the measurement,
+        the judge keeps the cells-dead move, and the delivered move follows the tissue."""
+        F, D, L = 40, 220, 64
+        fr = np.arange(F, dtype=float)
+        motion = 6.0 * np.sin(fr / 5.0) + 0.2 * fr                     # the TRUE per-frame move: shift only, no tilt
+        vol, top = self._synth(F, D, L, 60.0 + 0.03 * (fr - F / 2.0) ** 2, motion)
+        bands = {"0": [0, 11], "16": [0, 7], "32": [0, 3], "40": [0, 0]}
+        am = M._artifact_mask({**M.DEFAULT_PARAMS, "crop_bands": bands}, L, F)
+        assert 0.6 < am[:, 0].mean() < 0.7 and not am[:, 12:].any()
+        rng = np.random.default_rng(7)
+        for f in range(F):
+            lats = np.flatnonzero(am[:, f])
+            if lats.size:
+                r0 = 10 + 10 * f
+                vol[f, r0:r0 + 80, lats] = 1800.0 + 400.0 * rng.uniform(0, 1, (lats.size, 80))
+        # lat_step 2 / band 1: at L=64 the default sampling leaves the cells-dead frames < min_bands (a real scan
+        # has 128 bands). The tilt witness is off because the painted lid biases its raw-crossing reading equally
+        # in both runs (a separate matter); second/anterior passes off so the delivered move IS the stage's.
+        p = {"crop_bands": bands, "tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_tilt_witness": False,
+             "tissue_motion_second_pass": False, "tissue_motion_anterior_pass": False}
+        calls_on = []; calls_off = []
+        info_on, mv_on = self._run(monkeypatch, tmp_path, "on", vol, top, p, calls_on)
+        info_off, mv_off = self._run(monkeypatch, tmp_path, "off", vol, top, {**p, "tissue_motion_artifact_cells_dead": False}, calls_off)
+        ac = info_on["tissue_motion"]["artifact_cells"]
+        assert ac["zeroed"] == int(am.sum()) and ac["kept"] is True, ac
+        assert ac["scores"]["cells_dead"] < ac["scores"]["frames_dead"], ac["scores"]
+        assert len(calls_on) == 2 and len(calls_off) == 1                  # the judged second measurement, once
+        assert "artifact_cells" not in info_off["tissue_motion"]           # flag off: today's path, no record
+        assert info_on["pipeline_version"] == M.PIPELINE_VERSION == "2026-09-10.tissue-v8"
+        a_on, b_on = self._fit_move(mv_on, am); a_off, b_off = self._fit_move(mv_off, am)
+        # the delivered shift follows the tissue: (shift + true motion) sits on ONE smooth parabola (the dome the
+        # flatten aims at) with the lid gone, and wobbles by the lid's drag without
+        def _rms_about_parabola(a):
+            y = a + motion; c = np.polyfit(fr, y, 2); return float(np.sqrt(np.mean((y - np.polyval(c, fr)) ** 2)))
+        assert _rms_about_parabola(a_on) < 1.6 < 2.0 < _rms_about_parabola(a_off)
+        # the CLEAN frames (no band): no tilt with the lid dead, a >10 px hump when it is correlated (the p5 complaint)
+        # (the geometry line became robust on 2026-09-10, which already halves the lid's fake roll on the OFF side)
+        assert np.nanmax(np.abs(b_on[12:])) < 1.0 and np.nanmax(np.abs(b_off[12:])) > 5.0 * np.nanmax(np.abs(b_on[12:]))
+        # the stage's own tilt on the kept (cells-dead) measurement is the truth (none); the frames-dead one is not
+        assert float(np.abs(calls_on[1][1]).max()) < 1.0 and float(np.abs(calls_on[0][1]).max()) > 10.0
+
+    def test_cut_apex_delivers_the_tissue_tilt_not_the_served_top(self, tmp_path, monkeypatch):
+        """Surface crop: the dome's apex leaves the frame top over a block of frames. The served line on those
+        frames is the cut row (as the store's provided_edges), in run B with a spurious 30 px half-span tilt on
+        top. The delivered per-frame tilt must be the TISSUE stage's tilt on every frame (cropped frames
+        included), the served top's tilt must never enter the move, and the non-cropped frames are unchanged."""
+        F, D, L = 48, 220, 64
+        fr = np.arange(F, dtype=float)
+        motion = 5.0 * np.sin(fr / 4.0) + 0.25 * fr
+        vol, top = self._synth(F, D, L, 0.1 * (fr - F / 2.0) ** 2 - 20.0, motion)
+        cut = [int(f) for f in range(F) if float(top[:, f].min()) < 0.0]
+        assert 15 <= len(cut) <= 30 and cut == list(range(cut[0], cut[-1] + 1))
+        x = (np.arange(L) - (L - 1) / 2.0) / ((L - 1) / 2.0)
+        served_a = top.copy(); served_a[:, cut] = 8.0
+        served_b = served_a.copy(); served_b[:, cut] = 8.0 + 30.0 * x[:, None]
+        p = {"surface_crop_frames": cut, "tissue_motion_second_pass": False, "tissue_motion_anterior_pass": False}
+        calls_a = []; calls_b = []
+        info_a, mv_a = self._run(monkeypatch, tmp_path, "a", vol, served_a, p, calls_a)
+        info_b, mv_b = self._run(monkeypatch, tmp_path, "b", vol, served_b, p, calls_b)
+        assert len(calls_a) == len(calls_b) == 1 and "artifact_cells" not in info_a["tissue_motion"]   # no bands: one measurement
+        assert [s["stage"] for s in info_a["applied_move"]["stages"]] == ["flatten"]
+        cap = float(M.DEFAULT_PARAMS["tissue_motion_max_tilt_px"])
+        a_a, b_a = self._fit_move(mv_a); a_b, b_b = self._fit_move(mv_b)
+        stage_b_a = np.clip(np.asarray(calls_a[0][1], float), -cap, cap); stage_b_b = np.clip(np.asarray(calls_b[0][1], float), -cap, cap)
+        # every frame moves RIGIDLY, by the stage's own shift + tilt (cropped frames included)
+        rigid = max(float(np.nanmax(np.abs(mv_a[:, f] - (a_a[f] + b_a[f] * x)))) for f in range(F))
+        assert rigid < 1e-3
+        assert float(np.nanmax(np.abs(b_a[cut] - stage_b_a[cut]))) < 0.05 and float(np.nanmax(np.abs(b_a - stage_b_a))) < 0.05
+        assert float(np.nanmax(np.abs(a_a - np.asarray(calls_a[0][0], float)))) < 0.05
+        # the served top's spurious tilt never reaches the move: B == A on the cropped frames AND the rest
+        assert float(np.nanmax(np.abs(mv_b[:, cut] - mv_a[:, cut]))) < 1e-3
+        not_cut = [f for f in range(F) if f not in set(cut)]
+        assert float(np.nanmax(np.abs(mv_b[:, not_cut] - mv_a[:, not_cut]))) < 1e-3
+        assert float(np.nanmax(np.abs(b_b - stage_b_b))) < 0.05
+        assert float(np.abs(stage_b_a).max()) < 3.0                       # the tissue has no tilt to speak of
+
+
+# ───────────────────────── per-segment LATERAL shift across a dead gap (cs020_os_v4, 2026-09-10) ─────────────
+class TestLateralShift:
+    """cs020_os_v4: the eye moved LATERALLY during a reviewer-marked artifact band, so the segment after the band images
+    a different part of the cornea. The estimator must recover the shift from the raw crossing profiles, the gate must
+    refuse a small / implausible one, and the apply stage must roll a frame's tissue, served edge and applied move
+    TOGETHER (whole frames only — never a per-column warp)."""
+
+    def _vol(self, shift, F=60, D=220, L=160, gap=(30, 37), seed=4):
+        """dome tissue with a dead gap; post-gap frames' tissue AND served edge moved by `shift` laterals (eye motion:
+        new[l] = old[l - shift], vacated laterals empty). The across-lateral profile is a cornea-like dome with a LIMBUS
+        SHOULDER (the parabola's slope drops to 40 % beyond |u| = 50): on a pure parabola a lateral shift and a tilt are
+        the same profile change, and the estimator must (and does) refuse that case."""
+        rng = np.random.default_rng(seed); fr = np.arange(F, dtype=float); x = np.arange(L, dtype=float); rows = np.arange(D, dtype=float)
+        vol = np.zeros((F, D, L), np.float32); edge = np.full((L, F), np.nan)
+        u = x - 0.6 * L; prof = np.where(np.abs(u) <= 50, 0.012 * u ** 2, 0.012 * 50 ** 2 + 0.48 * (np.abs(u) - 50))
+        for f in range(F):
+            top = 40.0 + 0.02 * (fr[f] - F / 2.0) ** 2 + prof                                  # off-centre dome: a shift is not a symmetry
+            vol[f] = (30.0 + 20.0 * rng.uniform(0, 1, (D, L)) + np.where((rows[:, None] >= top[None, :]) & (rows[:, None] < top[None, :] + 60), 900.0 + 300.0 * rng.uniform(0, 1, (D, L)), 0.0)).astype(np.float32)
+            edge[:, f] = top
+            if shift and f > gap[1]:
+                vol[f] = M._roll_lateral_plane(vol[f], shift); edge[:, f] = M._roll_lateral_column(edge[:, f], shift, fill="nan")
+        vol[gap[0]:gap[1] + 1] = 0.0
+        return vol, edge
+
+    def _p(self):
+        return {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False, "tissue_motion_second_pass": False,
+                "tissue_motion_shape_sign_guard": False, "tissue_motion_bridge_max_gap": 20, "tissue_motion_tilt_witness": False}
+
+    def test_estimator_recovers_a_known_lateral_shift_and_rejects_none(self):
+        vol, edge = self._vol(30)
+        a, b, i = M.tissue_motion_move(vol, {**self._p(), "_gap_edge": edge})
+        rec = i.get("gap_lateral_shift"); assert rec and rec.get("applied"), rec
+        assert rec["reference"] == 0 and rec["dx"] == [0, -30], rec                                   # the roll that puts the post-gap frames back
+        g = rec["gaps"][0]; assert g["accepted"] and g["dx"] == -30 and g["witness"]["dx"] == -30, g
+        assert g["std_without"] > 3 * g["std_with"] and g["drop_px"] >= 8.0, g
+        # the same estimate straight from the crossing map (what the stage calls)
+        T = M._raw_crossing_map(vol, 800.0); live = vol.reshape(vol.shape[0], -1).max(axis=1) > 0
+        r2 = M._gap_lateral_shift_estimate(T, live, np.zeros(vol.shape[0], bool), [(0, 29), (38, 59)], self._p(), edge=edge)
+        assert r2["dx"] == [0, -30], r2
+        # applying the roll puts the post-gap crossing profile back on the pre-gap one
+        dxf = M.segment_lateral_dx_per_frame(rec, vol.shape[0]); assert dxf[45] == -30 and dxf[10] == 0 and dxf[33] in (0.0, -30.0)
+        pb = np.nanmedian(T[22:30], axis=0); pa = np.nanmedian(np.vstack([M._roll_lateral_column(T[f], dxf[f], fill="nan") for f in range(38, 46)]), axis=0)
+        ok = np.isfinite(pa) & np.isfinite(pb); assert ok.sum() > 100 and np.nanstd(pa[ok] - pb[ok]) < 2.0, np.nanstd(pa[ok] - pb[ok])
+        # ... and the axial step across the gap is then read on the same tissue: no spurious tilt from the shifted parabola
+        geo = (i.get("gap_edge_offset") or [{}])[0]; assert abs(geo.get("tilt_px", [0, 0])[1]) < 6.0, geo
+        a_off, b_off, i_off = M.tissue_motion_move(vol, {**self._p(), "_gap_edge": edge, "tissue_motion_gap_lateral_shift": False})
+        assert "gap_lateral_shift" not in i_off
+        geo_off = (i_off.get("gap_edge_offset") or [{}])[0]; assert abs(geo_off.get("tilt_px", [0, 0])[1]) > 8.0, geo_off   # the shift read as a tilt
+        # no shift → nothing accepted, nothing applied
+        vol0, edge0 = self._vol(0)
+        a0, b0, i0 = M.tissue_motion_move(vol0, {**self._p(), "_gap_edge": edge0})
+        rec0 = i0.get("gap_lateral_shift"); assert rec0 and not rec0["applied"] and rec0["dx"] == [0, 0], rec0
+        assert not rec0["gaps"][0]["accepted"], rec0["gaps"][0]
+
+    def test_gate_refuses_small_unrelated_or_noisy_shifts(self):
+        L = 400; x = np.arange(L, dtype=float); rng = np.random.default_rng(2); live = np.ones(20, bool); partial = np.zeros(20, bool)
+        u = x - 230.0; prof = 60.0 + np.where(np.abs(u) <= 120, 0.004 * u ** 2, 0.004 * 120 ** 2 + 0.96 * 0.4 * (np.abs(u) - 120))   # dome + limbus shoulder
+        parab = 60.0 + 0.004 * u ** 2
+        def T_of(pb, pa):
+            T = np.full((20, L), np.nan); T[:8] = pb + rng.normal(0, 0.3, (8, L)); T[12:] = pa + rng.normal(0, 0.3, (8, L)); return T
+        segs = [(0, 7), (12, 19)]
+        small = M._gap_lateral_shift_estimate(T_of(prof, M._roll_lateral_column(prof, 3, fill="nan")), live, partial, segs, {})
+        assert not small["applied"] and not small["gaps"][0]["accepted"] and "|dx|" in small["gaps"][0]["reason"], small["gaps"][0]
+        unrelated = M._gap_lateral_shift_estimate(T_of(prof, 60.0 + 40.0 * rng.uniform(0, 1, L)), live, partial, segs, {})
+        assert not unrelated["applied"], unrelated["gaps"][0]
+        noisy = M._gap_lateral_shift_estimate(T_of(prof, M._roll_lateral_column(prof, 40, fill="nan") + rng.normal(0, 20.0, L)), live, partial, segs, {})
+        assert not noisy["applied"] and "residual" in noisy["gaps"][0]["reason"], noisy["gaps"][0]          # 20 px of scatter left: not the same cornea
+        good = M._gap_lateral_shift_estimate(T_of(prof, M._roll_lateral_column(prof, 40, fill="nan")), live, partial, segs, {})
+        assert good["applied"] and good["dx"] == [0, -40], good["gaps"][0]
+        # on a PURE parabola a tilt explains the shifted profile exactly as well: refused (the axial stage's tilt is the simpler move)
+        para = M._gap_lateral_shift_estimate(T_of(parab, M._roll_lateral_column(parab, 40, fill="nan")), live, partial, segs, {})
+        assert not para["applied"] and "tilt" in para["gaps"][0]["reason"], para["gaps"][0]
+        assert para["gaps"][0]["std_without_line"] < 1.0 < para["gaps"][0]["std_without"], para["gaps"][0]
+        # the dual witness: an edge that only witnesses a DIFFERENT shift refuses the plain estimate
+        E = np.zeros((L, 20)); E[:, :8] = prof[:, None]; E[:, 12:] = M._roll_lateral_column(prof, 40, fill="hold")[:, None]
+        assert M._gap_lateral_shift_estimate(T_of(prof, M._roll_lateral_column(prof, 40, fill="nan")), live, partial, segs, {}, edge=E)["applied"]
+        E2 = E.copy(); E2[:, 12:] = (M._roll_lateral_column(prof, 40, fill="hold") + 200.0)[:, None]         # 200 px off the tissue: no witness
+        assert not M._gap_lateral_shift_estimate(T_of(prof, M._roll_lateral_column(prof, 40, fill="nan")), live, partial, segs, {}, edge=E2)["applied"]
+        # at the search limit or with too little overlap: refused
+        far = M._gap_lateral_shift_estimate(T_of(prof, M._roll_lateral_column(prof, 80, fill="nan")), live, partial, segs, {"tissue_motion_gap_lateral_max": 80})
+        assert not far["applied"], far["gaps"][0]
+
+    def test_apply_rolls_frames_edges_and_move_together(self, tmp_path):
+        F, D, L = 10, 12, 40; rng = np.random.default_rng(7)
+        vol = rng.uniform(1, 100, (F, D, L)).astype(np.float32); edges = rng.uniform(2, 9, (L, F)); fld = rng.uniform(-5, 5, (L, F)).astype(np.float32)
+        rec = {"segments": [[0, 3], [6, 9]], "dx": [0, 7], "reference": 0, "applied": True}
+        out, e_out, ent, info = M.apply_segment_lateral_shift(vol, rec, edges, [("flatten", fld), ("odd", None)], canvas_pad=5, params={"tissue_motion_gap_lateral_edge_fill": "nan", })
+        # frames 4-5 belong to no segment and hold the NEAREST segment's dx: 4 → segment 0 (dx 0), 5 → segment 1 (dx 7)
+        assert info["applied"] and info["frames_shifted"] == 5 and info["dx_per_frame"][5] == 7.0 and info["dx_per_frame"][4] == 0.0, info
+        assert np.array_equal(out[:5], vol[:5]) and np.array_equal(np.asarray(e_out)[:, :5], edges[:, :5].astype(np.float32))
+        for f in range(5, 10):
+            assert np.array_equal(out[f, :, 7:], vol[f, :, :-7]) and not out[f, :, :7].any()
+            assert np.allclose(np.asarray(e_out)[7:, f], edges[:-7, f].astype(np.float32)) and np.isnan(np.asarray(e_out)[:7, f]).all()
+            assert np.allclose(ent[0][1][7:, f], fld[:-7, f]) and not ent[0][1][:7, f].any()
+        assert ent[1] == ("odd", None) and ent[-1][0] == "lateral_shift" and not ent[-1][1].any()
+        # a cell's tissue, edge and move travel together: delivered lateral l holds raw lateral l − dx
+        l, f = 23, 8; assert out[f, :, l].tolist() == vol[f, :, l - 7].tolist() and np.asarray(e_out)[l, f] == np.float32(edges[l - 7, f]) and ent[0][1][l, f] == fld[l - 7, f]
+        move, stages, complete = M.compose_applied_move(ent[:1] + ent[2:], (L, F)); assert complete and np.allclose(move[:, 8], ent[0][1][:, 8])
+        # negative dx rolls the other way; sub-pixel dx interpolates; "hold" keeps the boundary value
+        neg, en, _, _ = M.apply_segment_lateral_shift(vol, {"segments": [[0, 4], [5, 9]], "dx": [0, -3], "applied": True}, edges, None, params={"tissue_motion_gap_lateral_edge_fill": "hold"})
+        assert np.array_equal(neg[7, :, :-3], vol[7, :, 3:]) and not neg[7, :, -3:].any() and np.allclose(np.asarray(en)[-3:, 7], np.float32(edges[-1, 7]))
+        col = M._roll_lateral_column(np.arange(10, dtype=float), 0.5, fill="nan"); assert np.isnan(col[0]) and abs(col[5] - 4.5) < 1e-9
+        # nothing accepted → identical objects back
+        same = M.apply_segment_lateral_shift(vol, {"segments": [[0, 9]], "dx": [0], "applied": False}, edges, [], params={})
+        assert same[0] is vol and same[1] is edges and not same[3]["applied"]
+        # the persisted caches: placed_edges.npz in RAW rows (edges − pad) with the per-frame dx; applied_move.npz carries lateral_dx
+        case = tmp_path / "case"; (case / "input").mkdir(parents=True); nii = case / "input" / "vol.nii.gz"; nii.write_bytes(b"x" * 100)
+        out2, e2, ent2, info2 = M.apply_segment_lateral_shift(vol, rec, edges, [("flatten", fld)], canvas_pad=5, out_nifti=nii, params={})
+        z = np.load(case / "border_cache" / "placed_edges.npz"); assert np.allclose(z["surface"][7:, 8], (edges[:-7, 8] - 5.0).astype(np.float32)) and z["lateral_dx"][8] == 7.0
+        r = M.write_applied_move_cache(nii, ent2, (L, F), canvas_pad=5, lateral_dx=np.asarray(info2["dx_per_frame"]))
+        assert r["written"] and r["lateral_dx_range"] == [0.0, 7.0], r
+        z2 = np.load(case / "border_cache" / "applied_move.npz"); assert z2["lateral_dx"].tolist()[5:] == [7.0] * 5 and np.isfinite(z2["move"]).all() and "lateral_shift" in str(z2["stages"])

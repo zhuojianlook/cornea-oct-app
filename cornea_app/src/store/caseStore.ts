@@ -121,6 +121,9 @@ interface CaseState {
   // `reason` is the reviewer's own words for WHY, persisted as manifest.difficult_reason and cleared with the
   // flag; omitting it leaves any existing reason alone so a plain toggle-on does not wipe one.
   setDifficult: (difficult: boolean, reason?: string) => Promise<void>;
+  /** ✗ Reject → next (2026-09-10): the scan is UNFIXABLE and leaves the approval queue for good
+   *  (manifest.rejected_unfixable). Distinct from difficult, which the reviewer may come back to. */
+  setRejected: (reject: boolean, note?: string) => Promise<void>;
   /** Persist drawn border anchors WITHOUT the user pressing "Confirm border". Used by the review loop so
    *  a correction + Reject is one click; the backend then harvests them as border_gt when the difficult
    *  flag is written, which is why this must complete BEFORE setDifficult. */
@@ -602,6 +605,28 @@ export const useCaseStore = create<CaseState>()(
         m.oct_params = op;
       });
       return acc;
+    },
+
+    setRejected: async (reject, note) => {
+      const id = get().caseId;
+      if (!id) return;
+      const text = (note ?? "").trim();
+      set((s) => {
+        if (!s.caseInfo) return;
+        const m = s.caseInfo.manifest as Record<string, unknown>;
+        m.rejected_unfixable = reject ? { ts: Date.now() / 1000, note: text || null } : null;
+        if (reject) {
+          const fl = m.review_flags;
+          if (Array.isArray(fl)) m.review_flags = fl.filter((f) => f !== "to-review");
+        }
+      });
+      try {
+        const body: Record<string, unknown> = { reject };
+        if (text) body.note = text;
+        await api.json(`/api/case/${id}/reject`, "POST", JSON.stringify(body));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
     },
 
     setDifficult: async (difficult, reason) => {

@@ -64,6 +64,7 @@ export function TimelineBar() {
   const classification = (manifest?.scar_classification as "scar" | "control" | null | undefined) ?? null;
   const setClassification = useCaseStore((s) => s.setClassification);
   const setDifficult = useCaseStore((s) => s.setDifficult);
+  const setRejected = useCaseStore((s) => s.setRejected);
   // Border corrections drawn but not Confirmed — committed by the reject handler so a correction costs one
   // click, not three. See pendingEditStore.
   const pendingEdit = usePendingEditStore((s) => s.pending);
@@ -639,18 +640,13 @@ export function TimelineBar() {
     await advance();
   };
 
-  const rejectAndNext = async () => {
-    setBusyAction("reject");
-    try {
-      if (activeCaseId) markSettled(activeCaseId, true);
-      // COMMIT THE CORRECTION FIRST. A border the reviewer drew is ground truth about where the cornea is,
-      // and rejecting is how they say "this scan is wrong — here is what it should have been". Requiring a
-      // separate "Confirm border" click before that counted meant a correction drawn and then rejected was
-      // silently discarded, which is the reverse of what the gesture means. The write must land BEFORE the
-      // difficult flag, because the backend harvests border_gt from the persisted anchors at that moment.
+  // SAVE WHAT WAS DRAWN before a verdict that leaves the scan (Difficult or Reject): a border the reviewer drew
+  // is ground truth about where the cornea is, whatever the verdict. Returns the derived summary note.
+  const savePendingForVerdict = async (): Promise<string> => {
+    let note = "";
+    {
       const edit = activeCaseId ? takePendingEdit(activeCaseId) : null;
       const ce = activeCaseId ? takeCorrectedEdge(activeCaseId) : null;
-      let note = "";
       if (edit || ce) {
         const parts: string[] = [];
         try {
@@ -690,6 +686,20 @@ export function TimelineBar() {
           note = "correction FAILED to save — re-open the scan and retry";
         }
       }
+    }
+    return note;
+  };
+
+  const rejectAndNext = async () => {
+    setBusyAction("reject");
+    try {
+      if (activeCaseId) markSettled(activeCaseId, true);
+      // COMMIT THE CORRECTION FIRST. A border the reviewer drew is ground truth about where the cornea is,
+      // and rejecting is how they say "this scan is wrong — here is what it should have been". Requiring a
+      // separate "Confirm border" click before that counted meant a correction drawn and then rejected was
+      // silently discarded, which is the reverse of what the gesture means. The write must land BEFORE the
+      // difficult flag, because the backend harvests border_gt from the persisted anchors at that moment.
+      const note = await savePendingForVerdict();
       // The reason is DERIVED, not typed: with a correction on screen the correction is the signal, and a
       // sentence of prose adds nothing the anchors do not already say. A free-text note is still accepted by
       // the endpoint for callers that want one.
@@ -702,6 +712,22 @@ export function TimelineBar() {
       // A failed write must not strand the reviewer on the scan they just judged. settleWrite re-throws if
       // the request rejects inside its 6 s race, and that propagated past the advance below — so one slow or
       // failed save silently stopped the loop dead, which is indistinguishable from the button not working.
+      setQueueNote(`Rejection may not have saved (${e instanceof Error ? e.message : String(e)}) — moving on anyway; re-check this scan.`);
+    } finally { setBusyAction(null); }
+    await advance();
+  };
+
+  // ✗ REJECT → NEXT (reviewer, 2026-09-10): "serve up scans that have been fixed and if I determine unfixable I will
+  // reject". Rejecting is final for the queue: the scan leaves "awaiting approval" and is never re-served after a
+  // fix (manifest.rejected_unfixable). Difficult stays the softer verdict for scans that may come back.
+  const rejectUnfixableAndNext = async () => {
+    setBusyAction("rejectfinal");
+    try {
+      if (activeCaseId) markSettled(activeCaseId, true);
+      const note = await savePendingForVerdict();
+      await settleWrite(setRejected(true, rejectReason.trim() || note), "Rejection");
+      setRejectReason("");
+    } catch (e) {
       setQueueNote(`Rejection may not have saved (${e instanceof Error ? e.message : String(e)}) — moving on anyway; re-check this scan.`);
     } finally { setBusyAction(null); }
     await advance();
@@ -910,6 +936,16 @@ export function TimelineBar() {
           ? `Save what you drew, flag this scan as difficult, and open the next one: ${pendingSummary}.`
           : "Flag this scan as difficult (excluded from training) and open the next one. The note is optional."}>
         {busyAction === "reject" ? "Rejecting…" : "✗ Difficult → next"}
+      </Button>
+      {/* REJECT = UNFIXABLE (reviewer, 2026-09-10). Leaves the approval queue for good; corrections drawn are still
+          saved as ground truth. Difficult (left) is the softer verdict for scans that may come back. */}
+      <Button size="small" variant="contained" color="error" disabled={busy || navigating} sx={ACT_SX}
+        onClick={() => void rejectUnfixableAndNext()}
+        startIcon={busyAction === "rejectfinal" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+        title={pendingEdit
+          ? `Save what you drew, REJECT this scan as unfixable (it leaves the queue for good), and open the next one: ${pendingSummary}.`
+          : "REJECT this scan as unfixable — it leaves the approval queue for good — and open the next one. The note is optional."}>
+        {busyAction === "rejectfinal" ? "Rejecting…" : "✗ Reject → next"}
       </Button>
       {Checkpoint}
       {tune && (tune.running || tune.note) && (

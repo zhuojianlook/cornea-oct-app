@@ -90,8 +90,11 @@ const scOf = (life?: Record<string, unknown>): boolean => {
 //
 // `status === "done"` is checked alongside the manifest flag because a scan preprocessed in THIS session is
 // locally "done" long before its `life` refreshes (that only happens on a segVersion bump).
+// REJECTED AS UNFIXABLE (✗ Reject → next, 2026-09-10) leaves the approval queue for good — unlike difficult_scan,
+// which marks a scan as wanting attention and stays in the queue.
 const needsApproval = (s: OctScan): boolean =>
-  s.status !== "error" && (Boolean(s.life?.oct_preprocessed) || s.status === "done") && !s.life?.preproc_vetted;
+  s.status !== "error" && (Boolean(s.life?.oct_preprocessed) || s.status === "done") && !s.life?.preproc_vetted
+  && !s.life?.rejected_unfixable;
 
 // One filter option. `test` is a PURE read of the scan's own state — no network, no manifest write
 // (filtering is view-only). Every predicate must be truthiness-based and tolerate life === undefined:
@@ -318,6 +321,12 @@ export function OctLoader() {
   // only durable channel is api.putConfig — a network write); also reset in ingest(), because an
   // app that boots showing 4 of 308 scans with the reason forgotten is the worst failure mode here.
   const [filter, setFilter] = useState<ScanFilter>("all");
+  // OPEN ON THE QUEUE (reviewer, 2026-09-10 "reloading does not populate the app with the scans required for
+  // verification"): the filter is component state and reset to "all scans" by every reload, so the reviewer had
+  // to re-pick "◆ To review (queued)" each time. Once per page load, when the lifecycle flags have arrived and at
+  // least one scan carries the to-review flag, the filter opens on that queue; any later choice by the reviewer
+  // stands (the ref stops this from firing again).
+  const autoQueueRef = useRef(false);
   const [query, setQuery] = useState("");
   const filtering = filter !== "all" || query.trim() !== "";
   const clearFilter = () => { setFilter("all"); setQuery(""); };
@@ -415,6 +424,13 @@ export function OctLoader() {
     catch { /* leave the previous count */ }
   };
   useEffect(() => { refreshCount(); }, []);
+  useEffect(() => {
+    if (autoQueueRef.current || filter !== "all") return;
+    if (scans.some((s) => reviewFlagsOf(s.life).includes("to-review"))) {
+      autoQueueRef.current = true;
+      setFilter("flag:to-review" as ScanFilter);
+    }
+  }, [scans, filter]);
 
   // #4: keep the sidebar entry's step colour/label in sync with the OPEN scan INSTANTLY. Timeline actions
   // (approve / classify / SAM2 / schedule …) mutate caseStore.caseInfo.manifest (immer → fresh ref), but

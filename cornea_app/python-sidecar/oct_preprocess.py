@@ -47,7 +47,13 @@ from sklearn.pipeline import make_pipeline
 #                         interpolation (crop_estimate_source="drawn"), chord witness dp-v8.2, band cell witness keep
 #   2026-09-09.tissue-v6  tissue-motion cut-guard mask per PAIR (symmetric, from the first non-zero row): the second pass on a
 #                         scratch-warped band scan no longer invents a shift+tilt step at the band boundary (p4_os_v1_2 frame 17)
-PIPELINE_VERSION = "2026-09-09.tissue-v6"
+#   2026-09-09.tissue-v7  tilt shape witness (the quadratic frame-trend of the tilt correction follows the raw edge's curvature
+#                         slope across laterals, cs024_os_v4), noisy secondary segments held from the main segment (cs025_os_v4),
+#                         artifact-dead frames + bridged dome (cs020_os_v4, cs021_od_v3), dual-witness interior guard, adaptive lag window
+#   2026-09-10.tissue-v8  the reviewer's PARTIAL artifact band is dead to the tissue-motion measurement per CELL, kept when the
+#                         run's own never-worse judge agrees (p5_os_v1_2/_3: a descending eyelid on half the width dragged the
+#                         correlation into a -200 px roll over the first 20 frames; tissue_motion_artifact_cells_dead)
+PIPELINE_VERSION = "2026-09-10.tissue-v8"
 
 # Defaults mirror DICOMSmootherSteps.py's sidebar defaults + the lossless converter.
 DEFAULT_PARAMS: dict = {
@@ -344,13 +350,54 @@ DEFAULT_PARAMS: dict = {
     "tissue_motion_cut_vote": True,        # 2026-09-09 (p1_od_v1 step at frame 28): a CUT band votes only when it agrees with the un-cut fit
     "crop_place_witness_keep": True,       # 2026-09-09 (p1_od_v1_2 display 233): a band cell whose first bright run starts at the served top is PRESENT
     "crop_place_witness_tol": 4.0,         #   ... within this many px; the estimate never replaces an image-witnessed top
-    "tissue_motion_cut_vote_min_fraction": 0.25,   # un-cut bands needed (fraction of the pair's bands, and >= min_bands) to demote the cut ones
+    "tissue_motion_cut_vote_min_fraction": 0.25,
+    "tissue_motion_cut_lock_tol": 1.5,    # 2026-09-09 (cs040_os_v1): a cut band votes only when it moved MORE than the un-cut bands (|lag| ≥ |un-cut move| + this); the un-cut move must be ≥ 2× this   # un-cut bands needed (fraction of the pair's bands, and >= min_bands) to demote the cut ones
     "tissue_motion_shape_default": 0.02,       # px/frame²: the dome used when the B-scan plane cannot be measured (sign is ALWAYS enforced)
     "pool_close_grace_s": 20.0,   # seconds a finished worker pool may take to exit before its children are killed
     "tissue_motion_interior_pair_guard": True,   # 2026-09-08: a split-vote interior pair takes its neighbours' mean (cs020 step at frame 38: −5→−2 px; 0 replacements on 5 control scans)
     "tissue_motion_pair_tol_px": 2.0,
     "tissue_motion_pair_spread_k": 3.0,
     "tissue_motion_pair_spread_min": 2.0,
+    "tissue_motion_pair_witness_min_laterals": 60,   # 2026-09-09: in-frame laterals the raw anterior step witness needs to arbitrate a split pair
+    "tissue_motion_pair_witness_replaces": True,    # ...and when it backs the measured lag, its own line (shift + tilt) replaces the biased fit
+    "tissue_motion_widen_window": True,   # 2026-09-09 (cs020_os_v2 blink, 85 px in one pair): re-read a pair whose votes pin at ±max_lag with a wider window
+    "tissue_motion_widen_frac": 0.25,     #   fraction of a pair's bands on the boundary that triggers the widening
+    "tissue_motion_widen_max": 160,       #   widened half-window in px (capped at D/3)
+    "tissue_motion_bridge_max_gap": 20,   # 2026-09-09 (cs020_os_v4): live segments separated by a dead gap this short share ONE dome (offset per segment)
+    "tissue_motion_artifact_dead_frac": 0.9,  #   a reviewer's artifact band covering this fraction of laterals at a frame makes the frame dead to the measurement
+    "tissue_motion_artifact_cells_edge_judge": True,  # 2026-09-10 (cs037_od_v1): the cells-dead move is also kept when it restores a concave outer slice that the whole-frame move lost
+    "tissue_motion_artifact_cells_dead": True,   # 2026-09-10 (p5_os_v1_2/_3 eyelid): a PARTIAL artifact band is dead to the measurement per CELL too (the whole-frame rule above stands for the rest); the cells-dead move is kept only when the never-worse judge agrees
+    "tissue_motion_artifact_min_live_frac": 0.25,  #   ... on frames that keep at least this fraction of un-marked laterals; below it today's rule stands (a one-sided limbus strip is not a measurement, cs008_od_v1)
+    "tissue_motion_artifact_cells_tol_px": 0.25,   #   ... judge tolerance: kept iff _score_rigid_move(cells-dead move) <= _score_rigid_move(frames-dead move) + this, both scored on the cells-dead copy
+    "crop_recon_anterior_dome": True,     # 2026-09-10 (p1_od_v1_3): reconstructed (cut) cells of the served line are re-placed on the delivered anterior dome of their own slice once the move is known
+    "tissue_motion_gap_edge_offset": True,  # 2026-09-10 (p1_od_v1_3): across a dead gap the served edge sets the height of each bridged segment (dome fixed to the tissue's)
+    "tissue_motion_gap_edge_witness_px": 30.0,  #   ... only for segments whose edge has a level crossing within this on most laterals×frames
+    "tissue_motion_gap_edge_min_px": 3.0,   #   ... a step smaller than this is noise and is not applied
+    "tissue_motion_gap_edge_frames": 8,     #   ... the step is read from up to this many live frames on either side of the gap
+    "tissue_motion_gap_lateral_shift": True,   # 2026-09-10 (cs020_os_v4 "the curvature is clearly different before and after the crop artifact"): across a dead gap the eye may also have moved ALONG THE LATERAL AXIS (raw anterior profile after the band = the profile before it shifted by 45 laterals); the post-gap segment is translated back as WHOLE frames by an integer dx — a rigid move, applied LAST on the delivered volume with its served edge and applied move rolled the same way
+    "tissue_motion_gap_lateral_max": 80,        #   ... |dx| search window (laterals); a dx at the limit is not applied
+    "tissue_motion_gap_lateral_min": 6,         #   ... a smaller |dx| is within the width of the step itself and is not applied
+    "tissue_motion_gap_lateral_min_overlap": 200,  #   ... laterals the two profiles must share at the chosen dx (capped at 40 % of the width)
+    "tissue_motion_gap_lateral_drop_frac": 0.40,   #   ... the residual std of after − before(l + dx) must fall by this fraction ...
+    "tissue_motion_gap_lateral_drop_px": 8.0,      #   ... and by this many px against dx = 0
+    "tissue_motion_gap_lateral_max_resid_px": 12.0,  #   ... and what is left must be this small (cs017_od_v1: 36 px left at dx = +77 is not the same cornea shifted)
+    "tissue_motion_gap_lateral_vs_tilt_frac": 0.40,  #   ... and the shift must beat the best rigid SHIFT + TILT at dx = 0 (a line's residual) by this fraction — on a parabola a tilt and a lateral shift are the same profile change, so only what a tilt CANNOT remove proves a shift (cs020_os_v4: line 8.4 → 4.25 px; the tilt had left 16-38 px steps on display 452-507; no other banded store gap passes)
+    "tissue_motion_gap_lateral_vs_tilt_px": 3.0,     #   ... and by this many px
+    "tissue_motion_gap_lateral_edge_witness": True,  #   ... when the served edge exists, the crossings within tissue_motion_gap_edge_witness_px of it must give the same dx (dual witness: it rejected every false positive of the 29-scan sweep, kept cs020_os_v4)
+    "tissue_motion_gap_lateral_witness_agree": 6,    #   ... agreement tolerance between the two estimates (laterals)
+    "tissue_motion_gap_lateral_edge_fill": "hold",   #   ... vacated laterals of the served/placed edge: "hold" (the boundary value; a NaN there broke the corrected-curve JSON, verifier 2026-09-10) or "nan"
+    "tissue_motion_noisy_segment_line_place": True,  # 2026-09-10 (cs025_os_v4): a held (unmeasurable) segment is placed on the main dome by its served line's linear trend
+    "tissue_motion_noisy_segment_gate": True,  # 2026-09-09 (cs025_os_v4): a short secondary segment whose band lags scatter far more than the main segment's is unmeasurable: its move is held from the main segment
+    "tissue_motion_noisy_segment_max_frames": 25,   #   ... secondary = not the longest live segment and at most this long
+    "tissue_motion_noisy_segment_ratio": 2.0,       #   ... median pair spread (MAD of band lags about the line) at least this × the longest segment's ...
+    "tissue_motion_noisy_segment_min_px": 1.5,      #   ... and at least this many px
+    "tissue_motion_tilt_trend_max": None,  # 2026-09-10: cap on the linear frame-trend of the tilt kept as geometry (px half-span per frame); OFF — 0.3 would change approved cs008_od_v2 by 23 px and p5's roll came from the eyelid inside the measurement (tissue_motion_artifact_cells_dead), not this stage
+    "tissue_motion_shape_curv_max_ratio": 1.0,  # 2026-09-10 (p5_os_v1_2 "too steep"): the dome the sign guard imposes is never steeper than the raw central frame-curvature the reviewer sees in the original pane (was 1.5)
+    "tissue_motion_tilt_witness": True,   # 2026-09-09 (cs024_os_v4): the QUADRATIC frame-trend of the tilt correction is set by the raw edge's curvature slope across laterals, not by the correlation
+    "tissue_motion_witness_cut_margin": 6.0,  # 2026-09-10 (p5_os_v1_3): a crossing within this of the masked top strip is a cut cornea, not the edge, in every raw-crossing witness
+    "tissue_motion_tilt_witness_level": 1000.0,  #   ... measured on the first-crossing of this raw intensity (or 0.75·p99 on a dimmer scan)
+    "tissue_motion_tilt_witness_min_frames": 60,  #   ... a lateral joins the witness only with a parabola over at least this many frames (or 60 % of the volume)
+    "tissue_motion_tilt_witness_add_cap_px": 15.0,  #   ... the witness may add at most max(2× measured, measured + this) px of quadratic tilt beyond the correlation's; removal is uncapped
     "tissue_motion_end_pairs": 0,             # OFF (2026-09-08): replacing end pairs by the interior trend fixed cs017's last-frame shift but overrode REAL end tilts (+23→+40 px) and moved cs009/cs002 by up to 25 px; opt-in only
     "tissue_motion_end_tol_px": 6.0,          # …and replaced by it when off by more than max(this, k·MAD)
     "tissue_motion_end_k_mad": 4.0,
@@ -7101,19 +7148,26 @@ def compose_applied_move(entries, shape) -> tuple:
     return (total.astype(np.float32) if complete else None), stages, bool(complete)
 
 
-def write_applied_move_cache(out_nifti, entries, shape, canvas_pad: int = 0, bottom_pad: int = 0) -> dict:
+def write_applied_move_cache(out_nifti, entries, shape, canvas_pad: int = 0, bottom_pad: int = 0,
+                             lateral_dx=None) -> dict:
     """border_cache/applied_move.npz (sibling convention of placed_edges.npz: <out>/../../border_cache) holding
     the EXACT move the run applied, in measure_applied_move's convention: corrected_row = raw_row + canvas_pad
     + move, i.e. `move` EXCLUDES the top canvas pad (recorded as canvas_pad; a bottom pad shifts no row).
     Fields: key ("<raw mtime_ns>:<corrected mtime_ns>:run:<PIPELINE_VERSION>", run_provenance-compatible), move
     (L, F) float32, n_extrapolated=0, source="run", canvas_pad, bottom_pad, stamp_mtime_ns + stamp_size of the
     delivered NIfTI (api_server compares them with work.stat() — a stale run move is ignored), stages (JSON).
+    lateral_dx (F,) float32 (2026-09-10): the per-frame LATERAL translation apply_segment_lateral_shift applied last
+    (0 where none); the move columns are already rolled by it, so corrected[f][:, l] came from raw lateral l − dx[f].
     Called AFTER the NIfTI write so the stamp is the delivered file's. Atomic (tmp + os.replace). Best-effort:
     returns a record for the run info and never raises; an incomplete composition writes nothing."""
     rec: dict = {"written": False, "canvas_pad": int(canvas_pad), "bottom_pad": int(bottom_pad)}
     try:
         move, stages, complete = compose_applied_move(entries, shape)
         rec["stages"] = stages; rec["complete"] = bool(complete)
+        _ldx = (np.zeros(int(shape[1]), dtype=np.float32) if lateral_dx is None
+                else np.asarray(lateral_dx, dtype=np.float32).reshape(-1))
+        if _ldx.size and np.any(_ldx != 0):
+            rec["lateral_dx_range"] = [round(float(_ldx.min()), 2), round(float(_ldx.max()), 2)]
         if not complete or move is None:
             rec["reason"] = "a stage moved tissue without recording its field; the api keeps measuring the move"
             print(f"[applied-move] not written: {rec['reason']} "
@@ -7132,7 +7186,8 @@ def write_applied_move_cache(out_nifti, entries, shape, canvas_pad: int = 0, bot
                             canvas_pad=np.array(int(canvas_pad)), bottom_pad=np.array(int(bottom_pad)),
                             stamp_mtime_ns=np.array(int(st.st_mtime_ns), dtype=np.int64),
                             stamp_size=np.array(int(st.st_size), dtype=np.int64),
-                            stages=np.array(json.dumps(stages)), pipeline_version=np.array(PIPELINE_VERSION))
+                            stages=np.array(json.dumps(stages)), pipeline_version=np.array(PIPELINE_VERSION),
+                            lateral_dx=_ldx)
         os.replace(tmp, bc / "applied_move.npz")
         rec.update({"written": True, "path": str(bc / "applied_move.npz"), "key": key,
                     "stamp": {"mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)},
@@ -12705,6 +12760,533 @@ def sign_guarded_quadratic(edge, fit, shape_curv, valid=None, min_fraction: floa
         return y, info
 
 
+def fill_unmeasured_move(a: np.ndarray, b: np.ndarray, dead: np.ndarray):
+    """Give frames the stage could not measure (dead) a move that makes no step: hold the nearest live value at
+    either end, interpolate linearly inside. Returns (a, b) copies."""
+    a = np.asarray(a, np.float64).copy(); b = np.asarray(b, np.float64).copy(); dead = np.asarray(dead, bool)
+    live = np.flatnonzero(~dead)
+    if live.size == 0 or not dead.any():
+        return a, b
+    idx = np.flatnonzero(dead)
+    a[idx] = np.interp(idx, live, a[live]); b[idx] = np.interp(idx, live, b[live])          # np.interp holds the end values
+    return a, b
+
+
+def _delivered_edge_curvature(vol: np.ndarray, a: np.ndarray, b: np.ndarray, p: dict, am=None):
+    """(edge, centre) frame-curvature (px/frame²) of the delivered anterior crossing: the raw level crossing of
+    `vol` (F, D, L; top strip + cut margin masked; artifact cells `am` (L, F) masked) moved by a + b·x, fitted with a
+    parabola over frames per lateral, medianed over the outer 6 % of laterals on each side (edge = the smaller of
+    the two sides) and over the central third (centre). NaN where fewer than 20 laterals fit."""
+    try:
+        F, D, L = vol.shape; fr = np.arange(F, dtype=np.float64)
+        v = np.asarray(vol, np.float64); pos = v[v > 0]
+        if pos.size == 0:
+            return float("nan"), float("nan")
+        lvl = min(float(p.get("tissue_motion_tilt_witness_level", 1000.0)), 0.75 * float(np.percentile(pos, 99)))
+        g = ndimage.gaussian_filter1d(v, 1.5, axis=1) >= lvl; g[:, :8, :] = False
+        r = np.where(g.any(axis=1), np.argmax(g, axis=1), np.nan).astype(float)              # (F, L)
+        r[r < 8.0 + float(p.get("tissue_motion_witness_cut_margin", 6.0))] = np.nan
+        if am is not None and np.asarray(am).shape == (L, F):
+            r[np.asarray(am, bool).T] = np.nan
+        x = (np.arange(L) - (L - 1) / 2.0) / max(1e-9, (L - 1) / 2.0)
+        P = r + np.asarray(a, np.float64)[:, None] + np.asarray(b, np.float64)[:, None] * x[None, :]
+        def _c(lats):
+            cs = []
+            for l in lats:
+                ok = np.isfinite(P[:, l])
+                if int(ok.sum()) >= 30 and (fr[ok].max() - fr[ok].min()) >= 30:
+                    cs.append(np.polyfit(fr[ok], P[ok, l], 2)[0])
+            return float(np.median(cs)) if len(cs) >= 20 else float("nan")
+        m = max(8, int(0.06 * L))
+        e1, e2, c = _c(range(0, m)), _c(range(L - m, L)), _c(range(L // 3, 2 * L // 3))
+        edge = np.nanmin([e1, e2]) if np.isfinite([e1, e2]).any() else float("nan")
+        return float(edge), float(c)
+    except Exception:  # noqa: BLE001
+        return float("nan"), float("nan")
+
+
+def _robust_line(x: np.ndarray, y: np.ndarray, iters: int = 3, k: float = 3.5) -> np.ndarray:
+    """Least-squares line with iterative MAD rejection (residual > k·MAD + 1 px dropped, ≥ 40 % of the points kept);
+    returns np.polyfit-style [slope, intercept]. Falls back to the plain fit when the data are too few."""
+    x = np.asarray(x, np.float64); y = np.asarray(y, np.float64)
+    if x.size < 6:
+        return np.polyfit(x, y, 1)
+    keep = np.ones(x.size, bool); c = np.polyfit(x, y, 1)
+    for _ in range(iters):
+        r = np.abs(y - np.polyval(c, x)); mad = float(np.median(r[keep])) + 1e-6
+        keep2 = r <= k * mad + 1.0
+        if int(keep2.sum()) < max(6, int(0.4 * x.size)):
+            break
+        keep = keep2; c = np.polyfit(x[keep], y[keep], 1)
+    return c
+
+
+def _raw_central_curvature(vol: np.ndarray, p: dict, live=None):
+    """Median quadratic coefficient (px/frame²) of the raw level crossing over the live frames on the central third
+    of the laterals — the tissue's own frame-curvature, motion included; None when fewer than 60 frames or 40 laterals
+    fit. Used as a plausibility bound on the dome the sign guard may impose. `vol` is (F, D, L)."""
+    try:
+        F, D, L = vol.shape; fr = np.arange(F, dtype=np.float64)
+        v = np.asarray(vol, np.float64); pos = v[v > 0]
+        if pos.size == 0:
+            return None
+        lvl = min(float(p.get("tissue_motion_tilt_witness_level", 1000.0)), 0.75 * float(np.percentile(pos, 99)))
+        lo, hi = L // 3, 2 * L // 3
+        g = ndimage.gaussian_filter1d(v[:, :, lo:hi], 1.5, axis=1); h = g >= lvl; h[:, :8, :] = False
+        r = np.where(h.any(axis=1), np.argmax(h, axis=1), np.nan).astype(float)              # (F, n)
+        r[r < 8.0 + float(p.get("tissue_motion_witness_cut_margin", 6.0))] = np.nan          # cut cells are not the edge
+        if live is not None:
+            r[~np.asarray(live, bool), :] = np.nan
+        _wm = p.get("_witness_artifact_mask")
+        if _wm is not None and np.asarray(_wm).shape == (L, F):
+            r[np.asarray(_wm, bool)[lo:hi].T] = np.nan
+        cs = []
+        _nmin = max(30, min(int(p.get("tissue_motion_tilt_witness_min_frames", 60)), int(0.6 * F)))
+        for k in range(r.shape[1]):
+            ok = np.isfinite(r[:, k])
+            if int(ok.sum()) >= _nmin and (fr[ok].max() - fr[ok].min()) >= _nmin - 1:
+                cs.append(np.polyfit(fr[ok], r[ok, k], 2)[0])
+        return float(np.median(cs)) if len(cs) >= 40 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _anterior_curvature_slope(vol: np.ndarray, p: dict, live=None) -> float:
+    """How the raw anterior edge's FRAME-curvature varies across laterals: per lateral a quadratic over the live frames
+    of the raw crossing (rows >= clip_edge_floor), then a robust line of that curvature against x ∈ [−1, 1] → its slope
+    (px/frame² per unit x). A cornea's sagittal curvature does not vary linearly across laterals (a sphere or a toric
+    surface has the same frame-curvature on every lateral), so a non-zero slope is the signature of a real ROLL of the
+    eye over the frames (a tilt whose quadratic trend adds x·U(f) to the surface); a zero slope means whatever quadratic
+    tilt trend the correlation measured is not in the tissue. NaN when too few laterals fit or the crossings disagree
+    (the correlation then stands). `vol` is (F, D, L)."""
+    try:
+        F, D, L = vol.shape; fr = np.arange(F, dtype=np.float64)
+        floor = float(p.get("clip_edge_floor", 8.0)); m0 = max(2, int(0.08 * L))
+        x = (np.arange(L) - (L - 1) / 2.0) / max(1e-9, (L - 1) / 2.0)
+        v = np.asarray(vol, np.float64); pos = v[v > 0]
+        if pos.size == 0:
+            return float("nan")
+        p99 = float(np.percentile(pos, 99))
+        g = ndimage.gaussian_filter1d(v, 1.5, axis=1)
+        # ONE crossing, the one the review metrics use: the first row at or above tissue_motion_tilt_witness_level
+        # (1000 in raw OCT units, or 0.75·p99 on a dimmer scan). Fraction-of-p99 thresholds picked different
+        # structures on different scans (a dim layer above the stroma on some laterals) and three of them never agreed
+        # with each other; the absolute level has matched what the reviewer sees on every scan so far.
+        ks = []
+        _lvl = min(float(p.get("tissue_motion_tilt_witness_level", 1000.0)), 0.75 * p99)
+        for thr in (_lvl,):
+            h = g >= thr
+            h[:, :max(0, int(floor)), :] = False                                             # the bright top strip of a raw B-scan is not the edge
+            r = np.where(h.any(axis=1), np.argmax(h, axis=1), np.nan).astype(float)          # (F, L) crossing row
+            # a crossing right under the masked strip is a cornea CUT by the frame top (surface-crop frames): its
+            # "surface" is the cut, flat at the top — on p5_os_v1_3 (48 cropped frames) those cells gave a 0.052
+            # slope and 86 px of quadratic tilt (display 488 curvature −45 against +51 at the centre)
+            r[r < float(floor) + float(p.get("tissue_motion_witness_cut_margin", 6.0))] = np.nan
+            if live is not None:
+                r[~np.asarray(live, bool), :] = np.nan
+            # a reviewer's artifact band (crop_bands) is bright junk, not the edge: those cells are out of every
+            # per-lateral fit (cs037_od_v1: a ragged band start over frames 66-91 put a 0.08 px/frame² "slope"
+            # across laterals into the witness and 75 px of quadratic tilt into the delivered edge)
+            _wm = p.get("_witness_artifact_mask")
+            if _wm is not None and np.asarray(_wm).shape == (L, F):
+                r[np.asarray(_wm, bool).T] = np.nan
+            cs = np.full(L, np.nan)
+            # a per-lateral parabola needs most of the volume: on p5_os_v1_4 a wedge-shaped band left 29-57 frames on
+            # the outer laterals and their fitted curvature ran 66-146 ×1e-3 against 25 elsewhere (slope 0.07 → 117 px)
+            _nmin = max(30, min(int(p.get("tissue_motion_tilt_witness_min_frames", 60)), int(0.6 * F)))
+            for l in range(m0, L - m0):
+                ok = np.isfinite(r[:, l])
+                if int(ok.sum()) >= _nmin and (fr[ok].max() - fr[ok].min()) >= _nmin - 1:
+                    cs[l] = np.polyfit(fr[ok], r[ok, l], 2)[0]
+            ok = np.isfinite(cs)
+            if int(ok.sum()) < 40:
+                continue
+            y = cs[ok]; xx = x[ok]; keep = np.ones(y.size, bool)
+            for _ in range(2):
+                c = np.polyfit(xx[keep], y[keep], 1); res = np.abs(y - np.polyval(c, xx)); mad = float(np.median(res[keep])) + 1e-9
+                keep2 = res <= 3.5 * mad + 1e-4
+                if int(keep2.sum()) < 30:
+                    break
+                keep = keep2
+            ks.append(float(c[0]))
+        if not ks:
+            return float("nan")
+        return float(np.median(ks))
+    except Exception:  # noqa: BLE001
+        return float("nan")
+
+
+def _anterior_step_witness(vol: np.ndarray, j: int, p: dict) -> float:
+    """Boundary-free witness of the rigid move at frame pair (j, j+1): the raw anterior crossing's step per lateral
+    (first row >= 0.5 × p99 on a σ=1.5 depth-smoothed column; positive = deeper) fitted by a robust LINE across the
+    in-frame laterals → (shift at the centre, half-span tilt, n laterals kept). Laterals whose crossing lies within
+    clip_edge_floor of the frame top in either frame (a cut column) are excluded; (nan, nan, n) when fewer than
+    tissue_motion_pair_witness_min_laterals laterals remain. `vol` is (F, D, L)."""
+    try:
+        F, D, L = vol.shape
+        if not (0 <= j < F - 1):
+            return float("nan"), float("nan"), 0
+        a = np.asarray(vol[j], np.float64); b = np.asarray(vol[j + 1], np.float64)
+        thr = 0.5 * float(np.percentile(np.concatenate([a[a > 0], b[b > 0]]) if ((a > 0).any() and (b > 0).any()) else np.array([1.0]), 99))
+        if not np.isfinite(thr) or thr <= 0:
+            return float("nan"), float("nan"), 0
+        ga = ndimage.gaussian_filter1d(a, 1.5, axis=0); gb = ndimage.gaussian_filter1d(b, 1.5, axis=0)
+        ha = ga >= thr; hb = gb >= thr
+        ra = np.where(ha.any(axis=0), np.argmax(ha, axis=0), np.nan).astype(float); rb = np.where(hb.any(axis=0), np.argmax(hb, axis=0), np.nan).astype(float)
+        floor = float(p.get("clip_edge_floor", 8.0)); m0 = max(2, int(0.08 * L))
+        ok = np.isfinite(ra) & np.isfinite(rb) & (ra >= floor) & (rb >= floor)
+        ok[:m0] = False; ok[L - m0:] = False
+        if int(ok.sum()) < int(p.get("tissue_motion_pair_witness_min_laterals", 60)):
+            return float("nan"), float("nan"), int(ok.sum())
+        step = rb[ok] - ra[ok]; x = (np.flatnonzero(ok) - (L - 1) / 2.0) / max(1e-9, (L - 1) / 2.0)   # the stage's x convention
+        # robust LINE across laterals (shift at the centre + half-span tilt). The FIRST rejection is about the MEDIAN, not
+        # about a fit: a streak that hides the surface on a third of the laterals puts a +38 px block into the steps, and a
+        # least-squares line through that block and the true +8 px lands at 20 with a MAD too wide to reject anything.
+        r0 = np.abs(step - float(np.median(step))); mad0 = float(np.median(r0)) + 1e-6
+        keep = r0 <= 3.5 * mad0 + 1.0
+        if int(keep.sum()) < 30:
+            keep = np.ones(step.size, bool)
+        sol = np.array([float(np.median(step)), 0.0])
+        for _ in range(2):
+            X = np.vstack([np.ones(int(keep.sum())), x[keep]]).T; sol = np.linalg.lstsq(X, step[keep], rcond=None)[0]
+            r = np.abs(step - (sol[0] + sol[1] * x)); mad = float(np.median(r[keep])) + 1e-6; keep2 = r <= 3.5 * mad + 1.0
+            if int(keep2.sum()) < 30:
+                break
+            keep = keep2
+        return float(sol[0]), float(sol[1]), int(keep.sum())
+    except Exception:  # noqa: BLE001 — a witness that cannot be computed decides nothing
+        return float("nan"), float("nan"), 0
+
+
+def _tissue_measurement_volume(vol: np.ndarray, am, p: dict):
+    """The copy of `vol` (F, D, L) the tissue-motion stage measures on, given the reviewer's artifact mask `am`
+    (lateral, frame). Whole-frame bands (>= tissue_motion_artifact_dead_frac of the laterals) make the frame dead
+    (the 2026-09-09 rule, cs020_os_v4). With tissue_motion_artifact_cells_dead (default True) every other marked CELL
+    is zeroed too, provided the frame keeps >= tissue_motion_artifact_min_live_frac un-marked laterals (else the
+    whole-frame-only rule: left in). Returns (vol_tm, n_dead_frames, n_dead_cells); vol_tm IS `vol` (no copy) when
+    nothing is zeroed.
+
+    WHY PER CELL (2026-09-10, p5_os_v1_2 / p5_os_v1_3 — "curvature changes rapidly and is too steep, bad curvature at
+    sagittal 28, over-rotation at 488"): the upper eyelid descends through raw laterals 0-~200 over frames 0-~26 on
+    both scans. The adjacent-frame correlation tracks the LID there (per-pair lag -10..-28 px on the lid side vs
+    +5..+10 on the cornea side), integrating a -200 px "roll" and a +-130 px drift over the first 20 frames; the
+    global dome/tilt fits are dragged by it (b = -95/-166 px at frame 0, clamped to +-40 by rigid_frame_warp, a
+    +-40 px hump in b on the CLEAN frames 20-100 = steeper at display 28, flatter at 488) and the shape guard then
+    imposes a 1.5x dome on top ("too steep"). The reviewer had marked that lid as a crop band on v1_2, but the
+    2026-09-09 rule honoured WHOLE-frame bands only (the band covers 49 % of the width at frame 0), so the lid stayed
+    in the measurement: 16,300 marked cells correlated. Zeroing the marked cells removes it: the stage already treats
+    a zero column as absent (fill < tissue_motion_min_fill -> NaN lag; the pair mask reads the first non-zero row).
+    The frame-level floor keeps the cs008_od_v1 lesson (a pair left with a one-sided limbus strip measures nothing
+    and gets a ZERO step), and the caller KEEPS the cells-dead move only when _score_rigid_move agrees — a ragged,
+    growing band (cs037_od_v1: 1 % -> 77 % of the width over 25 frames) is where the blind rule hurts."""
+    F = int(vol.shape[0])
+    if am is None or not np.asarray(am).any():
+        return vol, 0, 0
+    am = np.asarray(am, bool)
+    frac = am.mean(axis=0)                                   # marked fraction of the laterals, per frame
+    dead_frac = float(p.get("tissue_motion_artifact_dead_frac", 0.9))
+    dead_fr = np.flatnonzero(frac >= dead_frac)
+    cells = np.zeros(F, bool)
+    if bool(p.get("tissue_motion_artifact_cells_dead", True)):
+        min_live = float(p.get("tissue_motion_artifact_min_live_frac", 0.25))
+        cells = (frac > 0) & (frac < dead_frac) & ((1.0 - frac) >= min_live)
+    if not dead_fr.size and not cells.any():
+        return vol, 0, 0
+    out = np.array(vol, copy=True)
+    if dead_fr.size:
+        out[dead_fr, :, :] = 0.0
+    n_cells = 0
+    for f in np.flatnonzero(cells):
+        out[f][:, am[:, f]] = 0.0; n_cells += int(am[:, f].sum())
+    return out, int(dead_fr.size), n_cells
+
+
+def _raw_crossing_map(vol, level: float, row_min: int = 8, sigma: float = 1.5) -> np.ndarray:
+    """(F, L) first depth row >= row_min at which the depth-smoothed (gaussian sigma) intensity reaches `level`;
+    NaN where a column never does. `vol` is (F, D, L). One frame at a time (the whole-volume float64 filter is
+    not needed), numerically the same column-wise filter + argmax the gap-offset block used on its lateral bands."""
+    v = np.asarray(vol)
+    F, D, L = int(v.shape[0]), int(v.shape[1]), int(v.shape[2])
+    T = np.full((F, L), np.nan)
+    rm = max(0, int(row_min))
+    for f in range(F):
+        g = ndimage.gaussian_filter1d(np.asarray(v[f], np.float64), float(sigma), axis=0) >= float(level)
+        g[:rm] = False
+        has = g.any(axis=0)
+        if has.any():
+            T[f, has] = np.argmax(g[:, has], axis=0)
+    return T
+
+
+def _gap_lateral_shift_estimate(T, live, partial, segments, params: dict | None = None, edge=None) -> dict:
+    """LATERAL translation of the eye across a dead gap (2026-09-10, cs020_os_v4 "the curvature is clearly different
+    before and after the crop artifact"). `T` (F, L) = raw first-crossing map (NaN = no crossing / artifact cell /
+    cut column); `live`, `partial` (F,) bool; `segments` = [(f0, f1), ...] live segments in frame order.
+
+    Per gap between consecutive segments: pb = median crossing profile over the last <= tissue_motion_gap_edge_frames
+    live non-partial frames BEFORE the gap, pa = the same AFTER it; dx in [-max, max] minimising
+    std(pa(l) - pb(l + dx)) over >= min_overlap laterals. dx is the np.roll shift that puts the post-gap frames back
+    on the pre-gap tissue (new[l] = old[l - dx]). Plausibility: the residual std must drop by >= drop_frac AND
+    >= drop_px against dx = 0, |dx| >= min, dx not at the search limit, and what is left must be <= max_resid_px
+    (cs017_od_v1: a 36 px residual at dx = +77 is not the same cornea shifted), AND the shift must beat the best
+    rigid line (offset + tilt) fitted at dx = 0 by vs_tilt_frac / vs_tilt_px: on a parabola P(x + dx) - P(x) is
+    linear in x, i.e. a tilt and a lateral shift are the same profile change, so only what a tilt CANNOT remove
+    (the limbus shape) proves a lateral move — cs020_os_v4 line 8.4 -> 4.25 px, every other banded store gap fails.
+    When the served edge is given the crossings within tissue_motion_gap_edge_witness_px of it must give the same
+    dx (+-witness_agree) — the dual witness that rejected the sweep's remaining false positive (cs017_od_v1).
+    Chained outward from the longest segment; an unaccepted gap contributes 0. Returns the record (segments,
+    reference, gaps[...], dx per segment, applied)."""
+    p = params or {}
+    T = np.asarray(T, np.float64)
+    F, L = int(T.shape[0]), int(T.shape[1])
+    live = np.asarray(live, bool); partial = np.asarray(partial, bool)
+    near = max(2, int(p.get("tissue_motion_gap_edge_frames", 8)))
+    dxmax = max(1, min(int(p.get("tissue_motion_gap_lateral_max", 80)), L - 1))
+    dxmin = max(1, int(p.get("tissue_motion_gap_lateral_min", 6)))
+    min_ov = max(8, min(int(p.get("tissue_motion_gap_lateral_min_overlap", 200)), int(0.4 * L)))
+    drop_frac = float(p.get("tissue_motion_gap_lateral_drop_frac", 0.40))
+    drop_px = float(p.get("tissue_motion_gap_lateral_drop_px", 8.0))
+    max_resid = float(p.get("tissue_motion_gap_lateral_max_resid_px", 12.0))
+    vs_frac = float(p.get("tissue_motion_gap_lateral_vs_tilt_frac", 0.40))
+    vs_px = float(p.get("tissue_motion_gap_lateral_vs_tilt_px", 3.0))
+    agree = int(p.get("tissue_motion_gap_lateral_witness_agree", 6))
+    wtol = float(p.get("tissue_motion_gap_edge_witness_px", 30.0))
+    segs = [(int(s0), int(s1)) for s0, s1 in segments]
+    rec: dict = {"segments": [[s0, s1] for s0, s1 in segs], "gaps": [], "dx": [0] * len(segs), "applied": False,
+                 "search_max": int(dxmax), "min_overlap": int(min_ov)}
+    if len(segs) < 2:
+        rec["reason"] = "fewer than two segments"
+        return rec
+    ref = int(np.argmax([s1 - s0 for s0, s1 in segs])); rec["reference"] = ref
+    Tw = None
+    if bool(p.get("tissue_motion_gap_lateral_edge_witness", True)) and edge is not None:
+        E = np.asarray(edge, np.float64)
+        if E.shape == (L, F):
+            with np.errstate(invalid="ignore"):
+                Tw = np.where(np.abs(T - E.T) <= wtol, T, np.nan)
+    lat = np.arange(L)
+
+    def _profiles(TT, fa, fb):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return np.nanmedian(TT[fa], axis=0), np.nanmedian(TT[fb], axis=0)      # (before, after)
+
+    def _sweep(pb, pa):
+        """(best (std, dx, n, median offset), std at dx=0, n at dx=0, std at dx=0 about its best LINE). The dx is chosen
+        on the PLAIN residual only: letting a line float at every dx drifts the minimum to the search limit."""
+        best = None; s0 = None; n0 = 0; s0l = None
+        for dx in range(-dxmax, dxmax + 1):
+            src = lat + dx; m = (src >= 0) & (src < L)
+            r = pa[lat[m]] - pb[src[m]]; ok = np.isfinite(r); n = int(ok.sum())
+            if n < min_ov:
+                continue
+            s = float(np.std(r[ok]))
+            if dx == 0:
+                s0 = s; n0 = n
+                rr = r[ok]; ll = lat[m][ok].astype(np.float64)
+                s0l = float(np.std(rr - np.polyval(np.polyfit(ll, rr, 1), ll)))
+            if best is None or s < best[0]:
+                best = (s, int(dx), n, float(np.median(r[ok])))
+        return best, s0, n0, s0l
+
+    def _gate(best, s0, s0l):
+        s, dx, n, _ = best; reasons = []
+        if abs(dx) < dxmin:
+            reasons.append(f"|dx| < {dxmin}")
+        if abs(dx) >= dxmax:
+            reasons.append("dx at the search limit")
+        if not ((s0 - s) >= drop_px and (s0 - s) >= drop_frac * s0):
+            reasons.append("residual not reduced enough")
+        if s > max_resid:
+            reasons.append(f"residual {s:.1f} px > {max_resid:g}")
+        if s0l is not None and not (s <= (1.0 - vs_frac) * s0l and (s0l - s) >= vs_px):
+            reasons.append(f"a rigid tilt explains it as well (line residual {s0l:.1f} px)")
+        return reasons
+
+    gap_dx = []
+    for k in range(len(segs) - 1):
+        (a0, a1), (b0, b1) = segs[k], segs[k + 1]
+        fa = [f for f in range(a0, a1 + 1) if live[f] and not partial[f]][-near:]
+        fb = [f for f in range(b0, b1 + 1) if live[f] and not partial[f]][:near]
+        g: dict = {"before": [a0, a1], "after": [b0, b1], "frames_before": [int(f) for f in fa],
+                   "frames_after": [int(f) for f in fb], "dx": None, "accepted": False}
+        if len(fa) < 2 or len(fb) < 2:
+            g["reason"] = "too few live frames beside the gap"; rec["gaps"].append(g); gap_dx.append(0); continue
+        pb, pa = _profiles(T, fa, fb)
+        best, s0, n0, s0l = _sweep(pb, pa)
+        if best is None or s0 is None:
+            g["reason"] = "too few overlapping laterals"; rec["gaps"].append(g); gap_dx.append(0); continue
+        s, dx, n, off = best
+        g.update({"dx": int(dx), "std_with": round(s, 2), "std_without": round(s0, 2), "std_without_line": round(s0l, 2),
+                  "n_overlap": int(n), "n_overlap_without": int(n0), "axial_offset_px": round(off, 1), "drop_px": round(s0 - s, 2),
+                  "drop_frac": (round((s0 - s) / s0, 3) if s0 > 0 else 0.0)})
+        reasons = _gate(best, s0, s0l)
+        if Tw is not None:
+            pbw, paw = _profiles(Tw, fa, fb)
+            bw, s0w, _, s0wl = _sweep(pbw, paw)
+            if bw is None or s0w is None:
+                g["witness"] = {"error": "too few edge-witnessed laterals"}; reasons.append("edge witness has no overlap")
+            else:
+                rw = _gate(bw, s0w, s0wl)
+                g["witness"] = {"dx": int(bw[1]), "std_with": round(bw[0], 2), "std_without": round(s0w, 2),
+                                "std_without_line": round(s0wl, 2), "n_overlap": int(bw[2]), "accepted": not rw}
+                if rw:
+                    reasons.append("edge-witnessed profile does not confirm (" + "; ".join(rw) + ")")
+                elif abs(int(bw[1]) - int(dx)) > agree:
+                    reasons.append(f"edge-witnessed dx {int(bw[1])} disagrees with {int(dx)}")
+        g["accepted"] = not reasons
+        if reasons:
+            g["reason"] = "; ".join(reasons)
+        rec["gaps"].append(g); gap_dx.append(int(dx) if g["accepted"] else 0)
+    dxs = [0] * len(segs); acc = 0
+    for k in range(ref, len(segs) - 1):                      # segments after the reference: roll by the accumulated gap dx
+        acc += gap_dx[k]; dxs[k + 1] = acc
+    acc = 0
+    for k in range(ref - 1, -1, -1):                         # segments before it: the inverse roll, accumulated backwards
+        acc -= gap_dx[k]; dxs[k] = acc
+    rec["dx"] = [int(v) for v in dxs]; rec["applied"] = any(v != 0 for v in dxs)
+    return rec
+
+
+def segment_lateral_dx_per_frame(rec: dict, n_frames: int) -> np.ndarray:
+    """(F,) per-frame lateral dx from a gap_lateral_shift record: each segment's chained dx over its own frames;
+    frames no segment covers hold the nearest covered frame's dx (a dead band is zeroed anyway; a short live run
+    between segments moves with its nearest neighbour). Zeros for a missing / malformed record."""
+    F = int(n_frames); out = np.zeros(F, np.float64)
+    segs = (rec or {}).get("segments") or []; dxs = (rec or {}).get("dx") or []
+    if not segs or len(dxs) != len(segs):
+        return out
+    cov = np.zeros(F, bool)
+    for (f0, f1), d in zip(segs, dxs):
+        f0 = max(0, int(f0)); f1 = min(F - 1, int(f1))
+        if f1 >= f0:
+            out[f0:f1 + 1] = float(d); cov[f0:f1 + 1] = True
+    if cov.any() and not cov.all():
+        idx = np.flatnonzero(cov)
+        for f in np.flatnonzero(~cov):
+            out[f] = out[idx[int(np.argmin(np.abs(idx - f)))]]
+    return out
+
+
+def _roll_lateral_plane(plane: np.ndarray, dx: float) -> np.ndarray:
+    """One B-scan (depth, laterals) translated by dx along the lateral axis, zero fill: new[:, l] = old[:, l - dx].
+    Integer dx is an exact roll; a sub-pixel dx is a linear interpolation (ndimage.shift order 1)."""
+    a = np.asarray(plane); L = int(a.shape[1]); d = float(dx)
+    if abs(d) < 1e-9:
+        return a.copy()
+    if abs(d - round(d)) < 1e-6:
+        k = int(round(d))
+        if abs(k) >= L:
+            return np.zeros_like(a)
+        out = np.roll(a, k, axis=1)
+        if k > 0:
+            out[:, :k] = 0
+        else:
+            out[:, k:] = 0
+        return out
+    return ndimage.shift(a, (0.0, d), order=1, mode="constant", cval=0.0)
+
+
+def _roll_lateral_column(col: np.ndarray, dx: float, fill="nan") -> np.ndarray:
+    """A per-lateral field of one frame (L,) translated like its B-scan: new[l] = old[l - dx]. Vacated laterals take
+    `fill`: NaN, a number, or "hold" (the boundary value). Sub-pixel dx interpolates linearly."""
+    c = np.asarray(col, np.float64); L = int(c.shape[0]); d = float(dx)
+    if abs(d) < 1e-9:
+        return c.copy()
+    hold = isinstance(fill, str) and fill.lower() == "hold"
+    fv = np.nan if (isinstance(fill, str) and not hold) else (0.0 if hold else float(fill))
+    if abs(d - round(d)) < 1e-6:
+        k = int(round(d))
+        if abs(k) >= L:
+            return np.full(L, (c[0] if (hold and k > 0) else c[-1] if hold else fv))
+        out = np.roll(c, k)
+        if k > 0:
+            out[:k] = c[0] if hold else fv
+        else:
+            out[k:] = c[-1] if hold else fv
+        return out
+    lat = np.arange(L, dtype=np.float64)
+    return np.interp(lat - d, lat, c, left=(c[0] if hold else fv), right=(c[-1] if hold else fv))
+
+
+def apply_segment_lateral_shift(vol_delivered: np.ndarray, segments_dx, edges=None, entries=None,
+                                canvas_pad: int = 0, out_nifti=None, params: dict | None = None):
+    """THE LAST RIGID STAGE of a corrections run (2026-09-10, cs020_os_v4): translate WHOLE frames along the
+    lateral axis by the per-segment dx estimated across the dead gaps (_gap_lateral_shift_estimate, chained), so
+    the tissue after an artifact band sits on the same laterals as the tissue before it. Never a per-column warp.
+
+    `vol_delivered` (frames, depth, laterals) — the delivered volume AFTER the band zeroing (_apply_crop), so the
+    zeroed artifact cells travel with their frame; vacated laterals are zero. `edges` (L, F) = the served /
+    placed anterior in the run's (padded) rows: its columns are rolled the same way, vacated laterals NaN (or the
+    boundary value with tissue_motion_gap_lateral_edge_fill="hold"). `entries` = the CLOSED applied-move ledger
+    [(stage, (L, F) field | None)]: every field's columns are rolled with the tissue they describe (zero fill —
+    api_server rejects a non-finite move) and a 'lateral_shift' stage (zeros) is appended so the composition
+    stays complete. The corrected pane's line = placed(rolled) + move(rolled) + pad therefore stays on the tissue.
+    When `out_nifti` is given, border_cache/placed_edges.npz is (re)written with the rolled edge in RAW rows
+    (edges − canvas_pad) on EVERY shifted run — a non-surface-crop run has no placed file, and carrying the
+    unshifted provided_edges.npz by the shifted move would put the pane line on the wrong lateral.
+    Returns (volume, edges, entries, info); unchanged inputs and info["applied"]=False when nothing shifts."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    vol = np.asarray(vol_delivered)
+    F, D, L = int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2])
+    info: dict = {"applied": False, "stage": "lateral_shift"}
+    rec = segments_dx if isinstance(segments_dx, dict) else None
+    if not rec or not rec.get("applied"):
+        info["reason"] = "no accepted lateral shift"
+        return vol, edges, entries, info
+    dxf = segment_lateral_dx_per_frame(rec, F)
+    dxmax = float(p.get("tissue_motion_gap_lateral_max", 80))
+    dxf = np.clip(dxf, -dxmax, dxmax)
+    moving = np.flatnonzero(np.abs(dxf) > 1e-9)
+    if moving.size == 0:
+        info["reason"] = "every per-frame dx is zero"
+        return vol, edges, entries, info
+    fill = str(p.get("tissue_motion_gap_lateral_edge_fill", "nan")).lower()
+    out = np.array(vol, copy=True)
+    for f in moving:
+        out[f] = _roll_lateral_plane(vol[f], dxf[f])
+    edges_out = edges
+    if edges is not None:
+        e = np.asarray(edges, np.float64)
+        if e.shape == (L, F):
+            edges_out = e.copy()
+            for f in moving:
+                edges_out[:, f] = _roll_lateral_column(e[:, f], dxf[f], fill=("hold" if fill == "hold" else "nan"))
+            edges_out = edges_out.astype(np.float32)
+        else:
+            info["edges"] = f"shape {tuple(e.shape)} != {(L, F)}: not rolled"
+    entries_out = None
+    if entries is not None:
+        entries_out = []
+        for stage, fld in entries:
+            if fld is None:
+                entries_out.append((stage, None)); continue
+            a = np.asarray(fld, np.float64)
+            if a.shape != (L, F):
+                entries_out.append((stage, fld)); continue
+            b = a.copy()
+            for f in moving:
+                b[:, f] = _roll_lateral_column(a[:, f], dxf[f], fill=0.0)
+            entries_out.append((stage, b.astype(np.float32)))
+        entries_out.append(("lateral_shift", np.zeros((L, F), np.float32)))
+    info.update({"applied": True, "segments": rec.get("segments"), "dx": rec.get("dx"), "reference": rec.get("reference"),
+                 "frames_shifted": int(moving.size), "dx_range": [float(dxf.min()), float(dxf.max())],
+                 "dx_per_frame": [float(v) for v in dxf], "edge_fill": fill,
+                 "vacated_laterals_max": int(np.ceil(float(np.max(np.abs(dxf)))))})
+    if out_nifti is not None and edges_out is not None and np.asarray(edges_out).shape == (L, F):
+        try:
+            bc = Path(out_nifti).resolve().parent.parent / "border_cache"
+            bc.mkdir(parents=True, exist_ok=True)
+            tmp = bc / "placed_edges.tmp.npz"
+            np.savez_compressed(tmp, surface=np.asarray(np.asarray(edges_out, np.float64) - float(canvas_pad), np.float32),
+                                lateral_dx=np.asarray(dxf, np.float32))
+            os.replace(tmp, bc / "placed_edges.npz")
+            info["placed_edges"] = str(bc / "placed_edges.npz")
+        except Exception as exc:  # noqa: BLE001 — best-effort cache, never fails the run
+            info["placed_edges_error"] = f"{type(exc).__name__}: {exc}"
+    return out, edges_out, entries_out, info
+
+
 def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
     """SHAPE FROM LINES, MOTION FROM TISSUE (reviewer brainstorm + go/no-go 2026-09-05). The per-frame RIGID move
     (depth shift a[f], half-span tilt b[f]) measured from the TISSUE itself, no surface detected or drawn:
@@ -12743,6 +13325,8 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
     lag_tab = np.arange(-max_lag, max_lag + 1)          # MONOTONIC table (lag 0 / -1 must be interior for the refinement)
     M = np.full((lats.size, F - 1), np.nan, dtype=np.float64)
     CUT = np.zeros((lats.size, F - 1), dtype=bool)   # band i is cut (tissue-bright at the top rows) in frame j or j+1
+    ON_EDGE = np.zeros((lats.size, F - 1), dtype=bool)   # band lag pinned at ±max_lag: the true move is beyond the window
+    keep_full = bool(p.get("tissue_motion_widen_window", True)); XC_FULL: list = []
     cut_vote = bool(p.get("tissue_motion_cut_vote", False)); cut_frac = float(p.get("tissue_motion_cut_vote_min_fraction", 0.25))
     for i, l in enumerate(lats):
         cols = vol[:, :, l - band:l + band + 1].mean(axis=2).T.astype(np.float64)      # (D, F)
@@ -12798,8 +13382,8 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
             muA = (cA * nzA).sum(axis=0) / np.maximum(1, nzA.sum(axis=0)); muB = (cB * nzB).sum(axis=0) / np.maximum(1, nzB.sum(axis=0))
             colsA = np.where(nzA, cA - muA[None, :], 0.0); colsB = np.where(nzB, cB - muB[None, :], 0.0)
         A = np.fft.rfft(colsA, n=n, axis=0); B = np.fft.rfft(colsB, n=n, axis=0)
-        xc = np.fft.irfft(A * np.conj(B), n=n, axis=0)                                  # xc[s] = Σ_k a[k+s]·b[k]
-        xc = np.concatenate([xc[n - max_lag:], xc[:max_lag + 1]], axis=0)                  # xc[s] = Σ_k a[k+s]·b[k], s = -max_lag..max_lag
+        xc_full = np.fft.irfft(A * np.conj(B), n=n, axis=0)                             # xc[s] = Σ_k a[k+s]·b[k], circular in n
+        xc = np.concatenate([xc_full[n - max_lag:], xc_full[:max_lag + 1]], axis=0)        # s = -max_lag..max_lag
         k = np.argmax(xc, axis=0); best = lag_tab[k].astype(np.float64)
         for j in range(F - 1):                                                          # sub-pixel: 3-point parabola
             kk = int(k[j])
@@ -12810,6 +13394,35 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
         ok = (fill[:-1] >= min_fill) & (fill[1:] >= min_fill)
         best[~ok] = np.nan
         M[i] = best
+        ON_EDGE[i] = np.abs(best) >= (max_lag - 1)                                     # the peak sits on the window boundary
+        XC_FULL.append(xc_full if keep_full else None)
+    # ADAPTIVE WINDOW (2026-09-09, cs020_os_v2 frames 71-74: a blink moved the eye 85 px between two frames): the lag search
+    # is ±max_lag (40) and a move beyond it pins the votes at the boundary (78-91 of 128 bands at −40 on three pairs),
+    # delivering a 23 px spike at frame 73 that no later pass could recover. When at least tissue_motion_widen_frac of a
+    # pair's bands sit on the boundary, that pair is re-read from the full circular correlation with a window widened
+    # up to tissue_motion_widen_max (px, capped at D/3); the sub-pixel refinement is repeated on the widened table.
+    widened: list = []
+    if keep_full and ON_EDGE.any():
+        _wfrac = float(p.get("tissue_motion_widen_frac", 0.25)); _wmax = int(min(int(p.get("tissue_motion_widen_max", 160)), max(max_lag, D // 3)))
+        for j in range(F - 1):
+            col_ok = np.isfinite(M[:, j])
+            if col_ok.sum() == 0 or float(ON_EDGE[col_ok, j].mean()) < _wfrac or _wmax <= max_lag:
+                continue
+            wl = _wmax; tab2 = np.arange(-wl, wl + 1)
+            for i in range(lats.size):
+                xf = XC_FULL[i]
+                if xf is None or not col_ok[i]:
+                    continue
+                col = np.concatenate([xf[n - wl:, j], xf[:wl + 1, j]])
+                kk = int(np.argmax(col)); v = float(tab2[kk])
+                if 0 < kk < col.size - 1:
+                    y0, y1, y2 = col[kk - 1], col[kk], col[kk + 1]; den = y0 - 2.0 * y1 + y2
+                    if den < 0:
+                        v += 0.5 * (y0 - y2) / den
+                M[i, j] = v
+            widened.append(int(j))
+    if widened:
+        info["widened_pairs"] = widened
     da = np.zeros(F - 1); db = np.zeros(F - 1); nb = np.zeros(F - 1, dtype=int); tilt_fitted = np.zeros(F - 1, dtype=bool)
     spread = np.full(F - 1, np.nan)                       # per-pair MAD of the band lags about their linear fit (blunder witness)
     cut_demoted: list = []
@@ -12830,7 +13443,22 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
         if cut_vote:
             okc = ok & ~CUT[:, j]
             if int(okc.sum()) >= max(min_bands, int(np.ceil(cut_frac * float(ok.sum())))) and int(okc.sum()) < int(ok.sum()):
-                base = okc; cut_demoted.append(int(j))
+                # ONLY THE LOCKED ONES (2026-09-09, cs040_os_v1 "a small divot"): a band is demoted for the failure the
+                # rule exists for — its lag sits at 0 (|lag| < tissue_motion_cut_lock_tol) while the un-cut bands agree
+                # on a real move. A "cut" band that carries the move votes like everyone else: on cs040 a bright strip
+                # in the top rows marked the left third of the B-scan as cut, demoting it at the blink pairs 87-89
+                # removed the tilt lever arm (db −0.2 for a +3 half-span, +5.2 for −2.2) and the periphery kept a
+                # 15 px divot at frames 88-90.
+                # A cut band is demoted unless it moved MORE than the un-cut bands (by more than the tolerance): the
+                # cut edge can only hold a band back toward lag 0 (p1_od_v1_2 pair 28: cut lags −10…0 against an
+                # un-cut −12), never push it beyond the tissue's move, so a band beyond the un-cut move is tissue
+                # that really moved (cs040's left third at −15…−20 against −12 during a blink) and it votes.
+                _lock = float(p.get("tissue_motion_cut_lock_tol", 1.5)); _mu = float(np.median(v[okc]))
+                _locked = ok & CUT[:, j] & (np.abs(v) < abs(_mu) + _lock) & (abs(_mu) >= 2.0 * _lock)
+                if bool(p.get("tissue_motion_cut_lock_all", False)):        # the pre-2026-09-09-23:30 rule (every cut band), for A/B only
+                    _locked = ok & CUT[:, j]
+                if _locked.any():
+                    base = ok & ~_locked; cut_demoted.append(int(j))
         if (x[base].max() - x[base].min()) >= 1.0:
             X = np.vstack([np.ones(int(base.sum())), x[base]]).T
             sol0 = np.linalg.lstsq(X, v[base], rcond=None)[0]
@@ -12848,7 +13476,7 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
     _mdump = os.environ.get("CORNEA_DUMP_MOTION")                        # debug: dump the per-band lag matrix (blunder audit)
     if _mdump:
         os.makedirs(_mdump, exist_ok=True); _mk = int(os.environ.get("_CORNEA_DUMP_MOTION_K", "0")); os.environ["_CORNEA_DUMP_MOTION_K"] = str(_mk + 1)
-        np.savez(os.path.join(_mdump, f"motion_call{_mk}.npz"), M=M, lats=lats, spread=spread, da=da, db=db, nb=nb, x=x)
+        np.savez(os.path.join(_mdump, f"motion_call{_mk}.npz"), M=M, lats=lats, spread=spread, da=da, db=db, nb=nb, x=x, CUT=CUT)
     # frame pairs with NO measurement (a zeroed crop_region / blink block, an empty canvas frame): no lag is
     # invented across them — the trajectory is integrated with a zero step there and the dome is fitted PER
     # CONTIGUOUS LIVE SEGMENT, so a dead block can neither ramp the trajectory nor bend the parabola of the live
@@ -12910,9 +13538,30 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
             if spread[j] >= max(_minsp, _kp * _nsp):
                 _ma = 0.5 * (da[j - 1] + da[j + 1]); _mb = 0.5 * (db[j - 1] + db[j + 1])
                 if abs(da[j] - _ma) > _tolp:
-                    _fixed.append({"pair": int(j), "shift": round(float(da[j]), 2), "used": round(float(_ma), 2),
-                                   "spread": round(float(spread[j]), 2), "neighbour_spread": round(float(_nsp), 2)})
-                    da[j] = _ma; db[j] = _mb
+                    # DUAL WITNESS (2026-09-09, cs020_od_v1 pair 67, reviewer's "step that does not conform"): a split vote
+                    # is not proof of a blunder — on a band scan the split came from cut columns while the tissue really
+                    # moved 21 px (raw anterior edge); replacing the measured 16.7 px by the neighbours' 11.8 px delivered
+                    # a 20 px step. The raw anterior crossing (median step over in-frame laterals) is the boundary-free
+                    # witness: the pair is replaced only when the neighbours' mean is CLOSER to it than the measured lag.
+                    # No usable witness (fewer than tissue_motion_pair_witness_min_laterals in-frame laterals) → replace
+                    # as before (the streak case the guard was built for, cs020 pair 37: witness 0, measured 6 → replaced).
+                    _w, _wt, _wn = _anterior_step_witness(vol, j, p)
+                    _keep = bool(np.isfinite(_w) and abs((-da[j]) - _w) <= abs((-_ma) - _w))
+                    if _keep and bool(p.get("tissue_motion_pair_witness_replaces", True)):
+                        # the split vote biased the FIT as well as the vote (cs020 pair 67: an outlier block halved the
+                        # tilt of a 25→14 px tilted step, leaving a 12 px step on one side): the witness's own line —
+                        # shift and tilt from the raw anterior edge, which the correlation never sees — stands in for it.
+                        _used_a, _used_b = -float(_w), (-float(_wt) if np.isfinite(_wt) else float(db[j]))
+                    elif _keep:
+                        _used_a, _used_b = float(da[j]), float(db[j])
+                    else:
+                        _used_a, _used_b = float(_ma), float(_mb)
+                    _fixed.append({"pair": int(j), "shift": round(float(da[j]), 2), "tilt": round(float(db[j]), 2),
+                                   "used": round(_used_a, 2), "used_tilt": round(_used_b, 2),
+                                   "spread": round(float(spread[j]), 2), "neighbour_spread": round(float(_nsp), 2),
+                                   "witness": (round(float(_w), 2) if np.isfinite(_w) else None),
+                                   "witness_tilt": (round(float(_wt), 2) if np.isfinite(_wt) else None), "witness_n": int(_wn), "kept": _keep})
+                    da[j] = _used_a; db[j] = _used_b
         if _fixed:
             info["interior_pairs_replaced"] = _fixed
     info["pair_spread"] = [None if not np.isfinite(v) else round(float(v), 2) for v in spread]
@@ -12926,16 +13575,100 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
     fr = np.arange(F, dtype=np.float64)
     a = np.zeros(F); b = np.zeros(F); segments = []
     min_seg = int(p.get("tissue_motion_min_segment", 8))
+    # ONE DOME ACROSS A SHORT DEAD GAP (2026-09-09, cs020_os_v4 "two different curves"): a reviewer's artifact band
+    # (crop_bands) zeroes a block of frames, so the trajectory cannot be integrated across it and each live segment
+    # used to get its OWN parabola — two domes with unrelated curvature and an arbitrary offset, delivered as a
+    # cornea whose two halves do not lie on one curve. When the dead gap is at most tissue_motion_bridge_max_gap
+    # frames, the segments are fitted JOINTLY: one quadratic (curvature + slope shared) with a free offset per
+    # segment — the offset absorbs the unmeasurable rigid shift across the gap, and both halves land on the same
+    # dome. Longer gaps (a real blink block) keep independent domes.
+    _runs = []
+    _f = 0
+    while _f < F:
+        if not live[_f]:
+            _f += 1; continue
+        _g = _f
+        while _g + 1 < F and live[_g + 1]:
+            _g += 1
+        if _g - _f + 1 >= min_seg:
+            _runs.append((int(_f), int(_g)))
+        _f = _g + 1
+    # NOISY SECONDARY RUNS ARE DECIDED HERE, BEFORE ANY DOME FIT (2026-09-10): a short run whose band lags scatter far
+    # more than the longest run's (cs025_os_v4 tail: 1.76 vs 0.58 px, the correlation locked on a blob) is not a
+    # measurement; it is left out of the runs, the groups and the joint dome (which it used to pollute) and is
+    # placed afterwards — held from the main run, or put on the main dome by its served line.
+    _noisy_mask = np.zeros(F, bool)
+    if bool(p.get("tissue_motion_noisy_segment_gate", True)) and len(_runs) >= 2:
+        try:
+            _lens = [f1 - f0 + 1 for f0, f1 in _runs]; _main_i = int(np.argmax(_lens)); _mr0, _mr1 = _runs[_main_i]
+            _sp_main = float(np.nanmedian(spread[_mr0:_mr1])) if _mr1 > _mr0 else float("nan")
+            _ratio = float(p.get("tissue_motion_noisy_segment_ratio", 2.0)); _minpx = float(p.get("tissue_motion_noisy_segment_min_px", 1.5))
+            _maxlen = int(p.get("tissue_motion_noisy_segment_max_frames", 25))
+            # ... and only when no bright tissue sits near the served line over the run (2026-09-10, cs025_os_v4 after
+            # the reviewer's lines put the tail's edge on the deep bright structure): a high spread with the line
+            # witnessed by a level crossing is fast REAL motion, which the correlation did track, not noise.
+            _wrun = np.zeros(F)                              # no served line → nothing witnesses the run: the spread rule alone decides
+            _ge0 = p.get("_gap_edge")
+            if _ge0 is not None and np.asarray(_ge0).shape == (L, F):
+                try:
+                    _lc0 = np.arange(max(0, L // 2 - max(4, L // 8)), min(L, L // 2 + max(4, L // 8)))
+                    _v0 = np.asarray(vol[:, :, _lc0], np.float64); _pos0 = _v0[_v0 > 0]
+                    _lvl0 = min(float(p.get("tissue_motion_tilt_witness_level", 1000.0)), 0.75 * float(np.percentile(_pos0, 99))) if _pos0.size else 1000.0
+                    _h0 = ndimage.gaussian_filter1d(_v0, 1.5, axis=1) >= _lvl0; _h0[:, :8, :] = False
+                    _T0 = np.where(_h0.any(axis=1), np.argmax(_h0, axis=1), np.nan).astype(float)
+                    _wrun = np.nanmean(np.abs(_T0 - np.asarray(_ge0, np.float64)[_lc0].T) <= float(p.get("tissue_motion_gap_edge_witness_px", 30.0)), axis=1)
+                except Exception:  # noqa: BLE001
+                    _wrun = np.ones(F)
+            _keep_runs = []
+            for ri, (f0, f1) in enumerate(_runs):
+                _sp = float(np.nanmedian(spread[f0:f1])) if f1 > f0 else float("nan")
+                _unwit = bool(np.nanmean(_wrun[f0:f1 + 1]) < 0.5)
+                if ri != _main_i and (f1 - f0 + 1) <= _maxlen and _unwit and np.isfinite(_sp) and np.isfinite(_sp_main) and _sp >= _minpx and _sp >= _ratio * _sp_main:
+                    _noisy_mask[f0:f1 + 1] = True
+                    info.setdefault("noisy_segments", []).append({"segment": [int(f0), int(f1)], "spread_px": round(_sp, 2), "main_spread_px": round(_sp_main, 2)})
+                else:
+                    _keep_runs.append((f0, f1))
+            _runs = _keep_runs
+        except Exception as _e:  # noqa: BLE001
+            info["noisy_segment_error"] = repr(_e)[:120]
+    _meas = live & ~_noisy_mask                          # frames whose measurement is trusted: runs, groups, domes come from these
+    _bridge = int(p.get("tissue_motion_bridge_max_gap", 20))
+    _kx = _anterior_curvature_slope(vol, p, live) if bool(p.get("tissue_motion_tilt_witness", True)) else None
+    _dome_applied: dict = {}                            # (f0, f1) → (coef2, coef1, coef0) of the dome each segment was put on
+    _rawc = _raw_central_curvature(vol, p, live)        # median frame-curvature of the raw level crossing on the central laterals (or None)
+    _groups: list = []                                  # lists of runs fitted jointly
+    for r in _runs:
+        if _groups and (r[0] - _groups[-1][-1][1] - 1) <= _bridge:
+            _groups[-1].append(r)
+        else:
+            _groups.append([r])
+    _joint: dict = {}                                   # (f0, f1) → (c2, c1, offset) from a joint fit
+    for grp in _groups:
+        if len(grp) < 2:
+            continue
+        rows = []; ys = []
+        for gi, (g0, g1) in enumerate(grp):
+            for ff in range(g0, g1 + 1):
+                row = [ff * ff, ff] + [1.0 if gi == k else 0.0 for k in range(len(grp))]
+                rows.append(row); ys.append(pos[ff])
+        X = np.asarray(rows, np.float64); y = np.asarray(ys, np.float64)
+        sol = np.linalg.lstsq(X, y, rcond=None)[0]
+        for gi, (g0, g1) in enumerate(grp):
+            _joint[(g0, g1)] = (float(sol[0]), float(sol[1]), float(sol[2 + gi]))
+        info.setdefault("bridged_segments", []).append({"segments": [[g0, g1] for g0, g1 in grp], "curv": round(float(sol[0]), 6)})
     f0 = 0
     while f0 < F:
-        if not live[f0]:
+        if not _meas[f0]:
             f0 += 1; continue
         f1 = f0
-        while f1 + 1 < F and live[f1 + 1]:
+        while f1 + 1 < F and _meas[f1 + 1]:
             f1 += 1
         seg = np.arange(f0, f1 + 1)
         if seg.size >= min_seg:
             _c = np.polyfit(fr[seg], pos[seg], 2)
+            if (int(f0), int(f1)) in _joint:
+                _jc2, _jc1, _jo = _joint[(int(f0), int(f1))]
+                _c = np.array([_jc2, _jc1, _jo])       # the shared dome with this segment's offset
             # DOME SIGN GUARD (2026-09-08, cs017_od_v1 "curvature is not the correct sign"). When eye motion dominates
             # the dome, the trajectory's OWN parabola can have the wrong sign, and flattening onto it delivers an
             # inverted cornea (raw −67, delivered −29 ×1e-3 px/frame²; the reviewer's drawn lines were inverted too,
@@ -12945,6 +13678,16 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
             # fitted. First pass only — the caller clears the key for the residual pass, which would otherwise add
             # a whole dome to a nearly-flat residual.
             _shape = p.get("tissue_motion_shape_curv")
+            # THE IMPOSED DOME MAY NOT BE STEEPER THAN THE TISSUE SHOWS (2026-09-10, p5_os_v1_2 "too steep"): the B-scan
+            # plane's curvature is converted with the header's spacing ratio ((frame/lateral)² = 26 there against ~10
+            # elsewhere) and came out at 0.053 px/frame² where the raw edge's own frame-curvature is 0.026; the guard
+            # then imposed a dome twice as steep as the cornea. Capped at tissue_motion_shape_curv_max_ratio × the
+            # median raw central-lateral curvature (positive, ≥ 60 frames), never below the population default.
+            if _shape is not None and np.isfinite(float(_shape)) and _rawc is not None and np.isfinite(_rawc) and _rawc > 0:
+                _cap = max(float(p.get("tissue_motion_shape_curv_max_ratio", 1.5)) * float(_rawc), float(p.get("tissue_motion_shape_default", 0.02)))
+                if float(_shape) > _cap:
+                    info.setdefault("shape_curv_capped", []).append({"segment": [int(f0), int(f1)], "plane": round(float(_shape), 6), "raw_central": round(float(_rawc), 6), "used": round(_cap, 6)})
+                    _shape = _cap
             # …and a FLAT dome is not concave either (cs032_os_v1 delivered −0.3 ×1e-3, a straight line): when the own
             # coefficient is positive but below tissue_motion_shape_min_fraction of the B-scan-plane dome, the
             # trajectory is treated as motion-dominated too and the plane's dome is imposed.
@@ -12957,19 +13700,280 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
                 # so the delivered scan read as a ramp. Put the vertex at the segment's middle; only the constant
                 # is fitted. (Scans whose own parabola already has the right sign never reach this branch.)
                 _fmid = 0.5 * (float(fr[seg][0]) + float(fr[seg][-1]))
+                if (int(f0), int(f1)) in _joint:      # bridged segments share ONE vertex: the middle of the whole group
+                    _grp = [g for g in _groups if (int(f0), int(f1)) in g][0]
+                    _fmid = 0.5 * (float(_grp[0][0]) + float(_grp[-1][1]))
                 _p1 = -2.0 * _c2 * _fmid
                 _p0 = float(np.mean(pos[seg] - _c2 * fr[seg] ** 2 - _p1 * fr[seg]))
                 a[seg] = (_c2 * fr[seg] ** 2 + _p1 * fr[seg] + _p0) - pos[seg]
+                _dome_applied[(int(f0), int(f1))] = (float(_c2), float(_p1), float(_p0))
                 info.setdefault("shape_guard", []).append({"segment": [int(f0), int(f1)], "own_curv": round(float(_c[0]), 6),
                                                             "used_curv": round(_c2, 6)})
             else:
                 a[seg] = np.polyval(_c, fr[seg]) - pos[seg]   # onto the segment's own parabola (the dome)
-            b[seg] = np.polyval(np.polyfit(fr[seg], tlt[seg], 1), fr[seg]) - tlt[seg]   # keep constant + linear tilt (geometry)
+                _dome_applied[(int(f0), int(f1))] = (float(_c[0]), float(_c[1]), float(_c[2]))
+            # THE GEOMETRY LINE IS ROBUST (2026-09-10, cs037_od_v1 "slice 513 curved the wrong way"): a plain least-squares
+            # line through a tilt trajectory that is flat for 70 frames and then rolls −116 px over the last 20 is
+            # dragged by the roll; the correction (line − measured) then carries a spurious quadratic over the flat
+            # frames (+26 ×1e-3 at the edge slice, delivered curvature −9.6 against +20 in the raw). The line is fitted
+            # with MAD rejection so the majority of frames define the geometry and a short roll is removed as motion.
+            _tl = _robust_line(fr[seg], tlt[seg])
+            # A LINEAR TILT TREND IS A ROLL, NOT GEOMETRY, BEYOND A SMALL SLOPE (2026-09-10, p5_os_v1_2 "overrotations"):
+            # on a sphere the across-lateral slope of the surface does not change with the frame, so a trend of
+            # −2.2 px/frame half-span (176 px over the scan) can only be the eye rolling; only a trend up to
+            # tissue_motion_tilt_trend_max is kept, the excess is removed with the rest of the motion.
+            _tmax = p.get("tissue_motion_tilt_trend_max")                                   # None = off (default): see DEFAULT_PARAMS
+            if _tmax is not None and np.isfinite(_tl[0]) and abs(_tl[0]) > float(_tmax):
+                _tmax = float(_tmax)
+                _fm = 0.5 * (float(fr[seg][0]) + float(fr[seg][-1])); _keep = np.sign(_tl[0]) * _tmax
+                _tl = np.array([_keep, float(np.polyval(_tl, _fm)) - _keep * _fm])
+                info.setdefault("tilt_trend_capped", []).append({"segment": [int(f0), int(f1)], "trend_px_per_frame": round(float(np.polyfit(fr[seg], tlt[seg], 1)[0]), 3), "kept": round(float(_keep), 3)})
+            b[seg] = np.polyval(_tl, fr[seg]) - tlt[seg]
+            # TILT SHAPE WITNESS (2026-09-09, cs024_os_v4 "curvature becomes almost straight towards slice 513"): the
+            # correction above removes every non-linear frame-trend of the MEASURED tilt. When that trend is a
+            # measurement artefact (the raw anterior edge shows none), removing it injects its inverse into the
+            # delivered volume: the frame-curvature then varies linearly across laterals (+4 at one edge, +30 at the
+            # other, ×1e-3, against a uniform +19 in the raw). The non-linear component of the correction is therefore
+            # taken from the raw anterior edge's own tilt trajectory where that witness exists: the delivered tilt keeps
+            # the measured linear trend plus whatever non-linear shape the edge itself has, and nothing else.
+            if bool(p.get("tissue_motion_tilt_witness", True)) and _kx is not None and np.isfinite(_kx) and seg.size >= 12:
+                _fq = fr[seg]
+                _qt = np.polyval(np.polyfit(_fq, tlt[seg], 2), _fq) - np.polyval(np.polyfit(_fq, tlt[seg], 1), _fq)   # the correlation's quadratic tilt trend
+                _qn = _fq ** 2 - np.polyval(np.polyfit(_fq, _fq ** 2, 1), _fq)                                        # the pure quadratic shape
+                _qw = -float(_kx) * _qn                                       # quadratic part of the correction := −(raw curvature slope) · shape
+                # The witness may always REMOVE a quadratic tilt the tissue does not show (cs024) but may only ADD a
+                # limited amount beyond what the correlation measured: both estimates are uncertain when they say
+                # "more roll", so the added part is capped at max(2× measured, measured + tilt_witness_add_cap_px).
+                _mq = float(np.max(np.abs(_qt))); _wq = float(np.max(np.abs(_qw)))
+                _cap = max(2.0 * _mq, _mq + float(p.get("tissue_motion_tilt_witness_add_cap_px", 15.0)))
+                if _wq > _cap > 0:
+                    _qw = _qw * (_cap / _wq)
+                b[seg] = b[seg] + _qt + _qw
+                info.setdefault("tilt_witness", []).append({"segment": [int(f0), int(f1)], "measured_quad_px": round(_mq, 2),
+                                                             "raw_curv_slope": round(float(_kx), 6), "used_quad_px": round(float(np.max(np.abs(_qw))), 2), "capped": bool(_wq > _cap > 0)})
             segments.append([int(f0), int(f1)])
         f0 = f1 + 1
+    # THE EDGE SETS THE OFFSET ACROSS A DEAD GAP (2026-09-10, p1_od_v1_3 "curvature mismatch between cropped artifacts"):
+    # bridged segments share one dome SHAPE, but no live pair spans a dead gap, so each segment kept its own height —
+    # on p1_od_v1_3 the delivered cornea stepped 110 and 160 px at its two bands. The only witness across a gap is the
+    # served edge (on a band scan, the reviewer's own lines): with the dome FIXED to the one the tissue was put on
+    # (a free re-fit of the shape traded curvature for offset and mis-set cs021_od_v3 by 25 px), each segment's
+    # offset is the median of centre-line edge + a − dome over its live frames, and every segment is shifted to the
+    # longest segment's offset. Skipped for a segment whose edge is not witnessed by tissue (no level crossing within
+    # tissue_motion_gap_edge_witness_px of the edge on most of its laterals×frames).
+    _ge = p.get("_gap_edge")
+    # ONE raw-crossing witness map for the two gap stages below (first row >= 8 at which the depth-smoothed intensity
+    # reaches the witness level, per (frame, lateral)) — the same column-wise filter + argmax the offset stage used on
+    # its lateral bands, computed once for the whole width.
+    _pam = p.get("_witness_artifact_mask")
+    _pam_ok = _pam is not None and np.asarray(_pam).shape == (L, F)
+    # partially banded frames (the artifact covers some laterals) are the least trustworthy next to a gap — on
+    # cs021_od_v3 the edge follows the streak there — so they are out of every gap window
+    _partial = (np.asarray(_pam, bool).mean(axis=0) > 0.05) if _pam_ok else np.zeros(F, bool)
+    _all_segs = [(int(g0), int(g1)) for grp in _groups for (g0, g1) in grp]
+    _v = None; _lvl = None; _Tfull = None; _dxf = None
+    _want_lat = bool(p.get("tissue_motion_gap_lateral_shift", True)) and len(_all_segs) >= 2
+    _want_axial = _ge is not None and bool(p.get("tissue_motion_gap_edge_offset", True)) and any(len(g) >= 2 for g in _groups)
+    if _want_lat or _want_axial:
+        try:
+            _v = np.asarray(vol, np.float64); _pos = _v[_v > 0]
+            _lvl = min(float(p.get("tissue_motion_tilt_witness_level", 1000.0)), 0.75 * float(np.percentile(_pos, 99))) if _pos.size else 1000.0
+            del _pos
+            _Tfull = _raw_crossing_map(_v, _lvl, row_min=8)                                                    # (F, L)
+        except Exception as _e:  # noqa: BLE001
+            info["gap_witness_error"] = repr(_e)[:160]; _Tfull = None
+    # LATERAL TRANSLATION ACROSS A DEAD GAP (2026-09-10, cs020_os_v4 "the curvature is clearly different before and
+    # after the crop artifact"): the raw anterior profile z(x) after the band equals the profile before it shifted
+    # by dx ≈ −45 laterals (residual 4.8 px with the shift, 23 px without; the parabola vertex moves from lateral 332
+    # to 356) — the eye translated LATERALLY during the artifact, so slice 513 after the band images a different part
+    # of the cornea and no axial shift + tilt can meet both the centre and the outer slices (16-38 px steps stayed
+    # on display 452-507). Estimated FIRST, so the axial step/tilt below is read on laterals that hold the SAME tissue
+    # on both sides of the gap (the shift of a parabola reads as a tilt otherwise); applied as the LAST rigid stage
+    # by apply_segment_lateral_shift (whole frames rolled, chained outward from the longest segment).
+    if _want_lat and _Tfull is not None:
+        try:
+            _Tm = _Tfull.copy()
+            if _pam_ok:
+                _Tm[np.asarray(_pam, bool).T] = np.nan                                                          # artifact cells are not tissue
+            _Tm[_Tm < 8.0 + float(p.get("tissue_motion_witness_cut_margin", 6.0))] = np.nan                    # a cut cornea is not the edge
+            _Ew = np.asarray(_ge, np.float64) if (_ge is not None and np.asarray(_ge).shape == (L, F)) else None
+            _glr = _gap_lateral_shift_estimate(_Tm, live, _partial, _all_segs, p, edge=_Ew)
+            info["gap_lateral_shift"] = _glr
+            if _glr.get("applied"):
+                _dxf = segment_lateral_dx_per_frame(_glr, F)
+        except Exception as _e:  # noqa: BLE001
+            info["gap_lateral_shift_error"] = repr(_e)[:160]
+    if _want_axial and _Tfull is not None:
+        try:
+            _E = np.asarray(_ge, np.float64)
+            if _E.shape == (L, F):
+                _lc = np.arange(max(0, L // 2 - max(4, L // 8)), min(L, L // 2 + max(4, L // 8)))
+                _Ec = np.nanmedian(np.where(_E[_lc] >= float(p.get("clip_edge_floor", 8.0)), _E[_lc], np.nan), axis=0)   # (F,) centre line
+
+                def _samp(_lb):
+                    """(F, |_lb|) raw crossing and served edge at the DELIVERED laterals _lb: on a frame the lateral
+                    shift will roll by dx, delivered lateral l holds raw lateral l − dx, so both are read there (the
+                    step is then measured on the same tissue on both sides of the gap); with no shift this is
+                    exactly the previous sampling."""
+                    _Tk = _Tfull[:, _lb].copy(); _Ek = np.array(_E[_lb].T, dtype=np.float64, copy=True)
+                    if _dxf is not None:
+                        for _f in np.flatnonzero(np.abs(_dxf) > 1e-9):
+                            _ls = _lb - int(round(float(_dxf[_f]))); _m = (_ls >= 0) & (_ls < L)
+                            _Tk[_f] = np.nan; _Ek[_f] = np.nan
+                            _Tk[_f, _m] = _Tfull[_f, _ls[_m]]; _Ek[_f, _m] = _E[_ls[_m], _f]
+                    return _Tk, _Ek
+
+                # tissue witness of the edge: first crossing of the witness level near the served edge
+                _T, _Ec_ = _samp(_lc)                                                                             # (F, len(_lc))
+                _wtol = float(p.get("tissue_motion_gap_edge_witness_px", 30.0))
+                _wit = np.nanmean(np.abs(_T - _Ec_) <= _wtol, axis=1)                                             # (F,)
+                # THE TISSUE, NOT THE LINE, IS WHAT MUST MEET ACROSS THE GAP (2026-09-10, cs020_os_v4 "still does not
+                # match up, sagittal 311"): before the band the served line sat 21-39 px below the tissue's first
+                # crossing and 0-3 px from it after, so aligning the line left the tissue stepped by ~35 px. The step
+                # signal is the centre-median tissue crossing where it lies within _wtol of the line (the line is the
+                # cornea's whereabouts, the crossing its actual edge); frames without such a crossing are unwitnessed.
+                _Tc = np.nanmedian(np.where(np.abs(_T - _Ec_) <= _wtol, _T, np.nan), axis=1)                       # (F,) tissue edge at the centre
+                _Dsig = np.where(np.isfinite(_Tc), _Tc, np.nan)
+                # SHIFT AND TILT ACROSS THE GAP (2026-09-10, cs020_os_v4 "the curvatures of the left and right sides
+                # next to the crop artifact do not line up"): aligning the centre left a step of +72 px at display
+                # 452 and −2 at display 62 — the segment after the band is ROLLED relative to the one before. The
+                # step is read on five lateral bands (x = −0.75 … +0.75), fitted as s + t·x, and the segment gets
+                # both: a += s and the half-span tilt b += t (rigid per frame, as everything here).
+                _xb = np.array([-0.75, -0.375, 0.0, 0.375, 0.75]); _hw = max(3, L // 16); _Tb = []
+                for _xc in _xb:
+                    _lb = np.arange(max(0, int(round((L - 1) / 2.0 + _xc * (L - 1) / 2.0)) - _hw), min(L, int(round((L - 1) / 2.0 + _xc * (L - 1) / 2.0)) + _hw))
+                    _Tk, _Ek = _samp(_lb)                                                                       # crossing + served edge at the delivered laterals
+                    _Tk[_Tk < 8.0 + float(p.get("tissue_motion_witness_cut_margin", 6.0))] = np.nan            # a cut cornea is not the edge
+                    _Tb.append(np.nanmedian(np.where(np.abs(_Tk - _Ek) <= _wtol, _Tk, np.nan), axis=1))
+                _Tb = np.vstack(_Tb)                                                                                # (5, F)
+                _near = int(p.get("tissue_motion_gap_edge_frames", 8))
+                for grp in _groups:
+                    if len(grp) < 2:
+                        continue
+                    # MODEL-FREE: the delivered line D = edge + a over the group's live segment frames is fitted with ONE
+                    # parabola; the step at a gap is the change of (D − parabola) from the last _near live frames before
+                    # it to the first _near after it. Segments beyond the reference are shifted by the accumulated
+                    # steps and the fit is repeated until every step is under 1 px (a big step biases the first fit).
+                    # Referencing the tissue's own dome instead folded any shape mismatch between line and tissue
+                    # into a false offset (cs021_od_v3: −41…−107 px for a 2 px step).
+                    _segf = [np.array([f for f in range(g0, g1 + 1) if live[f] and np.isfinite(_Dsig[f]) and not _partial[f]], int) for g0, g1 in grp]
+                    _ref = int(np.argmax([g1 - g0 for g0, g1 in grp]))
+                    _rec = {"segments": [[g0, g1] for g0, g1 in grp], "reference": _ref, "gap_steps_px": [], "shift_px": [0.0] * len(grp), "iterations": 0}
+                    _wit_ok = [bool(_ff.size and np.nanmean(_wit[_ff[-_near:]]) >= 0.5 and np.nanmean(_wit[_ff[:_near]]) >= 0.5) for _ff in _segf]
+                    _rec["tilt_px"] = [0.0] * len(grp)
+                    _best = None                                         # (score, a copy, b copy, shift list, tilt list): the flattest iteration wins
+                    for _it in range(int(p.get("tissue_motion_gap_edge_iters", 6))):
+                        _all = np.concatenate([_ff for _ff in _segf if _ff.size])
+                        if _all.size < 12:
+                            break
+                        # per band k: the delivered tissue D_k = T_k + a + b·x_k, one parabola per band, step per gap
+                        _steps_b = np.full((_xb.size, len(grp) - 1), np.nan)
+                        for bi, _xc in enumerate(_xb):
+                            _Dk = _Tb[bi] + a + b * _xc; _okk = np.isfinite(_Dk[_all])
+                            if int(_okk.sum()) < 12:
+                                continue
+                            _Pk = np.polyval(np.polyfit(_all[_okk].astype(float), _Dk[_all][_okk], 2), np.arange(F, dtype=float)); _Rk = _Dk - _Pk
+                            for k in range(len(grp) - 1):
+                                _fa, _fb = _segf[k], _segf[k + 1]
+                                if _fa.size and _fb.size and _wit_ok[k] and _wit_ok[k + 1]:
+                                    _ra = _Rk[_fa[-_near:]]; _rb = _Rk[_fb[:_near]]
+                                    if np.isfinite(_ra).sum() >= 3 and np.isfinite(_rb).sum() >= 3:
+                                        _steps_b[bi, k] = float(np.nanmedian(_rb) - np.nanmedian(_ra))
+                        # fit s + t·x over the witnessed bands (≥ 3 bands, else shift only from what exists)
+                        _steps = []; _tilts = []
+                        for k in range(len(grp) - 1):
+                            _okb = np.isfinite(_steps_b[:, k])
+                            # the tilt is taken only from >= 4 witnessed bands AND only when the line leaves the bands
+                            # flatter than a plain shift would (a never-worse judge: a wrong side band on cs025's tail
+                            # or p1's cut slices must not roll a segment); otherwise the shift is the centre band's
+                            # step, or the median of what exists
+                            if int(_okb.sum()) >= 4:
+                                _cf = np.polyfit(_xb[_okb], _steps_b[_okb, k], 1)
+                                _s0 = float(_steps_b[2, k]) if np.isfinite(_steps_b[2, k]) else float(np.nanmedian(_steps_b[_okb, k]))
+                                _resA = np.nanmax(np.abs(_steps_b[_okb, k] - _s0)); _resB = np.nanmax(np.abs(_steps_b[_okb, k] - np.polyval(_cf, _xb[_okb])))
+                                if _resB <= 0.7 * _resA:
+                                    _steps.append(float(_cf[1])); _tilts.append(float(_cf[0]))
+                                else:
+                                    _steps.append(_s0); _tilts.append(0.0)
+                            elif int(_okb.sum()) >= 1:
+                                _s0 = float(_steps_b[2, k]) if np.isfinite(_steps_b[2, k]) else float(np.nanmedian(_steps_b[_okb, k]))
+                                _steps.append(_s0); _tilts.append(0.0)
+                            else:
+                                _steps.append(np.nan); _tilts.append(np.nan)
+                        _rec["gap_steps_px"] = [None if not np.isfinite(v) else round(v, 2) for v in _steps]
+                        _rec["gap_tilts_px"] = [None if not np.isfinite(v) else round(v, 2) for v in _tilts]; _rec["iterations"] = _it + 1
+                        # never worse than the flattest state seen: the iteration can oscillate on a short wild segment
+                        # (cs025's 17-frame tail: the centre step never went under 14 px) — keep the best and stop
+                        _score = float(np.nanmax(np.abs(_steps_b))) if np.isfinite(_steps_b).any() else float("inf")
+                        if _best is None or _score < _best[0] - 0.5:
+                            _best = (_score, a.copy(), b.copy(), list(_rec["shift_px"]), list(_rec["tilt_px"]))
+                        elif _score > _best[0] + 0.5:
+                            a[:] = _best[1]; b[:] = _best[2]; _rec["shift_px"] = list(_best[3]); _rec["tilt_px"] = list(_best[4]); _rec["reverted_to_best"] = True
+                            break
+                        _minpx = float(p.get("tissue_motion_gap_edge_min_px", 3.0))
+                        _sig = [np.isfinite(v) and (abs(v) >= _minpx or abs(t_) >= _minpx) for v, t_ in zip(_steps, _tilts)]
+                        if not any(_sig):
+                            break
+                        _steps = [v if (np.isfinite(v) and sg) else (0.0 if np.isfinite(v) else v) for v, sg in zip(_steps, _sig)]
+                        _tilts = [t_ if (np.isfinite(t_) and sg) else (0.0 if np.isfinite(t_) else t_) for t_, sg in zip(_tilts, _sig)]
+                        _sh = [0.0] * len(grp); _tl = [0.0] * len(grp); _acc = 0.0; _acct = 0.0
+                        for k in range(_ref, len(grp) - 1):
+                            if not np.isfinite(_steps[k]):
+                                break
+                            _acc -= _steps[k]; _acct -= _tilts[k]; _sh[k + 1] = _acc; _tl[k + 1] = _acct
+                        _acc = 0.0; _acct = 0.0
+                        for k in range(_ref - 1, -1, -1):
+                            if not np.isfinite(_steps[k]):
+                                break
+                            _acc += _steps[k]; _acct += _tilts[k]; _sh[k] = _acc; _tl[k] = _acct
+                        for gi, (g0, g1) in enumerate(grp):
+                            if gi != _ref and (_sh[gi] != 0.0 or _tl[gi] != 0.0):
+                                a[g0:g1 + 1] += _sh[gi]; b[g0:g1 + 1] += _tl[gi]
+                                _rec["shift_px"][gi] = round(_rec["shift_px"][gi] + _sh[gi], 2); _rec["tilt_px"][gi] = round(_rec["tilt_px"][gi] + _tl[gi], 2)
+                    info.setdefault("gap_edge_offset", []).append(_rec)
+        except Exception as _e:  # noqa: BLE001
+            info["gap_edge_offset_error"] = repr(_e)[:160]
+    # NOISY (UNMEASURABLE) RUNS: held from the main segment's nearest end, then — where the served line exists over
+    # the run — placed on the main segment's dome by the line's linear trend (2026-09-10, cs025_os_v4 "no corrected
+    # left side on the left of the crop artifact": a held run keeps its raw shape, which reads as uncorrected).
+    # a = dome_main(f) + c − linfit(line)(f); c = the main segment's own line-to-dome offset over its last frames
+    # (continuity); the line's jitter is removed by the fit so the tissue moves by a smooth rigid shift only.
+    if _noisy_mask.any() and segments:
+        try:
+            a, b = fill_unmeasured_move(a, b, _noisy_mask | ~live)
+            _ge2 = p.get("_gap_edge"); _lens = [f1 - f0 + 1 for f0, f1 in segments]; _m0, _m1 = segments[int(np.argmax(_lens))]
+            _dm = _dome_applied.get((int(_m0), int(_m1)))
+            if _ge2 is not None and _dm is not None and bool(p.get("tissue_motion_noisy_segment_line_place", True)):
+                _E2 = np.asarray(_ge2, np.float64)
+                if _E2.shape == (L, F):
+                    _lc2 = np.arange(max(0, L // 2 - max(4, L // 8)), min(L, L // 2 + max(4, L // 8)))
+                    _Ec2 = np.nanmedian(np.where(_E2[_lc2] >= float(p.get("clip_edge_floor", 8.0)), _E2[_lc2], np.nan), axis=0)
+                    _dome = lambda f: _dm[0] * f ** 2 + _dm[1] * f + _dm[2]
+                    _mf = np.array([f for f in range(_m0, _m1 + 1) if live[f] and np.isfinite(_Ec2[f])][-10:], int)
+                    if _mf.size >= 4:
+                        _c = float(np.median(_Ec2[_mf] + a[_mf] - _dome(_mf.astype(float))))
+                        for ns in info.get("noisy_segments", []):
+                            f0, f1 = ns["segment"]; _ff = np.array([f for f in range(f0, f1 + 1) if live[f] and np.isfinite(_Ec2[f])], int)
+                            if _ff.size < max(4, int(0.6 * (f1 - f0 + 1))):
+                                ns["line_placed"] = False; continue
+                            _lf = np.polyfit(_ff.astype(float), _Ec2[_ff], 1); _fr2 = np.arange(f0, f1 + 1, dtype=float)
+                            a[f0:f1 + 1] = _dome(_fr2) + _c - np.polyval(_lf, _fr2)
+                            ns["line_placed"] = True; ns["line_slope_px_per_frame"] = round(float(_lf[0]), 2)
+        except Exception as _e:  # noqa: BLE001
+            info["noisy_segment_place_error"] = repr(_e)[:120]
     if not segments:
         info["reason"] = f"no live segment of >= {min_seg} frames"
         return np.zeros(F), np.zeros(F), info
+    # FRAMES OUTSIDE EVERY SEGMENT (2026-09-10, p1_od_v1_3 frames 66-67 between two bands): a live run too short to be
+    # a segment kept a = 0 and sat 180 px off the dome. Every frame no segment covers takes the move interpolated
+    # between (or held from) the nearest segment ends; dead frames are zeroed later anyway.
+    _cov = np.zeros(F, bool)
+    for f0, f1 in segments:
+        _cov[f0:f1 + 1] = True
+    if not (_cov | _noisy_mask).all():
+        a, b = fill_unmeasured_move(a, b, ~_cov & ~_noisy_mask)
+        a[~live] = 0.0; b[~live] = 0.0                     # dead frames stay unmoved (zeroed later or empty)
+        info["filled_frames"] = int((~_cov & ~_noisy_mask & live).sum())
     sm = float(p.get("tissue_motion_smooth", 0.0) or 0.0)
     if sm > 0:
         a = ndimage.gaussian_filter1d(a, sm, mode="nearest"); b = ndimage.gaussian_filter1d(b, sm, mode="nearest")
@@ -14506,6 +15510,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                             _tinfo["drawn_top_override"] = {"error": type(_ove).__name__}
                         _ok = np.isfinite(_placed[:, _cf])
                         _pe[:, _cf] = np.where(_ok, _placed[:, _cf], _pe[:, _cf])
+                        _recon_cells = np.zeros(_pe.shape, dtype=bool); _recon_cells[:, _cf] |= _ok
                         # the DENSIFIED drawn polyline is protected (what the reviewer saw), not the points only
                         _drawn_d = np.zeros(_pe.shape, dtype=bool)
                         for _l, _r in _dtop.items():
@@ -14521,6 +15526,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                    else np.ones((_Lp, _cf.size), dtype=bool))
                         _take = np.isfinite(_rec[:, _cf]) & (~_drawn_d[:, _cf]) & (~_ok) & _abs_cf
                         _pe[:, _cf] = np.where(_take, _rec[:, _cf], _pe[:, _cf])
+                        _recon_cells[:, _cf] |= _take
                         # DE-ALTERNATE the served top along frames inside the band (lateral 472, 2026-09-05): where the
                         # present/absent witness flips every frame the line alternated ±10 px between the visible top
                         # and the estimate. A cell whose BOTH in-band neighbours are of the other class takes the
@@ -14580,6 +15586,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                     _drawn[_si2, _fi2] = True
                         _take = np.isfinite(_rec[:, _cf]) & (~_drawn[:, _cf])
                         _pe[:, _cf] = np.where(_take, _rec[:, _cf], _pe[:, _cf])
+                        _recon_cells = np.zeros(_pe.shape, dtype=bool); _recon_cells[:, _cf] |= _take
                         provided_edges = _pe
                         _crop_recon_info = {"n_frames": int(_cf.size),
                                             "n_columns_rebuilt": int(_take.sum()),
@@ -14645,8 +15652,95 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     _bp["shape_curv_px_per_frame2"] = (round(_shape_curv, 6) if np.isfinite(_shape_curv) else None)
                 except Exception:  # noqa: BLE001
                     _bp = {"curv_px_per_lat2": None}; _pex["tissue_motion_shape_curv"] = None
-                _tm_a, _tm_b, _tm_info = tissue_motion_move(vol, _pex)
+                # THE REVIEWER'S ARTIFACT BANDS ARE DEAD TO THE MEASUREMENT (2026-09-09, cs020_os_v4): the crop is applied
+                # to the delivered volume later, so the stage was correlating the artifact itself across the marked
+                # frames and the two halves of the cornea inherited an unrelated offset and dome. Zero those columns in
+                # the copy the stage measures on; a fully dead frame has no pair measurement, the halves become two
+                # live segments, and the joint dome fit (tissue_motion_bridge_max_gap) puts them on one curve.
+                # Two copies (_tissue_measurement_volume): _vol_tm0 = WHOLE-frame bands dead (>= tissue_motion_artifact_
+                # dead_frac of the laterals; a partial band stays in — zeroing it left too few bands on some pairs and a
+                # pair with no measurement gets a ZERO step, cs008_od_v1: 34 px of real motion lost) and, since
+                # 2026-09-10, _vol_tm1 = every marked CELL dead as well on frames that keep >= tissue_motion_artifact_
+                # min_live_frac un-marked laterals (p5_os_v1_2/_3: the eyelid the reviewer marked on half the width was
+                # still being correlated). The stage runs on _vol_tm0 as before; _vol_tm1 is a JUDGED candidate below.
+                _vol_tm = _vol_tm0 = vol; _vol_tm1 = None; _tm_dead = _tm_cells = 0
+                try:
+                    _am = _artifact_mask(_pex, int(vol.shape[2]), int(vol.shape[0]))     # (lateral, frame)
+                    _vol_tm1, _tm_dead, _tm_cells = _tissue_measurement_volume(vol, _am, _pex)
+                    if _tm_cells:
+                        _vol_tm0, _, _ = _tissue_measurement_volume(vol, _am, {**_pex, "tissue_motion_artifact_cells_dead": False})
+                    else:
+                        _vol_tm0, _vol_tm1 = _vol_tm1, None            # no partial band: the one copy IS today's copy
+                    _vol_tm = _vol_tm0
+                except Exception:  # noqa: BLE001
+                    _vol_tm = _vol_tm0 = vol; _vol_tm1 = None; _tm_dead = _tm_cells = 0
+                try:
+                    _pex["_witness_artifact_mask"] = _am if _am.any() else None            # (lateral, frame) reviewer artifact cells
+                except Exception:  # noqa: BLE001
+                    _pex["_witness_artifact_mask"] = None
+                _pex["_gap_edge"] = _pe                                                  # the served raw edge (L, F): offset witness across dead gaps
+                _tm_a, _tm_b, _tm_info = tissue_motion_move(_vol_tm, _pex)
+                if _tm_cells and _vol_tm1 is not None:
+                    # ARTIFACT CELLS DEAD, JUDGED (2026-09-10, p5_os_v1_2 / p5_os_v1_3 — see _tissue_measurement_volume).
+                    # The stage is run once more on the cells-dead copy and that move is kept iff the run's own
+                    # never-worse judge agrees (the pattern of the second pass and the anterior pass): both candidates
+                    # are scored on the cells-dead copy, so the artifact never scores. Read-only sweep of the 29 store
+                    # cases with crop_bands (2026-09-10): the blind rule helps every lid/blink-shaped band (anterior
+                    # judge p5_os_v1_2 4.29->1.10, cs023_od_v1 4.89->2.98, cs005_od_v5 3.08->2.56, ...) but HURTS a
+                    # ragged, growing band (cs037_od_v1 19.9->26.3, cs037_od_v1_3 4.7->12.8: only a one-sided limbus
+                    # strip is left to correlate on) — with the judge 23 keep it, 6 keep today's, 3 have no partial band.
+                    # Scored as DELIVERED: the tilt clamped at tissue_motion_max_tilt_px, as rigid_frame_warp applies it.
+                    try:
+                        _a1, _b1, _i1 = tissue_motion_move(_vol_tm1, _pex)
+                        _cf_ac = [int(f) for f in (params or {}).get("surface_crop_frames") or []]
+                        _cap_ac = float(_pex.get("tissue_motion_max_tilt_px", 40.0))
+                        _tol_ac = float(_pex.get("tissue_motion_artifact_cells_tol_px", 0.25))
+                        _s_fd = _score_rigid_move(_vol_tm1, np.asarray(_tm_a, np.float64),
+                                                  np.clip(np.asarray(_tm_b, np.float64), -_cap_ac, _cap_ac), _cf_ac)
+                        _s_cd = _score_rigid_move(_vol_tm1, np.asarray(_a1, np.float64),
+                                                  np.clip(np.asarray(_b1, np.float64), -_cap_ac, _cap_ac), _cf_ac)
+                        _keep_ac = bool(_i1.get("applied") and np.isfinite(_s_fd) and np.isfinite(_s_cd) and _s_cd <= _s_fd + _tol_ac)
+                        # THE EDGE MUST STAY CONCAVE (2026-09-10, cs037_od_v1 "slice 513 curved the wrong way, still looks
+                        # wrong"): the roughness judge preferred the whole-frame rule (19.9 vs 26.3) while that move
+                        # delivered a CONVEX outer slice (−9.6 ×1e-3 against +23 at the centre) and the cells-dead move a
+                        # concave one (+22). A move whose outer slices lose the dome is wrong whatever its roughness, so
+                        # the cells-dead candidate is also kept when it restores the edge: its edge curvature must be
+                        # ≥ 0.5 × its centre while the whole-frame candidate's edge is < 0.3 × its centre or negative.
+                        _edge_rec = None
+                        if bool(_i1.get("applied")) and not _keep_ac and bool(_pex.get("tissue_motion_artifact_cells_edge_judge", True)):
+                            try:
+                                _e0, _c0 = _delivered_edge_curvature(_vol_tm1, np.asarray(_tm_a, np.float64), np.clip(np.asarray(_tm_b, np.float64), -_cap_ac, _cap_ac), _pex, _am)
+                                _e1, _c1 = _delivered_edge_curvature(_vol_tm1, np.asarray(_a1, np.float64), np.clip(np.asarray(_b1, np.float64), -_cap_ac, _cap_ac), _pex, _am)
+                                _bad0 = np.isfinite(_e0) and np.isfinite(_c0) and _c0 > 0 and _e0 < 0.3 * _c0
+                                _good1 = np.isfinite(_e1) and np.isfinite(_c1) and _c1 > 0 and _e1 >= 0.5 * _c1
+                                _edge_rec = {"frames_dead": [round(_e0, 5), round(_c0, 5)], "cells_dead": [round(_e1, 5), round(_c1, 5)], "kept_for_edge": bool(_bad0 and _good1)}
+                                if _bad0 and _good1:
+                                    _keep_ac = True
+                            except Exception:  # noqa: BLE001
+                                _edge_rec = None
+                        _rec_ac = {"zeroed": int(_tm_cells), "kept": _keep_ac, "tol_px": _tol_ac, "edge_judge": _edge_rec,
+                                   "min_live_frac": float(_pex.get("tissue_motion_artifact_min_live_frac", 0.25)),
+                                   "scores": {"frames_dead": (round(_s_fd, 2) if np.isfinite(_s_fd) else None),
+                                              "cells_dead": (round(_s_cd, 2) if np.isfinite(_s_cd) else None)},
+                                   "frames_dead": {"shift_range": _tm_info.get("shift_range"), "tilt_max_px": _tm_info.get("tilt_max_px")},
+                                   "cells_dead": {"shift_range": _i1.get("shift_range"), "tilt_max_px": _i1.get("tilt_max_px"),
+                                                  "applied": bool(_i1.get("applied"))}}
+                        if _keep_ac:
+                            _tm_a, _tm_b, _tm_info = _a1, _b1, _i1
+                            _vol_tm = _vol_tm1                          # the kept copy is what the second pass re-measures
+                            print(f"[flatten] tissue motion: {int(_tm_cells)} reviewer artifact cells dead to the measurement "
+                                  f"(judge {_s_fd:.2f} -> {_s_cd:.2f} px)", file=sys.stderr)
+                        else:
+                            _rec_ac["reason"] = ("the cells-dead measurement could not be applied" if not _i1.get("applied")
+                                                 else "the judge could not score both candidates" if not (np.isfinite(_s_fd) and np.isfinite(_s_cd))
+                                                 else "the judge preferred the whole-frame rule")
+                        _tm_info["artifact_cells"] = _rec_ac
+                    except Exception as _ace:  # noqa: BLE001 — a judged candidate must never fail the run
+                        _tm_info["artifact_cells"] = {"zeroed": int(_tm_cells), "kept": False, "error": type(_ace).__name__}
+                _pex.pop("_gap_edge", None)                    # the mask stays for the residual pass (cs037_od_v1: an unmasked pass-2 witness re-injected 75 px of tilt)
                 _tm_info["bscan_plane"] = _bp
+                if _tm_dead:
+                    _tm_info["artifact_dead_frames"] = _tm_dead
                 if _tm_info.get("applied") and bool(_pex.get("tissue_motion_second_pass", True)):
                     # SECOND PASS (2026-09-07). The lag search is most accurate on a nearly-aligned volume, so on a
                     # scan with large motion one pass leaves a frame-common remainder: measured on the DELIVERED
@@ -14655,7 +15749,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     # must not be touched (cs008_od_v2: 0.71 px left, and a second pass made it 1.42), hence the
                     # threshold; a third pass was worse on all three, so it stops at two.
                     try:
-                        _s2 = _rigid_scratch_warp(vol, _tm_a, _tm_b)
+                        _s2 = _rigid_scratch_warp(_vol_tm, _tm_a, _tm_b)
                         _a2, _b2, _i2 = tissue_motion_move(_s2, {**_pex, "tissue_motion_shape_curv": None})   # residual pass: no shape guard
                         _left = float(_i2.get("residual_rms_px") or 0.0)
                         _min2 = float(_pex.get("tissue_motion_second_pass_min_px", 1.0))
@@ -14758,6 +15852,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                         _tm_info["band_bottom_guide"] = {"applied": False,
                                                          "reason": ("no served posterior" if _served_post is None or not _served_cf
                                                                     else f"lateral mismatch {getattr(_served_post, 'shape', None)} vs {_pe.shape}")}
+                    _pex.pop("_witness_artifact_mask", None)
                     _tissue_move = {"a": [float(v) for v in _tm_a], "b": [float(v) for v in _tm_b]}
                     _xl_tm = (np.arange(_pe.shape[0], dtype=np.float64) - (_pe.shape[0] - 1) / 2.0)
                     _xl_tm /= max(1e-9, np.abs(_xl_tm).max())
@@ -14782,6 +15877,55 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         # and the delivered anterior edge scored 19.4 px off its own parabola against 7.0 for the same move on a
         # padded canvas. So reserve the move: the top pad absorbs the largest UPWARD move, and _bot_pad below the
         # largest DOWNWARD one. Costs rows on a big-motion scan and nothing on a quiet one.
+        # THE RECONSTRUCTED LINE FOLLOWS THE ANTERIOR DOME (2026-09-10, p1_od_v1_3 "some parts of the edges are aligned
+        # while others are not", display 409): on a slice whose cornea is cut by the frame top the served line is a
+        # reconstruction (bottom − thickness, else posterior continuity), and on p1 it sat 65-100 px lower before the
+        # band than the measured surface after it. Once the rigid move is known, every reconstructed cell is re-placed
+        # on the DELIVERED anterior dome of its own slice: a parabola over frames fitted to the delivered line of the
+        # measured (non-reconstructed) cells of that slice and its ±8 neighbours (≥ 30 cells spanning ≥ 40 frames),
+        # mapped back to raw rows by subtracting the move. Cells with no such witness keep the reconstruction.
+        # The tissue is untouched (it is cut there); only the line the reviewer sees and the pad sizing change.
+        _recon_refined = None
+        try:
+            if (_tm_used and _tissue_move is not None and isinstance(locals().get("_recon_cells"), np.ndarray)
+                    and bool(_pex.get("crop_recon_anterior_dome", True)) and _recon_cells.any()):
+                _ta_ = np.asarray(_tissue_move.get("a") or [], np.float64); _tb_ = np.asarray(_tissue_move.get("b") or [], np.float64)
+                _Lr, _Fr = _pe.shape
+                if _ta_.size == _Fr and _tb_.size == _Fr:
+                    _xr = (np.arange(_Lr, dtype=np.float64) - (_Lr - 1) / 2.0) / max(1e-9, (_Lr - 1) / 2.0)
+                    _Dl = _pe.astype(np.float64) + _ta_[None, :] + _tb_[None, :] * _xr[:, None]          # delivered line
+                    _meas = np.isfinite(_pe) & ~_recon_cells
+                    _fr_ = np.arange(_Fr, dtype=np.float64); _n_ref = 0; _pe_new = _pe.copy(); _hw = 8
+                    for _l in range(_Lr):
+                        if not _recon_cells[_l].any():
+                            continue
+                        _lo, _hi = max(0, _l - _hw), min(_Lr, _l + _hw + 1)
+                        _mm = _meas[_lo:_hi]; _cells = np.argwhere(_mm)
+                        if _cells.shape[0] < 30:
+                            continue
+                        _ff = _cells[:, 1].astype(np.float64); _yy = _Dl[_lo:_hi][_mm]
+                        if (_ff.max() - _ff.min()) < 40:
+                            continue
+                        _cf_ = np.polyfit(_ff, _yy, 2)
+                        _rc = np.flatnonzero(_recon_cells[_l])
+                        _pe_new[_l, _rc] = (np.polyval(_cf_, _fr_[_rc]) - _ta_[_rc] - _tb_[_rc] * _xr[_l]).astype(_pe.dtype)
+                        _n_ref += int(_rc.size)
+                    if _n_ref:
+                        _pe = _pe_new; provided_edges = _pe
+                        _recon_refined = {"cells": int(_n_ref), "of": int(_recon_cells.sum())}
+                        _moved = _pe.astype(np.float64) + _ta_[None, :] + _tb_[None, :] * _xr[:, None]
+                        if np.isfinite(_moved).any():
+                            _above = min(_above, float(np.nanmin(_moved)))
+                        try:
+                            _bc_dir2 = Path(out_nifti).resolve().parent.parent / "border_cache"; _bc_dir2.mkdir(parents=True, exist_ok=True)
+                            _tmp_pl2 = _bc_dir2 / "placed_edges.tmp.npz"; np.savez_compressed(_tmp_pl2, surface=np.asarray(_pe, dtype=np.float32)); os.replace(_tmp_pl2, _bc_dir2 / "placed_edges.npz")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        print(f"[crop] reconstructed line re-placed on the anterior dome: {_n_ref} cells", file=sys.stderr)
+        except Exception as _rre:  # noqa: BLE001 — never fail the run over the refinement
+            _recon_refined = {"error": type(_rre).__name__}
+        if isinstance(_tm_info, dict) and _recon_refined is not None:
+            _tm_info["recon_anterior_dome"] = _recon_refined
         _up_px = _dn_px = 0.0
         if _tm_used and _tissue_move is not None:
             try:
@@ -15250,12 +16394,34 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         corrected, n_crop = _apply_crop(corrected, p_all)          # zeroes cells, moves nothing
         if n_crop:
             info["crop"] = {"n_voxels": n_crop}
+        # PER-SEGMENT LATERAL TRANSLATION (2026-09-10, cs020_os_v4 "the curvature is clearly different before and after
+        # the crop artifact"): the eye also moved ALONG THE LATERAL AXIS during the artifact band, so the segment after
+        # it is rolled back as WHOLE frames (integer dx, zero fill; see tissue_motion_move / _gap_lateral_shift_
+        # estimate). The LAST rigid stage: after the band zeroing so the zeroed artifact cells travel with their
+        # frame, and on the CLOSED ledger so every recorded depth field and the served edge are column-rolled with
+        # the tissue they describe — the corrected pane's line (placed + move + pad) stays on the tissue. Best-effort.
+        _entries = _ledger_close(); _lat_dx = None
+        _gls = _tm_info.get("gap_lateral_shift") if isinstance(_tm_info, dict) else None
+        if _gls and bool(p_all.get("tissue_motion_gap_lateral_shift", DEFAULT_PARAMS.get("tissue_motion_gap_lateral_shift", True))):
+            try:
+                corrected, _pe_sh, _entries, _lsi = apply_segment_lateral_shift(
+                    corrected, _gls, provided_edges, _entries, canvas_pad=int(_ext_pad_used), out_nifti=out_nifti, params=p_all)
+                info["lateral_shift"] = _lsi
+                if _lsi.get("applied"):
+                    _lat_dx = np.asarray(_lsi.get("dx_per_frame"), dtype=np.float32)
+                    if _pe_sh is not None:
+                        provided_edges = _pe_sh
+                    print(f"[lateral-shift] segments {_lsi.get('segments')} rolled by {_lsi.get('dx')} laterals "
+                          f"({_lsi.get('frames_shifted')} frames)", file=sys.stderr)
+            except Exception as _lse:  # noqa: BLE001 — the last stage must never fail the run
+                info["lateral_shift"] = {"applied": False, "error": f"{type(_lse).__name__}: {_lse}"}
         write_volume_nifti(corrected, out_nifti, sp)
         # PERSIST THE EXACT APPLIED MOVE (option (b), 2026-09-09) — after the write so the stamp is the delivered
         # file's. corrected_row = raw_row + _ext_pad_used + move; the bottom pad shifts no row. Best-effort.
-        info["applied_move"] = write_applied_move_cache(out_nifti, _ledger_close(),
+        info["applied_move"] = write_applied_move_cache(out_nifti, _entries,
                                                         (int(corrected.shape[2]), int(corrected.shape[0])),
-                                                        canvas_pad=int(_ext_pad_used), bottom_pad=int(_bot_pad))
+                                                        canvas_pad=int(_ext_pad_used), bottom_pad=int(_bot_pad),
+                                                        lateral_dx=_lat_dx)
         # QA on the fix-columns path too. Like the surface-crop branch this hardcodes metrics=[] /
         # axial_metrics=[] (it is a single same-canvas warp, no iterate loop), so without this the
         # delivered volume carries no quality number at all. Latent today (0/308 are 'redetect') but

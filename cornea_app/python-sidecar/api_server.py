@@ -3303,6 +3303,11 @@ def vet_preprocessing(case_id: str, req: VetRequest | None = None) -> dict:
     updates["border_gt"] = ({"confirmed": True, "corpus_eligible": corpus_eligible,
                              "n_slices": ns, "n_points": npts, "anchors_sig": sig,
                              "ts": round(time.time(), 1)} if npts > 0 else None)
+    # APPROVAL LEAVES THE QUEUE (2026-09-10): the "to-review" flag marks a scan queued for this review pass; once
+    # approved it must not keep populating the ◆ To review filter (six approved scans did until cleared by hand).
+    _m0 = orch.read_manifest(cid); _fl = _m0.get("review_flags")
+    if isinstance(_fl, list) and "to-review" in _fl:
+        updates["review_flags"] = [f for f in _fl if f != "to-review"]
     m = orch.write_manifest_value(cid, updates)
     return {"ok": True, "preproc_vetted": bool(m.get("preproc_vetted")), "border_gt": m.get("border_gt")}
 
@@ -3365,6 +3370,33 @@ def set_defect_marks(case_id: str, req: DefectMarksRequest) -> dict:
         marks.append(entry)
     m = orch.write_manifest_value(_require_case(case_id), {"defect_marks": marks})
     return {"ok": True, "defect_marks": m.get("defect_marks", [])}
+
+
+class RejectRequest(BaseModel):
+    reject: bool = True
+    note: str | None = None
+
+
+@app.post("/api/case/{case_id}/reject")
+def set_rejected_unfixable(case_id: str, req: RejectRequest) -> dict:
+    """REJECT = UNFIXABLE (reviewer, 2026-09-10: "add another button called reject. Serve up scans that have been
+    fixed and if I determine unfixable I will reject"). Distinct from difficult_scan (a scan that is hard and may
+    come back): a rejected scan leaves the approval queue for good — manifest.rejected_unfixable = {ts, note} — and
+    its "to-review" flag is dropped. reviewer_rejected is stamped too so the review counter sees it. Manifest-only;
+    reject=false undoes it. A CONFIRMED border_gt is never touched."""
+    cid = _require_case(case_id)
+    m0 = orch.read_manifest(cid)
+    values: dict = {}
+    if bool(req.reject):
+        values["rejected_unfixable"] = {"ts": round(time.time(), 1), "note": (req.note or "").strip() or None}
+        values["reviewer_rejected"] = m0.get("reviewer_rejected") or {"ts": round(time.time(), 1)}
+        fl = m0.get("review_flags")
+        if isinstance(fl, list) and "to-review" in fl:
+            values["review_flags"] = [f for f in fl if f != "to-review"]
+    else:
+        values["rejected_unfixable"] = None
+    m = orch.write_manifest_value(cid, values)
+    return {"ok": True, "rejected_unfixable": m.get("rejected_unfixable"), "review_flags": m.get("review_flags", [])}
 
 
 class DifficultRequest(BaseModel):
@@ -7808,6 +7840,8 @@ def cases_list() -> dict:
                 # Rejected BY THE REVIEWER, as distinct from difficult_scan (which bulk preprocessing also
                 # sets). This is what the review counter is built on.
                 "reviewer_rejected": bool(m.get("reviewer_rejected")),
+                # REJECTED AS UNFIXABLE (the ✗ Reject → next button): out of the approval queue for good.
+                "rejected_unfixable": bool(m.get("rejected_unfixable")),
                 # The rejection reason travels with the flag so the sidebar can show WHY a scan was rejected
                 # on hover, without opening it. Text only — the timestamp stays in the manifest.
                 "difficult_reason": (((m.get("difficult_reason") or {}).get("text"))

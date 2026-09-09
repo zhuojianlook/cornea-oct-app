@@ -32,7 +32,7 @@ def _api():
 def test_pipeline_version_is_a_nonempty_string():
     assert isinstance(oct_mod.PIPELINE_VERSION, str)
     assert oct_mod.PIPELINE_VERSION.strip()
-    assert oct_mod.PIPELINE_VERSION == "2026-09-09.tissue-v6"
+    assert oct_mod.PIPELINE_VERSION == "2026-09-10.tissue-v8"
 
 
 def test_every_return_of_preprocess_oct_to_nifti_stamps_the_record():
