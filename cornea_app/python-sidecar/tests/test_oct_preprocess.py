@@ -2039,6 +2039,63 @@ class TestInteriorPairGuard:
         assert not i1.get("interior_pairs_replaced") and np.allclose(a0, a1) and np.allclose(b0, b1)
 
 
+class TestCutBandVote:
+    """p1_od_v1_2 (2026-09-09): laterals whose cornea is cut by the frame top lock their correlation to lag 0 and
+    out-vote a real move; with the rule they vote only when they agree with the un-cut fit."""
+
+    def _vol(self):
+        F = 60; fr = np.arange(F, dtype=float)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=0.3 * fr)
+        vol[30:] = np.roll(vol[30:], 12, axis=1)                                     # one real 12 px step at pair 29
+        # the LEFT quarter of every frame is cut by the frame top: tissue-bright from row 0 down to the posterior
+        L = vol.shape[2]; D = vol.shape[1]; rows = np.arange(D)[:, None]
+        lo = L // 4
+        vol[:, :, :lo] = np.where(rows < 110, 900.0 + 300.0 * np.random.default_rng(1).uniform(0, 1, (F, D, lo)), vol[:, :, :lo])
+        return vol
+
+    def test_cut_bands_no_longer_outvote_a_real_move(self):
+        vol = self._vol(); p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False}
+        a_old, _, i_old = M.tissue_motion_move(vol, {**p, "tissue_motion_cut_vote": False})
+        a_new, _, i_new = M.tissue_motion_move(vol, {**p, "tissue_motion_cut_vote": True})
+        assert i_new.get("cut_demoted_pairs", 0) > 0 and max(i_new["cut_bands_per_pair"]) > 0
+        step_old = (a_old[30] - a_old[29]) - (a_old[29] - a_old[28]); step_new = (a_new[30] - a_new[29]) - (a_new[29] - a_new[28])
+        # the delivered step at pair 29 (trajectory is −Σlag: a 12 px deeper frame moves the trajectory by −12)
+        assert abs(step_new + 12.0) < 2.5, (step_old, step_new)
+        assert abs(step_new + 12.0) < abs(step_old + 12.0)
+
+    def test_guard_keeps_the_pair_once_the_vote_is_clean(self):
+        vol = self._vol(); p = {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": True}
+        a_new, _, i_new = M.tissue_motion_move(vol, {**p, "tissue_motion_cut_vote": True})
+        assert not any(r["pair"] == 29 for r in (i_new.get("interior_pairs_replaced") or [])), i_new.get("interior_pairs_replaced")
+        assert abs((a_new[30] - a_new[29]) - (a_new[29] - a_new[28]) + 12.0) < 2.5
+
+    def test_all_cut_frame_still_votes(self):
+        # a surface-crop band frame: nearly every band cut → no demotion, the old vote stands
+        F = 40; vol = _synth_moving_dome(F=F, frame_curv=0.03); D = vol.shape[1]; rows = np.arange(D)[:, None]
+        vol[:, :, :] = np.where(rows < 110, 900.0 + 300.0 * np.random.default_rng(2).uniform(0, 1, vol.shape), vol)
+        a, _, i = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_cut_vote": True})
+        assert i.get("cut_demoted_pairs", 0) == 0
+
+
+class TestAnteriorPass:
+    def test_common_residual_recovers_a_frame_wide_wave(self):
+        F = 60; fr = np.arange(F, dtype=float); wave = 4.0 * np.sin(fr / 4.0)
+        vol = _synth_moving_dome(frame_curv=0.03, motion=wave)          # the same wave on every lateral
+        r = M.anterior_common_residual(vol)
+        k = np.isfinite(r) & (fr > 5) & (fr < F - 6)
+        assert k.sum() > 30 and np.corrcoef(r[k], wave[k])[0, 1] > 0.9 and abs(np.std(r[k]) - np.std(wave[k])) < 1.5
+
+    def test_clean_dome_has_no_common_residual(self):
+        vol = _synth_moving_dome(frame_curv=0.03, motion=np.zeros(60))
+        r = M.anterior_common_residual(vol); k = np.isfinite(r)
+        assert k.sum() > 30 and np.sqrt(np.nanmean(r[k] ** 2)) < 1.0
+
+    def test_crop_and_dead_frames_are_excluded_from_the_fit(self):
+        F = 60; vol = _synth_moving_dome(frame_curv=0.03, motion=np.zeros(F)); live = np.ones(F, bool); live[50:] = False
+        r = M.anterior_common_residual(vol, live=live, crop_frames=list(range(0, 8)))
+        assert np.isfinite(r).sum() > 30
+
+
 class TestDomeSignGuard:
     def test_bscan_plane_curvature_is_positive_and_motion_free(self):
         vol = _synth_moving_dome(motion=np.linspace(-40, 40, 60) ** 1)   # a huge linear drift across frames

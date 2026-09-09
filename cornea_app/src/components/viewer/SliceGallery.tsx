@@ -3086,11 +3086,11 @@ const PROP_SLICE_BAND = 20;
                             .then((acc) => setCorrAccurate(acc))
                             .catch(() => { /* marking is a judgement; a failed write must not block the review */ });
                         }}
-                        title={"Mark this sagittal slice ACCURATE — the DETECTED edge here follows the true surface, whether or not it is smooth.\n\n"
-                          + "That is the point: on a verified slice the gap to the blue quadratic is REAL shape, not detector\n"
-                          + "error, so nothing should try to flatten it. Other slices are judged against the deviation you\n"
-                          + "verified as real here, not against zero. On a fold your marked slices are pinned frame-by-frame.\n\n"
-                          + "Marking changes nothing in the volume. Click again to unmark."}
+                        title={"Mark this sagittal slice ACCURATE — the line here already sits on the true surface, whether or not it is smooth.\n\n"
+                          + "What the mark does: on the next Regenerate the line on this slice is pinned frame-by-frame as it is, and\n"
+                          + "exported as ground truth. Other slices are judged against the deviation you confirmed as real here.\n\n"
+                          + "What it does NOT do: it does not move the tissue. The per-frame move is measured from the tissue itself,\n"
+                          + "so a mark cannot make the corrected scan smoother — it confirms the line. Click again to unmark."}
                         style={{ background: isT ? "rgba(52,211,153,0.18)" : "none",
                                  border: "1px solid", borderColor: isT ? "#34d399" : "var(--c-border)",
                                  borderRadius: 4, color: isT ? "#34d399" : "var(--c-text-dim)",
@@ -3394,7 +3394,7 @@ const PROP_SLICE_BAND = 20;
                                   border: "1px solid #34d399", background: "rgba(52,211,153,0.12)", borderRadius: 4,
                                   overflow: "hidden", whiteSpace: "nowrap" }}>
                               <button onClick={() => jumpToSlice(a.lateral)}
-                                title={`Slice ${dispSlice(a.lateral)} — verified accurate at ${(a.base as number).toFixed(2)} px, `
+                                title={`Slice ${dispSlice(a.lateral)} — line confirmed accurate at ${(a.base as number).toFixed(2)} px, `
                                   + `now ${(a.now as number).toFixed(2)} px. Click to go back and look at it.`}
                                 style={{ border: "none", background: "none", color: "#a7f3d0", fontSize: 10,
                                          padding: "0px 4px", cursor: "pointer" }}>

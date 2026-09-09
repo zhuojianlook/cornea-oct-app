@@ -42,7 +42,8 @@ from sklearn.pipeline import make_pipeline
 # mode "tissue" too, and every future change would need a new heuristic.
 #   2026-09-07.tissue-v3  corrections path = tissue-measured per-frame move + judged second pass, canvas
 #                         reserved (pad + bottom_pad) with reserved rows left BLACK (no synthetic fill).
-PIPELINE_VERSION = "2026-09-07.tissue-v3"
+#   2026-09-09.tissue-v4  cut (top-clipped) bands are second-class voters in the tissue-motion fit (p1_od_v1_2 step at frame 28)
+PIPELINE_VERSION = "2026-09-09.tissue-v4"
 
 # Defaults mirror DICOMSmootherSteps.py's sidebar defaults + the lossless converter.
 DEFAULT_PARAMS: dict = {
@@ -321,6 +322,8 @@ DEFAULT_PARAMS: dict = {
     "fill_empty_margins": False,           # post-warp margin fill — OFF (reverted 2026-09-07); the pad is filled before the warp instead
     "margin_fill_src": 24,                 # rows of real background sampled per column for that fill
     "tissue_motion_cut_guard": 40,         # rows masked at the top of a column whose tissue starts at the canvas edge (a cut, not anatomy)
+    "tissue_motion_cut_vote": True,        # 2026-09-09 (p1_od_v1 step at frame 28): a CUT band votes only when it agrees with the un-cut fit
+    "tissue_motion_cut_vote_min_fraction": 0.25,   # un-cut bands needed (fraction of the pair's bands, and >= min_bands) to demote the cut ones
     "tissue_motion_shape_default": 0.02,       # px/frame²: the dome used when the B-scan plane cannot be measured (sign is ALWAYS enforced)
     "pool_close_grace_s": 20.0,   # seconds a finished worker pool may take to exit before its children are killed
     "tissue_motion_interior_pair_guard": True,   # 2026-09-08: a split-vote interior pair takes its neighbours' mean (cs020 step at frame 38: −5→−2 px; 0 replacements on 5 control scans)
@@ -333,6 +336,10 @@ DEFAULT_PARAMS: dict = {
     "tissue_motion_shape_min_fraction": 0.5,  # a dome flatter than this fraction of the B-scan-plane dome is treated as motion-dominated
     "tissue_motion_shape_sign_guard": True,   # replace a sign-wrong trajectory parabola with the B-scan-plane dome (first pass only)
     "move_max_pad": 400,                       # cap on the canvas reserved for the per-frame move (crop_max_pad is for crops)
+    "tissue_motion_anterior_pass": True,   # judged shift-only pass on the frame-common ANTERIOR residual the bulk correlation leaves (2026-09-09)
+    "tissue_motion_anterior_cap_px": 8.0,
+    "tissue_motion_anterior_smooth": 1.0,
+    "tissue_motion_anterior_min_px": 0.5,
     "tissue_motion_second_pass": True,     # re-measure on the once-moved volume and fold in what is still available
     "tissue_motion_second_pass_min_px": 1.0,   # only when this much rigid move is still left (else the scan is converged)
     "tissue_motion_second_pass_max_px": 15.0,  # (legacy, unused: the second pass is judged by _score_rigid_move)
@@ -3841,6 +3848,40 @@ def _fill_empty_margins(vol: np.ndarray, p: dict | None = None) -> np.ndarray:
         return out
     except Exception:  # noqa: BLE001 — cosmetic; never fail a run over it
         return np.asarray(vol)
+
+
+def anterior_common_residual(volume: np.ndarray, live=None, crop_frames=None, thr: float = 1000.0,
+                             lat_step: int = 4) -> np.ndarray:
+    """Per-frame residual of the ANTERIOR edge shared by all laterals (px, NaN where unmeasurable).
+
+    For every sampled lateral the first row crossing `thr` is taken across frames (a threshold crossing, the same
+    witness the judge uses — never the DP detector), each lateral is fitted with its own deg-2 over the live,
+    non-crop frames, and the per-frame MEDIAN over laterals of (edge − own parabola) is returned. Positive = the
+    edge sits deeper than its parabola in that frame on most laterals. The tissue correlation tracks the BULK of
+    the stroma; where the anterior disagrees with it frame-wide this is the rigid, per-frame part of that
+    disagreement. `volume` is (frames, depth, lateral)."""
+    v = np.asarray(volume); F, D, L = int(v.shape[0]), int(v.shape[1]), int(v.shape[2])
+    fr = np.arange(F, dtype=np.float64)
+    lv = np.ones(F, dtype=bool) if live is None else np.asarray(live, bool).ravel()[:F]
+    band = {int(f) for f in (crop_frames or [])}
+    fit_ok = lv & np.array([f not in band for f in range(F)])
+    rows = []
+    _margin = int(min(24, max(2, L // 8)))                     # 24 laterals on a 513-wide scan; scaled down for small volumes
+    for l in range(_margin, L - _margin, max(1, int(lat_step))):
+        g = ndimage.gaussian_filter1d(v[:, :, l].astype(np.float64), 1.5, axis=1)      # (F, D)
+        hit = g >= thr; ok = hit.any(axis=1)
+        y = np.where(ok, np.argmax(hit, axis=1), np.nan).astype(np.float64)
+        k = np.isfinite(y) & fit_ok
+        if int(k.sum()) < 30:
+            continue
+        med = float(np.nanmedian(y[k])); k &= (y > med - 80.0) & (y < med + 120.0)     # drop artifact-block crossings
+        if int(k.sum()) < 30:
+            continue
+        r = y - np.polyval(np.polyfit(fr[k], y[k], 2), fr)
+        rows.append(np.where(k, r, np.nan))
+    if len(rows) < min(8, 4):
+        return np.full(F, np.nan)
+    return np.nanmedian(np.array(rows), axis=0)
 
 
 def _score_rigid_move(volume: np.ndarray, a, b, crop_frames=None, pad: int = 120, lat_step: int = 8,
@@ -12193,6 +12234,8 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
     n = 1 << int(np.ceil(np.log2(2 * D)))
     lag_tab = np.arange(-max_lag, max_lag + 1)          # MONOTONIC table (lag 0 / -1 must be interior for the refinement)
     M = np.full((lats.size, F - 1), np.nan, dtype=np.float64)
+    CUT = np.zeros((lats.size, F - 1), dtype=bool)   # band i is cut (tissue-bright at the top rows) in frame j or j+1
+    cut_vote = bool(p.get("tissue_motion_cut_vote", False)); cut_frac = float(p.get("tissue_motion_cut_vote_min_fraction", 0.25))
     for i, l in enumerate(lats):
         cols = vol[:, :, l - band:l + band + 1].mean(axis=2).T.astype(np.float64)      # (D, F)
         nz = cols > 0                                                                   # zero rows = canvas pad / cut
@@ -12205,6 +12248,7 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
             _bright = float(np.percentile(cols[nz], 90)) if nz.any() else 0.0
             _cut = (cols[:3, :].mean(axis=0) > 0.5 * _bright) if _bright > 0 else np.zeros(cols.shape[1], dtype=bool)
             if _cut.any():
+                CUT[i] = _cut[:-1] | _cut[1:]
                 _cut_pair = _cut.copy(); _cut_pair[:-1] |= _cut[1:]; _cut_pair[1:] |= _cut[:-1]
                 # never mask more than 30% of a column's visible rows (thin visible tissue keeps enough to correlate)
                 _g = int(min(cut_guard, 0.3 * float(nz.sum(axis=0).min())))
@@ -12237,6 +12281,7 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
         M[i] = best
     da = np.zeros(F - 1); db = np.zeros(F - 1); nb = np.zeros(F - 1, dtype=int); tilt_fitted = np.zeros(F - 1, dtype=bool)
     spread = np.full(F - 1, np.nan)                       # per-pair MAD of the band lags about their linear fit (blunder witness)
+    cut_demoted: list = []
     for j in range(F - 1):
         v = M[:, j]; ok = np.isfinite(v)
         if int(ok.sum()) < min_bands:
@@ -12244,12 +12289,24 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
         # outliers are judged against the LINEAR fit (a tilted frame's extreme laterals are the signal, not
         # outliers — judged against the median they were dropped and the tilt came out at half its size)
         keep = ok.copy()
-        if (x[ok].max() - x[ok].min()) >= 1.0:
-            X = np.vstack([np.ones(int(ok.sum())), x[ok]]).T
-            sol0 = np.linalg.lstsq(X, v[ok], rcond=None)[0]; r = np.abs(v[ok] - X @ sol0)
+        # CUT BANDS ARE SECOND-CLASS VOTERS (2026-09-09, p1_od_v1_2 "an obvious step" at frame 28→29): a column whose
+        # cornea is cut by the frame top keeps that cut (and the guard's mask edge) at the SAME row in both frames,
+        # so its correlation locks to lag 0 whatever the tissue did — 25 such bands voted "no motion" against a real
+        # 12 px move, the fit landed at 7 px with MAD 4.9, and the interior guard then discarded the pair as a blunder
+        # (the step was delivered untouched). When enough un-cut bands exist, the fit is taken on them alone and a cut
+        # band re-enters only if it agrees; with too few un-cut bands (a surface-crop band frame) all bands vote as before.
+        base = ok
+        if cut_vote:
+            okc = ok & ~CUT[:, j]
+            if int(okc.sum()) >= max(min_bands, int(np.ceil(cut_frac * float(ok.sum())))) and int(okc.sum()) < int(ok.sum()):
+                base = okc; cut_demoted.append(int(j))
+        if (x[base].max() - x[base].min()) >= 1.0:
+            X = np.vstack([np.ones(int(base.sum())), x[base]]).T
+            sol0 = np.linalg.lstsq(X, v[base], rcond=None)[0]
+            r = np.abs(v[ok] - np.vstack([np.ones(int(ok.sum())), x[ok]]).T @ sol0)
         else:
-            r = np.abs(v[ok] - float(np.median(v[ok])))
-        mad = float(np.median(r)) + 1e-6
+            r = np.abs(v[ok] - float(np.median(v[base])))
+        mad = float(np.median(r[base[ok]])) + 1e-6
         spread[j] = mad
         keep[ok] = r <= 3.5 * mad + 1.0
         da[j] = float(np.median(v[keep])); nb[j] = int(keep.sum())
@@ -12257,6 +12314,10 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
             X = np.vstack([np.ones(int(keep.sum())), x[keep]]).T
             sol = np.linalg.lstsq(X, v[keep], rcond=None)[0]
             da[j], db[j] = float(sol[0]), float(sol[1]); tilt_fitted[j] = True
+    _mdump = os.environ.get("CORNEA_DUMP_MOTION")                        # debug: dump the per-band lag matrix (blunder audit)
+    if _mdump:
+        os.makedirs(_mdump, exist_ok=True); _mk = int(os.environ.get("_CORNEA_DUMP_MOTION_K", "0")); os.environ["_CORNEA_DUMP_MOTION_K"] = str(_mk + 1)
+        np.savez(os.path.join(_mdump, f"motion_call{_mk}.npz"), M=M, lats=lats, spread=spread, da=da, db=db, nb=nb, x=x)
     # frame pairs with NO measurement (a zeroed crop_region / blink block, an empty canvas frame): no lag is
     # invented across them — the trajectory is integrated with a zero step there and the dome is fitted PER
     # CONTIGUOUS LIVE SEGMENT, so a dead block can neither ramp the trajectory nor bend the parabola of the live
@@ -12324,6 +12385,9 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
         if _fixed:
             info["interior_pairs_replaced"] = _fixed
     info["pair_spread"] = [None if not np.isfinite(v) else round(float(v), 2) for v in spread]
+    info["cut_bands_per_pair"] = [int(v) for v in CUT.sum(axis=0)]
+    if cut_demoted:
+        info["cut_demoted_pairs"] = int(len(cut_demoted))
     info["bands_per_pair"] = [int(v) for v in nb]          # per-pair agreement count: the decorrelation witness
     pos = -np.concatenate([[0.0], np.cumsum(da)])        # frame f+1 is SHALLOWER by the lag → position falls by it
     tlt = -np.concatenate([[0.0], np.cumsum(db)])
@@ -13940,6 +14004,45 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                         del _s2
                     except Exception as _s2e:  # noqa: BLE001 — a refinement must never fail the run
                         _tm_info["pass2"] = {"applied": False, "error": type(_s2e).__name__}
+                # ANTERIOR PASS (2026-09-09). The correlation tracks the bulk of the stroma; the reviewer judges the
+                # anterior edge. Where the two disagree by a frame-wide amount there is a rigid per-frame shift the
+                # tissue move left on the table (measured on the delivered volumes: 3.6 px frame-common on
+                # cs020_od_v1, 2.6 on cs002, 1.0 on cs009). Shift-only, capped, smoothed, live frames only, and
+                # JUDGED by the same never-worse score as the second pass — it is rejected where it does not help
+                # (p1_od_v1, cs015) and accepted where it does (cs020_od_v1 4.73→4.24, cs002 2.03→1.77 median).
+                if _tm_info.get("applied") and bool(_pex.get("tissue_motion_anterior_pass", True)):
+                    try:
+                        _s3 = _rigid_scratch_warp(vol, _tm_a, _tm_b)
+                        _live3 = np.zeros(int(_s3.shape[0]), dtype=bool)
+                        for _f0, _f1 in (_tm_info.get("segments") or [[0, int(_s3.shape[0]) - 1]]):
+                            _live3[max(0, int(_f0)):min(int(_s3.shape[0]), int(_f1) + 1)] = True
+                        _cf3 = [int(f) for f in (params or {}).get("surface_crop_frames") or []]
+                        _res3 = anterior_common_residual(_s3, _live3, _cf3)
+                        _cap3 = float(_pex.get("tissue_motion_anterior_cap_px", 8.0))
+                        _a3 = -np.clip(np.nan_to_num(_res3, nan=0.0), -_cap3, _cap3)
+                        _a3 = ndimage.gaussian_filter1d(_a3, float(_pex.get("tissue_motion_anterior_smooth", 1.0)), mode="nearest")
+                        _a3[~_live3] = 0.0
+                        _left3 = float(np.sqrt(np.nanmean(np.square(_res3[_live3])))) if np.isfinite(_res3[_live3]).any() else 0.0
+                        _keep3 = False
+                        if _left3 >= float(_pex.get("tissue_motion_anterior_min_px", 0.5)) and np.abs(_a3).max() > 0.0:
+                            _s_cur = _score_rigid_move(vol, _tm_a, _tm_b, _cf3)
+                            _s_ant = _score_rigid_move(vol, np.asarray(_tm_a, np.float64) + _a3, _tm_b, _cf3)
+                            _keep3 = bool(np.isfinite(_s_cur) and np.isfinite(_s_ant) and _s_ant < _s_cur - 0.05)
+                            _tm_info["anterior_pass_scores"] = {"before": (round(_s_cur, 2) if np.isfinite(_s_cur) else None),
+                                                                "after": (round(_s_ant, 2) if np.isfinite(_s_ant) else None)}
+                        if _keep3:
+                            _tm_a = np.asarray(_tm_a, np.float64) + _a3
+                            _tm_info["anterior_pass"] = {"applied": True, "common_left_px": round(_left3, 2),
+                                                         "shift_range": [round(float(_a3.min()), 1), round(float(_a3.max()), 1)]}
+                            _tm_info["shift_range"] = [round(float(np.min(_tm_a)), 1), round(float(np.max(_tm_a)), 1)]
+                            print(f"[flatten] anterior pass applied ({_left3:.2f} px frame-common anterior residual)", file=sys.stderr)
+                        else:
+                            _tm_info["anterior_pass"] = {"applied": False, "common_left_px": round(_left3, 2),
+                                                         "reason": ("below threshold" if _left3 < float(_pex.get("tissue_motion_anterior_min_px", 0.5))
+                                                                    else "the judge preferred the tissue move alone")}
+                        del _s3
+                    except Exception as _s3e:  # noqa: BLE001
+                        _tm_info["anterior_pass"] = {"applied": False, "error": type(_s3e).__name__}
                 if _tm_info.get("applied"):
                     # BOTTOM-EDGE GUIDE FOR THE CROP BAND (reviewer 2026-09-05): inside the band the anterior does not
                     # exist, so the band's per-frame move is refined until the SERVED POSTERIOR (detector + the

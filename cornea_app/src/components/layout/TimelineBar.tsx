@@ -873,23 +873,22 @@ export function TimelineBar() {
           onClick={() => void foldToOriginalAndRerun()}
           startIcon={busyAction === "rerun" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
           title={(rawDirty ? "NOTE: you have unconfirmed edits on the ORIGINAL pane — they are not part of this regenerate. Confirm them first if you want them in.\n\n" : "")
-            + "REGENERATE the corrected scan from every slice you have verified on it (~2 min).\n\n"
-            + "Both kinds of verification count and are treated the same way:\n"
-            + "  \u2022 slices you DREW on — those depths are written into the original scan's edge, replacing the\n"
-            + "    earlier raw anchor wherever they disagree;\n"
-            + "  \u2022 slices you MARKED accurate — pinned frame-by-frame to the surface you vouched for, so the\n"
-            + "    new scan has to reproduce them.\n\n"
-            + "The whole correction is then re-run from that improved ground truth, so the defect is not\n"
-            + "re-created — nothing is warped after the fact.\n\n"
-            + "Your drawings set the EDGE LINE the scan is flattened to; they do not by themselves move frames\n"
-            + "(a per-frame move fitted from a few hand-drawn lines measured worse than none — cs002, 2026-09-05).\n"
-            + "The per-frame move itself is measured from the tissue (adjacent-frame correlation of the whole B-scan).\n\n"
+            + "REGENERATE: write the lines you confirmed on this corrected scan into the ground truth, then re-run (~2 min).\n\n"
+            + "What goes in:\n"
+            + "  \u2022 slices you DREW on — those depths become the original scan's edge line, replacing the earlier\n"
+            + "    raw anchor wherever they disagree;\n"
+            + "  \u2022 slices you MARKED accurate — their line is pinned frame-by-frame as it is.\n\n"
+            + "What this changes: the EDGE LINE drawn on both panes and the exported ground truth.\n"
+            + "What it does NOT change: the tissue. The per-frame move is measured from the tissue itself\n"
+            + "(adjacent-frame correlation of the whole B-scan), not from your lines — a move fitted from hand-drawn\n"
+            + "lines measured worse than none (cs002, 2026-09-05). So drawing or marking here cannot make the\n"
+            + "corrected scan smoother; it makes the line right where you have checked it.\n\n"
             + "Your verifications are CLEARED afterwards: they described the previous corrected scan, and the next\n"
             + "round starts on the one just produced. Their readings are kept in oct_iter.corrected_fold, and the\n"
             + "pre-run anchors are snapshotted to cases/<id>/fold_backup/prefold_<ts>.json."}
           sx={ACT_SX}>
           {busyAction === "rerun" ? "Regenerating…"
-            : `\u2934 Regenerate from ${foldableLats} verified slice${foldableLats === 1 ? "" : "s"}`}
+            : `\u2934 Confirm ${foldableLats} slice${foldableLats === 1 ? "" : "s"} into the ground truth & re-run`}
         </Button>
       )}
       {/* The "why the smooth-align did nothing" line went with its button (2026-09-01). It explained declines of
