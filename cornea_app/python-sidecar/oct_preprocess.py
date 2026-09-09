@@ -43,7 +43,11 @@ from sklearn.pipeline import make_pipeline
 #   2026-09-07.tissue-v3  corrections path = tissue-measured per-frame move + judged second pass, canvas
 #                         reserved (pad + bottom_pad) with reserved rows left BLACK (no synthetic fill).
 #   2026-09-09.tissue-v4  cut (top-clipped) bands are second-class voters in the tissue-motion fit (p1_od_v1_2 step at frame 28)
-PIPELINE_VERSION = "2026-09-09.tissue-v4"
+#   2026-09-09.tissue-v5  exact applied move persisted by the run (corrected pane carry), band line between drawn slices = their
+#                         interpolation (crop_estimate_source="drawn"), chord witness dp-v8.2, band cell witness keep
+#   2026-09-09.tissue-v6  tissue-motion cut-guard mask per PAIR (symmetric, from the first non-zero row): the second pass on a
+#                         scratch-warped band scan no longer invents a shift+tilt step at the band boundary (p4_os_v1_2 frame 17)
+PIPELINE_VERSION = "2026-09-09.tissue-v6"
 
 # Defaults mirror DICOMSmootherSteps.py's sidebar defaults + the lossless converter.
 DEFAULT_PARAMS: dict = {
@@ -233,7 +237,11 @@ DEFAULT_PARAMS: dict = {
     "crop_place_estimate_fallback": True,
     "crop_drawn_top_override": False,  # OFF (2026-09-08): built, but the band columns are placed by the crop reconstruction, not by the flatten target — the delta never reached the tissue (cs020: 334/434 unchanged); opt-in until that path carries it
     "crop_drawn_top_reach": 64,        # laterals over which that drawn offset is carried to un-drawn neighbours (fading)
-    "crop_estimate_source": "parabola",    # "parabola" = each slice's un-cropped parabola extrapolated (curvature); "drawn" = the reviewer's in-band estimate
+    "crop_estimate_source": "drawn",       # 2026-09-09 (p1_od_v1_3 slice 378): the band LINE between two drawn slices is the interpolation of the
+                                           #   reviewer's lines ("drawn"); each slice's own un-cropped parabola only where no drawn lines bracket it
+                                           #   within crop_estimate_reach laterals. The parabola alone was fitted through a blink dip there and put
+                                           #   the line 180 px under the cut edge while the reviewer's neighbouring lines agreed within 5 px.
+    "crop_estimate_reach": 120,            # laterals: a drawn slice farther than this does not define the band line (the parabola does)
     "crop_place_present_tol": 20.0,        # a "present" band cell farther than this from the calibrated estimate is treated as absent
                                   # px: physical guard — on a cell whose top rows are bright tissue the apex cannot
                                   #   sit INSIDE the frame, so a placed top deeper than this row is clamped to it
@@ -284,6 +292,17 @@ DEFAULT_PARAMS: dict = {
     # (cs002: median 5.5 px, up to 35 px off the segments the reviewer saw — "the edges I corrected seem to
     # change"). Densify every drawn line along frames so what they saw is what every consumer gets.
     "densify_drawn_polylines": True,
+    # CHORD WITNESS (2026-09-09, p1_od_v1_2 slice 289): a stroke gap whose straight chord the RAW slice says runs
+    # through tissue (or through air far above the surface) is NOT bridged — the gap is left to the interpolation,
+    # exactly what the folded-lateral guard already does. The auto surface is never the yardstick (the reviewer
+    # draws where the auto is wrong); the witnesses are the raw bright-edge crossing and the chord row's own
+    # boundary contrast, calibrated on this lateral's drawn points. See chord_witness_refusals.
+    "chord_witness": True,
+    "chord_witness_max_dev": 12.0,    # px from the raw bright-edge crossing before a chord frame counts as off the surface
+    "chord_witness_conf_lo": 0.35,    # chord-row contrast / this lateral's drawn-point contrast below which there is no boundary there
+    "chord_witness_min_run": 5,       # failing frames in a row (1-frame holes closed) that refuse the gap; shorter gaps are never judged
+    "chord_witness_end_tol": 12.0,    # both drawn endpoints must agree with the witness this closely, else the gap is bridged as before
+    "chord_witness_fill_margin": 2.0, # a refusal stands only if the fill beats the chord by this many px against the same witness (chord_fill_check)
     # Laterals whose raw anchors were FOLDED from corrected-pane edits (regenerate, transform mode). They repair the
     # SERVED surface where the auto detector was weak (so the pane line is right where the reviewer drew), but
     # they must NOT drive the flatten's drawn-frame fit: the per-frame transform was fitted for the flatten as it
@@ -323,6 +342,8 @@ DEFAULT_PARAMS: dict = {
     "margin_fill_src": 24,                 # rows of real background sampled per column for that fill
     "tissue_motion_cut_guard": 40,         # rows masked at the top of a column whose tissue starts at the canvas edge (a cut, not anatomy)
     "tissue_motion_cut_vote": True,        # 2026-09-09 (p1_od_v1 step at frame 28): a CUT band votes only when it agrees with the un-cut fit
+    "crop_place_witness_keep": True,       # 2026-09-09 (p1_od_v1_2 display 233): a band cell whose first bright run starts at the served top is PRESENT
+    "crop_place_witness_tol": 4.0,         #   ... within this many px; the estimate never replaces an image-witnessed top
     "tissue_motion_cut_vote_min_fraction": 0.25,   # un-cut bands needed (fraction of the pair's bands, and >= min_bands) to demote the cut ones
     "tissue_motion_shape_default": 0.02,       # px/frame²: the dome used when the B-scan plane cannot be measured (sign is ALWAYS enforced)
     "pool_close_grace_s": 20.0,   # seconds a finished worker pool may take to exit before its children are killed
@@ -1317,6 +1338,9 @@ DEFAULT_PARAMS: dict = {
     # that are pure noise (no coherent cornea surface, ~zero edge contrast). Auto-detected + zeroed before SAM2
     # (like the manual #9 crop). Only LONG boundary blocks are cut, so a faint cornea EDGE is never removed.
     "auto_crop_region": True,
+    "crop_noise_tissue_contrast": 0.3,     # 2026-09-09: a boundary frame whose depth-profile ridge stands this far above its median AND
+    "crop_noise_dome_r2": 0.6,             #   forms a concave dome across laterals (parabola R² >= this, curvature >= crop_noise_dome_curv
+    "crop_noise_dome_curv": 0.75e-3,       #   px/lateral²) is never cropped as noise (p6_os_v1: the detector lost a dim deep cornea)
     "crop_noise_frac": 0.20,   # a frame is "no cornea" if its edge contrast < this fraction of the cornea frames'
     "crop_noise_min_run": 10,  # ...and only a contiguous boundary run of >= this many such frames is cropped
     "crop_noise_max_frac": 0.75,  # safety: never auto-crop more than this fraction of frames (a failed scan)
@@ -4759,6 +4783,47 @@ def detect_noise_frames(sag: np.ndarray, params: dict | None = None, workers: in
         return []
     ref = float(np.median(pos[-max(5, pos.size // 4):]))
     low = con < ref * float(p.get("crop_noise_frac", 0.20))
+    # TISSUE-DOME WITNESS (2026-09-09, p6_os_v1: 25 frames of real cornea zeroed): the edge-contrast score is the
+    # DETECTOR's confidence, and when the detector loses a dim, deep cornea it traces noise above it and scores ~0
+    # — indistinguishable from an empty frame. The image itself is not ambiguous: per lateral band (16 bands over
+    # the central 80 %), the depth profile's smoothed peak row is the tissue ridge; on a cornea those rows form a
+    # CONCAVE parabola across laterals (curvature > 0, R² high) and stand well above the profile median. A frame
+    # that passes is never "noise", whatever the detector scored. An eyelid/blink band is bright too but flat or
+    # convex (cs037_od_v1_3 frames 89-100: curvature −0.6..+0.5e-3), so the dome test, not brightness alone, is
+    # what separates them (measured on the 5 auto-cropped store scans: p6 / cs049 frames all concave R² ≥ 0.95;
+    # cs017 73-81 and cs025 80-88 were real cornea zeroed with the eyelid frames beyond them).
+    _tw = float(p.get("crop_noise_tissue_contrast", 0.3) or 0.0)
+    if _tw > 0:
+        try:
+            _r2_min = float(p.get("crop_noise_dome_r2", 0.6)); _cv_min = float(p.get("crop_noise_dome_curv", 0.75e-3))
+            _nb = 16; _L = int(sag.shape[0]); _edges = np.linspace(int(_L * 0.1), int(_L * 0.9), _nb + 1).astype(int)
+            _wit = np.zeros(nf, dtype=bool)
+            for _f in range(nf):
+                if not low[_f]:
+                    continue
+                xs = []; ys = []; cs = []
+                for _i in range(_nb):
+                    _prof = np.asarray(sag[_edges[_i]:max(_edges[_i] + 1, _edges[_i + 1]), :, _f], np.float64).mean(axis=0)
+                    _sm = ndimage.gaussian_filter1d(_prof, 4.0); _r = int(np.argmax(_sm)); _bg = float(np.median(_sm))
+                    _c = (float(_sm[_r]) - _bg) / max(_bg, 1.0)
+                    if _c >= 0.15:
+                        xs.append(0.5 * (_edges[_i] + _edges[_i + 1])); ys.append(float(_r)); cs.append(_c)
+                if len(xs) >= 8 and float(np.median(cs)) >= _tw:
+                    _cf = np.polyfit(np.asarray(xs), np.asarray(ys), 2); _res = np.asarray(ys) - np.polyval(_cf, np.asarray(xs))
+                    _r2 = 1.0 - float(_res.var()) / max(1e-9, float(np.asarray(ys).var()))
+                    if _r2 >= _r2_min and float(_cf[0]) >= _cv_min:
+                        _wit[_f] = True
+            # an ISOLATED witnessed frame inside a low run (both neighbours low and un-witnessed) is a marginal pass,
+            # not evidence of cornea (cs037_od_v1_3: one eyelid frame at +0.53e-3 would otherwise break an 11-frame
+            # noise run and un-crop the whole eyelid); two or more in a row, or one next to a kept frame, stand.
+            _iso = _wit.copy()
+            for _f in np.flatnonzero(_wit):
+                _lo_l = (_f - 1 < 0) or (low[_f - 1] and not _wit[_f - 1]); _lo_r = (_f + 1 >= nf) or (low[_f + 1] and not _wit[_f + 1])
+                _iso[_f] = bool(_lo_l and _lo_r)
+            _wit &= ~_iso
+            low &= ~_wit
+        except Exception:  # noqa: BLE001 — the witness is a guard; on failure the old rule stands
+            pass
     run = int(p.get("crop_noise_min_run", 10))
     out: list[int] = []
     f = 0; lead = []
@@ -5233,10 +5298,19 @@ def place_top_from_thickness(top_served: np.ndarray, bottom: np.ndarray, crop_fr
     if cf:
         _cfa = np.asarray(cf, dtype=int); _xs = np.arange(L, dtype=np.float64)
         if _est_src == "drawn":
+            _reach = float(p.get("crop_estimate_reach", 120) or 0)
             for f in cf:
                 col = dta[:, f]; okc = np.isfinite(col)
                 if okc.sum() >= 2:
-                    est[:, f] = np.interp(_xs, _xs[okc], col[okc])
+                    ks = _xs[okc]
+                    v = np.interp(_xs, ks, col[okc])
+                    if _reach > 0:
+                        # only BETWEEN drawn slices that are both within reach; beyond that the parabola stands
+                        idx = np.searchsorted(ks, _xs)
+                        dl = np.where(idx > 0, _xs - ks[np.clip(idx - 1, 0, ks.size - 1)], np.inf)
+                        dr = np.where(idx < ks.size, ks[np.clip(idx, 0, ks.size - 1)] - _xs, np.inf)
+                        v = np.where((dl <= _reach) & (dr <= _reach), v, np.nan)
+                    est[:, f] = v
         # THE CURVATURE COMES FROM THE UN-CROPPED FRAMES (reviewer 2026-09-05, sagittal 133: "the corrected slice does
         # not actually raise those columns to preserve the curvature"): each slice's own parabola through its served
         # top OUTSIDE the crop, extrapolated into the band. The reviewer's in-band top estimates are nearly flat just
@@ -5268,6 +5342,8 @@ def place_top_from_thickness(top_served: np.ndarray, bottom: np.ndarray, crop_fr
         # sitting inside a clipped column, lateral 200 frames 0-3) — otherwise the line alternates 20 px between
         # the two sources frame to frame. The ceiling stays; the motion still comes from bottom − T.
         _tol = float(p.get("crop_place_present_tol", 20.0))
+        _wit_keep = bool(p.get("crop_place_witness_keep", True)); _wit_tol = float(p.get("crop_place_witness_tol", 4.0))
+        info_witness_kept = [0]
         for sl in range(L):
             vis = [f for f in cf if (not absent[sl, f]) and np.isfinite(ts[sl, f]) and np.isfinite(est[sl, f])]
             if len(vis) >= 1:                                   # even one visible cell is real evidence (472 had two)
@@ -5276,11 +5352,23 @@ def place_top_from_thickness(top_served: np.ndarray, bottom: np.ndarray, crop_fr
                     est[sl, _cfa] = est[sl, _cfa] + off
             for f in cf:
                 if (not absent[sl, f]) and np.isfinite(ts[sl, f]) and np.isfinite(est[sl, f]) and abs(ts[sl, f] - est[sl, f]) > _tol:
+                    # IMAGE-WITNESSED TOP STAYS PRESENT (p1_od_v1_2 display 233, 2026-09-09): the tolerance rule above
+                    # exists for a detector sitting INSIDE a clipped column; it also fired on a genuinely visible
+                    # surface whose slice parabola was 25-35 px off (a blink distorts the flanks), and the pane line
+                    # then jumped 20-30 px above the tissue on frames 35-40. When the first bright run of the column
+                    # starts at (or within crop_place_witness_tol px of) the served top and that start lies inside the
+                    # frame, the image itself confirms the top — air above, tissue below — and the estimate must not
+                    # replace it. A clipped column (run start < floor) or a served top inside the run is unaffected.
+                    if _wit_keep and tr is not None and np.isfinite(tr[sl, f]) and tr[sl, f] >= floor \
+                            and abs(float(tr[sl, f]) - float(ts[sl, f])) <= _wit_tol:
+                        info_witness_kept[0] += 1
+                        continue
                     absent[sl, f] = True
     info = {"model": model, "source": source, "flank_frames": int(K), "n_bands": 0,
             "n_slices_drawn_left": 0, "n_slices_drawn_right": 0, "n_slices_served": 0, "n_slices_fallback": 0,
             "n_candidates_rejected": 0, "n_clamped": 0, "n_slope_gated": 0, "n_placed": 0,
             "n_placed_override_drawn": 0, "n_top_present_kept": 0, "n_ceiling_clamped": 0, "n_estimate_fallback": 0,
+            "n_witness_kept": (int(info_witness_kept[0]) if cf else 0),
             "thickness": {"median": None, "p10": None, "p90": None},
             "boundary": {"left_median": None, "right_median": None}}
     if not cf:
@@ -5738,7 +5826,7 @@ def auto_tune_detector(sag: np.ndarray, params: dict | None = None, n_sample: in
 
 
 def densify_anchor_polylines(anchors, depth: int | None = None, enabled: bool = True,
-                             reference=None, max_dev: float = 12.0, guarded_slices=None) -> dict:
+                             reference=None, max_dev: float = 12.0, guarded_slices=None, refuse_gaps=None) -> dict:
     """{int slice: {int frame: depth}} with every gap between consecutive drawn frames on a slice filled by
     LINEAR interpolation — the straight segment the fix-columns editor draws between two points. Frames outside
     a slice's drawn span are left alone (the reviewer did not draw there). A gap touching an ABSENT sentinel
@@ -5784,6 +5872,7 @@ def densify_anchor_polylines(anchors, depth: int | None = None, enabled: bool = 
         except Exception:  # noqa: BLE001 — a bad reference must never break pinning; fall back to bridging
             return None
         return None
+    _refused = _refused_gap_sets(refuse_gaps)
     for s_key, frames in (anchors or {}).items():
         try:
             si = int(s_key)
@@ -5817,9 +5906,267 @@ def densify_anchor_polylines(anchors, depth: int | None = None, enabled: bool = 
                     ok = np.isfinite(rr)
                     if ok.any() and float(np.max(np.abs(chord[ok] - rr[ok]))) > float(max_dev):
                         continue                    # separate strokes: leave the gap to the interpolation
+                # the folded-lateral reference guard above keeps precedence (review 2026-09-09): a gap it refuses stays
+                # WHOLLY open — the witness's per-run logic must not put chord fragments back on those laterals
+                # (cs042_os_v1_3: 1411 cells moved 5-80 px onto a two-point chord the old guard had rejected).
+                if _refused is not None and (f0, f1) in _refused.get(si, {}):
+                    _open = _refused[si][(f0, f1)]            # chord witness (raw image): leave the failing frames open
+                    if _open is None:
+                        continue                              # the whole gap
+                    for f in range(f0 + 1, f1):
+                        if not any(lo <= f <= hi for lo, hi in _open):
+                            row[f] = d0 + (d1 - d0) * (f - f0) / float(f1 - f0)    # the chord where it sits on the surface
+                    continue
                 for f in range(f0 + 1, f1):
                     row[f] = d0 + (d1 - d0) * (f - f0) / float(f1 - f0)
         out[si] = row
+    return out
+
+
+def _refused_gap_sets(refuse_gaps):
+    """{int lateral: {(f0, f1), ...}} from any of the forms a refusal set travels in: chord_witness_refusals' dict
+    {lateral: {(f0, f1): rec}}, a dict of lists, or the JSON-safe list [[lateral, f0, f1], ...] handed to the worker.
+    None / empty → None (nothing refused)."""
+    if not refuse_gaps:
+        return None
+    out: dict[int, dict] = {}
+
+    def _runs(rec):
+        r = rec.get("runs") if isinstance(rec, dict) else (rec if isinstance(rec, (list, tuple)) else None)
+        try:
+            t = tuple((int(a), int(b)) for a, b in (r or []))
+        except (TypeError, ValueError):
+            t = ()
+        return t or None                       # None → the whole gap is left open
+    try:
+        if isinstance(refuse_gaps, dict):
+            for k, v in refuse_gaps.items():
+                si = int(k)
+                if isinstance(v, dict):
+                    for g, rec in v.items():
+                        out.setdefault(si, {})[(int(g[0]), int(g[1]))] = _runs(rec)
+                else:
+                    for g in v:
+                        out.setdefault(si, {})[(int(g[0]), int(g[1]))] = _runs(g[2] if len(g) > 2 else None)
+        else:
+            for g in refuse_gaps:
+                if isinstance(g, dict):
+                    out.setdefault(int(g["lateral"]), {})[(int(g["f0"]), int(g["f1"]))] = _runs(g)
+                else:
+                    out.setdefault(int(g[0]), {})[(int(g[1]), int(g[2]))] = _runs(g[3] if len(g) > 3 else None)
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+    return out or None
+
+
+def _longest_true_run(mask) -> int:
+    best = cur = 0
+    for v in np.asarray(mask, bool):
+        cur = cur + 1 if v else 0
+        best = max(best, cur)
+    return int(best)
+
+
+def _true_runs(mask, min_len: int = 1) -> list:
+    """[(i0, i1), ...] inclusive index ranges of the True runs of `mask` with length >= min_len."""
+    m = np.asarray(mask, bool); out = []; i = 0; n = m.size
+    while i < n:
+        if not m[i]:
+            i += 1; continue
+        j = i
+        while j + 1 < n and m[j + 1]:
+            j += 1
+        if j - i + 1 >= int(min_len):
+            out.append((int(i), int(j)))
+        i = j + 1
+    return out
+
+
+def chord_witness_refusals(sag: np.ndarray, anchors, params: dict | None = None) -> dict:
+    """{int lateral: {(f0, f1): rec}} of stroke gaps whose straight chord the RAW sagittal slice refuses.
+
+    `sag` = (lateral, depth, frames), depth 0 = frame top — sag[s] is the slice the editor shows. Only gaps with
+    >= chord_witness_min_run interior frames are judged; ABSENT-sentinel gaps are skipped like densify does.
+    Never reads a detected surface, never moves or drops a drawn point.
+
+    WHY (p1_od_v1_2 slice 289, 2026-09-09): a fast drag stores {frame: depth}, so a lifted pointer (or a stroke
+    that ran on the served edge and was auto-cleared) leaves a gap the consumers bridged with a straight chord.
+    On slice 271 that chord started inside a blink dip and ran 45 px under the apex for 28 frames; the un-drawn
+    slices next to it are interpolated from it, so slice 289 was served 16 px deep although nobody drew it. The
+    earlier reference=auto guard was retired because the reviewer draws exactly where the auto is wrong; the
+    yardstick here is the image:
+      W1  the raw bright-edge crossing per frame (_first_bright_run on the ±2-lateral mean — the crop
+          placement's own absence witness); a chord frame is OFF the surface when |chord − W1| > max_dev;
+      W2  the chord row's own boundary contrast (mean of 6 rows below − 6 rows above on the smoothed slice)
+          divided by the median contrast at THIS lateral's drawn points; < conf_lo means no boundary there
+          (inside tissue: bright above and below; in air: dark above and below).
+    A frame fails only when BOTH hold, a gap is refused when >= min_run failing frames run consecutively (a
+    single passing frame does not break the run), and the gap is judged at all only when both drawn endpoints
+    agree with W1 within end_tol — the reviewer's own points vouch for the witness on that gap. Every failure
+    mode of the witness (a faint layer, a flare, an eyelid band, a top-clipped column, no bright run) falls back
+    to bridging, i.e. today's behaviour."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not bool(p.get("chord_witness", True)):
+        return {}
+    A = _normalize_anchors(anchors)
+    if not A:
+        return {}
+    arr = np.asarray(sag)
+    if arr.ndim != 3:
+        return {}
+    L, D, F = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+    max_dev = float(p.get("chord_witness_max_dev", 12.0)); c_lo = float(p.get("chord_witness_conf_lo", 0.35))
+    min_run = max(1, int(p.get("chord_witness_min_run", 5))); end_tol = float(p.get("chord_witness_end_tol", 12.0))
+    floor = float(p.get("clip_edge_floor", 8.0))
+    out: dict = {}
+    if D < 16 or F < 3:
+        return out
+    for s in sorted(A):
+        if not (0 <= s < L):
+            continue
+        row = A[s]; fr = sorted(row)
+        gaps = [(f0, f1) for f0, f1 in zip(fr[:-1], fr[1:])
+                if (f1 - f0 - 1) >= min_run and row[f0] < D - 1 and row[f1] < D - 1 and 0 <= f0 and f1 < F]
+        if not gaps:
+            continue
+        try:
+            sm = ndimage.gaussian_filter(np.ascontiguousarray(arr[s]).astype(np.float64), (1.0, 0.6))
+            top, _ = _first_bright_run(arr[max(0, s - 2):s + 3].astype(np.float32).mean(axis=0), p)
+        except Exception:  # noqa: BLE001 — a witness that cannot be computed refuses nothing
+            continue
+        top = np.where(np.isfinite(top) & (top < floor), np.nan, top)         # bright from the frame top → unscorable
+
+        def contrast(rows, frames):
+            ei = np.clip(np.round(np.asarray(rows, np.float64)).astype(int), 6, D - 7)
+            fi = np.asarray(frames, int)
+            below = np.mean([sm[ei + j, fi] for j in range(1, 7)], axis=0)
+            above = np.mean([sm[ei - j, fi] for j in range(1, 7)], axis=0)
+            return below - above
+
+        dr = np.array(fr, int); dd = np.array([row[f] for f in fr], np.float64)
+        okp = (dr >= 0) & (dr < F) & (dd >= 0) & (dd < D - 1)
+        if okp.sum() < 1:
+            continue
+        c_pts = contrast(dd[okp], dr[okp])
+        ref_c = float(np.median(c_pts[c_pts > 0])) if (c_pts > 0).any() else float("nan")
+        for f0, f1 in gaps:
+            d0, d1 = row[f0], row[f1]
+            if not (np.isfinite(top[f0]) and np.isfinite(top[f1]) and abs(d0 - top[f0]) <= end_tol and abs(d1 - top[f1]) <= end_tol):
+                continue                                                      # uncalibrated → bridged as before
+            fs = np.arange(f0 + 1, f1)
+            chord = d0 + (d1 - d0) * (fs - f0) / float(f1 - f0)
+            dev = chord - top[fs]                                             # > 0: chord below the top (inside tissue); < 0: above (air)
+            if np.isfinite(ref_c) and ref_c > 0:
+                cn = contrast(chord, fs) / ref_c
+            else:
+                cn = np.full(fs.size, np.nan)
+            fail = np.isfinite(dev) & (np.abs(dev) > max_dev) & np.isfinite(cn) & (cn < c_lo)
+            closed = fail.copy()
+            if closed.size >= 3:
+                closed[1:-1] |= fail[:-2] & fail[2:]
+            runs = _true_runs(closed, min_run)
+            # a passing stretch shorter than min_run BETWEEN two failing runs is where the chord merely crosses the
+            # surface on its way through a dip (1-3 frames within max_dev, with contrast): absorbed, or it is served
+            # as an isolated chord fragment — a 16-30 px spike on p1 slices 271 / 289 (2026-09-09).
+            if len(runs) > 1:
+                merged = [list(runs[0])]
+                for i0, i1 in runs[1:]:
+                    if i0 - merged[-1][1] - 1 < min_run:
+                        merged[-1][1] = i1
+                    else:
+                        merged.append([i0, i1])
+                runs = [(a, b) for a, b in merged]
+            if runs:
+                # ONLY THE FAILING RUN(S) ARE LEFT OPEN (review 2026-09-09): the frames of the gap where the chord
+                # sits on the surface (within max_dev of W1, with a boundary there) keep the chord — refusing the
+                # whole gap threw those frames to a fill 8-18 px inside the tissue (cs002_os_v1 lateral 392).
+                sel = np.zeros(fs.size, bool)
+                for i0, i1 in runs:
+                    sel[i0:i1 + 1] = True
+                md = float(np.nanmedian(dev[sel & np.isfinite(dev)])) if (sel & np.isfinite(dev)).any() else float("nan")
+                out.setdefault(s, {})[(int(f0), int(f1))] = {
+                    "run": int(max(i1 - i0 + 1 for i0, i1 in runs)), "runs": [[int(fs[i0]), int(fs[i1])] for i0, i1 in runs],
+                    "n_frames": int(fs.size), "med_dev": round(md, 1), "reason": ("tissue" if md > 0 else "air")}
+    return out
+
+
+def chord_fill_check(sag: np.ndarray, anchors, refused: dict, filled: np.ndarray, params: dict | None = None):
+    """Keep a refusal only when what REPLACES the chord is closer to the image than the chord was.
+
+    `filled` = the served surface built WITH `refused` left open (lateral, frames). For every refused gap the
+    median |surface − W1| over the gap frames (W1 = the raw bright-edge crossing, as in chord_witness_refusals)
+    is compared for the chord and for the fill; the gap stays refused only if the fill wins by
+    chord_witness_fill_margin px. Why: on the dense route the fill is the across-lateral interpolation of the
+    nearest laterals that still have a knot at that frame; when nearly every drawn line on a scan is a
+    two-point chord (cs017_od_v3, cs020_od_v4: 15 of 15 judged gaps refused) those knots are 100+ laterals
+    away and the fill lands 50-90 px off, worse than the 45 px chord it replaced. The chord is then kept — the
+    served line is never made worse than today by the witness's own yardstick.
+    Returns (kept: {lateral: {(f0, f1): rec}}, dropped: [rec, ...]) — dropped recs carry both distances."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if not refused:
+        return {}, []
+    margin = float(p.get("chord_witness_fill_margin", 2.0)); c_lo = float(p.get("chord_witness_conf_lo", 0.35))
+    A = _normalize_anchors(anchors); arr = np.asarray(sag); S = np.asarray(filled, np.float64)
+    if arr.ndim != 3 or S.ndim != 2:
+        return refused, []
+    L, D, F = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+    floor = float(p.get("clip_edge_floor", 8.0))
+    kept: dict = {}; dropped: list = []
+    for s in sorted(refused):
+        row = A.get(int(s)) or {}
+        try:
+            top, _ = _first_bright_run(arr[max(0, s - 2):s + 3].astype(np.float32).mean(axis=0), p)
+            sm = ndimage.gaussian_filter(np.ascontiguousarray(arr[s]).astype(np.float64), (1.0, 0.6))
+        except Exception:  # noqa: BLE001
+            kept[s] = dict(refused[s]); continue
+        top = np.where(np.isfinite(top) & (top < floor), np.nan, top)
+
+        def contrast(rows, frames):
+            ei = np.clip(np.round(np.asarray(rows, np.float64)).astype(int), 6, D - 7); fi = np.asarray(frames, int)
+            return (np.mean([sm[ei + j, fi] for j in range(1, 7)], axis=0) - np.mean([sm[ei - j, fi] for j in range(1, 7)], axis=0))
+
+        fr_s = np.array(sorted(row), int); dd_s = np.array([row[f] for f in sorted(row)], np.float64)
+        okp = (fr_s >= 0) & (fr_s < F) & (dd_s >= 0) & (dd_s < D - 1)
+        c_pts = contrast(dd_s[okp], fr_s[okp]) if okp.any() else np.zeros(0)
+        ref_c = float(np.median(c_pts[c_pts > 0])) if (c_pts > 0).any() else float("nan")
+        for (f0, f1), rec in refused[s].items():
+            if f0 not in row or f1 not in row or not (0 <= s < S.shape[0]) or f1 >= S.shape[1]:
+                kept.setdefault(s, {})[(f0, f1)] = rec; continue
+            _runs = rec.get("runs") if isinstance(rec, dict) else None
+            fs = np.concatenate([np.arange(int(lo), int(hi) + 1) for lo, hi in _runs]) if _runs else np.arange(f0 + 1, f1)
+            fs = fs[(fs > f0) & (fs < f1) & (fs < top.size)]
+            ok = np.isfinite(top[fs]) if fs.size else np.zeros(0, bool)
+            if not ok.any():
+                kept.setdefault(s, {})[(f0, f1)] = rec; continue
+            chord = row[f0] + (row[f1] - row[f0]) * (fs - f0) / float(f1 - f0)
+            d_chord = float(np.median(np.abs(chord[ok] - top[fs][ok])))
+            d_fill = float(np.median(np.abs(S[s, fs][ok] - top[fs][ok])))
+            # THE FILL MUST ITSELF BE WITNESSED (review 2026-09-09, cs042_os_v1_3): W1 can be a structure above the
+            # cornea (an eyelid touching it on the middle frames) — then the chord on the real surface reads as
+            # "inside tissue", and a fill judged by W1 alone replaced 2 px-correct chords with an auto 13 px off on
+            # an approved scan. The fill row must show a boundary (its own contrast, normalised like the chord's,
+            # at/above conf_lo on most open frames); a fill the image cannot vouch for keeps the chord.
+            fin = np.isfinite(S[s, fs])
+            if np.isfinite(ref_c) and ref_c > 0 and fin.any():
+                cn_fill = contrast(S[s, fs][fin], fs[fin]) / ref_c
+                fill_conf = float(np.median(cn_fill))
+            else:
+                fill_conf = float("nan")
+            rec2 = {**rec, "chord_px": round(d_chord, 1), "fill_px": round(d_fill, 1),
+                    "fill_conf": (round(fill_conf, 2) if np.isfinite(fill_conf) else None)}
+            if np.isfinite(d_fill) and d_fill + margin <= d_chord and np.isfinite(fill_conf) and fill_conf >= c_lo:
+                kept.setdefault(s, {})[(f0, f1)] = rec2
+            else:
+                dropped.append({"lateral": int(s), "f0": int(f0), "f1": int(f1), **{k: rec2[k] for k in ("run", "runs", "n_frames", "med_dev", "reason", "chord_px", "fill_px", "fill_conf") if k in rec2}})
+    return kept, dropped
+
+
+def chord_refusals_to_list(refused: dict) -> list:
+    """JSON-safe [{lateral, f0, f1, run, n_frames, med_dev, reason}, ...] of chord_witness_refusals' result."""
+    out = []
+    for s in sorted(refused or {}):
+        for (f0, f1), rec in sorted((refused[s] or {}).items()):
+            out.append({"lateral": int(s), "f0": int(f0), "f1": int(f1), **{k: rec[k] for k in ("run", "runs", "n_frames", "med_dev", "reason", "chord_px", "fill_px", "fill_conf") if k in rec}})
     return out
 
 
@@ -5851,7 +6198,7 @@ def folded_laterals(p) -> set:
 
 
 def pin_anchors(surface: np.ndarray, anchors: dict, depth: int,
-                crop_max_pad: float = 120.0, guarded_slices=None) -> np.ndarray:
+                crop_max_pad: float = 120.0, guarded_slices=None, refuse_gaps=None) -> np.ndarray:
     """Force `surface` to the reviewer's DRAWN depth at every anchored (slice, frame), IN PLACE.
 
     Ground truth: the reviewer's fix-columns line is what the surface IS at the frames they drew. A detector
@@ -5871,7 +6218,7 @@ def pin_anchors(surface: np.ndarray, anchors: dict, depth: int,
     if S.ndim != 2:
         return surface
     L, F = int(S.shape[0]), int(S.shape[1])
-    anchors = densify_anchor_polylines(anchors, depth, reference=S, guarded_slices=guarded_slices)   # whole line; folded strokes guarded vs S
+    anchors = densify_anchor_polylines(anchors, depth, reference=S, guarded_slices=guarded_slices, refuse_gaps=refuse_gaps)   # whole line; folded strokes guarded vs S; witnessed gaps left open
     for s_key, frames in anchors.items():
         try:
             s = int(s_key)
@@ -6313,8 +6660,22 @@ def interpolate_anchors_surface(anchors, baseline: np.ndarray, params: dict | No
             A[si] = row
     if not A:
         return baseline
+    A_all = A
+    _ref = p.get("_refused_chords")                      # private working key (never persisted): chord-witness refusals
     if p.get("densify_drawn_polylines", True):
-        A = densify_anchor_polylines(A, None, reference=base, guarded_slices=folded_laterals(p))   # drag gaps bridged; folded strokes guarded
+        # A_all: every gap bridged — it decides the per-frame on/off gate below, so a refused chord can never flip a
+        # whole frame from interpolated to auto (75-84 frames on cs017_od_v3 / cs020_od_v4 otherwise; and on
+        # cs042_os_v1_3 a surviving-knot gate tapered 1400 good cells toward a bad auto).
+        # A: the knots — a refused chord frame contributes no knot on its lateral, so the lateral there takes the
+        # across-lateral interpolation of its nearest drawn neighbours, what every un-drawn lateral already receives.
+        A_all = densify_anchor_polylines(A, None, reference=base, guarded_slices=folded_laterals(p))   # drag gaps bridged; folded strokes guarded
+        A = densify_anchor_polylines(A, None, reference=base, guarded_slices=folded_laterals(p), refuse_gaps=_ref) if _ref else A_all
+    # FILL REACH (review 2026-09-09): a lifted pointer is a time-axis event, so refusals cluster on the same frames
+    # across laterals and the surviving knots can be 100+ laterals apart; a straight span that wide across the B-scan
+    # dome landed 27 px inside the tissue where the auto was 2 px off (cs002_os_v3 frames 47-62). A cell whose knot
+    # span exceeds `reach` (the dense route's own gap bound) is tapered toward the auto — per CELL, so nothing changes
+    # where the knots are as close as the dense rule guarantees today, and no whole frame flips.
+    reach = float(p.get("interp_fill_reach", 0) or 0) or float(max(int(p.get("dense_max_gap", 2 * max(1, int(p.get("redetect_slice_band", 20))))), 40))
     pure = base.copy()
     wf = np.zeros(F)
     xs = np.arange(L)
@@ -6324,8 +6685,20 @@ def interpolate_anchors_surface(anchors, baseline: np.ndarray, params: dict | No
             sls = np.array([q[0] for q in pts], dtype=np.float64)
             dep = np.array([q[1] for q in pts], dtype=np.float64)
             pure[:, f] = np.interp(xs, sls, dep)                 # exact at drawn slices, linear between
-            if len(pts) >= min_slices:
-                wf[f] = 1.0
+            if _ref and reach > 0:
+                def _span(knots):
+                    idx = np.searchsorted(knots, xs)
+                    dl = np.where(idx > 0, xs - knots[np.clip(idx - 1, 0, knots.size - 1)], np.inf)
+                    dr = np.where(idx < knots.size, knots[np.clip(idx, 0, knots.size - 1)] - xs, np.inf)
+                    return np.where(np.isfinite(dl) & np.isfinite(dr), dl + dr, 2.0 * np.minimum(dl, dr))
+                span = _span(sls)
+                sls_all = np.array(sorted(s for s in A_all if f in A_all[s]), dtype=np.float64)
+                span_all = _span(sls_all) if sls_all.size else np.full(xs.size, np.inf)
+                w = np.clip((2.0 * reach - span) / reach, 0.0, 1.0)     # 1 within reach, 0 beyond twice the reach
+                w = np.where(span_all >= span - 0.5, 1.0, w)             # a span already this wide today (folded-guard gap) is today's line: untouched
+                pure[:, f] = w * pure[:, f] + (1.0 - w) * base[:, f]
+        if sum(1 for s in A_all if f in A_all[s]) >= min_slices:
+            wf[f] = 1.0
     if wf.max() <= 0.0:
         return baseline                                          # no frame drawn densely enough → leave auto
     wf = ndimage.gaussian_filter1d(wf, taper)                    # taper the on/off across frames (no seam)
@@ -6341,31 +6714,25 @@ def _artifact_mask(p: dict, n_lat: int, n_frames: int):
     flatten_rigid_quad: _frame_common_shift fitted each lateral's quadratic over every finite frame, so marked
     artifact tissue was helping decide the corneal curvature the correction aims at. Measured on cs048_od_v1
     that inflated the apparent edge dip at frames 96-97 from 7.31 px to 9.40 px."""
-    out = np.zeros((n_lat, n_frames), dtype=bool)
-    raw = p.get("crop_bands") or {}
-    if not isinstance(raw, dict) or not raw:
+    n_lat = int(n_lat); n_frames = int(n_frames)
+    out = np.zeros((max(0, n_lat), max(0, n_frames)), dtype=bool)
+    if n_lat < 1 or n_frames < 1:
         return out
+    # 2026-09-09 (explicit-band contract): the SAME resolver as every other consumer (_artifact_bands →
+    # resolve_crop_bands) — both crop_bands forms, per-band interpolation from each band's OWN marks, the UNION
+    # over the bands covering a lateral, the floor(x+0.5) rounding and each band's [min marked, max marked]
+    # lateral span. The previous private parser extrapolated the band across the FULL width (np.interp end-clamp)
+    # and rounded floor/ceil; those two divergences from what actually gets cropped are gone.
     try:
-        lats, los, his = [], [], []
-        for k, v in raw.items():
-            try:
-                l = int(k); a, b = int(v[0]), int(v[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            lats.append(l); los.append(min(a, b)); his.append(max(a, b))
-        if not lats:
-            return out
-        order = np.argsort(lats)
-        lats = np.asarray(lats, float)[order]
-        los = np.asarray(los, float)[order]; his = np.asarray(his, float)[order]
-        idx = np.arange(n_lat, dtype=float)
-        lo_i = np.interp(idx, lats, los); hi_i = np.interp(idx, lats, his)
-        for l in range(n_lat):
-            a = int(max(0, np.floor(lo_i[l]))); b = int(min(n_frames - 1, np.ceil(hi_i[l])))
-            if b >= a:
-                out[l, a:b + 1] = True
+        bands = _artifact_bands(p or {}, n_frames, n_lat)
     except Exception:  # noqa: BLE001 — on any doubt, mask nothing (historical behaviour)
-        return np.zeros((n_lat, n_frames), dtype=bool)
+        return out
+    if bands is None:
+        return out
+    for l in range(min(n_lat, len(bands))):
+        fs = bands[l]
+        if fs is not None and len(fs):
+            out[l, np.clip(np.asarray(fs, dtype=int), 0, n_frames - 1)] = True
     return out
 
 
@@ -6657,6 +7024,126 @@ def _frame_common_shift(edges: np.ndarray, p: dict | None = None):
 _LAST_FLATTEN_INFO: dict = {}
 _LAST_DRAWN_FIT: dict = {}      # what _drawn_frame_rigid did on the last call (unified/robust/placed-target counts)
 
+# ── APPLIED-MOVE LEDGER (2026-09-09, option (b) of api_server._corrected_prior_surface) ──────────────────────
+# While a corrections run builds its output, every mover that warps tissue notes the per-(lateral, frame) depth
+# displacement it applied here (+ = content DEEPER, the _warp_by_displacement sign: out[r] = in[r - d]). The branch
+# sums the entries after the final NIfTI write into border_cache/applied_move.npz (source="run") so the corrected
+# pane carries the served line by the EXACT move instead of re-measuring raw vs corrected — on case_p1_od_v1_3
+# that measurement extrapolated 40 of 101 frames and the pane line ran 30-160 px off the tissue. Every mover is
+# a per-column depth translation, so the composition is a plain sum (sub-pixel resampling is the only
+# non-additivity). None outside a corrections run: _ledger_note is then a no-op.
+_MOVE_LEDGER: list | None = None
+
+
+def _ledger_open() -> None:
+    global _MOVE_LEDGER
+    _MOVE_LEDGER = []
+
+
+def _ledger_close() -> list:
+    global _MOVE_LEDGER
+    out = _MOVE_LEDGER if _MOVE_LEDGER is not None else []
+    _MOVE_LEDGER = None
+    return out
+
+
+def _ledger_mark() -> int:
+    return len(_MOVE_LEDGER) if _MOVE_LEDGER is not None else 0
+
+
+def _ledger_note(stage: str, disp_lf) -> None:
+    """A mover records the (lateral, frames) depth displacement it just applied. No-op outside a corrections
+    run; never raises (a field it cannot store is recorded as None = composition incomplete)."""
+    if _MOVE_LEDGER is None:
+        return
+    try:
+        _MOVE_LEDGER.append((str(stage), None if disp_lf is None else np.asarray(disp_lf, dtype=np.float32)))
+    except Exception:  # noqa: BLE001
+        _MOVE_LEDGER.append((str(stage), None))
+
+
+def _ledger_settle(stage: str, before, after, mark: int) -> None:
+    """After a stage (and its guards) ran on the corrections path. A declined / reverted stage hands its INPUT
+    back (the same object): whatever it logged is dropped. A stage that changed the volume without logging a
+    field leaves a None entry — the composition is then incomplete, the run move is NOT written and the api
+    keeps measuring (today's behaviour). An unchanged copy counts as a no-op."""
+    if _MOVE_LEDGER is None:
+        return
+    if after is before:
+        del _MOVE_LEDGER[mark:]
+        return
+    if len(_MOVE_LEDGER) == mark:
+        try:
+            same = (getattr(after, "shape", None) == getattr(before, "shape", None)
+                    and bool(np.array_equal(np.asarray(after), np.asarray(before))))
+        except Exception:  # noqa: BLE001
+            same = False
+        if not same:
+            _MOVE_LEDGER.append((str(stage), None))
+
+
+def compose_applied_move(entries, shape) -> tuple:
+    """Sum ledger entries into ONE (lateral, frames) float32 move. Returns (move | None, stages, complete):
+    complete=False (and move=None, never a partial sum) when any entry has no field or the wrong shape."""
+    L, F = int(shape[0]), int(shape[1])
+    total = np.zeros((L, F), dtype=np.float64); stages: list = []; complete = True
+    for stage, fld in (entries or []):
+        if fld is None:
+            stages.append({"stage": str(stage), "composed": False}); complete = False; continue
+        a = np.asarray(fld, dtype=np.float64)
+        if a.shape != (L, F):
+            stages.append({"stage": str(stage), "composed": False, "shape": [int(v) for v in a.shape]}); complete = False
+            continue
+        a = np.where(np.isfinite(a), a, 0.0)
+        total += a
+        stages.append({"stage": str(stage), "composed": True,
+                       "max_abs_px": round(float(np.max(np.abs(a))) if a.size else 0.0, 2)})
+    return (total.astype(np.float32) if complete else None), stages, bool(complete)
+
+
+def write_applied_move_cache(out_nifti, entries, shape, canvas_pad: int = 0, bottom_pad: int = 0) -> dict:
+    """border_cache/applied_move.npz (sibling convention of placed_edges.npz: <out>/../../border_cache) holding
+    the EXACT move the run applied, in measure_applied_move's convention: corrected_row = raw_row + canvas_pad
+    + move, i.e. `move` EXCLUDES the top canvas pad (recorded as canvas_pad; a bottom pad shifts no row).
+    Fields: key ("<raw mtime_ns>:<corrected mtime_ns>:run:<PIPELINE_VERSION>", run_provenance-compatible), move
+    (L, F) float32, n_extrapolated=0, source="run", canvas_pad, bottom_pad, stamp_mtime_ns + stamp_size of the
+    delivered NIfTI (api_server compares them with work.stat() — a stale run move is ignored), stages (JSON).
+    Called AFTER the NIfTI write so the stamp is the delivered file's. Atomic (tmp + os.replace). Best-effort:
+    returns a record for the run info and never raises; an incomplete composition writes nothing."""
+    rec: dict = {"written": False, "canvas_pad": int(canvas_pad), "bottom_pad": int(bottom_pad)}
+    try:
+        move, stages, complete = compose_applied_move(entries, shape)
+        rec["stages"] = stages; rec["complete"] = bool(complete)
+        if not complete or move is None:
+            rec["reason"] = "a stage moved tissue without recording its field; the api keeps measuring the move"
+            print(f"[applied-move] not written: {rec['reason']} "
+                  f"({[s['stage'] for s in stages if not s.get('composed')]})", file=sys.stderr)
+            return rec
+        out_p = Path(out_nifti).resolve()
+        st = out_p.stat()
+        raw_p = out_p.parent / "_raw_border.nii.gz"
+        raw_mt = int(raw_p.stat().st_mtime_ns) if raw_p.exists() else 0
+        bc = out_p.parent.parent / "border_cache"
+        bc.mkdir(parents=True, exist_ok=True)
+        key = f"{raw_mt}:{int(st.st_mtime_ns)}:run:{PIPELINE_VERSION}"
+        tmp = bc / "applied_move.run.tmp.npz"
+        np.savez_compressed(tmp, key=np.array(key), move=np.asarray(move, dtype=np.float32),
+                            n_extrapolated=np.array(0), source=np.array("run"),
+                            canvas_pad=np.array(int(canvas_pad)), bottom_pad=np.array(int(bottom_pad)),
+                            stamp_mtime_ns=np.array(int(st.st_mtime_ns), dtype=np.int64),
+                            stamp_size=np.array(int(st.st_size), dtype=np.int64),
+                            stages=np.array(json.dumps(stages)), pipeline_version=np.array(PIPELINE_VERSION))
+        os.replace(tmp, bc / "applied_move.npz")
+        rec.update({"written": True, "path": str(bc / "applied_move.npz"), "key": key,
+                    "stamp": {"mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)},
+                    "move_range": [round(float(np.min(move)), 2), round(float(np.max(move)), 2)]})
+        print(f"[applied-move] persisted {move.shape} move {rec['move_range']} px (+pad {int(canvas_pad)}) "
+              f"from {[s['stage'] for s in stages]}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — never fail the run over the cache
+        rec["error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[applied-move] not written: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return rec
+
 
 def _drawn_fit_record(a: np.ndarray, p: dict) -> dict:
     """Run-record proofs for the crop-boundary continuity claim (reviewer design 2026-09-04, §4 of the plan):
@@ -6745,7 +7232,8 @@ def _drawn_frame_rigid(edges: np.ndarray, quad: np.ndarray, p: dict):
     _ba_fit = {k: v for k, v in (p.get("border_anchors") or {}).items()
                if not (str(k).lstrip("-").isdigit() and int(k) in _excl)}      # folded laterals: served-surface GT only
     _fit_pts = bool(p.get("flatten_fit_points_only", True))
-    top = _norm(_ba_fit) if _fit_pts else _norm(densify_anchor_polylines(_ba_fit, None, _dens, reference=_ref_e, guarded_slices=_excl))
+    top = _norm(_ba_fit) if _fit_pts else _norm(densify_anchor_polylines(_ba_fit, None, _dens, reference=_ref_e, guarded_slices=_excl,
+                                                                         refuse_gaps=p.get("chord_refused_gaps")))
     bot = _norm(densify_anchor_polylines(p.get("crop_post_anchors"), _rd, _dens),
                 drop_from=(float(_rd) - 1.0 if (unified and _rd is not None) else None))
     placed = _norm(p.get("_crop_top_placed")) if unified else {}
@@ -7208,7 +7696,8 @@ def determinism_report(anchors, baseline: np.ndarray, served: np.ndarray | None,
         if p.get("densify_drawn_polylines", True):
             # mirror the pipeline: a drawn line is the polyline through its points, so every frame inside a
             # slice's drawn span counts as drawn there (otherwise fast-drag gaps report as DISCARDED frames)
-            A = densify_anchor_polylines(A, None, reference=np.asarray(baseline, dtype=np.float64), guarded_slices=folded_laterals(p))
+            A = densify_anchor_polylines(A, None, reference=np.asarray(baseline, dtype=np.float64), guarded_slices=folded_laterals(p),
+                                         refuse_gaps=p.get("_refused_chords") or p.get("chord_refused_gaps"))
         if not A:
             return {}                                   # no correction curve → structurally absent
         L, F = base.shape
@@ -8455,6 +8944,7 @@ def smooth_volume(volume: np.ndarray, params: dict | None = None, progress=None,
     _subpx = bool(p.get("subpixel_warp", False))
     if _dump_dir:
         np.save(os.path.join(_dump_dir, "disp_final.npy"), disp_field)
+    _ledger_note("flatten", disp_field)                       # the exact per-cell field the warp below applies
     warped = np.array([_warp_by_displacement(sag[i], disp_field[i], subpixel=_subpx) for i in range(n)])
     if progress:
         progress(1.0)
@@ -10195,11 +10685,14 @@ def rigid_sagittal_motion_correct(volume: np.ndarray, params: dict | None = None
     # zero-centre the depth shift (minimal canvas use); clip. Rotation is already zero-mean (drift - mean).
     depth_shift = np.clip(depth_shift - (np.median(depth_shift) if depth_on else 0.0), -max_shift, max_shift)
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((F, L), dtype=np.float64)                    # applied-move ledger (frames, laterals)
     for f in range(F):
         disp = np.full(L, depth_shift[f]) + rot_slope[f] * xn   # per-lateral: translation + rotation(shear)
         if float(np.max(np.abs(disp))) > 0.05:
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), disp, subpixel=True)
+            _lg[f] = disp
             nadj += 1
+    _ledger_note("rigid_sagittal_mc", _lg.T)
     info.update({"applied": bool(nadj), "frames_adjusted": int(nadj),
                  "depth_applied": bool(depth_on), "tilt_applied": bool(tilt_on),
                  "max_shift": round(float(np.max(np.abs(depth_shift))), 1) if depth_on else 0.0,
@@ -10500,11 +10993,14 @@ def align_corrected_to_smooth(volume: np.ndarray, params: dict | None = None,
                             "reason": "declined — rigid move does not reduce deviation from the drawn line"}
         _anchor_improved = bool(_pre)   # passed the anchor never-worse check → the drawn edges got closer
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((F, L), dtype=np.float64)                 # applied-move ledger (frames, laterals)
     for f in range(F):
         disp = shift[f] + tilt[f] * xn                       # per-lateral: translation + rotation(shear)
         if float(np.max(np.abs(disp))) > 0.05:
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), disp, subpixel=True)
+            _lg[f] = disp
             nadj += 1
+    _ledger_note("corrected_smooth_align", _lg.T)            # dropped again by the caller if this stage declines
     # NEVER-WORSE guard on the SAGITTAL edge — the metric the reviewer actually judges. Re-detect the result and
     # keep it ONLY if the across-frame surface got MORE quadratic; otherwise hand the input back unchanged.
     lo, hi = int(0.2 * L), int(0.8 * L)
@@ -10613,10 +11109,13 @@ def axial_motion_correct(volume: np.ndarray, params: dict | None = None, workers
     if float(np.std(M)) < float(p.get("amc_min_motion", 1.0)):   # motion-free → strict no-op
         return volume, {"applied": False, "motion_std": round(float(np.std(M)), 2)}
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((F, L), dtype=np.float64)                 # applied-move ledger (frames, laterals)
     for f in range(F):
         if abs(M[f]) > 0.05:
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -M[f]), subpixel=True)
+            _lg[f] = -M[f]
             nadj += 1
+    _ledger_note("axial_motion_correct", _lg.T)
     # `shift` = the per-frame rigid depth shift APPLIED (each B-scan moved by -M[f]). Surface-crop detection
     # runs on this de-tilted volume, where a clipped apex that was pinned at the raw frame TOP now sits at
     # ~M[f]; adding M[f] back recovers the raw-top-relative surface for the "edge within N px of the top"
@@ -10715,10 +11214,13 @@ def rigid_height_refine(volume: np.ndarray, params: dict | None = None, workers:
                         "max_jitter": round(float(np.max(np.abs(jitter))), 2)}
     r0 = _rough(S)
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((F, L), dtype=np.float64)                 # applied-move ledger (frames, laterals)
     for f in range(F):
         if abs(jitter[f]) > 0.02:
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), np.full(L, -jitter[f]), subpixel=True)
+            _lg[f] = -jitter[f]
             nadj += 1
+    _ledger_note("rigid_height_refine", _lg.T)               # dropped again by the caller if the self-gate reverts
     try:                                            # SELF-GATE: keep only if the surface got smoother
         S2 = detect_surface_all(reformat_to_sagittal(out), p, workers=workers)
         r1 = _rough(S2)
@@ -11107,11 +11609,14 @@ def edge_frame_guard(volume: np.ndarray, params: dict | None = None, workers: in
         return volume, {"applied": False, "reason": "no move needed"}
     od0 = _offdome(_resid_field(S, sag, 0, L))          # FULL lateral range for the gate
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((volume.shape[0], L), dtype=np.float64)   # applied-move ledger (frames, laterals)
     for f in np.where(np.abs(shift) >= 0.3)[0]:
         out[f] = _warp_by_displacement(np.ascontiguousarray(volume[f]), np.full(L, shift[f]), subpixel=True)
+        _lg[f] = shift[f]
         nadj += 1
     if nadj == 0:
         return volume, {"applied": False, "reason": "gate: if nadj == 0"}
+    _ledger_note("edge_frame_guard", _lg.T)                  # dropped again by the caller if the self-gate reverts
     try:
         sag2 = reformat_to_sagittal(out)
         S2 = detect_surface_all(sag2, p, workers=workers)
@@ -11219,11 +11724,14 @@ def reconcile_manual_line(volume: np.ndarray, provided_edges: np.ndarray, params
         return float(np.nanmedian(v)) if v else float("nan")
     off0, rgh0 = _offline(S), _rough(S)
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((volume.shape[0], L), dtype=np.float64)   # applied-move ledger (frames, laterals)
     for f in np.where(np.abs(shift) >= 0.3)[0]:
         out[f] = _warp_by_displacement(np.ascontiguousarray(volume[f]), np.full(L, shift[f]), subpixel=True)
+        _lg[f] = shift[f]
         nadj += 1
     if nadj == 0:
         return volume, {"applied": False}
+    _ledger_note("reconcile_manual_line", _lg.T)             # dropped again by the caller if the self-gate reverts
     try:
         S2 = detect_surface_all(reformat_to_sagittal(out), p, workers=workers).astype(float)
     except Exception:  # noqa: BLE001
@@ -12239,21 +12747,36 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
     for i, l in enumerate(lats):
         cols = vol[:, :, l - band:l + band + 1].mean(axis=2).T.astype(np.float64)      # (D, F)
         nz = cols > 0                                                                   # zero rows = canvas pad / cut
+        _pair_mask = None                                                               # (D, F-1): rows masked in BOTH frames of a pair
         if cut_guard > 0:
             # A column whose tissue starts at the canvas edge is CUT (surface-crop band): its first rows are the cut
             # edge, not anatomy, and at the pair straddling the band boundary the correlation matched that edge
             # instead of the stroma (cs008_od_v2: 1 px bias at the boundary pair → a 1-2 px step of the band).
             # Those rows are masked out for BOTH frames of every pair the column takes part in.
-            # "cut" = TISSUE-bright at the canvas edge (background is ~33 there on a real scan, never zero)
+            # "cut" = TISSUE-bright at the FIRST NON-ZERO rows (background is ~33 there on a real scan, never zero;
+            # on a canvas-padded or scratch-warped volume the cut edge sits below a block of zero rows — reading
+            # rows 0-2 there missed it, p4_os_v1_2 2026-09-09).
             _bright = float(np.percentile(cols[nz], 90)) if nz.any() else 0.0
-            _cut = (cols[:3, :].mean(axis=0) > 0.5 * _bright) if _bright > 0 else np.zeros(cols.shape[1], dtype=bool)
+            _r0 = np.where(nz.any(axis=0), np.argmax(nz, axis=0), 0)                     # first non-zero row per frame
+            _cut = np.zeros(cols.shape[1], dtype=bool)
+            if _bright > 0:
+                for _f in range(cols.shape[1]):
+                    _a = int(_r0[_f]); _cut[_f] = bool(cols[_a:_a + 3, _f].mean() > 0.5 * _bright)
             if _cut.any():
                 CUT[i] = _cut[:-1] | _cut[1:]
-                _cut_pair = _cut.copy(); _cut_pair[:-1] |= _cut[1:]; _cut_pair[1:] |= _cut[:-1]
                 # never mask more than 30% of a column's visible rows (thin visible tissue keeps enough to correlate)
                 _g = int(min(cut_guard, 0.3 * float(nz.sum(axis=0).min())))
                 if _g > 0:
-                    nz[:_g, :] &= ~_cut_pair[None, :]
+                    # PER PAIR and SYMMETRIC (2026-09-09, p4_os_v1_2 frames 16→17): masking the neighbours of a cut
+                    # FRAME left one frame of a pair masked and the other not, so the mask edge (row g) in one frame
+                    # correlated with the cut edge (row ~6) in the other and the pair measured a 27-34 px lag on a
+                    # nearly aligned volume — delivered as an 18 px shift + 18 px tilt step by the second pass.
+                    # A pair is masked in BOTH its frames, from each frame's first non-zero row, iff either is cut.
+                    _cutp = _cut[:-1] | _cut[1:]
+                    _pair_mask = np.zeros((cols.shape[0], cols.shape[1] - 1), dtype=bool)
+                    for _j in np.flatnonzero(_cutp):
+                        for _f in (_j, _j + 1):
+                            _a = int(_r0[_f]); _pair_mask[_a:_a + _g, _j] = True
         if depth_sm > 0:
             # PIXEL-LOCKING GUARD (review 2026-09-05): a 1-px-sharp correlation peak biases the 3-point sub-pixel
             # refinement toward integer lags; along a dome flank that bias has one sign for tens of frames and
@@ -12264,9 +12787,17 @@ def tissue_motion_move(volume: np.ndarray, params: dict | None = None):
             _den = ndimage.gaussian_filter1d(nz.astype(np.float64), depth_sm, axis=0, mode="nearest")
             cols = np.where(nz, _num / np.maximum(_den, 1e-6), 0.0)
         fill = nz.mean(axis=0)
-        mu = (cols * nz).sum(axis=0) / np.maximum(1, nz.sum(axis=0))
-        cols = np.where(nz, cols - mu[None, :], 0.0)     # zero rows contribute nothing: no pedestal pulling lags to 0
-        A = np.fft.rfft(cols[:, :-1], n=n, axis=0); B = np.fft.rfft(cols[:, 1:], n=n, axis=0)
+        if _pair_mask is None:
+            mu = (cols * nz).sum(axis=0) / np.maximum(1, nz.sum(axis=0))
+            cols = np.where(nz, cols - mu[None, :], 0.0)     # zero rows contribute nothing: no pedestal pulling lags to 0
+            colsA, colsB = cols[:, :-1], cols[:, 1:]
+        else:
+            # pair-specific masks: each side of pair j is re-centred over ITS unmasked rows
+            nzA = nz[:, :-1] & ~_pair_mask; nzB = nz[:, 1:] & ~_pair_mask
+            cA = cols[:, :-1]; cB = cols[:, 1:]
+            muA = (cA * nzA).sum(axis=0) / np.maximum(1, nzA.sum(axis=0)); muB = (cB * nzB).sum(axis=0) / np.maximum(1, nzB.sum(axis=0))
+            colsA = np.where(nzA, cA - muA[None, :], 0.0); colsB = np.where(nzB, cB - muB[None, :], 0.0)
+        A = np.fft.rfft(colsA, n=n, axis=0); B = np.fft.rfft(colsB, n=n, axis=0)
         xc = np.fft.irfft(A * np.conj(B), n=n, axis=0)                                  # xc[s] = Σ_k a[k+s]·b[k]
         xc = np.concatenate([xc[n - max_lag:], xc[:max_lag + 1]], axis=0)                  # xc[s] = Σ_k a[k+s]·b[k], s = -max_lag..max_lag
         k = np.argmax(xc, axis=0); best = lag_tab[k].astype(np.float64)
@@ -12667,12 +13198,15 @@ def apply_edit_transform(volume: np.ndarray, et, params: dict | None = None) -> 
     cap = float(p.get("edit_transform_max_px", 80.0))
     xc = (np.arange(L, dtype=np.float64) - (L - 1) / 2.0) / max(1.0, (L - 1) / 2.0)
     out = volume.copy(); n = 0
+    _lg = np.zeros((F, L), dtype=np.float64)                 # applied-move ledger (frames, laterals)
     for f in range(F):
         d = np.clip(a[f] + b[f] * xc, -cap, cap)
         if float(np.max(np.abs(d))) < 0.05:
             continue
         out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), d, subpixel=True)
+        _lg[f] = d
         n += 1
+    _ledger_note("edit_transform", _lg.T)
     return out, {"applied": bool(n), "frames_moved": int(n), "max_shift_px": round(float(np.abs(a).max()), 2),
                  "max_tilt_px": round(float(np.abs(b).max()), 2), "rounds": int(et.get("rounds", 1) or 1)}
 
@@ -12695,6 +13229,7 @@ def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
     nz, depth = volume.shape[0], volume.shape[1]
     out = volume.copy()
     n = 0
+    _lg = np.zeros((nz, volume.shape[2]), dtype=np.float64)  # applied-move ledger (frames, laterals)
     for f, px in pairs:
         try:
             fpx = float(px)
@@ -12712,7 +13247,9 @@ def apply_manual_shifts(volume: np.ndarray, shifts) -> tuple[np.ndarray, int]:
         elif s < 0 and -s < depth:       # move pixels UP
             shifted[:depth + s, :] = b[-s:, :]
         out[fi] = shifted
+        _lg[fi, :] += float(s)           # composes when the same frame is listed twice (both shifts apply)
         n += 1
+    _ledger_note("manual_shifts", _lg.T)
     return out, n
 
 
@@ -12750,6 +13287,7 @@ def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | Non
     except Exception:  # noqa: BLE001 — best effort; without a current surface we cannot diff → no-op
         return volume, {"applied": False, "frames_adjusted": 0}
     out = volume.copy(); nadj = 0; xs = np.arange(L, dtype=np.float64)
+    _lg = np.zeros((nF, L), dtype=np.float64)                    # applied-move ledger (frames, laterals)
     for f_key, lat_map in axial_anchors.items():
         try:
             f = int(f_key)
@@ -12785,7 +13323,9 @@ def apply_axial_surface_gt(volume: np.ndarray, axial_anchors, params: dict | Non
         shift = np.clip(shift, -(depth - 2), depth - 2)
         if np.any(np.abs(shift) > 1e-6):
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), shift, subpixel=True)
+            _lg[f] = shift                                       # per-cell (feathered), recorded as-is
             nadj += 1
+    _ledger_note("axial_anchors", _lg.T)
     return out, {"applied": nadj > 0, "frames_adjusted": int(nadj)}
 
 
@@ -12916,6 +13456,7 @@ def apply_sagittal_surface_gt(volume: np.ndarray, sag_anchors, params: dict | No
     # meaningful improvement required: a periphery-only defect makes dev_after >= dev_before → decline
     apply_ok = nn > 0 and (dev_after < dev_before - 0.4) and (dev_after < 0.92 * dev_before)
     out = volume.copy(); nadj = 0
+    _lg = np.zeros((nF, L), dtype=np.float64)                    # applied-move ledger (frames, laterals)
     if apply_ok:
         for f in range(nF):
             if abs(shift_i[f]) < 1e-6 and abs(tilt_i[f]) < 1e-9:
@@ -12923,7 +13464,9 @@ def apply_sagittal_surface_gt(volume: np.ndarray, sag_anchors, params: dict | No
             disp = shift_i[f] + tilt_i[f] * (xs - xc)
             disp = np.clip(disp, -(depth - 2), depth - 2)
             out[f] = _warp_by_displacement(np.ascontiguousarray(out[f]), disp, subpixel=True)
+            _lg[f] = disp
             nadj += 1
+    _ledger_note("corrected_edge_anchors", _lg.T)
     return out, {"applied": nadj > 0, "frames_adjusted": int(nadj),
                  "declined": bool(not apply_ok and nn > 0),
                  "dev_before": round(dev_before, 2), "dev_after": round(dev_after, 2),
@@ -12996,67 +13539,199 @@ def _crop_lateral_indices(params: dict | None, n_lateral: int) -> np.ndarray:
     return np.array(out, dtype=int)
 
 
-def _artifact_bands(params: dict | None, n_frames: int, n_lateral: int):
-    """#9 v3 ARTIFACT CROP: a PER-LATERAL frame band, marked on several slices and INTERPOLATED across laterals.
-
-    A time-domain artifact (e.g. an eyelid closing during the slow scan) occupies a frame band [lo, hi] whose
-    extent VARIES per sagittal slice (lateral) — so a single uniform box (crop_region) can't describe it. The
-    reviewer marks the band [lo, hi] on a few laterals; params['crop_bands'] = {str(lateral): [lo, hi]} (inclusive
-    frame indices). This LINEARLY interpolates lo and hi across laterals BETWEEN the marked slices, so the
-    artifact volume fills in without marking every slice. NO crop outside the marked lateral span — the reviewer
-    marks where the artifact is present, so its lateral extent is exactly [min marked lateral, max marked lateral]
-    (mark the boundary slices to control it). One mark → that lateral only.
-
-    Returns a list of length n_lateral, each an int ndarray of frame indices to exclude/zero for that lateral
-    (possibly empty), or None when no valid band is defined. Consumed as per-lateral zero_cols in the fit (so the
-    cornea is fit to the remaining frames) and zeroed by _apply_crop before SAM2."""
-    raw = (params or {}).get("crop_bands")
-    if not isinstance(raw, dict) or not raw:
+def _crop_band_pair(v):
+    """Parse ONE mark value [lo, hi] → (lo, hi) ints with lo <= hi, or None when unparseable. Accepts exactly what
+    the pre-2026-09-09 single-band parser accepted (a list/tuple of two int()-able scalars, either order), so a
+    legacy map resolves bit-identically (tests/test_crop_bands.py). A NESTED list ([[lo, hi], …] — the abandoned
+    intermediate form) is not a mark and is dropped."""
+    if not isinstance(v, (list, tuple)) or len(v) != 2:
         return None
-    marks = []
-    for k, v in raw.items():
+    try:
+        lo, hi = int(v[0]), int(v[1])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return (min(lo, hi), max(lo, hi))
+
+
+def _parse_band_marks(marks, n_lateral: int | None = None, n_frames: int | None = None) -> dict:
+    """ONE band's marks {"<lateral>": [lo, hi]} → {lateral: (lo, hi)} (ints, lo <= hi), sorted by lateral. At most
+    one mark per lateral per band (a dict key is unique). Invalid keys/values are skipped; with n_lateral, laterals
+    outside [0, n_lateral) are DROPPED; with n_frames, lo/hi are CLAMPED into [0, n_frames-1] (a mark past the last
+    frame becomes the last frame, not lost — the legacy resolver's rule)."""
+    out: dict = {}
+    if not isinstance(marks, dict):
+        return out
+    for k, v in marks.items():
         try:
             lat = int(k)
-            if not isinstance(v, (list, tuple)) or len(v) != 2:
+        except (TypeError, ValueError, OverflowError):
+            continue
+        pair = _crop_band_pair(v)
+        if pair is None:
+            continue
+        if n_lateral is not None and not (0 <= lat < int(n_lateral)):
+            continue
+        lo, hi = pair
+        if n_frames is not None:
+            nf = int(n_frames)
+            lo = max(0, min(nf - 1, lo)); hi = max(0, min(nf - 1, hi))
+        out[lat] = (lo, hi)
+    return dict(sorted(out.items()))
+
+
+def parse_crop_bands(raw, n_lateral: int | None = None, n_frames: int | None = None) -> list:
+    """oct_params.crop_bands (EITHER persisted form) → [(band_id, {lateral: (lo, hi)}), …] sorted by band id.
+
+    EXPLICIT-BAND CONTRACT (2026-09-09, the reviewer: "specify the start of one crop, e.g. start band on one slice
+    and end band on another, which is the normal function, and also other bands with their own start and end"):
+      * EXPLICIT form  {"bands": [{"id": <int>, "marks": {"<lateral>": [lo, hi]}}, …]} — a BAND is an explicit
+        object with an id and ITS OWN marks (at most one per lateral). Bands are independent: no linking, no
+        merging across bands, ever.
+      * LEGACY form    {"<lateral>": [lo, hi]} — read as ONE band (id 1) with those marks.
+      * {} / {"bands": []} → no band. The intermediate {"<lateral>": [[lo, hi], …]} form is NOT supported (its
+        values are not marks and are dropped).
+    Bands without a single valid mark are dropped (an empty band crops nothing and must not trip the sticky-crop
+    gate). Ids: int >= 1; a missing/invalid id, or one already taken by an earlier band in the list, is replaced by
+    the smallest unused positive id (marks are never silently merged into another band). n_lateral / n_frames as in
+    _parse_band_marks."""
+    if not isinstance(raw, dict) or not raw:
+        return []
+    if isinstance(raw.get("bands"), list):
+        entries: list = []
+        for b in raw["bands"]:
+            if not isinstance(b, dict):
                 continue
-            lo, hi = int(v[0]), int(v[1])
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= lat < int(n_lateral)):
-            continue
-        lo, hi = sorted((lo, hi))
-        lo = max(0, min(int(n_frames) - 1, lo)); hi = max(0, min(int(n_frames) - 1, hi))
-        marks.append((lat, float(lo), float(hi)))
-    if not marks:
-        return None
-    marks.sort()
-    lats = np.array([m[0] for m in marks], dtype=np.float64)
-    los = np.array([m[1] for m in marks], dtype=np.float64)
-    his = np.array([m[2] for m in marks], dtype=np.float64)
-    out = [np.array([], dtype=int) for _ in range(int(n_lateral))]
-    lo_lat, hi_lat = int(lats[0]), int(lats[-1])
-    for x in range(lo_lat, hi_lat + 1):
+            try:
+                bid = int(b.get("id"))
+            except (TypeError, ValueError, OverflowError):
+                bid = None
+            if bid is not None and bid < 1:
+                bid = None
+            marks = _parse_band_marks(b.get("marks"), n_lateral, n_frames)
+            if marks:
+                entries.append([bid, marks])
+        used: set = set()
+        for e in entries:
+            if e[0] is None or e[0] in used:
+                e[0] = None
+            else:
+                used.add(e[0])
+        nxt = 1
+        for e in entries:
+            if e[0] is None:
+                while nxt in used:
+                    nxt += 1
+                e[0] = nxt; used.add(nxt)
+        return sorted(((int(i), m) for i, m in entries), key=lambda t: t[0])
+    marks = _parse_band_marks(raw, n_lateral, n_frames)
+    return [(1, marks)] if marks else []
+
+
+def normalize_crop_bands(raw) -> dict:
+    """The canonical PERSISTED form of crop_bands (what the api writes to oct_params), ALWAYS the explicit form:
+    {"bands": [{"id": 1, "marks": {"0": [30, 39], "511": [30, 39]}}, …]} — bands sorted by id, marks by lateral,
+    lo <= hi, keys str(int). A legacy map in → the explicit form out (one band, id 1). {} when no band carries a
+    valid mark. Idempotent; json.dumps(sort_keys=True) of it is the surface-cache signature (api_server
+    _detect_params_sig), so one geometry has ONE spelling whichever form the client sent."""
+    bands = parse_crop_bands(raw)
+    if not bands:
+        return {}
+    return {"bands": [{"id": int(bid), "marks": {str(lat): [int(lo), int(hi)] for lat, (lo, hi) in marks.items()}}
+                      for bid, marks in bands]}
+
+
+def _interp_band(marks: dict, n_frames: int) -> dict:
+    """ONE band's marks {lateral: (lo, hi)} → {lateral: (lo, hi)} over exactly [min marked, max marked] lateral of
+    THIS band; lo and hi linearly interpolated between the band's two nearest marked laterals (piecewise when it has
+    a middle mark); a single-mark band covers its lateral only. Rounding is round-half-UP (floor(x+0.5)), NOT
+    Python's banker's round(): the frontend preview (src/store/cropBands.ts bandsAt) interpolates with the SAME
+    formula and rounds via JS Math.round (half-up), so preview == what actually gets cropped at half-integer
+    boundaries (frames are >= 0, so floor(x+0.5) == Math.round(x)). This is byte-for-byte the pre-contract
+    single-band interpolation."""
+    nf = int(n_frames)
+    items = sorted(marks.items())
+    lats = np.array([lat for lat, _ in items], dtype=np.float64)
+    los = np.array([lo for _, (lo, _hi) in items], dtype=np.float64)
+    his = np.array([hi for _, (_lo, hi) in items], dtype=np.float64)
+    out: dict = {}
+    for x in range(int(lats[0]), int(lats[-1]) + 1):
         if lats.size == 1:
             a, b = los[0], his[0]
         else:
             a = float(np.interp(x, lats, los)); b = float(np.interp(x, lats, his))
-        # round-half-UP (floor(x+0.5)), NOT Python's banker's round(): the frontend preview interpolates with the
-        # SAME formula but rounds via JS Math.round (half-up). Matching it keeps preview == what actually gets
-        # cropped at half-integer interpolated boundaries (frames are >=0, so floor(x+0.5) == Math.round(x)).
         a = int(math.floor(a + 0.5)); b = int(math.floor(b + 0.5))
-        a = max(0, min(int(n_frames) - 1, a)); b = max(0, min(int(n_frames) - 1, b))
+        a = max(0, min(nf - 1, a)); b = max(0, min(nf - 1, b))
         if b >= a:
-            out[x] = np.arange(a, b + 1, dtype=int)
+            out[x] = (a, b)
     return out
+
+
+def resolve_crop_bands(raw, n_lateral: int, n_frames: int, params: dict | None = None) -> dict:
+    """THE shared crop-band resolver (explicit-band contract, 2026-09-09): raw crop_bands (either form) →
+    {lateral: [(lo, hi, band_id), …]} for EVERY lateral in [0, n_lateral) — the bands covering that lateral, in
+    ascending band id, each interpolated from ITS OWN marks (_interp_band). Bands may overlap in frames; a
+    consumer that needs a frame SET takes the union (_artifact_bands / _artifact_mask). An unmarked/unspanned
+    lateral is []. `params` is accepted for signature stability and unused — there are NO knobs: no linking, no
+    grouping, no merging across bands. The frontend twin is src/store/cropBands.ts bandsAt; the two are pinned
+    to each other by tests/data/crop_band_fixtures.json."""
+    del params
+    n_lateral = int(n_lateral)
+    out: dict = {lat: [] for lat in range(max(0, n_lateral))}
+    if n_lateral < 1 or int(n_frames) < 1:
+        return out
+    for bid, marks in parse_crop_bands(raw, n_lateral, n_frames):
+        for lat, (lo, hi) in _interp_band(marks, n_frames).items():
+            out[lat].append((lo, hi, bid))
+    return out
+
+
+def _artifact_bands(params: dict | None, n_frames: int, n_lateral: int):
+    """#9 v3 ARTIFACT CROP: PER-LATERAL frame band(s), each marked on a few slices and INTERPOLATED across laterals.
+
+    A time-domain artifact (e.g. an eyelid closing during the slow scan) occupies a frame band [lo, hi] whose
+    extent VARIES per sagittal slice (lateral) — so a single uniform box (crop_region) can't describe it. The
+    reviewer marks a BAND on a few laterals (start it on one slice, end it on another) and may add OTHER bands
+    with their own start and end; params['crop_bands'] is {"bands": [{"id", "marks": {str(lateral): [lo, hi]}}]}
+    (or the legacy {str(lateral): [lo, hi]} = one band) — inclusive frame indices. Each band's lo/hi are LINEARLY
+    interpolated across laterals BETWEEN ITS marked slices (resolve_crop_bands), so the artifact volume fills in
+    without marking every slice. NO crop outside a band's marked lateral span — its lateral extent is exactly
+    [min marked lateral, max marked lateral] of its marks (mark the boundary slices to control it). One mark →
+    that lateral only. Bands never link or merge: two bands are two bands.
+
+    Returns a list of length n_lateral, each an int ndarray of frame indices to exclude/zero for that lateral
+    (the UNION over the bands covering the slice, ascending, unique, possibly empty), or None when no valid band
+    is defined. Consumed as per-lateral zero_cols in the fit (so the cornea is fit to the remaining frames) and
+    zeroed by _apply_crop before SAM2. Every consumer takes an index SET per lateral, so several bands need no
+    change there; only _reconstruct_surface_over_bands cares about contiguity (it walks the runs). A legacy
+    single-band map yields exactly the pre-contract arrays (tests/test_crop_bands.py regression)."""
+    raw = (params or {}).get("crop_bands")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    resolved = resolve_crop_bands(raw, n_lateral, n_frames)
+    out = [np.array([], dtype=int) for _ in range(int(n_lateral))]
+    any_band = False
+    for lat, bands in resolved.items():
+        if not bands:
+            continue
+        if len(bands) == 1:
+            a, b, _ = bands[0]
+            out[lat] = np.arange(a, b + 1, dtype=int)
+        else:
+            out[lat] = np.unique(np.concatenate([np.arange(a, b + 1, dtype=int) for a, b, _ in bands]))
+        any_band = True
+    return out if any_band else None
 
 
 def _reconstruct_surface_over_bands(surface: np.ndarray, params: dict | None) -> np.ndarray:
     """Make the DETECTED surface IGNORE the marked artifact bands (#9 v3). The raw detector tracks the artifact
     (a deep bright structure) INSIDE the band — the displayed edge dives into it instead of ignoring it. Per
-    lateral, replace the band frames' surface with a smooth reconstruction from the NON-artifact frames on either
-    side: linear-interp between the two boundary values when the band is interior, or a FLAT HOLD from whichever
-    side exists when it runs to a frame edge. The band is cropped (zeroed) anyway, so this only makes the DISPLAYED
-    edge honest — it no longer follows the artifact. `surface` is (n_lateral, n_frames). Off (no crop_bands) → no-op.
+    lateral and per CONTIGUOUS run of the band UNION (a slice may carry several bands), replace the run's surface
+    with a smooth reconstruction from the NON-artifact frames on either side: linear-interp between the two
+    boundary values when the band is interior, or a FLAT HOLD from whichever side exists when it runs to a frame
+    edge. The boundary values are medians over up to 5 frames on each side, taken from NON-band frames only (so
+    a neighbouring band's reconstruction never feeds this one, and the cornea BETWEEN two bands is kept — it is
+    never straight-lined across). The band is cropped (zeroed) anyway, so this only makes the DISPLAYED edge
+    honest — it no longer follows the artifact. `surface` is (n_lateral, n_frames). Off (no crop_bands) → no-op.
 
     NOTE this does NOT touch the flatten: smooth_volume detects its own edges and EXCLUDES the band from the fit
     via zero_cols (see the _artifact_bands injection there), so the warp already ignores the artifact; this fixes
@@ -13072,17 +13747,26 @@ def _reconstruct_surface_over_bands(surface: np.ndarray, params: dict | None) ->
         fs = bands[lat]
         if not fs.size:
             continue
-        lo, hi = int(fs.min()), int(fs.max())
-        left = out[lat, max(0, lo - 5):lo]
-        right = out[lat, hi + 1:min(n_frames, hi + 6)]
-        lval = float(np.median(left[np.isfinite(left)])) if np.isfinite(left).any() else None
-        rval = float(np.median(right[np.isfinite(right)])) if np.isfinite(right).any() else None
-        if lval is None and rval is None:
+        fs = np.unique(np.asarray(fs, dtype=int))
+        fs = fs[(fs >= 0) & (fs < n_frames)]
+        if not fs.size:
             continue
-        if lval is not None and rval is not None:
-            out[lat, lo:hi + 1] = np.linspace(lval, rval, hi - lo + 1)   # interior band → interpolate across
-        else:
-            out[lat, lo:hi + 1] = lval if lval is not None else rval     # band runs to an edge → flat hold
+        inb = np.zeros(n_frames, dtype=bool); inb[fs] = True
+        for run in np.split(fs, np.flatnonzero(np.diff(fs) != 1) + 1):
+            if not run.size:
+                continue
+            lo, hi = int(run[0]), int(run[-1])
+            lw = np.arange(max(0, lo - 5), lo); rw = np.arange(hi + 1, min(n_frames, hi + 6))
+            left = out[lat, lw[~inb[lw]]] if lw.size else out[lat, 0:0]
+            right = out[lat, rw[~inb[rw]]] if rw.size else out[lat, 0:0]
+            lval = float(np.median(left[np.isfinite(left)])) if np.isfinite(left).any() else None
+            rval = float(np.median(right[np.isfinite(right)])) if np.isfinite(right).any() else None
+            if lval is None and rval is None:
+                continue
+            if lval is not None and rval is not None:
+                out[lat, lo:hi + 1] = np.linspace(lval, rval, hi - lo + 1)   # interior band → interpolate across
+            else:
+                out[lat, lo:hi + 1] = lval if lval is not None else rval     # band runs to an edge → flat hold
     return out.astype(surface.dtype)
 
 
@@ -13734,7 +14418,8 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                         # fallback; cells with no placement fall back to today's rule below (verbatim).
                         _dens_on = bool(p_full.get("densify_drawn_polylines", True))
                         _rawD = int(_sagv_c.shape[1])
-                        _dtop = densify_anchor_polylines((params or {}).get("border_anchors"), None, _dens_on)
+                        _dtop = densify_anchor_polylines((params or {}).get("border_anchors"), None, _dens_on,
+                                                         refuse_gaps=(params or {}).get("chord_refused_gaps"))   # same gaps the served line left open
                         _dbot0 = densify_anchor_polylines((params or {}).get("crop_post_anchors"), _rawD, _dens_on)
                         _dbot = {_l: {_f: _v for _f, _v in _r.items() if _v < _rawD - 1}      # sentinel = no bottom
                                  for _l, _r in _dbot0.items()}
@@ -14203,9 +14888,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                 _sv_params["_crop_top_shape"] = _crop_top_shape         # transient: the dome estimate = the SHAPE
             _sv_params["_crop_thickness_ok"] = _crop_thickness_ok   # transient: cells where the unified rule applies
         _LAST_FLATTEN_INFO.clear()
+        # APPLIED-MOVE LEDGER (2026-09-09): from here to the NIfTI write every mover notes the per-cell field it
+        # applied; the sum is persisted as border_cache/applied_move.npz (see write_applied_move_cache). Each
+        # stage is settled right after its guards so a declined/reverted stage contributes nothing.
+        _ledger_open()
         corrected = smooth_volume(vol, _sv_params, progress=progress, provided_edges=provided_edges, workers=workers)
+        _ledger_settle("flatten", vol, corrected, 0)
         if _tm_used and bool(_sv_params.get("fill_empty_margins", False)):
-            corrected = _fill_empty_margins(corrected, _sv_params)
+            corrected = _fill_empty_margins(corrected, _sv_params)   # fill only: moves nothing
         info = {"passes": 1, "best_pass": 1, "metrics": [], "axial_metrics": [], "stopped": "redetect",
                 "apex_clipped": {"slices": {}, "n_slices": 0, "n_frames_total": 0}}
         if _LAST_FLATTEN_INFO:
@@ -14331,12 +15021,16 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         # (undulation improved 4.2->0.6, lateral held), two approved scans below the gate and left untouched.
         # Rigid (one depth shift per frame), so the B-scan is never deformed — the reviewer's exact spec.
         if provided_edges is not None and bool(p_all.get("rigid_sagittal_mc", True)):
+            _lm = _ledger_mark(); _lb = corrected
             corrected, _smc = rigid_sagittal_motion_correct(corrected, params, workers=workers)
             info["rigid_sagittal_mc"] = _smc
+            _ledger_settle("rigid_sagittal_mc", _lb, corrected, _lm)
         if provided_edges is not None and bool(p_all.get("redetect_amc", False)) \
                 and bool(p_all.get("axial_motion_correct", True)):
+            _lm = _ledger_mark(); _lb = corrected
             corrected, _amc2 = axial_motion_correct(corrected, params, workers=workers)
             info["axial_motion_correct_post"] = _amc2
+            _ledger_settle("axial_motion_correct_post", _lb, corrected, _lm)
         if bool(p_all.get("rigid_frame_warp", True)) and bool(p_all.get("redetect_finish", True)):
             # SINGLE SAGITTAL OPTIMISER (reviewer directive): rigid_height_refine / derotate / rigid_frame_refine each
             # do axial corrections toward their OWN aggregate targets (dome roughness, boundary), which pass their
@@ -14410,7 +15104,7 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                         del _cs
                     except Exception:  # noqa: BLE001
                         _rhr_det = None
-                _before = corrected; _rgh = None
+                _before = corrected; _rgh = None; _lm = _ledger_mark()
                 corrected, _rhr = rigid_height_refine(corrected, _rp, workers=workers, detect=_rhr_det)
                 _rhr["surface"] = "guided" if _rhr_det is not None else "self-detected"
                 info["rigid_height_refine"] = _rhr
@@ -14421,8 +15115,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     corrected, _tsm = _reject_if_stepped(_before, corrected, "rigid_height_refine", info, _rp, _tsm)
                     if corrected is _before and _kept is not _before:
                         _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
+                _ledger_settle("rigid_height_refine", _before, corrected, _lm)
             if p_all.get("rigid_frame_derotate", True) and not _sole and not _skip_det:
-                _before = corrected
+                _before = corrected; _lm = _ledger_mark()
                 corrected, _rfd = rigid_frame_derotate(corrected, _rp, workers=workers)
                 info["rigid_frame_derotate"] = _rfd
                 _rgh_in = _rgh
@@ -14432,8 +15127,9 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     corrected, _tsm = _reject_if_stepped(_before, corrected, "rigid_frame_derotate", info, _rp, _tsm)
                     if corrected is _before and _kept is not _before:
                         _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
+                _ledger_settle("rigid_frame_derotate", _before, corrected, _lm)   # not instrumented: flags incomplete if it moved
             if p_all.get("rigid_frame_refine", True) and not _sole and not _skip_det:
-                _before = corrected
+                _before = corrected; _lm = _ledger_mark()
                 corrected, _rfr = rigid_frame_refine(corrected, _rp, workers=workers)
                 info["rigid_frame_refine"] = _rfr
                 _rgh_in = _rgh
@@ -14443,10 +15139,11 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     corrected, _tsm = _reject_if_stepped(_before, corrected, "rigid_frame_refine", info, _rp, _tsm)
                     if corrected is _before and _kept is not _before:
                         _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
+                _ledger_settle("rigid_frame_refine", _before, corrected, _lm)     # not instrumented: flags incomplete if it moved
             # EDGE-FRAME GUARD: nudge the outermost acquisition-edge frames back onto the interior corneal curvature
             # (the faint FOV corner where the de-jitter dips them below the dome). Rigid, tapered, self-gated.
             if p_all.get("edge_guard", True):
-                _before = corrected
+                _before = corrected; _lm = _ledger_mark()
                 corrected, _efg = edge_frame_guard(corrected, _rp, workers=workers)
                 info["edge_frame_guard"] = _efg
                 _rgh_in = _rgh
@@ -14456,11 +15153,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     corrected, _tsm = _reject_if_stepped(_before, corrected, "edge_frame_guard", info, _rp, _tsm)
                     if corrected is _before and _kept is not _before:
                         _rgh = _rgh_in   # guard reverted the stage: the chain's roughness is the INPUT's again
+                _ledger_settle("edge_frame_guard", _before, corrected, _lm)
             # RECONCILE TO THE MANUAL LINE: keep the de-jitter in the reliable interior, but pin the faint FOV-corner
             # frames back to the user's drawn line (provided_edges) where the de-jitter's correction is unreliable.
             if provided_edges is not None and p_all.get("reconcile_line", True):
+                _lm = _ledger_mark(); _lb = corrected
                 corrected, _rec = reconcile_manual_line(corrected, provided_edges, params, workers=workers)
                 info["reconcile_manual_line"] = _rec
+                _ledger_settle("reconcile_manual_line", _lb, corrected, _lm)
             # TRULY FINAL flatten: land the sagittal (across-frame) surface on its per-lateral QUADRATIC with a rigid
             # per-frame axial translation — the reviewer's "corrected result should fit a nice smooth quadratic". Runs
             # AFTER edge_frame_guard + reconcile so it flattens the SAME surface the viewer sees: on the off-centre
@@ -14469,11 +15169,14 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
             # 37 px redetect step (the edge stages had not yet settled the surface) and the gate rejected it. The
             # edge/crop frames are held flat, so the reconciled manual line is preserved. Self-gated on the central body.
             if p_all.get("sag_quad_align", False):
-                _before = corrected
+                _before = corrected; _lm = _ledger_mark()
                 corrected, _sqa = sagittal_quad_align(corrected, params, workers=workers)
                 info["sagittal_quad_align"] = _sqa
                 if _step_guard:   # the 'never a step' promise covers the final flatten too (its own gate reads the DP)
                     corrected, _tsm = _reject_if_stepped(_before, corrected, "sagittal_quad_align", info, _rp, _tsm)
+                # a true in-plane ROTATION (affine_transform) is not a per-column depth move: never composed —
+                # when it applies, the run move is not written and the api measures as before
+                _ledger_settle("sagittal_quad_align", _before, corrected, _lm)
             else:
                 info["sagittal_quad_align"] = {
                     "applied": False,
@@ -14490,20 +15193,26 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
         # input exactly (_fill_black_bands for the two *_surface_gt warps, raw for align_corrected_to_smooth).
         _axa = p_all.get("axial_anchors")   # AXIAL fix-tool GT (see main path) — applies on the fix-columns path too
         if _axa:
+            _lm = _ledger_mark(); _lb = corrected
             corrected, _axinfo = apply_axial_surface_gt(corrected, _axa, params, workers=workers,
                                                         detect=_corr_detect(corrected, filled=True))
             info["axial_anchors"] = _axinfo
+            _ledger_settle("axial_anchors", _lb, corrected, _lm)
         # "Smooth to trusted slices" propagates the reviewer's edited + approved curves; it CONSUMES
         # corrected_edge_anchors as the edited GT, so the standalone warp is skipped in that mode (no double-apply).
         if p_all.get("corrected_smooth_align"):
+            _lm = _ledger_mark(); _lb = corrected
             corrected, _csa = align_corrected_to_smooth(corrected, params, workers=workers,
                                                         detect=_corr_detect(corrected, filled=False))
             info["corrected_smooth_align"] = _csa
+            _ledger_settle("corrected_smooth_align", _lb, corrected, _lm)
         elif p_all.get("corrected_edge_anchors"):   # standalone CORRECTED-edge fix-tool (guarded rigid axial move)
+            _lm = _ledger_mark(); _lb = corrected
             corrected, _ceinfo = apply_sagittal_surface_gt(corrected, p_all.get("corrected_edge_anchors"), params,
                                                            workers=workers,
                                                            detect=_corr_detect(corrected, filled=True))
             info["corrected_edge_anchors"] = _ceinfo
+            _ledger_settle("corrected_edge_anchors", _lb, corrected, _lm)
         if _gt_base:
             info["corrected_gt_baseline"] = _gt_base
         # STICKY CORRECTED-PANE TRANSFORM (corrected_edit_mode="transform"): the reviewer's accumulated per-frame
@@ -14518,9 +15227,10 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                                       "reason": f"corrected_edit_mode={str(p_all.get('corrected_edit_mode', DEFAULT_PARAMS['corrected_edit_mode']))!r}: "
                                                 "stored transform kept on record, not applied"}
         elif isinstance(_et, dict) and _et.get("shift"):
-            _before = corrected
+            _before = corrected; _lm = _ledger_mark()
             corrected, _eti = apply_edit_transform(corrected, _et, params)
             info["edit_transform"] = _eti
+            _ledger_settle("edit_transform", _before, corrected, _lm)
             if _eti.get("applied"):
                 try:
                     _tmp: dict = {"edit_transform": {}}
@@ -14533,12 +15243,19 @@ def preprocess_oct_to_nifti(oct_path: str | Path, out_nifti: str | Path,
                     pass
         ms = p_all.get("manual_shifts")
         if ms:
+            _lm = _ledger_mark(); _lb = corrected
             corrected, n_ms = apply_manual_shifts(corrected, ms)
             info["manual_shifts"] = {"n_frames": int(n_ms)}
-        corrected, n_crop = _apply_crop(corrected, p_all)
+            _ledger_settle("manual_shifts", _lb, corrected, _lm)
+        corrected, n_crop = _apply_crop(corrected, p_all)          # zeroes cells, moves nothing
         if n_crop:
             info["crop"] = {"n_voxels": n_crop}
         write_volume_nifti(corrected, out_nifti, sp)
+        # PERSIST THE EXACT APPLIED MOVE (option (b), 2026-09-09) — after the write so the stamp is the delivered
+        # file's. corrected_row = raw_row + _ext_pad_used + move; the bottom pad shifts no row. Best-effort.
+        info["applied_move"] = write_applied_move_cache(out_nifti, _ledger_close(),
+                                                        (int(corrected.shape[2]), int(corrected.shape[0])),
+                                                        canvas_pad=int(_ext_pad_used), bottom_pad=int(_bot_pad))
         # QA on the fix-columns path too. Like the surface-crop branch this hardcodes metrics=[] /
         # axial_metrics=[] (it is a single same-canvas warp, no iterate loop), so without this the
         # delivered volume carries no quality number at all. Latent today (0/308 are 'redetect') but

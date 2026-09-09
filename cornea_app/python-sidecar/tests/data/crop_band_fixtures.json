@@ -1,0 +1,133 @@
+{
+  "spec": "SHARED crop-band fixtures — EXPLICIT-BAND contract (2026-09-09). Backend: oct_preprocess.resolve_crop_bands(crop_bands, n_lateral, n_frames) ; frontend: bandsAt(parseCropBands(crop_bands), lat). For every case and every key of `probes` (a probe lateral, as a string), the resolved bands at that lateral must EQUAL the listed [[lo, hi, id], ...] exactly — the bands COVERING that lateral, in ASCENDING band id, each with ITS OWN interpolated [lo, hi] (bands may overlap in frames and are NOT merged in this listing; a consumer that needs a frame set takes the union). RULES pinned here: (1) A BAND is {\"id\": <int>, \"marks\": {\"<lateral>\": [lo, hi]}} — at most ONE mark per lateral per band; lo/hi are swapped into lo <= hi; laterals outside [0, n_lateral) are dropped; lo/hi are CLAMPED into [0, n_frames-1]; invalid keys/values/bands are skipped; key/list order is irrelevant. (2) PERSISTED FORMS: explicit {\"bands\": [BAND, ...]} (ids unique, small positive ints); LEGACY {\"<lateral>\": [lo, hi]} is read as ONE band with id 1 and those marks; {} and {\"bands\": []} are no band; a band without a valid mark contributes nothing; the abandoned intermediate {\"<lateral>\": [[lo, hi], ...]} form is NOT a mark and is dropped. (3) INTERPOLATION per band, from ITS marks only: a band's lateral extent is exactly [min marked lateral, max marked lateral] of its marks; for each lateral x in that span, lo(x) and hi(x) are linear between the band's two nearest marked laterals (piecewise when it has a middle mark), rounded half-UP (Python floor(v + 0.5) == JS Math.round(v) for v >= 0), then clamped into [0, n_frames-1]; a single-mark band covers its lateral only. (4) Bands are INDEPENDENT: no linking, no grouping, no merging across bands — two bands with identical frames on adjacent laterals stay two bands, and nothing is cropped between two single-mark bands. (5) Unmarked/unspanned laterals are [].",
+  "cases": [
+    {
+      "name": "legacy_single_band_flat",
+      "note": "The pre-contract single-band map, marked on both boundary laterals → ONE band (id 1); every lateral in between carries the same band.",
+      "n_lateral": 60,
+      "n_frames": 40,
+      "crop_bands": {"0": [30, 39], "59": [30, 39]},
+      "probes": {"0": [[30, 39, 1]], "30": [[30, 39, 1]], "59": [[30, 39, 1]]}
+    },
+    {
+      "name": "legacy_single_band_sloped_half_up_rounding",
+      "note": "lo/hi interpolate linearly between the marked laterals; 22.5 -> 23 and 23.5 -> 24 (half-up, NOT banker's rounding); no crop outside [10, 20].",
+      "n_lateral": 64,
+      "n_frames": 50,
+      "crop_bands": {"10": [20, 30], "20": [25, 35]},
+      "probes": {"9": [], "10": [[20, 30, 1]], "12": [[21, 31, 1]], "15": [[23, 33, 1]], "17": [[24, 34, 1]], "20": [[25, 35, 1]], "21": []}
+    },
+    {
+      "name": "explicit_single_band_equals_legacy",
+      "note": "The same marks in the explicit form resolve identically to the legacy case above.",
+      "n_lateral": 64,
+      "n_frames": 50,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"10": [20, 30], "20": [25, 35]}}]},
+      "probes": {"9": [], "10": [[20, 30, 1]], "12": [[21, 31, 1]], "15": [[23, 33, 1]], "17": [[24, 34, 1]], "20": [[25, 35, 1]], "21": []}
+    },
+    {
+      "name": "two_bands_overlapping_laterals_disjoint_frames",
+      "note": "Two bands on the same lateral span, disjoint in frames: each interpolates from its OWN marks. t=0.25 at lateral 20 (5.25 -> 5, 10.25 -> 10; 30.5 -> 31, 40.5 -> 41), t=0.5 at lateral 30 (5.5 -> 6, 10.5 -> 11; 31, 41).",
+      "n_lateral": 100,
+      "n_frames": 60,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"10": [5, 10], "50": [6, 11]}}, {"id": 2, "marks": {"10": [30, 40], "50": [32, 42]}}]},
+      "probes": {"9": [], "10": [[5, 10, 1], [30, 40, 2]], "20": [[5, 10, 1], [31, 41, 2]], "30": [[6, 11, 1], [31, 41, 2]], "50": [[6, 11, 1], [32, 42, 2]], "51": []}
+    },
+    {
+      "name": "two_bands_same_frames_separate_lateral_spans",
+      "note": "Identical frame ranges on two separate lateral spans: two bands, nothing cropped between them (no auto-linking by frame overlap).",
+      "n_lateral": 512,
+      "n_frames": 100,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"0": [20, 30], "100": [20, 30]}}, {"id": 2, "marks": {"300": [20, 30], "400": [20, 30]}}]},
+      "probes": {"0": [[20, 30, 1]], "50": [[20, 30, 1]], "100": [[20, 30, 1]], "101": [], "200": [], "299": [], "300": [[20, 30, 2]], "350": [[20, 30, 2]], "400": [[20, 30, 2]], "401": []}
+    },
+    {
+      "name": "two_bands_overlapping_in_both_union_at_shared_laterals",
+      "note": "Band 1 spans laterals 0-20 at frames 0-10, band 2 spans 10-30 at frames 8-15: on laterals 10-20 BOTH are listed, overlapping and unmerged (their union of frames there is 0-15, which is what _artifact_bands / the mask crop).",
+      "n_lateral": 40,
+      "n_frames": 30,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"0": [0, 10], "20": [0, 10]}}, {"id": 2, "marks": {"10": [8, 15], "30": [8, 15]}}]},
+      "probes": {"0": [[0, 10, 1]], "5": [[0, 10, 1]], "10": [[0, 10, 1], [8, 15, 2]], "15": [[0, 10, 1], [8, 15, 2]], "20": [[0, 10, 1], [8, 15, 2]], "21": [[8, 15, 2]], "30": [[8, 15, 2]], "31": []}
+    },
+    {
+      "name": "single_mark_band",
+      "note": "A band with one mark covers its slice only.",
+      "n_lateral": 30,
+      "n_frames": 40,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"7": [3, 9]}}]},
+      "probes": {"6": [], "7": [[3, 9, 1]], "8": []}
+    },
+    {
+      "name": "middle_mark_piecewise_interpolation",
+      "note": "Three marks on one band: lo/hi are linear between the two NEAREST marked laterals (piecewise), not a single line from first to last. Lateral 3 is t=0.3 of segment 0->10 (13, 23); lateral 20 is t=0.5 of segment 10->30 (10, 20); lateral 25 is t=0.75 (5, 15).",
+      "n_lateral": 64,
+      "n_frames": 50,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"0": [10, 20], "10": [20, 30], "30": [0, 10]}}]},
+      "probes": {"0": [[10, 20, 1]], "3": [[13, 23, 1]], "5": [[15, 25, 1]], "10": [[20, 30, 1]], "20": [[10, 20, 1]], "25": [[5, 15, 1]], "30": [[0, 10, 1]], "31": []}
+    },
+    {
+      "name": "slice_carrying_marks_of_two_bands",
+      "note": "Lateral 5 carries a mark of band 1 AND a mark of band 2; the bands have different lateral extents (band 1: 5-40, band 2: 5-15). Lateral 10 is t=0.5 of band 2 (21, 26).",
+      "n_lateral": 64,
+      "n_frames": 50,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"5": [0, 5], "40": [0, 5]}}, {"id": 2, "marks": {"5": [20, 25], "15": [22, 27]}}]},
+      "probes": {"4": [], "5": [[0, 5, 1], [20, 25, 2]], "10": [[0, 5, 1], [21, 26, 2]], "15": [[0, 5, 1], [22, 27, 2]], "16": [[0, 5, 1]], "40": [[0, 5, 1]], "41": []}
+    },
+    {
+      "name": "ids_preserved_and_listed_ascending",
+      "note": "Ids are whatever the writer chose (7 and 3 here, listed out of order in the file); the probes list the covering bands in ascending id.",
+      "n_lateral": 20,
+      "n_frames": 20,
+      "crop_bands": {"bands": [{"id": 7, "marks": {"0": [10, 12], "19": [10, 12]}}, {"id": 3, "marks": {"0": [2, 4], "19": [2, 4]}}]},
+      "probes": {"0": [[2, 4, 3], [10, 12, 7]], "10": [[2, 4, 3], [10, 12, 7]], "19": [[2, 4, 3], [10, 12, 7]]}
+    },
+    {
+      "name": "legacy_reversed_lo_hi_frame_clamp_unsorted_keys",
+      "note": "[9, 2] reads as [2, 9]; [35, 45] is clamped to [35, 39] for n_frames = 40; key order does not matter. Both marks belong to the ONE legacy band, so lateral 4 interpolates between them (18.5 -> 19, 24).",
+      "n_lateral": 8,
+      "n_frames": 40,
+      "crop_bands": {"5": [35, 45], "3": [9, 2]},
+      "probes": {"2": [], "3": [[2, 9, 1]], "4": [[19, 24, 1]], "5": [[35, 39, 1]], "6": []}
+    },
+    {
+      "name": "explicit_clamp_and_swap",
+      "note": "Marks [25, 15] -> [15, 25] -> clamped [15, 19] (n_frames 20) and [-3, 4] -> [0, 4]; lateral 4 is t=0.5 (7.5 -> 8, 11.5 -> 12).",
+      "n_lateral": 10,
+      "n_frames": 20,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"2": [25, 15], "6": [-3, 4]}}]},
+      "probes": {"1": [], "2": [[15, 19, 1]], "4": [[8, 12, 1]], "6": [[0, 4, 1]], "7": []}
+    },
+    {
+      "name": "legacy_invalid_entries_dropped",
+      "note": "A non-numeric key, a one-element value, a non-list value, an out-of-range lateral and the unsupported nested-list value are skipped; the valid mark survives as band 1.",
+      "n_lateral": 8,
+      "n_frames": 40,
+      "crop_bands": {"x": [1, 2], "2": [1], "3": "junk", "9": [1, 2], "4": [5, 7], "6": [[1, 2], [3, 4]]},
+      "probes": {"3": [], "4": [[5, 7, 1]], "5": [], "6": []}
+    },
+    {
+      "name": "explicit_invalid_bands_dropped",
+      "note": "A band with no marks, a non-object entry, a band whose marks are all invalid/out of range, and a band without a marks key contribute nothing; the valid band survives with its own id.",
+      "n_lateral": 8,
+      "n_frames": 40,
+      "crop_bands": {"bands": [{"id": 1, "marks": {"2": [1, 3]}}, {"id": 2, "marks": {}}, "junk", {"id": 3, "marks": {"x": [1, 2], "9": [1, 2]}}, {"id": 4}]},
+      "probes": {"1": [], "2": [[1, 3, 1]], "3": []}
+    },
+    {
+      "name": "empty_explicit",
+      "note": "{\"bands\": []} is no band.",
+      "n_lateral": 8,
+      "n_frames": 40,
+      "crop_bands": {"bands": []},
+      "probes": {"0": [], "4": [], "7": []}
+    },
+    {
+      "name": "empty_legacy",
+      "note": "{} is no band.",
+      "n_lateral": 8,
+      "n_frames": 40,
+      "crop_bands": {},
+      "probes": {"0": [], "4": [], "7": []}
+    }
+  ]
+}

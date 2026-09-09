@@ -3,7 +3,7 @@ import { api, resourceUrl } from "../../api/client";
 import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { usePendingEditStore } from "../../store/pendingEditStore";
-import { parseCropBands, interpBand } from "../../store/cropBands";
+import { parseCropBands, bandsAt, bandColor, inAnyBand } from "../../store/cropBands";
 import type { CaseInfo } from "../../api/types";
 
 // CORRECTED-RESULT sagittal fix-tool — the RIGHT ("corrected") pane of the before/after fix-columns view.
@@ -227,11 +227,17 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
     if (a != null) return a;                       // un-confirmed drag → WYSIWYG (the line you're moving is visible)
     return edge ? edge[f] : 0;
   };
-  // #9 v3: the interpolated artifact band for THIS lateral — the corrected result has these frames ZEROED (black),
-  // so the red surface line is BROKEN over them (drawing a line across the removed/black region is misleading).
+  // #9 v3: the EXPLICIT artifact bands resolved at THIS lateral (every band whose marked span covers it, each
+  // interpolated between its own marks — store/cropBands.ts, the backend's twin) — the corrected result has these
+  // frames ZEROED (black), so every surface line is BROKEN over every band (drawing a line across the removed/black
+  // region is misleading) and each band is painted faintly in ITS colour, the same colour as on the left pane.
+  // FRAME MAPPING: raw frame f == corrected frame f and raw lateral == corrected lateral (the pipeline never
+  // re-indexes frames or laterals; only DEPTH differs on canvas-extended runs, which a full-height band ignores),
+  // so the bands are resolved at the same sliceIndex and painted over the same frame indices as the original pane.
   const cropBandsSig = JSON.stringify(ocParams(caseInfo).crop_bands ?? {});
-  const curBand = useMemo(() => interpBand(parseCropBands(JSON.parse(cropBandsSig)), sliceIndex), [cropBandsSig, sliceIndex]);
-  const inBand = (f: number) => curBand != null && f >= curBand[0] && f <= curBand[1];
+  const curBands = useMemo(() => bandsAt(parseCropBands(JSON.parse(cropBandsSig)), sliceIndex, nFrames > 0 ? nFrames : undefined),
+                           [cropBandsSig, sliceIndex, nFrames]);
+  const inBand = (f: number) => inAnyBand(curBands, f);
   // (3) THE BLUE QUADRATIC — the deg-2 LEAST-SQUARES best fit of the corrected surface across frames, drawn
   // for reference. CALCULATED, never editable and never a target: the reviewer's quality criterion for a
   // corrected result is that the anterior surface is a smooth quadratic best fit, so this shows what that
@@ -492,6 +498,14 @@ export function CorrectedEdgePanel({ sliceIndex, bDispW, bDispH, bSized, bZoom, 
                   detection stays legible, and only when it actually differs (otherwise it would just double the
                   red line). Where amber and red separate, "what you approve" and "what Run uses" differ by that
                   much — the same quantity the endpoint reports as warp_gap. */}
+              {/* #9 v3 ARTIFACT BANDS — every band resolved at this lateral, each in ITS OWN colour (bandColor,
+                  the same palette as the original pane) so the two panes read as one picture and a band can be
+                  told from its neighbour. Drawn first (under the pink marks and every line): the frames are
+                  already zeroed in this volume, the tint just says WHY they are black — and which band did it. */}
+              {curBands.map((b) => (
+                <rect key={`cb${b.id}`} x={b.lo} y={0} width={Math.max(1, b.hi - b.lo + 1)} height={depthVox}
+                      fill={`rgba(${bandColor(b.id).rgb},0.15)`} stroke="none" pointerEvents="none" />
+              ))}
               {/* ⚑ marks: pink bands over the frames the reviewer flagged on THIS corrected slice, plus the one
                   being dragged. Full depth, drawn first so the surface lines stay on top. */}
               {[...curMarks, ...(markDrag ? [[Math.min(...markDrag), Math.max(...markDrag)]] : [])].map((b, i) => (

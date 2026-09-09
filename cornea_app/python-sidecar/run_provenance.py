@@ -1225,6 +1225,25 @@ def _node_top_lines(ctx: RunCtx, sl: dict, R: _Renderer | None) -> dict:
                source={"manifest": ["oct_params.border_anchors", "oct_params.border_generalize", "oct_params.border_guided"], "files": []})
 
 
+def _crop_bands_brief(cb) -> str:
+    """One line for oct_params.crop_bands in EITHER persisted form (explicit {"bands": [{"id", "marks"}, …]} since
+    2026-09-09; legacy {"<lateral>": [lo, hi]} = one band): 'N band(s), M mark(s): band 1 (2 marks) @ 0:[30,39]
+    511:[30,39]; …'. Bands are independent (each interpolated across its own marks), so they are listed per band."""
+    try:
+        bands = oct_mod.parse_crop_bands(cb)
+    except Exception:  # noqa: BLE001 — provenance must never fail on a malformed mark
+        return "unparseable"
+    if not bands:
+        return "absent"
+    parts = []
+    for bid, marks in bands[:4]:
+        items = list(marks.items())
+        txt = " ".join(f"{lat}:[{lo},{hi}]" for lat, (lo, hi) in items[:4]) + (" …" if len(items) > 4 else "")
+        parts.append(f"band {bid} ({len(items)} marks) @ {txt}")
+    n_marks = sum(len(m) for _, m in bands)
+    return f"{len(bands)} band(s), {n_marks} mark(s): " + "; ".join(parts) + (" …" if len(bands) > 4 else "")
+
+
 # ── n03 crop marks ─────────────────────────────────────────────────────────────────────────────────────────
 def _node_crop_marks(ctx: RunCtx, sl: dict, R: _Renderer | None) -> dict:
     p, it = ctx.p, ctx.it
@@ -1233,7 +1252,7 @@ def _node_crop_marks(ctx: RunCtx, sl: dict, R: _Renderer | None) -> dict:
     cb = p.get("crop_bands") if isinstance(p.get("crop_bands"), dict) else {}
     cr = p.get("crop_region") if isinstance(p.get("crop_region"), dict) else {}
     numbers = [_n("surface-crop band", f"{mode}: frames {_runs(cf)} ({len(cf)} of {ctx.F or '?'})" if cf else "absent"),
-               _n("artifact bands (crop_bands)", (f"{len(cb)} laterals: " + "; ".join(f"{k}: {v}" for k, v in list(cb.items())[:6])) if cb else "absent"),
+               _n("artifact bands (crop_bands)", _crop_bands_brief(cb) if cb else "absent"),
                _n("crop region", (f"laterals {cr.get('lateral')} × {len(cr.get('frames') or [])} frames" + (" (auto)" if cr.get("auto") else "")) if cr and cr.get("frames") else "absent")]
     scv = it.get("surface_crop") if isinstance(it.get("surface_crop"), dict) else None
     if scv:
@@ -2201,7 +2220,8 @@ def _node_crop_auto(ctx: RunCtx, sl: dict, R) -> dict:
         status, reason = "declined", "crop marks on record but the last run zeroed nothing"
     else:
         status, reason = "not_run", "no crop region / artifact bands on record"
-    numbers = [_n("zeroed voxels", rec.get("n_voxels") if rec else None), _n("crop region", bool(cr)), _n("artifact bands", len(cb) if cb else 0),
+    numbers = [_n("zeroed voxels", rec.get("n_voxels") if rec else None), _n("crop region", bool(cr)),
+               _n("artifact bands", len(oct_mod.parse_crop_bands(cb)) if cb else 0),
                _n("guard-removed frames", ctx.it.get("crop_guard_removed_frames"))]
     return _mk("a09_crop", "decision", "spine", "Crop (zero artifact columns / region)", status, reason,
                (f"{rec.get('n_voxels')} voxels zeroed" if rec else (reason or "")),

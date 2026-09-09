@@ -7,6 +7,7 @@ import { useWorkflowStore } from "./workflowStore";
 import { describeSmoothAlign, type SmoothAlignInfo } from "./smoothAlign";
 import { usePendingEditStore } from "./pendingEditStore";
 import { RERUN_WITH_CORRECTIONS_BODY, autoRerunNotice, shouldAutoRerun } from "./autoRerun";
+import { serialiseCropBands, type CropBands } from "./cropBands";
 
 // The last case openCase() actually switched to — so we only reset the per-case
 // workflow state on a genuine case CHANGE, not on a same-case reopen/refresh.
@@ -136,9 +137,11 @@ interface CaseState {
    *  path the review loop needs, since "Confirm & re-run" costs a full ~2 min reprocess. */
   commitOctMarks: (cropFrames: number[] | null, cropRegion: { lateral: [number, number]; frames: number[] } | null,
                    postAnchors?: Record<string, Record<string, number>> | null) => Promise<void>;
-  /** Persist the per-lateral ARTIFACT bands (crop_bands = {lateral:[lo,hi]}) as sticky GT (oct-marks, no re-run).
-   *  Interpolated across laterals + excluded from the cornea fit on the next Run. Empty {} clears. */
-  commitCropBands: (bands: Record<number, [number, number]>) => Promise<void>;
+  /** Persist the EXPLICIT artifact bands (crop_bands = {"bands": [{id, marks: {lateral: [lo,hi]}}, ...]}) as
+   *  sticky GT (oct-marks, no re-run). Each band is interpolated across its own marked laterals + excluded from
+   *  the cornea fit on the next Run. Takes the {bands: [...]} set; serialised to the wire form (always the new
+   *  form; empty bands dropped) by serialiseCropBands. No marks → {} clears. */
+  commitCropBands: (bands: CropBands) => Promise<void>;
   /** Kick off the guarded re-run over the scans corrected so far. Returns immediately; the pass runs
    *  in the background on the sidecar and only re-writes a scan that measures better. */
   startReprocessBatch: () => Promise<{ started: number } | null>;
@@ -522,13 +525,16 @@ export const useCaseStore = create<CaseState>()(
     commitCropBands: async (bands) => {
       const id = get().caseId;
       if (!id) return;
-      // Sticky per-lateral artifact bands. REPLACE semantics — the caller holds the full {lateral:[lo,hi]} map;
-      // {} clears. Persisted to oct_params.crop_bands (no re-run here); the next Run interpolates + excludes them.
+      // Sticky explicit artifact bands. REPLACE semantics — the caller holds the full {bands: [...]} set; no marks
+      // → {} clears. Sent + mirrored in the WIRE form ({"bands": [{id, marks}]}, the new form only — legacy
+      // {lateral: [lo,hi]} is read but never written) so the manifest we hold locally is byte-for-byte what the
+      // sidecar persists to oct_params.crop_bands (no re-run here); the next Run interpolates + excludes them.
+      const wire = serialiseCropBands(bands ?? { bands: [] });
       await api.json(`/api/case/${id}/oct-marks`, "POST",
-        JSON.stringify({ crop_bands: bands ?? {} }));
+        JSON.stringify({ crop_bands: wire }));
       set((s) => { if (s.caseInfo) {
         const op = ((s.caseInfo.manifest as Record<string, unknown>).oct_params ?? {}) as Record<string, unknown>;
-        if (bands && Object.keys(bands).length) op.crop_bands = bands; else delete op.crop_bands;
+        if (wire.bands?.length) op.crop_bands = wire; else delete op.crop_bands;
         (s.caseInfo.manifest as Record<string, unknown>).oct_params = op;
       } });
     },

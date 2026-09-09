@@ -1335,6 +1335,188 @@ class TestFlattenExcludeLaterals:
         assert abs(a_ex[25]) < abs(a_all[25]) - 5                                   # the spike no longer pulls frame 25
 
 
+def _witness_volume(L=5, D=200, F=60, dip=False, seed=0, surf_fn=None):
+    """(vol (L, D, F) float32, surface (F,)) — a bright tissue block under a dome surface, dark air above. dip=True
+    plunges the surface 100 px over frames ~40-50 (a blink); surf_fn overrides the surface."""
+    rng = np.random.default_rng(seed); fr = np.arange(F, dtype=float)
+    surf = surf_fn(fr) if surf_fn is not None else 60.0 + 0.03 * (fr - 30.0) ** 2
+    if dip:
+        surf = surf + 100.0 * np.exp(-0.5 * ((fr - 45.0) / 3.0) ** 2)
+    rows = np.arange(D, dtype=float)[:, None]
+    tissue = (rows >= surf[None, :]) & (rows < surf[None, :] + 120.0)
+    sl = np.where(tissue, 1000.0 + 40.0 * rng.standard_normal((D, F)), 50.0 + 10.0 * rng.standard_normal((D, F)))
+    vol = np.repeat(sl[None, :, :], L, axis=0).astype(np.float32)
+    return vol, surf
+
+
+class TestChordWitness:
+    """A stroke gap is bridged by a straight chord ONLY when the raw slice says the chord runs along the surface."""
+
+    def test_fast_drag_along_the_surface_bridges_exactly_as_today(self):
+        vol, surf = _witness_volume()
+        anchors = {2: {10: float(surf[10]), 31: float(surf[31])}}          # 20-frame gap; chord sagitta ~3 px
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        assert R == {}
+        out = M.densify_anchor_polylines(anchors, refuse_gaps=R)
+        assert out == M.densify_anchor_polylines(anchors) and set(out[2]) == set(range(10, 32))
+        # a WRONG surface reference must not matter: the witness never consults one
+        ref = np.tile(surf + 25.0, (5, 1))
+        assert set(M.densify_anchor_polylines(anchors, reference=ref, guarded_slices={2})[2]) == {10, 31}   # old guard refuses
+        assert set(M.densify_anchor_polylines(anchors, refuse_gaps=R)[2]) == set(range(10, 32))              # witness bridges
+
+    def test_chord_across_the_blink_dip_is_refused_and_points_kept(self):
+        vol, surf = _witness_volume(dip=True)
+        anchors = {2: {39: float(surf[39]), 51: float(surf[51])}}          # chord ~100 px ABOVE the plunging tissue
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        assert (39, 51) in R.get(2, {}) and R[2][(39, 51)]["reason"] == "air" and R[2][(39, 51)]["run"] >= 5
+        opened = {f for lo, hi in R[2][(39, 51)]["runs"] for f in range(lo, hi + 1)}
+        assert len(opened) >= 5 and opened <= set(range(40, 51))
+        d = M.densify_anchor_polylines(anchors, refuse_gaps=R)
+        assert not (opened & set(d[2])) and d[2][39] == float(surf[39]) and d[2][51] == float(surf[51])   # open frames carry no chord
+        S = np.tile(surf, (5, 1)).astype(np.float64); before = S.copy()
+        M.pin_anchors(S, anchors, depth=200, refuse_gaps=R)
+        fo = sorted(opened)
+        assert np.allclose(S[2, fo], before[2, fo]) and S[2, 39] == float(surf[39])
+        assert M.chord_refusals_to_list(R)[0]["lateral"] == 2 and M.chord_refusals_to_list(R)[0]["f0"] == 39
+
+    def test_chord_through_tissue_is_refused(self):
+        # the p1 geometry: a dome between two deep shoulders; the chord between the shoulders runs INSIDE the tissue
+        fn = lambda fr: np.minimum(141.0 + 0.25 * (fr - 30.0) ** 2, 186.0)
+        vol, surf = _witness_volume(D=320, surf_fn=fn)
+        anchors = {2: {16: float(surf[16]), 44: float(surf[44])}}          # both at the 186 shoulders; chord flat at 186, dome apex at 141
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        assert (16, 44) in R.get(2, {}) and R[2][(16, 44)]["reason"] == "tissue" and R[2][(16, 44)]["med_dev"] > 12
+        assert M.chord_witness_refusals(vol, anchors, {**M.DEFAULT_PARAMS, "chord_witness": False}) == {}
+
+    def test_only_the_failing_run_is_left_open(self):
+        # a gap whose chord fails on the dip frames only: the rest of the gap keeps the chord (it sits on the surface)
+        vol, surf = _witness_volume(dip=True)
+        anchors = {2: {30: float(surf[30]), 59: float(surf[59])}}           # 28 interior frames; the dip is ~40-50
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        rec = R[2][(30, 59)]; runs = rec["runs"]
+        assert len(runs) >= 1 and runs[0][0] >= 36 and runs[-1][1] <= 55, runs           # only the dip frames fail
+        d = M.densify_anchor_polylines(anchors, refuse_gaps=R)[2]
+        opened = {f for lo, hi in runs for f in range(lo, hi + 1)}
+        assert all(f not in d for f in opened) and all(f in d for f in range(31, 59) if f not in opened)
+        lst = M.chord_refusals_to_list(R)                                    # the JSON/list form carries the runs
+        d2 = M.densify_anchor_polylines(anchors, refuse_gaps=[[r["lateral"], r["f0"], r["f1"], r["runs"]] for r in lst])[2]
+        assert set(d2) == set(d)
+
+    def test_refusal_is_local_and_never_flips_a_frame(self):
+        vol, surf = _witness_volume(L=16, dip=True)
+        base = np.tile(surf - 30.0, (16, 1)).astype(np.float64)             # a deliberately WRONG auto (30 px shallow)
+        anchors = {s: {f: float(surf[f]) for f in range(60)} for s in range(1, 15)}
+        anchors[7] = {f: float(surf[f]) for f in list(range(0, 40)) + list(range(51, 60))}   # lifted the pointer across the dip
+        p = {**M.DEFAULT_PARAMS, "interp_min_slices": 12}
+        R = M.chord_witness_refusals(vol, anchors, p)
+        assert set(R) == {7} and (39, 51) in R[7]
+        fo = sorted({f for lo, hi in R[7][(39, 51)]["runs"] for f in range(lo, hi + 1)})   # the frames left open
+        assert len(fo) >= 5 and set(fo) <= set(range(40, 51))
+        S_old = np.asarray(M.interpolate_anchors_surface(anchors, base, p), np.float64)
+        S_new = np.asarray(M.interpolate_anchors_surface(anchors, base, {**p, "_refused_chords": R}), np.float64)
+        assert np.allclose(S_new[7, fo], surf[fo], atol=1e-4)                # the neighbours' drawn line, not the chord, not the auto
+        assert np.max(np.abs(S_old[7, fo] - surf[fo])) > 20                   # the chord was ~100 px off there
+        mask = np.zeros(S_old.shape, bool); mask[7, fo] = True
+        assert np.array_equal(S_new[~mask], S_old[~mask])                    # locality: chord frames within 12 px of the witness stay
+        assert anchors[7] == {f: float(surf[f]) for f in list(range(0, 40)) + list(range(51, 60))}   # points untouched
+
+    def test_fill_check_keeps_the_chord_when_the_fill_is_worse(self):
+        vol, surf = _witness_volume(dip=True)
+        anchors = {2: {39: float(surf[39]), 51: float(surf[51])}}
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        assert (39, 51) in R[2]
+        good = np.tile(surf, (5, 1)).astype(np.float64)                        # a fill ON the surface: refusal stands
+        kept, dropped = M.chord_fill_check(vol, anchors, R, good, M.DEFAULT_PARAMS)
+        assert (39, 51) in kept.get(2, {}) and dropped == [] and kept[2][(39, 51)]["fill_px"] < 3
+        bad = good.copy(); bad[2, 40:51] = surf[40:51] + 150.0                   # a fill 150 px off: worse than the ~100 px chord → chord kept
+        kept2, dropped2 = M.chord_fill_check(vol, anchors, R, bad, M.DEFAULT_PARAMS)
+        assert kept2 == {} and len(dropped2) == 1 and dropped2[0]["fill_px"] > dropped2[0]["chord_px"]
+
+    def test_far_knots_taper_to_the_auto_per_cell(self):
+        vol, surf = _witness_volume(L=16, dip=True)
+        base = np.tile(surf - 30.0, (16, 1)).astype(np.float64)
+        anchors = {s: {f: float(surf[f]) for f in range(60)} for s in range(1, 15)}
+        for s in range(3, 13):                                              # laterals 3..12 lift the pointer across the dip
+            anchors[s] = {f: float(surf[f]) for f in list(range(0, 40)) + list(range(51, 60))}
+        p = {**M.DEFAULT_PARAMS, "interp_min_slices": 12, "interp_fill_reach": 3.0}
+        R = M.chord_witness_refusals(vol, anchors, p)
+        assert set(R) == set(range(3, 13))
+        fo = sorted({f for lo, hi in R[7][(39, 51)]["runs"] for f in range(lo, hi + 1)})
+        S = np.asarray(M.interpolate_anchors_surface(anchors, base, {**p, "_refused_chords": R}), np.float64)
+        # lateral 7: nearest surviving knots at 2 and 13 (span 11 > 2*reach) → the auto; lateral 1: drawn → exact
+        assert np.allclose(S[7, fo], base[7, fo]) and np.allclose(S[1, fo], surf[fo])
+        # the frame gate did not flip: undrawn lateral 0 at an open frame is still the interpolated/extended line, not a base blend
+        assert np.allclose(S[0, fo], surf[fo], atol=1e-6)
+
+    def test_short_pass_between_failing_runs_is_absorbed(self):
+        # two dips in one gap, 3 passing frames between them where the chord crosses the surface → ONE open run
+        fn = lambda fr: 60.0 + 0.03 * (fr - 30.0) ** 2 + 100.0 * (np.exp(-0.5 * ((fr - 36.0) / 2.5) ** 2) + np.exp(-0.5 * ((fr - 48.0) / 2.5) ** 2))
+        vol, surf = _witness_volume(surf_fn=fn)
+        anchors = {2: {29: float(surf[29]), 55: float(surf[55])}}
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        rec = R[2][(29, 55)]
+        assert len(rec["runs"]) == 1 and rec["runs"][0][0] <= 34 and rec["runs"][0][1] >= 50, rec["runs"]
+
+    def test_folded_lateral_guard_keeps_precedence(self):
+        # a gap the folded-lateral reference guard refuses stays WHOLLY open even when the witness only fails part of it
+        vol, surf = _witness_volume(dip=True)
+        anchors = {2: {30: float(surf[30]), 59: float(surf[59])}}
+        R = M.chord_witness_refusals(vol, anchors, M.DEFAULT_PARAMS)
+        assert R[2][(30, 59)]["runs"][0][0] > 31                                # the witness leaves frames 31.. bridged
+        ref = np.tile(surf, (5, 1)).astype(np.float64)                           # the chord is > 12 px off this reference at the dip
+        d = M.densify_anchor_polylines(anchors, reference=ref, guarded_slices={2}, refuse_gaps=R)
+        assert set(d[2]) == {30, 59}                                             # no chord fragments on a guarded lateral
+
+    def test_witness_fail_safes_bridge_as_today(self):
+        vol, surf = _witness_volume(dip=True)
+        p = M.DEFAULT_PARAMS
+        # (a) endpoints 30 px above the tissue: the witness cannot vouch → bridged
+        a = {2: {39: float(surf[39]) - 30.0, 51: float(surf[51]) - 30.0}}
+        assert M.chord_witness_refusals(vol, a, p) == {}
+        # (b) tissue bright from row 0 over the gap (apex above the window) → unscorable → bridged
+        v2 = vol.copy(); v2[:, :, 40:51] = 1000.0
+        assert M.chord_witness_refusals(v2, {2: {39: float(surf[39]), 51: float(surf[51])}}, p) == {}
+        # (c) too short a gap is never judged
+        assert M.chord_witness_refusals(vol, {2: {43: float(surf[43]), 47: float(surf[47])}}, p) == {}
+        # (d) the list form round-trips into densify
+        R = M.chord_witness_refusals(vol, {2: {39: float(surf[39]), 51: float(surf[51])}}, p)
+        lst = [[r["lateral"], r["f0"], r["f1"]] for r in M.chord_refusals_to_list(R)]
+        assert set(M.densify_anchor_polylines({2: {39: 1.0, 51: 2.0}}, refuse_gaps=lst)[2]) == {39, 51}
+        assert M._json_safe({"_refused_chords": R, "keep": 1}) == {"keep": 1}
+
+
+class TestNoiseCropTissueWitness:
+    """p6_os_v1 (2026-09-09): the auto noise crop zeroed 25 frames of real cornea because the detector lost a dim, deep
+    cornea and scored them like empty frames. A boundary frame whose tissue ridge forms a concave dome across laterals
+    is never noise; a bright but FLAT band (an eyelid) still is."""
+
+    def _sag(self, tail="dim_dome", seed=0):
+        rng = np.random.default_rng(seed); L, D, F = 40, 200, 40
+        sag = (40.0 + 12.0 * rng.standard_normal((L, D, F))).astype(np.float32)          # speckle background
+        x = np.arange(L, dtype=float); dome = 0.05 * (x - L / 2.0) ** 2                  # concave across laterals
+        rows = np.arange(D, dtype=float)
+        def band(top, amp):                                    # a tissue band: brightest at its anterior, decaying into the stroma
+            d = rows[None, :] - top[:, None]
+            return np.where((d >= 0) & (d < 60), amp * np.exp(-d / 20.0), 0.0)
+        for f in range(F):
+            if f < 25:
+                sag[:, :, f] += band(60 + 2 * f + dome, 900.0)
+            elif tail == "dim_dome":
+                sag[:, :, f] += band(110 + 2 * (f - 25) + dome, 60.0)              # dim (~+150 % over bg at the ridge), concave
+            elif tail == "bright_flat":
+                sag[:, :, f] += band(110 + 2 * (f - 25) + np.zeros(L), 900.0)      # eyelid-like: bright, flat across laterals
+        return sag
+
+    def test_dim_dome_kept_flat_band_and_pure_noise_cropped(self):
+        import oct_preprocess as op
+        det = np.full((40, 40), 5.0); det[:, :25] = 60 + 2 * np.arange(25)[None, :]   # detector "lost" the tail
+        p = {"crop_noise_min_run": 5}
+        assert op.detect_noise_frames(self._sag("dim_dome"), p, detect=det) == []                    # dim concave band: tissue, kept
+        assert op.detect_noise_frames(self._sag("bright_flat"), p, detect=det) == list(range(25, 40))  # bright FLAT band: not a cornea, cropped
+        assert op.detect_noise_frames(self._sag("none"), p, detect=det) == list(range(25, 40))         # speckle only: cropped
+        assert op.detect_noise_frames(self._sag("dim_dome"), {**p, "crop_noise_tissue_contrast": 0}, detect=det) == list(range(25, 40))   # disabled → old rule
+
+
 class TestPlaceTopFromThickness:
     def test_two_flanks_drawn_and_bracketed_slices(self):
         import json
@@ -1616,6 +1798,71 @@ class TestFirstBrightRunWitness:
         assert np.isfinite(placed[0, 4]) and placed[0, 4] <= 2.0        # inside the run → placed, ceiling = row 2
         assert np.isnan(placed[0, 5]) and np.isnan(placed[0, 6])         # eyelid band above a gap / in-frame → kept
         assert info["n_top_present_kept"] >= 2
+
+
+class TestPlaceTopWitnessKeep:
+    """p1_od_v1_2 display 233 (2026-09-09): a band cell whose served top is REAL (the column's first bright run starts
+    right there, inside the frame) must not be demoted to absent just because the slice parabola disagrees."""
+
+    def _case(self):
+        F = 60; fr = np.arange(F, dtype=float); crop = list(range(20, 40))
+        par = 100.0 + 0.05 * (fr - 30.0) ** 2                      # the slice's own parabola outside the crop
+        top = par.copy()
+        top[34:40] += 35.0                                          # a real, visible top 35 px off the parabola on 6 cells
+        served = top[None, :].copy(); bottom = served + 250.0       # T = 250 (inside the clamp)
+        tr = served.copy(); te = served + 200.0                     # the first bright run starts AT the served top
+        clip = np.zeros((1, F), bool)
+        return served, bottom, crop, tr, te, clip
+
+    def test_image_witnessed_top_is_kept(self):
+        served, bottom, crop, tr, te, clip = self._case()
+        p_on = {"crop_place_witness_keep": True}
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, p_on, None, None, clip, top_row=tr, top_run_end=te)
+        assert np.isnan(placed[0, 34:40]).all(), placed[0, 34:40]              # nothing placed over a witnessed top
+        assert info["n_witness_kept"] == 6
+
+    def test_without_the_gate_the_estimate_replaced_it(self):
+        served, bottom, crop, tr, te, clip = self._case()
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, {"crop_place_witness_keep": False}, None, None, clip, top_row=tr, top_run_end=te)
+        assert np.isfinite(placed[0, 34:40]).all() and info["n_witness_kept"] == 0
+        assert (np.abs(placed[0, 34:40] - served[0, 34:40]) > 20).all()          # the old behaviour: 35 px off the real top
+
+    def test_top_inside_a_clipped_column_is_still_demoted(self):
+        served, bottom, crop, tr, te, clip = self._case()
+        tr[0, 34:40] = 2.0; te[0, 34:40] = 300.0                    # the tissue is continuous from the frame top: clipped
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, {"crop_place_witness_keep": True}, None, None, clip, top_row=tr, top_run_end=te)
+        assert np.isfinite(placed[0, 34:40]).all() and info["n_witness_kept"] == 0
+
+
+class TestPlaceTopDrawnBandLine:
+    """p1_od_v1_3 slice 378 (2026-09-09): between two drawn slices the band line is the interpolation of the reviewer's
+    lines; a slice with no drawn line within reach keeps its own parabola."""
+
+    def _case(self, L=9, F=60):
+        fr = np.arange(F, dtype=float); crop = list(range(20, 40))
+        par = 100.0 + 0.05 * (fr - 30.0) ** 2                       # the served top outside the crop (a dome)
+        served = np.tile(par, (L, 1)); served[:, crop] = -20.0       # inside the crop the served top is above the window
+        bottom = np.tile(par + 250.0, (L, 1)); clip = np.zeros((L, F), bool); clip[:, crop] = True
+        tr = np.zeros((L, F)); tr[:, [f for f in range(F) if f not in crop]] = served[:, [f for f in range(F) if f not in crop]]
+        te = tr + 200.0
+        # drawn lines on slices 2 and 6: the reviewer's estimate sits ABOVE the window (negative rows), as a clipped apex does
+        dt = {s: {f: float(par[f] - 140.0) for f in crop} for s in (2, 6)}
+        return served, bottom, crop, clip, tr, te, dt
+
+    def test_between_drawn_slices_the_line_is_their_interpolation(self):
+        served, bottom, crop, clip, tr, te, dt = self._case()
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, {"crop_estimate_source": "drawn", "crop_estimate_reach": 10},
+                                                     dt, None, clip, top_row=tr, top_run_end=te)
+        fr = np.arange(60, dtype=float); par = 100.0 + 0.05 * (fr - 30.0) ** 2
+        assert np.allclose(placed[4, crop], par[crop] - 140.0, atol=1.5)     # slice 4 lies between 2 and 6 → their line
+        assert np.allclose(placed[2, crop], par[crop] - 140.0, atol=1.5)     # the drawn slice itself
+
+    def test_beyond_reach_the_parabola_stands(self):
+        served, bottom, crop, clip, tr, te, dt = self._case()
+        p = {"crop_estimate_source": "drawn", "crop_estimate_reach": 1}      # reach 1 lateral: slice 4 is 2 away from both
+        placed, T, info = M.place_top_from_thickness(served, bottom, crop, p, dt, None, clip, top_row=tr, top_run_end=te)
+        placed_par, _, _ = M.place_top_from_thickness(served, bottom, crop, {"crop_estimate_source": "parabola"}, dt, None, clip, top_row=tr, top_run_end=te)
+        assert np.allclose(placed[4, crop], placed_par[4, crop], atol=1e-6)
 
 
 class TestPlaceTopEstimateFallback:
@@ -2039,6 +2286,32 @@ class TestInteriorPairGuard:
         assert not i1.get("interior_pairs_replaced") and np.allclose(a0, a1) and np.allclose(b0, b1)
 
 
+class TestCutMaskPairSymmetric:
+    """p4_os_v1_2 (2026-09-09): on a scratch-warped (zero-padded) volume a cut frame next to a shifted one had the
+    guard's mask edge in one frame of the pair and the cut edge in the other → a 27-34 px lag. The mask must be
+    per pair, symmetric, and start at each frame's first non-zero row."""
+
+    def _vol(self):
+        F = 30; D = 220; L = 24; rng = np.random.default_rng(5)
+        vol = np.full((F, D, L), 40.0, np.float32) + 10.0 * rng.standard_normal((F, D, L)).astype(np.float32)
+        # a CUT column: tissue from row 0 down to row 120 (speckled), every frame; frames >= 15 shifted 5 px deeper
+        # with zero rows on top (as _rigid_scratch_warp leaves them)
+        tissue = 900.0 + 300.0 * rng.uniform(0, 1, (F, 120, L)).astype(np.float32)
+        for f in range(F):
+            s0 = 5 if f >= 15 else 0
+            vol[f, :, :] = np.where(np.arange(D)[:, None] < s0, 0.0, vol[f, :, :])
+            vol[f, s0:s0 + 120, :] = tissue[f]
+        return vol
+
+    def test_cut_frame_next_to_a_shifted_one_measures_the_shift(self):
+        vol = self._vol()
+        a, b, info = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_interior_pair_guard": False,
+                                              "tissue_motion_shape_sign_guard": False, "tissue_motion_second_pass": False})
+        step = -(a[15] - a[14])                                       # trajectory falls by the lag: a deeper frame → −Δa = +5
+        assert abs(step - 5.0) < 1.5, (a[13:17], info.get("pair_spread", [])[12:16])
+        assert max(abs(-(a[f + 1] - a[f])) for f in (12, 13, 16, 17)) < 1.5
+
+
 class TestCutBandVote:
     """p1_od_v1_2 (2026-09-09): laterals whose cornea is cut by the frame top lock their correlation to lag 0 and
     out-vote a real move; with the rule they vote only when they agree with the un-cut fit."""
@@ -2157,3 +2430,191 @@ class TestDomeSignGuard:
         _, _, i = M.tissue_motion_move(vol, {"tissue_motion_lat_step": 2, "tissue_motion_band": 1, "tissue_motion_shape_curv": 0.03, "tissue_motion_shape_sign_guard": False})
         assert "shape_guard" not in i
 
+
+
+# ───────────────────────── applied move: persisted by the corrections run (option b) ─────────────────────────
+def _crossing(col, thr=450.0):
+    """sub-pixel first crossing of `thr` in a depth column (linear between the two rows straddling it)"""
+    idx = np.where(np.asarray(col, np.float64) >= thr)[0]
+    if idx.size == 0 or idx[0] == 0:
+        return np.nan
+    r = int(idx[0]); a, b = float(col[r - 1]), float(col[r])
+    return r - 1 + (thr - a) / (b - a)
+
+
+class TestAppliedMovePersisted:
+    """border_cache/applied_move.npz written by preprocess_oct_to_nifti's corrections branch = the EXACT
+    per-(lateral, frame) move the run applied, in measure_applied_move's convention:
+    corrected_row = raw_row + canvas_pad + move (the bottom pad shifts no row)."""
+
+    def test_applied_move_run_cache_matches_corrected_minus_raw_crossings(self, tmp_path, monkeypatch):
+        F, D, L = 40, 220, 64
+        fr = np.arange(F, dtype=float); x = np.arange(L, dtype=float)
+        motion = 10.0 * np.sin(fr / 4.0) + 0.3 * fr                      # up to ±10 px + a drift: a real move
+        vol = _synth_moving_dome(F=F, D=D, L=L, frame_curv=0.03, motion=motion)
+        top = ((60.0 + 0.03 * (fr - F / 2.0) ** 2)[None, :] + (0.02 * (x - L / 2.0) ** 2)[:, None]
+               + motion[None, :]).astype(np.float32)                    # the served line, RAW rows (L, F)
+        monkeypatch.setattr(M, "read_oct_zstack", lambda p, i=0: vol)
+        out = tmp_path / "case" / "input" / "vol.nii.gz"
+        info = M.preprocess_oct_to_nifti("fake.OCT", out, params={}, provided_edges=top, workers=1)
+        rec = info["applied_move"]
+        assert rec["written"] and rec["complete"], rec
+        assert [s["stage"] for s in rec["stages"]] == ["flatten"]       # default tissue path: one mover
+        assert M._MOVE_LEDGER is None                                    # closed after the write
+        bc = tmp_path / "case" / "border_cache" / "applied_move.npz"    # sibling convention of placed_edges.npz
+        z = np.load(bc, allow_pickle=False)
+        assert str(z["source"]) == "run" and int(z["n_extrapolated"]) == 0
+        assert z["move"].shape == (L, F) and z["move"].dtype == np.float32
+        assert str(z["key"]).split(":")[2] == "run"
+        st = out.stat()
+        assert int(z["stamp_mtime_ns"]) == st.st_mtime_ns and int(z["stamp_size"]) == st.st_size
+        pad = int(z["canvas_pad"]); ce = info.get("canvas_extend") or {}
+        assert pad == int(ce.get("pad", 0)) and int(z["bottom_pad"]) == int(ce.get("bottom_pad", 0))
+        stages = __import__("json").loads(str(z["stages"]))
+        assert stages[0]["stage"] == "flatten" and stages[0]["composed"]
+        # THE CONTRACT: corrected crossing − raw crossing − pad == move, on every frame
+        import nibabel as nib
+        cor = np.asarray(nib.load(str(out)).dataobj).astype(np.float32)   # (L, D', F)
+        raw = M.reformat_to_sagittal(vol).astype(np.float32)
+        assert cor.shape[1] == D + pad + int(z["bottom_pad"])
+        err = np.full((L, F), np.nan)
+        for f in range(F):
+            for l in range(0, L, 3):
+                cr, cc = _crossing(raw[l, :, f]), _crossing(cor[l, :, f])
+                if np.isfinite(cr) and np.isfinite(cc):
+                    err[l, f] = (cc - cr - pad) - float(z["move"][l, f])
+        assert np.isfinite(err).any(axis=0).all(), "every frame must have a measurable crossing"
+        per_frame = np.nanmax(np.abs(err), axis=0)
+        assert float(per_frame.max()) < 0.5, per_frame
+        assert float(np.nanmax(np.abs(z["move"]))) > 5.0                  # the run really moved the tissue
+
+    def test_applied_move_compose_and_ledger_settle(self):
+        L, F = 5, 4
+        a = np.full((L, F), 2.0, np.float32); b = -np.ones((L, F), np.float32)
+        mv, stages, ok = M.compose_applied_move([("flatten", a), ("edit_transform", b)], (L, F))
+        assert ok and mv.dtype == np.float32 and np.allclose(mv, 1.0)
+        assert [s["stage"] for s in stages] == ["flatten", "edit_transform"] and all(s["composed"] for s in stages)
+        # a missing field or a wrong shape → incomplete, and NEVER a partial sum
+        mv2, st2, ok2 = M.compose_applied_move([("flatten", a), ("sagittal_quad_align", None)], (L, F))
+        assert not ok2 and mv2 is None and st2[1] == {"stage": "sagittal_quad_align", "composed": False}
+        mv3, _, ok3 = M.compose_applied_move([("flatten", np.zeros((L + 1, F)))], (L, F))
+        assert not ok3 and mv3 is None
+        # the ledger: notes are no-ops when closed; a declined stage (same object back) drops what it logged; a
+        # mover that changed the volume without logging leaves a None entry; an unchanged copy is a no-op
+        M._ledger_note("x", a)
+        assert M._MOVE_LEDGER is None
+        M._ledger_open()
+        try:
+            before = np.ones((F, 8, L), np.float32)
+            m0 = M._ledger_mark(); M._ledger_note("flatten", a)
+            M._ledger_settle("flatten", before, before.copy() * 2, m0)
+            assert [s for s, _ in M._MOVE_LEDGER] == ["flatten"]
+            m1 = M._ledger_mark(); M._ledger_note("rigid_height_refine", b)
+            M._ledger_settle("rigid_height_refine", before, before, m1)                    # reverted → dropped
+            assert [s for s, _ in M._MOVE_LEDGER] == ["flatten"]
+            m2 = M._ledger_mark()
+            M._ledger_settle("rigid_frame_refine", before, before.copy(), m2)              # unchanged copy → no-op
+            assert [s for s, _ in M._MOVE_LEDGER] == ["flatten"]
+            m3 = M._ledger_mark()
+            M._ledger_settle("rigid_frame_derotate", before, before * 3, m3)               # moved, unlogged → None
+            assert M._MOVE_LEDGER[-1] == ("rigid_frame_derotate", None)
+            entries = M._ledger_close()
+        finally:
+            M._MOVE_LEDGER = None
+        assert M._MOVE_LEDGER is None
+        mv4, _, ok4 = M.compose_applied_move(entries, (L, F))
+        assert not ok4 and mv4 is None
+
+    def test_applied_move_cache_write_is_best_effort(self, tmp_path):
+        # an incomplete composition writes nothing and reports why; a missing output never raises
+        rec = M.write_applied_move_cache(tmp_path / "input" / "missing.nii.gz", [("flatten", None)], (3, 2))
+        assert rec["written"] is False and rec["complete"] is False and "reason" in rec
+        assert not (tmp_path / "border_cache").exists()
+        rec2 = M.write_applied_move_cache(tmp_path / "input" / "missing.nii.gz", [("flatten", np.zeros((3, 2)))], (3, 2))
+        assert rec2["written"] is False and "error" in rec2
+
+
+class TestCorrectedPriorRunMove:
+    """api_server._corrected_prior_surface prefers the run-persisted move (source="run") when it belongs to the
+    corrected volume being served, and falls back to the measurement (source="measured") otherwise."""
+
+    @staticmethod
+    def _case(cases_root, cid, L=6, D=40, F=5, pad=4):
+        import nibabel as nib
+        import orchestration as orch
+        orch.ensure_case_dirs(cid)
+        root = orch.case_root(cid)
+        aff = np.diag([0.02, 0.02, 0.04, 1.0])
+        raw = root / "input" / "_raw_border.nii.gz"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        nib.save(nib.Nifti1Image(np.full((L, D, F), 20, np.uint16), aff), str(raw))
+        work = root / "input" / "vol.nii.gz"
+        nib.save(nib.Nifti1Image(np.full((L, D + pad, F), 20, np.uint16), aff), str(work))
+        bc = root / "border_cache"; bc.mkdir(parents=True, exist_ok=True)
+        surf0 = (10.0 + np.arange(L)[:, None] + 0.5 * np.arange(F)[None, :]).astype(np.float32)
+        np.savez_compressed(bc / "provided_edges.npz", surface=surf0)
+        return root, work, bc, surf0
+
+    @staticmethod
+    def _write_run_move(bc, work, move, pad, stale=False):
+        import json as _json
+        st = work.stat()
+        np.savez_compressed(bc / "applied_move.npz", key=np.array("0:1:run:test"), move=move.astype(np.float32),
+                            n_extrapolated=np.array(0), source=np.array("run"), canvas_pad=np.array(int(pad)),
+                            bottom_pad=np.array(0),
+                            stamp_mtime_ns=np.array(int(st.st_mtime_ns) - (1 if stale else 0), dtype=np.int64),
+                            stamp_size=np.array(int(st.st_size), dtype=np.int64),
+                            stages=np.array(_json.dumps([{"stage": "flatten", "composed": True}])))
+
+    def test_corrected_prior_prefers_the_run_move_and_measures_nothing(self, cases_root, monkeypatch):
+        import api_server as api
+        L, D, F, pad = 6, 40, 5, 4
+        root, work, bc, surf0 = self._case(cases_root, "case_am_run", L, D, F, pad)
+        move = (np.arange(L)[:, None] * 0.25 - 3.0 + np.arange(F)[None, :]).astype(np.float32)
+        self._write_run_move(bc, work, move, pad)
+
+        def _boom(*a, **k):
+            raise AssertionError("measure_applied_move must not run when a valid run move exists")
+        monkeypatch.setattr(api.oct_mod, "measure_applied_move", _boom)
+        prior, meta = api._corrected_prior_surface("case_am_run", work, {}, (L, D + pad, F))
+        assert prior is not None and meta["source"] == "run" and meta["cached"] is True
+        assert meta["n_extrapolated"] == 0 and meta["canvas_pad"] == pad and meta["stages"] == ["flatten"]
+        expect = np.clip(surf0.astype(np.float64) + pad + move, 0, D + pad - 1)
+        assert np.allclose(prior, expect, atol=1e-5)
+        # the posterior line rides the SAME run move (no posterior_edges.npz here → the documented reason)
+        pb, why = api._corrected_prior_surface("case_am_run", work, {}, (L, D + pad, F), which="posterior")
+        assert pb is None and "posterior_edges" in why
+        # a second call must not have replaced the run move with a measured cache
+        z = np.load(bc / "applied_move.npz", allow_pickle=False)
+        assert str(z["source"]) == "run"
+        assert api._run_applied_move(bc / "applied_move.npz", work, (L, F)) is not None
+        # wrong shape → ignored, never a crash
+        assert api._run_applied_move(bc / "applied_move.npz", work, (L + 1, F)) is None
+
+    def test_corrected_prior_stale_run_move_falls_back_to_measured_and_replaces_it(self, cases_root, monkeypatch):
+        import api_server as api
+        L, D, F, pad = 6, 40, 5, 4
+        root, work, bc, surf0 = self._case(cases_root, "case_am_stale", L, D, F, pad)
+        self._write_run_move(bc, work, np.full((L, F), 99.0, np.float32), pad, stale=True)   # older corrected volume
+        measured = (np.arange(F)[None, :] * 1.5 - 2.0) * np.ones((L, 1))
+        calls = []
+
+        def _fake_measure(rv, cv, p):
+            calls.append((rv.shape, cv.shape, p.get("corrected_prior_max_lag")))
+            return {"move": measured.astype(np.float32), "extrapolated_frames": [4], "resid_mad": np.zeros(F)}
+        monkeypatch.setattr(api.oct_mod, "measure_applied_move", _fake_measure)
+        prior, meta = api._corrected_prior_surface("case_am_stale", work, {}, (L, D + pad, F))
+        assert prior is not None and meta["source"] == "measured" and meta["cached"] is False
+        assert meta["n_extrapolated"] == 1 and meta["canvas_pad"] == pad
+        assert len(calls) == 1 and calls[0][0] == calls[0][1] == (L, D + pad, F)     # raw padded on top to match
+        assert np.allclose(prior, np.clip(surf0 + pad + measured, 0, D + pad - 1), atol=1e-5)
+        z = np.load(bc / "applied_move.npz", allow_pickle=False)              # the stale run move was replaced
+        assert str(z["source"]) == "measured" and int(z["n_extrapolated"]) == 1
+        # ...and the measured cache is served next time without re-measuring
+        prior2, meta2 = api._corrected_prior_surface("case_am_stale", work, {}, (L, D + pad, F))
+        assert len(calls) == 1 and meta2 == {"source": "measured", "n_extrapolated": 1, "cached": True, "canvas_pad": pad}
+        assert np.allclose(prior2, prior)
+        # a fresh run move written for the CURRENT volume takes over again
+        self._write_run_move(bc, work, np.zeros((L, F), np.float32), pad)
+        prior3, meta3 = api._corrected_prior_surface("case_am_stale", work, {}, (L, D + pad, F))
+        assert meta3["source"] == "run" and len(calls) == 1 and np.allclose(prior3, surf0 + pad)

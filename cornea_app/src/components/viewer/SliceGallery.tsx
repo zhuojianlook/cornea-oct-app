@@ -12,7 +12,8 @@ import { pxToIjk, brushVoxels } from "../../api/coords";
 import { octProposals } from "../../api/lifecycle";
 import { usePendingEditStore } from "../../store/pendingEditStore";
 import { CorrectedEdgePanel } from "./CorrectedEdgePanel";
-import { interpBand as interpBandOf } from "../../store/cropBands";
+import { type BandAt, type CropBands, bandColor, bandsAt as bandsAtOf, clearMark, countMarks, emptyCropBands,
+         findBand, inAnyBand, markedLaterals, newBand, parseCropBands, removeBand, setMark } from "../../store/cropBands";
 import type { PreviewImage } from "../../api/types";
 
 // A preview either carries an inline base64 data_url (segmentation/consensus) or a lazy `src`
@@ -581,6 +582,19 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // on, not the failing top-edge detection. Fetched (debounced) as the slice / cropCols change.
   const [cropPreview, setCropPreview] = useState<{ top: number[]; bottom: number[]; recon: number[] } | null>(null);
   const cropPaintRef = useRef<null | "add" | "remove">(null);
+  // ⊟ artifact bands — the GESTURE (reuses the tool's existing press/move/release plumbing; no new keys):
+  //   DRAG (pointer moved ≥ 4 px) across the artifact → on release, the stroke's [min,max] frames become the ACTIVE
+  //   band's mark on THIS slice (replacing that band's mark here — one mark per slice per band) and are persisted.
+  //   CLICK (no movement) inside ANOTHER band painted on this slice → that band becomes the ACTIVE band (nothing is
+  //   written); a click anywhere else — empty, or inside the active band — marks that SINGLE column [f, f] for the
+  //   active band (a one-frame artifact must be markable; a frame is ~6 px wide, under the 4 px drag threshold).
+  //   shift / middle button = pan, as in every other tool. bandStrokeRef records the press and whether it moved;
+  //   lastBandPaintRef bridges the frames between two sampled pointer events so one stroke is one contiguous run.
+  const bandStrokeRef = useRef<{ x: number; y: number; frame: number | null; moved: boolean } | null>(null);
+  const lastBandPaintRef = useRef<number | null>(null);
+  // The stroke's frames, mirrored in a ref: pointermove updates are continuous-priority in React, so the release
+  // handler commits from here rather than from a render closure that may not yet hold the last painted frames.
+  const bandDraftRef = useRef<Set<number>>(new Set());
   const cropColsSig = useMemo(() => [...cropCols].sort((a, b) => a - b).join(","), [cropCols]);
   // Did the PIPELINE take the surface-crop path on this scan? Shown as a ✓ on the mode button (see below).
   const scAuto = ((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_iter as
@@ -632,12 +646,20 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   const [latCropLo, setLatCropLo] = useState<number | null>(null);             // lateral range start (slice index)
   const [latCropHi, setLatCropHi] = useState<number | null>(null);             // lateral range end (slice index)
   const [latCropBusy] = useState(false);    // retained: still gates disabled states
-  // #9 v3 ARTIFACT BANDS — the per-lateral [lo,hi] band, marked on several slices + interpolated across laterals.
-  // cropBands is the MARKED source-of-truth map {lateral:[lo,hi]}; bandDraft is the frames being painted on the
-  // CURRENT slice (the "＋ Mark band" button snapshots bandDraft → cropBands[slice], then clears it). Kept fully
-  // separate from the legacy uniform-box latCropFrames/crop_region path so that stays intact for old cases.
-  const [cropBands, setCropBands] = useState<Record<number, [number, number]>>({});
+  // #9 v3 ARTIFACT BANDS — EXPLICIT bands {id, marks: {lateral: [lo,hi]}}: the reviewer starts a band on one slice
+  // and ends it on another (its marks), and opens FURTHER bands with their own start and end; each band is
+  // interpolated across the laterals between ITS OWN marks (store/cropBands.ts, the backend's twin). Which band a
+  // drag belongs to is the ACTIVE band (activeBandId, chosen in the toolbar control or by clicking a band) — never
+  // inferred from geometry. cropBands is the MARKED source-of-truth set; bandDraft is the frames of the stroke being
+  // drawn on the CURRENT slice (committed on release, see bandStrokeRef). Kept fully separate from the legacy
+  // uniform-box latCropFrames/crop_region path so that stays intact for old cases.
+  const [cropBands, setCropBands] = useState<CropBands>(emptyCropBands());
+  const [activeBandId, setActiveBandId] = useState<number | null>(null);
   const [bandDraft, setBandDraft] = useState<Set<number>>(new Set());
+  // Two-step arming for the destructive band controls (✕ Delete band / Clear all bands) — the pane's own
+  // confirmation style (window.confirm never shows in this webview; see the corrected-round Clear button).
+  const [bandDeleteArm, setBandDeleteArm] = useState<"idle" | "armed">("idle");
+  const [bandClearArm, setBandClearArm] = useState<"idle" | "armed">("idle");
   const persistedCropBandsSig = JSON.stringify(
     (((caseInfo?.manifest as Record<string, unknown> | undefined)?.oct_params as Record<string, unknown> | undefined)
       ?.crop_bands) ?? null);
@@ -677,19 +699,26 @@ export function SliceGallery({ fixCols = false, cropStart = false, orientProp, f
   // Seed the marked artifact bands from persisted oct_params.crop_bands (not while editing — don't wipe unsaved).
   useEffect(() => {
     if (latCropMode) return;
-    try {
-      const raw = JSON.parse(persistedCropBandsSig) as Record<string, [number, number]> | null;
-      const next: Record<number, [number, number]> = {};
-      if (raw) for (const [k, v] of Object.entries(raw))
-        if (Array.isArray(v) && v.length === 2) next[Number(k)] = [Number(v[0]), Number(v[1])];
-      setCropBands(next);
-    } catch { setCropBands({}); }
+    // parseCropBands accepts BOTH persisted forms (the explicit {"bands": [...]} form and the legacy single band
+    // {lateral: [lo,hi]} → band 1) — the one parser shared with the corrected pane, so the two panes can never
+    // disagree about what is marked.
+    try { setCropBands(parseCropBands(JSON.parse(persistedCropBandsSig))); } catch { setCropBands(emptyCropBands()); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [persistedCropBandsSig, openCaseKey]);
-  // Interpolate the artifact band for a lateral from the MARKED cropBands — mirrors backend _artifact_bands:
-  // linear between the two nearest marked laterals, confined to the [min,max] marked span (null outside),
-  // single mark → that lateral only. Returns [lo,hi] | null.
-  const interpBand = useMemo(() => (lat: number) => interpBandOf(cropBands, lat), [cropBands]);
+  // A band id never carries from one scan to the next (band 2 of the last scan is not band 2 of this one).
+  // The TOOL does not carry either (review 2026-09-09): this gallery stays mounted across a scan switch, and the
+  // seed effect above deliberately skips while the tool is active — so with ⊟ left on, scan A's bands were painted
+  // on scan B and the next drag would have persisted them into B. Leaving the tool and re-seeding from B's own
+  // persisted value closes that path.
+  useEffect(() => {
+    setActiveBandId(null); setBandDeleteArm("idle"); setBandClearArm("idle");
+    setLatCropMode(false); bandDraftRef.current = new Set(); bandStrokeRef.current = null; lastBandPaintRef.current = null;
+    try { setCropBands(parseCropBands(JSON.parse(persistedCropBandsSig))); } catch { setCropBands(emptyCropBands()); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openCaseKey]);
+  // The ACTIVE band: the chosen id if it still exists, else the first band (none → a drag creates band 1).
+  const activeBand = findBand(cropBands, activeBandId) ?? cropBands.bands[0];
+  const activeId: number | null = activeBand?.id ?? null;
   // #9 — tell the viewer (VolumeCanvas) that Crop mode is active so it forces SAGITTAL and disables coronal.
   useEffect(() => { wfSet("cropRegionMode", fixCols && latCropMode); return () => wfSet("cropRegionMode", false); }, [fixCols, latCropMode]);
   // Bumped after we render context previews on demand, to force the fetch effect to
@@ -1330,11 +1359,15 @@ const PROP_SLICE_BAND = 20;
   // The border for the CURRENT slice: the accurate (settled) curve if we have it, else the instant fast one.
   const curEdge = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.edge ?? allCurves?.edges[borderSliceIdx]) : null) ?? null;
   const curFit = (borderSliceIdx != null ? (accurate.get(borderSliceIdx)?.fit ?? allCurves?.fits[borderSliceIdx]) : null) ?? null;
-  // #9 v3: the marked/applied artifact band for THIS slice (interpolated across the marked laterals). The surface
-  // lines (red detected edge + cyan quadratic fit) are BROKEN over it — those frames are cropped/removed, so a
-  // surface drawn across them is misleading (the reviewer sees a line on an area that no longer exists).
-  const curBand = (borderSliceIdx != null && Object.keys(cropBands).length > 0) ? interpBand(borderSliceIdx) : null;
-  const inBand = (f: number) => curBand != null && f >= curBand[0] && f <= curBand[1];
+  // #9 v3: the artifact bands resolved at THIS slice — EVERY band whose marked span covers it, each interpolated
+  // between its own two nearest marks (bandsAt, the backend's twin), as {id, lo, hi}. The surface lines (red
+  // detected edge + cyan quadratic fit + estimated bottom) are BROKEN over every band — those frames are
+  // cropped/removed, so a surface drawn across them is misleading (the reviewer sees a line on an area that no
+  // longer exists).
+  const curBands: BandAt[] = useMemo(
+    () => (borderSliceIdx != null ? bandsAtOf(cropBands, borderSliceIdx, nFrames > 0 ? nFrames : undefined) : []),
+    [cropBands, borderSliceIdx, nFrames]);
+  const inBand = (f: number) => inAnyBand(curBands, f);
 
   // ── "THERE IS NO ANTERIOR SURFACE ON THIS FRAME" ─────────────────────────────────────────────────────
   // The reviewer says so by dragging the red line to the image floor, which stores the absent sentinel
@@ -1716,12 +1749,36 @@ const PROP_SLICE_BAND = 20;
   const paintLatCrop = (clientX: number, svg: Element) => {
     const f = frameAtBorder(clientX, svg);
     if (f == null) return;
-    // Paint into the PER-SLICE draft (bandDraft); "＋ Mark band" snapshots it into cropBands[slice].
-    setBandDraft((prev) => {
-      const next = new Set(prev);
-      if (cropPaintRef.current === "remove") next.delete(f); else next.add(f);
-      return next;
-    });
+    // Paint into the PER-SLICE draft (bandDraft); on release the draft's [min,max] becomes the ACTIVE band's mark
+    // here. BRIDGED from the last painted frame: pointer events are sampled, so a quick drag skips frames.
+    const from = lastBandPaintRef.current ?? f;
+    lastBandPaintRef.current = f;
+    const lo = Math.min(from, f), hi = Math.max(from, f);
+    for (let x = lo; x <= hi; x++) bandDraftRef.current.add(x);
+    setBandDraft(new Set(bandDraftRef.current));
+  };
+  // COMMIT a finished stroke: the ACTIVE band's mark on this slice := [min,max] of the stroke (replacing the mark
+  // that band had here). With no band on the scan yet the stroke opens band 1 and makes it active. Persisted at
+  // once through the sticky oct-marks path (no re-run).
+  const commitBandStroke = (frames: Set<number>) => {
+    if (borderSliceIdx == null || frames.size === 0) return;
+    let lo = Infinity, hi = -Infinity;
+    frames.forEach((f) => { if (f < lo) lo = f; if (f > hi) hi = f; });
+    if (!Number.isFinite(lo) || !Number.isFinite(hi)) return;
+    let bands = cropBands, id = activeId;
+    if (id == null) { const nb = newBand(bands); bands = nb.bands; id = nb.id; setActiveBandId(id); }
+    const next = setMark(bands, id, borderSliceIdx, [lo, hi]);
+    setCropBands(next); void commitCropBands(next);
+  };
+  // Which band a CLICK at frame f selects: the narrowest band painted over f on this slice (ties → highest id, the
+  // one drawn on top), so a small band inside a wide one can still be picked.
+  const bandUnderFrame = (f: number): number | null => {
+    let best: BandAt | null = null;
+    for (const b of curBands) {
+      if (f < b.lo || f > b.hi) continue;
+      if (!best || (b.hi - b.lo) < (best.hi - best.lo) || ((b.hi - b.lo) === (best.hi - best.lo) && b.id > best.id)) best = b;
+    }
+    return best?.id ?? null;
   };
   const onBorderDown = (e: React.PointerEvent<SVGSVGElement>) => {
     e.preventDefault(); (e.target as Element).setPointerCapture?.(e.pointerId);
@@ -1790,10 +1847,16 @@ const PROP_SLICE_BAND = 20;
       paintMark(e.clientX, e.currentTarget);
       return;
     }
-    if (latCropMode) {     // #9 crop region: drag to add/remove FRAME columns (pan with shift/middle or readOnly)
+    if (latCropMode) {     // #9 v3 artifact bands: drag to paint a band on this slice (pan with shift/middle or readOnly)
       if (readOnly || e.button === 1 || e.shiftKey) { borderDragRef.current = { x: e.clientX, y: e.clientY, moved: false, mode: "pan" }; return; }
       const f = frameAtBorder(e.clientX, e.currentTarget);
-      cropPaintRef.current = (f != null && bandDraft.has(f)) ? "remove" : "add";
+      // Every press starts a fresh stroke (the previous one was committed on its release). Click-vs-drag is
+      // decided on release from bandStrokeRef.moved (≥ 4 px, the pane's usual threshold).
+      bandStrokeRef.current = { x: e.clientX, y: e.clientY, frame: f, moved: false };
+      lastBandPaintRef.current = null;
+      bandDraftRef.current = new Set();
+      setBandDraft(new Set());
+      cropPaintRef.current = "add";
       paintLatCrop(e.clientX, e.currentTarget);
       return;
     }
@@ -1808,7 +1871,11 @@ const PROP_SLICE_BAND = 20;
   const onBorderMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (cropMode && cropPaintRef.current) { paintCrop(e.clientX, e.currentTarget); return; }
     if (markMode && cropPaintRef.current) { paintMark(e.clientX, e.currentTarget); return; }
-    if (latCropMode && cropPaintRef.current) { paintLatCrop(e.clientX, e.currentTarget); return; }
+    if (latCropMode && cropPaintRef.current) {
+      const bs = bandStrokeRef.current;
+      if (bs && !bs.moved && Math.hypot(e.clientX - bs.x, e.clientY - bs.y) >= 4) bs.moved = true;   // a drag, not a click
+      paintLatCrop(e.clientX, e.currentTarget); return;
+    }
     if (cutDragRef.current) {   // dragging a cut line
       const r = e.currentTarget.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) return;
@@ -1882,6 +1949,23 @@ const PROP_SLICE_BAND = 20;
       });
     }
     postClickRef.current = null;
+    // ⊟ STROKE RELEASE: a DRAG commits the stroke as the ACTIVE band's mark on this slice; a CLICK inside a band
+    // painted here makes THAT band active (and writes nothing). Either way the draft is done.
+    const bs = bandStrokeRef.current;
+    if (bs && latCropMode) {
+      if (bs.moved) commitBandStroke(bandDraftRef.current);
+      else if (bs.frame != null) {
+        // A CLICK: inside ANOTHER band → that band becomes active; anywhere else (empty, or inside the active band)
+        // → a SINGLE-COLUMN mark [f, f] for the active band (reviewer 2026-09-09: "unable to mark a single column" —
+        // one frame is ~6 px wide, so a drag that stays inside it never clears the 4 px drag threshold).
+        const hit = bandUnderFrame(bs.frame);
+        if (hit != null && hit !== activeId) setActiveBandId(hit);
+        else commitBandStroke(new Set([bs.frame]));
+      }
+      bandDraftRef.current = new Set();
+      setBandDraft(new Set());
+    }
+    bandStrokeRef.current = null; lastBandPaintRef.current = null;
     borderDragRef.current = null; cutDragRef.current = null; cropPaintRef.current = null;
     borderPaintRef.current = null;
     paraDragRef.current = null;   // release the arc handle, so the next press picks its own
@@ -2848,24 +2932,34 @@ const PROP_SLICE_BAND = 20;
               fill={latCropMode ? "rgba(93,176,255,0.34)" : "rgba(93,176,255,0.16)"} stroke="none"
               pointerEvents="none" />
           ))}
-        {/* #9 v3 ARTIFACT BANDS — the INTERPOLATED band for THIS slice (from the marked cropBands): the light
-            preview of what will be cropped here. A slice you actually MARKED shows slightly stronger. Shown in
-            latcrop mode + also when the scan simply carries bands (so they stay visible from any mode). */}
-        {(latCropMode || Object.keys(cropBands).length > 0) && borderSliceIdx != null && (() => {
-          const band = interpBand(borderSliceIdx);
-          if (!band) return null;
-          const marked = cropBands[borderSliceIdx] != null;
-          const rects = [];
-          for (let f = band[0]; f <= band[1]; f++)
-            rects.push(<rect key={`ib${f}`} x={f} y={0} width={1} height={depthVox}
-              fill={marked ? "rgba(93,176,255,0.30)" : "rgba(93,176,255,0.15)"} stroke="none" pointerEvents="none" />);
-          return rects;
+        {/* #9 v3 ARTIFACT BANDS — EVERY band resolved at THIS slice, each in ITS OWN colour (bandColor — the same
+            palette the corrected pane uses, so a band reads as the same band in both): the light preview of what
+            will be cropped here. A band MARKED on this very slice is laid over stronger with a solid outline; a band
+            passing through from marks on neighbouring slices stays light (dashed outline). In the ⊟ tool the ACTIVE
+            band's outline is bold — that is the band the next drag writes to; click inside another to switch.
+            Shown in latcrop mode + also when the scan simply carries bands (so they stay visible from any mode). */}
+        {(latCropMode || cropBands.bands.length > 0) && borderSliceIdx != null && curBands.map((b) => {
+          const col = bandColor(b.id);
+          const own = findBand(cropBands, b.id)?.marks[borderSliceIdx] != null;
+          const active = latCropMode && b.id === activeId;
+          return (
+            <rect key={`ib${b.id}`} x={b.lo} y={0} width={Math.max(1, b.hi - b.lo + 1)} height={depthVox}
+              fill={`rgba(${col.rgb},${own ? 0.30 : 0.15})`}
+              stroke={latCropMode ? col.hex : "none"} strokeWidth={active ? 1.2 : 0.5}
+              strokeOpacity={active ? 0.95 : 0.7} strokeDasharray={own ? undefined : "4 3"}
+              vectorEffect="non-scaling-stroke" pointerEvents="none" />
+          );
+        })}
+        {/* the LIVE stroke on this slice (bright, in the active band's colour) — what the release will record */}
+        {latCropMode && bandDraft.size > 0 && (() => {
+          const col = bandColor(activeId ?? 1);
+          let lo = Infinity, hi = -Infinity;
+          bandDraft.forEach((f) => { if (f < lo) lo = f; if (f > hi) hi = f; });
+          return (
+            <rect key="bd" x={lo} y={0} width={Math.max(1, hi - lo + 1)} height={depthVox}
+              fill={`rgba(${col.rgb},0.55)`} stroke="none" pointerEvents="none" />
+          );
         })()}
-        {/* the LIVE painted draft on this slice (bright) — what "＋ Mark band" will snapshot */}
-        {latCropMode && [...bandDraft].map((f) => (
-          <rect key={`bd${f}`} x={f} y={0} width={1} height={depthVox}
-            fill="rgba(93,176,255,0.55)" stroke="none" pointerEvents="none" />
-        ))}
       </svg>
       {/* First-open of a scan can leave this PNG in flight while the sidecar computes its caches; without this
           the pane shows the red/cyan lines over black, which reads as "broken". Cover it with a plain "loading"
@@ -3009,8 +3103,72 @@ const PROP_SLICE_BAND = 20;
                     className={proposals.hasProposal ? "crop-proposal-glow" : undefined}
                     title={proposals.hasProposal
                       ? "BLUE bands — frames to remove from the scan entirely.\nAn automatic crop was DETECTED but not applied: open to load the pink proposal and adjust it.\nSaved when you Reject."
-                      : "BLUE bands — frames to remove from the scan entirely (blink, off-cornea, junk).\nDrag across them to add, drag again to remove. Applies to all slices.\nThese frames are zeroed before SAM2 and excluded from scar alignment. Saved when you Reject."}>⊟ Crop artifact</ToggleButton>
+                      : "COLOURED bands — artifact frames to remove (blink, eyelid, junk).\nDrag across the artifact on a slice to set the ACTIVE band's extent there; do it on a few slices and the band is interpolated across the laterals between its marks. + New band opens another band with its own start and end; click inside a band to make it active.\nThese frames are excluded from the cornea fit and zeroed before SAM2."}>⊟ Crop artifact</ToggleButton>
                 </ToggleButtonGroup>
+                {/* ⊟ ACTIVE-BAND CONTROL — which explicit band the next drag writes to. "Band N ▾" lists every band
+                    (its colour swatch + the slices it is marked on); "+ New band" opens an empty band and makes it
+                    active; "✕ Delete band" removes the active band with all its marks (two-step arm, the pane's
+                    confirmation style). Sits right beside the tool button so band choice and drawing share a glance. */}
+                {latCropMode && (
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                    <Select size="small" displayEmpty value={activeId ?? ""}
+                      onChange={(e) => { const v = Number(e.target.value); if (Number.isFinite(v) && v > 0) setActiveBandId(v); }}
+                      title="The ACTIVE band — the one your next drag marks. Each band lists the slices it is marked on."
+                      renderValue={(v) => {
+                        const id = Number(v);
+                        if (!(id > 0)) return <span style={{ color: "var(--c-text-dim)" }}>no band yet</span>;
+                        const col = bandColor(id);
+                        return (<span style={{ display: "inline-flex", alignItems: "center", gap: 5, color: col.hex }}>
+                          <span style={{ width: 9, height: 9, borderRadius: 2, background: col.hex, display: "inline-block" }} />
+                          Band {id}</span>);
+                      }}
+                      sx={{ fontSize: 11, height: 24, minWidth: 92, "& .MuiSelect-select": { py: 0.2, px: 1, display: "flex", alignItems: "center" } }}>
+                      {cropBands.bands.length === 0 && (
+                        <MenuItem value="" disabled sx={{ fontSize: 11 }}>no band yet — drag on a slice to open Band 1</MenuItem>
+                      )}
+                      {cropBands.bands.map((b) => {
+                        const col = bandColor(b.id); const lats = markedLaterals(b);
+                        const shown = lats.slice(0, 8).join(", ") + (lats.length > 8 ? ", …" : "");
+                        return (
+                          <MenuItem key={b.id} value={b.id} sx={{ fontSize: 11, gap: 6 }}>
+                            <span style={{ width: 9, height: 9, borderRadius: 2, background: col.hex, display: "inline-block", flex: "none" }} />
+                            <span style={{ color: col.hex }}>Band {b.id}</span>
+                            <span style={{ color: "var(--c-text-dim)" }}>
+                              {lats.length ? `· ${lats.length} slice${lats.length === 1 ? "" : "s"}: ${shown}` : "· no marks yet"}</span>
+                          </MenuItem>
+                        );
+                      })}
+                    </Select>
+                    {!readOnly && (
+                      <button onClick={() => { const nb = newBand(cropBands); setCropBands(nb.bands); setActiveBandId(nb.id); setBandDeleteArm("idle"); }}
+                        title="Open ANOTHER artifact band with its own start and end slices, and make it the active one. It is saved once you drag its first mark."
+                        style={{ background: "none", border: `1px solid ${bandColor(cropBands.bands.length + 1).hex}`, borderRadius: 4,
+                                 color: bandColor(cropBands.bands.length + 1).hex, cursor: "pointer", fontSize: 11, padding: "2px 6px", whiteSpace: "nowrap" }}>
+                        + New band
+                      </button>
+                    )}
+                    {!readOnly && activeId != null && (
+                      <button onClick={() => {
+                          // TWO-STEP (see the corrected-round Clear button): arm on the first click, act on the
+                          // second, disarm after 4 s. Removes the active band AND every mark it carries.
+                          if (bandDeleteArm !== "armed") {
+                            setBandDeleteArm("armed"); window.setTimeout(() => setBandDeleteArm("idle"), 4000); return;
+                          }
+                          setBandDeleteArm("idle");
+                          const next = removeBand(cropBands, activeId);
+                          setCropBands(next); setActiveBandId(next.bands[0]?.id ?? null); setBandDraft(new Set());
+                          void commitCropBands(next);
+                        }}
+                        title={`Delete Band ${activeId} and all ${Object.keys(activeBand?.marks ?? {}).length} of its mark(s). Click twice to confirm.`}
+                        style={{ background: bandDeleteArm === "armed" ? "rgba(239,68,68,0.18)" : "none",
+                                 border: `1px solid ${bandDeleteArm === "armed" ? "#ef4444" : "var(--c-border)"}`, borderRadius: 4,
+                                 color: bandDeleteArm === "armed" ? "#ef4444" : "var(--c-text-dim)", cursor: "pointer", fontSize: 11,
+                                 padding: "2px 6px", whiteSpace: "nowrap" }}>
+                        {bandDeleteArm === "armed" ? `✕ Delete Band ${activeId}?` : "✕ Delete band"}
+                      </button>
+                    )}
+                  </span>
+                )}
                 {/* STAIRSTEP toggle — draw the red detected edge as a per-column horizontal step at each column's
                     exact depth (a slope becomes a staircase), so the true per-column surface is visible. Display only.
                     Drives BOTH panes: on the corrected pane a step is one FRAME, which is the unit the corrected-edge
@@ -3121,7 +3279,19 @@ const PROP_SLICE_BAND = 20;
                 )}
                 <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
                   {borderBusy || redetectBusy ? (redetectBusy ? "Applying correction…" : "Detecting border…") :
-                    latCropMode ? (<>Paint the <b style={{ color: "#5db0ff" }}>artifact band</b> on this slice, then <b>＋ Mark band</b>. Mark it on a few slices — its extent is <b>interpolated across the laterals</b> between them, excluded from the cornea fit + zeroed. slice <b>{borderSliceIdx ?? "—"}</b>{bandDraft.size > 0 ? <> · draft <b style={{ color: "#5db0ff" }}>{Math.min(...bandDraft)}–{Math.max(...bandDraft)}</b></> : (() => { const b = borderSliceIdx != null ? interpBand(borderSliceIdx) : null; return b ? <> · band here <b style={{ color: "#5db0ff" }}>{b[0]}–{b[1]}</b>{cropBands[borderSliceIdx!] ? " (marked)" : " (interp)"}</> : " · no band here"; })()} · <b>{Object.keys(cropBands).length}</b> marked slice(s)</>) :
+                    latCropMode ? (() => {
+                      const actCol = bandColor(activeId ?? 1);
+                      const actLats = activeBand ? markedLaterals(activeBand) : [];
+                      return (<>Drag across the <b style={{ color: actCol.hex }}>artifact</b> on this slice → sets <b style={{ color: actCol.hex }}>Band {activeId ?? 1}</b>'s extent here (a new drag replaces it). Mark it on a few slices — each band is <b>interpolated across the laterals</b> between <i>its own</i> marks, excluded from the cornea fit + zeroed. <b>+ New band</b> for another artifact; <b>click</b> inside a band to make it active. slice <b>{borderSliceIdx ?? "—"}</b>
+                        {bandDraft.size > 0 ? <> · stroke <b style={{ color: actCol.hex }}>{Math.min(...bandDraft)}–{Math.max(...bandDraft)}</b></>
+                          : (curBands.length ? <> · here: {curBands.map((b, i) => (
+                              <span key={b.id}>{i ? ", " : ""}<b style={{ color: bandColor(b.id).hex }}>Band {b.id} {b.lo}–{b.hi}</b>{findBand(cropBands, b.id)?.marks[borderSliceIdx ?? -1] ? " (marked)" : " (interp)"}</span>))}</>
+                            : " · no band here")}
+                        {activeBand && actLats.length > 0 && <> · <b style={{ color: actCol.hex }}>Band {activeBand.id}</b> marked on {actLats.map((s, i) => (
+                          <span key={s}>{i ? ", " : ""}<button onClick={() => jumpToSlice(s)} title={`Jump to slice ${s}`}
+                            style={{ border: "none", background: "none", padding: 0, color: actCol.hex, cursor: "pointer", fontSize: 11, textDecoration: "underline" }}>{s}</button></span>))}</>}
+                        {" · "}<b>{countMarks(cropBands)}</b> mark(s) in <b>{cropBands.bands.length}</b> band(s)</>);
+                    })() :
                     cropMode ? (cropBusy ? "Detecting surface-cropped frames…" : (<>The <b style={{ color: "#ffaa28" }}>amber</b> columns are surface-cropped — aligned by the <b style={{ color: "#ffaa28" }}>orange bottom edge</b> → <b style={{ color: "#39d98a" }}>green reconstructed surface</b> (it leaves the top where the apex is cropped). Click/drag columns to add/remove, then <b>Confirm &amp; re-run</b>. · {cropCols.size} frame(s)</>)) :
                     cutMode ? (<>Drag the <b style={{ color: "#ffd24d" }}>yellow lines</b> to where the surface leaves the frame (top / left / right), then <b>Re-run with cuts</b>.</>) :
                     borderMode === "parabola" ? (surfaceGone
@@ -3664,25 +3834,28 @@ const PROP_SLICE_BAND = 20;
             {fixCols ? (
               latCropMode ? (
                 <>
-                  {/* ＋ Mark band: snapshot the painted draft on THIS slice into cropBands[slice] (as [min,max]) and
-                      persist. Mark a few slices; the band interpolates across the laterals between them. */}
-                  {bandDraft.size > 0 && borderSliceIdx != null && !readOnly && (
-                    <button
-                      onClick={() => {
-                        const fs = [...bandDraft].sort((a, b) => a - b);
-                        const next = { ...cropBands, [borderSliceIdx]: [fs[0], fs[fs.length - 1]] as [number, number] };
-                        setCropBands(next); setBandDraft(new Set()); void commitCropBands(next);
-                      }} disabled={latCropBusy}
-                      title="Record the artifact band you painted on this slice. Mark several slices; the band is interpolated across the laterals in between and excluded from the cornea fit on re-run."
-                      style={{ background: "none", border: "1px solid var(--c-accent, #5db0ff)", borderRadius: 4, color: "var(--c-accent, #5db0ff)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
-                      ＋ Mark band [{Math.min(...bandDraft)}–{Math.max(...bandDraft)}] on slice {borderSliceIdx}
+                  {/* The stroke itself is the mark (committed on release — see bandStrokeRef), so there is no
+                      "Mark band" button any more. What remains here is the undo side: drop the ACTIVE band's mark on
+                      THIS slice, or clear every band on the scan (two-step arm, the pane's confirmation style). */}
+                  {borderSliceIdx != null && activeBand && activeBand.marks[borderSliceIdx] != null && !readOnly && (
+                    <button onClick={() => { const next = clearMark(cropBands, activeBand.id, borderSliceIdx); setCropBands(next); setBandDraft(new Set()); void commitCropBands(next); }}
+                      disabled={latCropBusy}
+                      title={`Remove Band ${activeBand.id}'s mark on slice ${borderSliceIdx} (${activeBand.marks[borderSliceIdx][0]}–${activeBand.marks[borderSliceIdx][1]}). The band keeps its other marks; between them it is interpolated as if this slice had never been marked.`}
+                      style={{ background: "none", border: `1px solid ${bandColor(activeBand.id).hex}`, borderRadius: 4, color: bandColor(activeBand.id).hex, cursor: "pointer", fontSize: 11, padding: "2px 6px", whiteSpace: "nowrap" }}>
+                      − Unmark slice {borderSliceIdx} (Band {activeBand.id})
                     </button>
                   )}
-                  {Object.keys(cropBands).length > 0 && !readOnly && (
-                    <button onClick={() => { setCropBands({}); setBandDraft(new Set()); void commitCropBands({}); }} disabled={latCropBusy}
-                      title={`Clear all ${Object.keys(cropBands).length} marked artifact band(s) on this scan.`}
-                      style={{ background: "none", border: "1px solid var(--c-border)", borderRadius: 4, color: "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px" }}>
-                      Clear bands ({Object.keys(cropBands).length})
+                  {cropBands.bands.length > 0 && !readOnly && (
+                    <button onClick={() => {
+                        if (bandClearArm !== "armed") { setBandClearArm("armed"); window.setTimeout(() => setBandClearArm("idle"), 4000); return; }
+                        setBandClearArm("idle");
+                        setCropBands(emptyCropBands()); setActiveBandId(null); setBandDraft(new Set()); void commitCropBands(emptyCropBands());
+                      }} disabled={latCropBusy}
+                      title={`Clear ALL ${cropBands.bands.length} artifact band(s) (${countMarks(cropBands)} mark(s)) on this scan. Click twice to confirm. (To delete ONE band: choose it, then ✕ Delete band.)`}
+                      style={{ background: bandClearArm === "armed" ? "rgba(239,68,68,0.18)" : "none",
+                               border: `1px solid ${bandClearArm === "armed" ? "#ef4444" : "var(--c-border)"}`, borderRadius: 4,
+                               color: bandClearArm === "armed" ? "#ef4444" : "var(--c-text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 6px", whiteSpace: "nowrap" }}>
+                      {bandClearArm === "armed" ? `Clear all ${cropBands.bands.length} band(s)?` : `Clear all bands (${cropBands.bands.length})`}
                     </button>
                   )}
                   {/* Legacy uniform-box clear (only if such a crop is still present on an old case). */}

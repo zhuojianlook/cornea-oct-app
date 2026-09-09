@@ -2211,10 +2211,14 @@ class OctPreprocessRequest(BaseModel):
                                              # certain FRAME columns over a RANGE of LATERAL slices (zeroed before
                                              # SAM2). A STICKY oct_param recorded so scar-alignment excludes the
                                              # lost box. None = carry persisted; {} or empty frames = clear the crop.
-    crop_bands: dict | None = None           # #9 v3 per-lateral ARTIFACT band {'str(lateral)':[lo,hi]} — a
-                                             # time-domain artifact whose frame extent VARIES per slice; marked on
-                                             # several slices, interpolated across laterals, EXCLUDED from the fit +
-                                             # zeroed before SAM2. Sticky. None = carry persisted; {} = clear.
+    crop_bands: dict | None = None           # #9 v3 per-lateral ARTIFACT band(s). EXPLICIT form (2026-09-09):
+                                             # {"bands": [{"id": int, "marks": {'str(lateral)': [lo,hi]}}, …]} — each
+                                             # band has its OWN start/end marks and is interpolated across ITS marked
+                                             # laterals (no linking between bands); the LEGACY {'str(lateral)': [lo,hi]}
+                                             # map is accepted as one band (id 1). Persisted in the explicit form
+                                             # (oct_preprocess.normalize_crop_bands). A time-domain artifact whose
+                                             # frame extent VARIES per slice; EXCLUDED from the fit + zeroed before
+                                             # SAM2. Sticky. None = carry persisted; {} or {"bands": []} = clear.
     max_iterations: int | None = None        # >1 = iterative refinement (auto-converge); 1 = single faithful pass
     inject_pass: int | None = None           # re-run iteration applying force_columns at ONLY this pass (1-based)
     manual_patch: dict | None = None         # reviewer-accepted RIGID patch: {frame_index: [depth_px, tilt_px]}.
@@ -2668,6 +2672,8 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
         try:
             import shutil as _sh_clr
             _sh_clr.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)
+            m["border_chord_witness"] = None            # the chord-witness record died with border_cache
+            orch.write_manifest_value(case_id, {"border_chord_witness": None})
         except Exception:  # noqa: BLE001
             pass
         # surface_crop_manual is a TOP-LEVEL review mark (not oct_params, steers nothing) — clear it too so the
@@ -2755,17 +2761,13 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
             eff_params.pop("crop_lateral", None)
     # #9 v3 ARTIFACT BANDS — STICKY per-lateral artifact crop, its OWN independent `if` (NOT part of the
     # crop_region/crop_lateral if/elif chain above — placed after it so the legacy elif still binds to crop_region).
-    # REPLACE when this request supplies crop_bands (non-None); empty dict clears. Interpolated across laterals +
-    # excluded from the fit at run time (oct_preprocess._artifact_bands).
+    # REPLACE when this request supplies crop_bands (non-None); {} / {"bands": []} clears. Each band is interpolated
+    # across ITS marked laterals + excluded from the fit at run time (oct_preprocess._artifact_bands).
     if req.crop_bands is not None:
-        cb: dict = {}
-        for lk, band in (req.crop_bands if isinstance(req.crop_bands, dict) else {}).items():
-            if not isinstance(band, (list, tuple)) or len(band) != 2:
-                continue
-            try:
-                cb[str(int(lk))] = [int(band[0]), int(band[1])]
-            except (TypeError, ValueError):
-                continue
+        # Both forms accepted (the explicit {"bands": [...]} form, or the legacy {lateral: [lo, hi]} map = one band);
+        # persisted in the explicit form (ids unique, lo <= hi, bands without a mark dropped) — the SAME normaliser
+        # as set_oct_marks and the surface-cache signature, so one geometry has one persisted spelling.
+        cb: dict = oct_mod.normalize_crop_bands(req.crop_bands if isinstance(req.crop_bands, dict) else {})
         if cb:
             eff_params["crop_bands"] = cb
         else:
@@ -2946,6 +2948,10 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
         except Exception:  # noqa: BLE001 — advisory; never fail a preprocessing run over it
             _det_rep = None
         eff_params["border_anchors"] = anchors        # keep them persisted on the case
+        # CHORD WITNESS: the gap list the served surface / provided_edges.npz were built with, so the worker's
+        # surface-crop top placement leaves the same stroke gaps open (served line == placed top inside the band).
+        _cw_rec = _read_chord_witness(case_id, anchors)
+        eff_params["chord_refused_gaps"] = _chord_refused_gaps_list(_cw_rec)
         # SHAPED-PARABOLA TARGETS for the drawn flatten (see oct_preprocess._drawn_frame_rigid): a drawn line that
         # is itself a parabola (Quadratic tool: deg-2 RMS < shaped_line_max_rms over >= shaped_line_min_frames)
         # means "the edge SHOULD be here", so its target is parabola − the auto edge, de-meaned per lateral.
@@ -2974,6 +2980,10 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
         eff_params.pop("detect_lo", None); eff_params.pop("detect_hi", None)   # legacy band keys, if any
         import shutil as _sh0
         _sh0.rmtree(orch.case_root(case_id) / "border_cache", ignore_errors=True)
+        try:
+            orch.write_manifest_value(case_id, {"border_chord_witness": None})
+        except Exception:  # noqa: BLE001
+            pass
     cls = req.classification or m.get("scar_classification")
     sr = req.scar_range or m.get("scar_range")
     # Iterative refinement: auto-converge by default (cap 8). Persisted as oct_max_iterations so a
@@ -3029,6 +3039,11 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
     # it (there are no anchors), so the key is simply absent there — the prompt is structurally off.
     if isinstance(iter_info, dict) and isinstance(_det_rep, dict) and _det_rep:
         iter_info["determinism"] = _det_rep
+    try:
+        if isinstance(iter_info, dict) and _cw_rec:
+            iter_info["chord_witness"] = _cw_rec
+    except NameError:
+        pass
     # Same for the corrected-edit FOLD: it rewrote the raw GT before the worker ran, so record what it did
     # (points folded, laterals, backup file) where a reload can still read it.
     if isinstance(iter_info, dict) and isinstance(_folded_corrected, dict):
@@ -3834,9 +3849,10 @@ class OctMarksRequest(BaseModel):
     surface_crop_frames: list[int] | None = None      # frames whose apex is above the window
     crop_region: dict | None = None                   # {"lateral":[lo,hi], "frames":[...]}
     crop_post_anchors: dict | None = None             # {slice: {frame: depth}} manual posterior edge
-    crop_bands: dict | None = None                    # #9 v3 per-lateral artifact band: {str(lateral):[lo,hi]}
-                                                       #   marked on several slices, interpolated across laterals.
-                                                       #   REPLACE semantics (full map each commit); {} clears.
+    crop_bands: dict | None = None                    # #9 v3 per-lateral artifact band(s): the explicit form
+                                                       #   {"bands": [{"id", "marks": {str(lateral): [lo,hi]}}, …]}
+                                                       #   (2026-09-09) or the legacy {str(lateral): [lo,hi]} map (one
+                                                       #   band). REPLACE semantics (the full set each commit); {} clears.
 
 
 @app.post("/api/case/{case_id}/oct-marks")
@@ -3890,17 +3906,12 @@ def set_oct_marks(case_id: str, req: OctMarksRequest) -> dict:
             op.pop("crop_post_anchors", None)
         changed["crop_post_anchors"] = {k: len(v) for k, v in cur.items()}
     if req.crop_bands is not None:
-        # #9 v3 per-lateral artifact band. REPLACE semantics (the frontend holds the full {lateral:[lo,hi]} map):
-        # this request fully defines the set; an empty dict CLEARS. Interpolated across laterals at run time.
-        cb: dict = {}
-        for lk, band in (req.crop_bands or {}).items():
-            if not isinstance(band, (list, tuple)) or len(band) != 2:
-                continue
-            try:
-                lat = int(lk); lo, hi = sorted((int(band[0]), int(band[1])))
-            except (TypeError, ValueError):
-                continue
-            cb[str(lat)] = [lo, hi]
+        # #9 v3 per-lateral artifact band(s). REPLACE semantics (the frontend holds the full set of bands): this
+        # request fully defines the set; {} or {"bands": []} CLEARS. Either form accepted (the explicit
+        # {"bands": [...]} form, or the legacy {lateral: [lo, hi]} map = one band); persisted in the explicit form
+        # (oct_preprocess.normalize_crop_bands: ids unique, lo <= hi, bands without a mark dropped). Each band is
+        # interpolated across ITS marked laterals at run time (resolve_crop_bands) — no linking between bands.
+        cb: dict = oct_mod.normalize_crop_bands(req.crop_bands if isinstance(req.crop_bands, dict) else {})
         if cb:
             op["crop_bands"] = cb
         else:
@@ -4722,7 +4733,8 @@ def oct_surface_crop_preview(case_id: str, req: OctPreprocessRequest) -> dict:
                     except Exception:  # noqa: BLE001
                         pass
                 _dens = bool(p.get("densify_drawn_polylines", True))
-                _dt = oct_mod.densify_anchor_polylines({si: (_anc.get(str(si)) or _anc.get(si) or {})}, None, _dens)
+                _dt = oct_mod.densify_anchor_polylines({si: (_anc.get(str(si)) or _anc.get(si) or {})}, None, _dens,
+                                                       refuse_gaps=_chord_refused_gaps_list(_read_chord_witness(case_id, _anc)))
                 _db = oct_mod.densify_anchor_polylines({si: (_row or {})}, depth_vox, _dens)
                 _db = {_l: {_f: _v for _f, _v in _r.items() if _v < depth_vox - 1} for _l, _r in _db.items()}
                 _dt = {0: _dt.get(si, {})} if _dt else {}
@@ -4972,13 +4984,16 @@ _DETECT_PARAM_KEYS = ("flatten_exclude_laterals",   # chord-guarded (folded) lat
                       "frame_edge_snap",
                       # PURE interpolation between dense manual corrections — its params change the served/warp
                       # surface on the dense-anchor path, so they must invalidate the redetect.npz cache
-                      "dense_pure_interp", "interp_min_slices", "interp_frame_taper")
+                      "dense_pure_interp", "interp_min_slices", "interp_frame_taper",
+                      # CHORD WITNESS (2026-09-09): which stroke gaps are left open changes the served/warp surface
+                      "chord_witness", "chord_witness_max_dev", "chord_witness_conf_lo", "chord_witness_min_run", "chord_witness_end_tol",
+                      "chord_witness_fill_margin")
 
 # Bumped whenever redetect_surface()'s region/march LOGIC changes (not just its params), so an APP UPDATE
 # invalidates surfaces written by the old algorithm. "per-slice-v2" = the per-slice frame-region fix (a
 # redetect.npz from the prior global-union code would otherwise be served unchanged after an update — the
 # detection params are identical — silently keeping the old buggy surface on already-confirmed cases).
-_REDETECT_ALGO_VERSION = "dp-v7-pure-interp"   # dense-anchor path now PURE-interpolates the drawn edge between slices (interpolate_anchors_surface) instead of re-detecting; + dp-v6 corner re-trace
+_REDETECT_ALGO_VERSION = "dp-v8.2-chord-witness-runs"   # stroke-gap chords through tissue/air are no longer bridged (chord_witness_refusals); + dp-v7 pure interp   # dense-anchor path now PURE-interpolates the drawn edge between slices (interpolate_anchors_surface) instead of re-detecting; + dp-v6 corner re-trace
 
 
 def _detect_params_sig(p: dict) -> str:
@@ -4993,8 +5008,12 @@ def _detect_params_sig(p: dict) -> str:
     if _cb:
         import json as _j
         try:
-            sig += ";crop_bands=" + _j.dumps({str(k): [int(v[0]), int(v[1])] for k, v in _cb.items()}, sort_keys=True)
-        except (TypeError, ValueError, IndexError):
+            # normalize_crop_bands: both persisted forms → ONE canonical spelling (the explicit {"bands": [...]}
+            # form, ids/marks sorted, lo <= hi), so a legacy map and its explicit twin hash the same and no value
+            # can fall through to the unsorted repr fallback. Only when bands exist (uncropped scans keep their
+            # pre-contract sig byte-for-byte: no cache churn). Resolution has no knobs, so nothing else joins.
+            sig += ";crop_bands=" + _j.dumps(oct_mod.normalize_crop_bands(_cb), sort_keys=True)
+        except Exception:  # noqa: BLE001
             sig += f";crop_bands={_cb}"
     return sig
 
@@ -5116,6 +5135,50 @@ def _redetect_surface_fresh(case_id: str, anchors: dict):
         return None
 
 
+def _chord_witness_path(case_id: str) -> Path:
+    return orch.case_root(case_id) / "border_cache" / "chord_witness.json"
+
+
+def _chord_witness_record(case_id: str, anchors: dict, p: dict, refused: dict, route: str, kept_chords: list | None = None) -> dict:
+    """The chord-witness decisions the served surface was built with, written atomically next to the surface
+    caches (keyed by anchors_sig) so Confirm, the crop preview and the Run all read the SAME gap list."""
+    import json
+    import os
+    rec = {"anchors_sig": _border_anchors_sig(anchors), "route": route, "algo": _REDETECT_ALGO_VERSION,
+           "params": {k: p.get(k) for k in ("chord_witness", "chord_witness_max_dev", "chord_witness_conf_lo",
+                                            "chord_witness_min_run", "chord_witness_end_tol")},
+           "refused": oct_mod.chord_refusals_to_list(refused), "chord_kept": list(kept_chords or [])}
+    try:
+        cp = _chord_witness_path(case_id); cp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cp.with_name(f"chord_witness.{os.getpid()}.tmp.json")
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, cp)
+    except Exception:  # noqa: BLE001 — provenance is best-effort; the surface cache is the contract
+        pass
+    return rec
+
+
+def _read_chord_witness(case_id: str, anchors: dict):
+    """The stored record iff it belongs to `anchors` (same signature); else None."""
+    import json
+    cp = _chord_witness_path(case_id)
+    if not anchors or not cp.exists():
+        return None
+    try:
+        rec = json.load(open(cp))
+        if str(rec.get("anchors_sig")) != _border_anchors_sig(anchors):
+            return None
+        return rec
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _chord_refused_gaps_list(rec) -> list:
+    """[[lateral, f0, f1], ...] for the worker / densify consumers, from a stored record (None → [])."""
+    return [[int(r["lateral"]), int(r["f0"]), int(r["f1"]), (r.get("runs") or None)] for r in ((rec or {}).get("refused") or [])]
+
+
 def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     """MARCH the tilt-aware re-detection on the RAW volume seeded by `anchors`, cache it (+ anchors sig +
     raw mtime), and return the surface (lateral, frames). Shared by Confirm and Run so both use the SAME
@@ -5131,11 +5194,14 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     # snap adds detection bumps to the warp target without improving tightness. Baseline stays on the original
     # params (window unused by detect_surface_all); only the redetect surface + its cache sig use p_eff.
     p_eff = _effective_redetect_params(anchors, int(arr.shape[0]), m)
+    # CHORD WITNESS (2026-09-09): stroke gaps whose straight chord the RAW slice refuses (through tissue / air) are
+    # left open by every consumer below, and the decision is recorded beside the cache (preview == run).
+    _refused = oct_mod.chord_witness_refusals(arr, anchors, p_eff)
     surface = oct_mod.redetect_surface(arr, anchors, p_eff, baseline=baseline)   # local-band correction (lateral, frames)
     # PIN the reviewer's drawn frames to their exact value: the local-band march snaps to within a couple of
     # px of the drawn line (redetect_seed_window), which drifts a correction off where it was drawn. Ground
     # truth wins at the frames the reviewer actually touched; the march still governs the propagated band.
-    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff))
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff), refuse_gaps=_refused)
     # DENSE (only): light across-FRAME smoothing to remove the pinned hand-drawn jitter that would otherwise
     # STEP the rigid warp (bumpy, un-curved B-scan). Confined to cornea frames (below the earliest crop-band lo),
     # so the artifact-band reconstruction can't be blurred into the cornea. Applied AFTER pin so it smooths the
@@ -5183,18 +5249,34 @@ def _compute_redetect_cache(case_id: str, m: dict, anchors: dict):
     # linear interp of ONLY the drawn values across slices: smooth AND exact at every drawn edge. Frames drawn on
     # < interp_min_slices keep the auto baseline (the mid-dome the reviewer left alone). Only for DENSE anchors
     # (gap-bounded, so interpolation never spans a huge un-marked gap). See interpolate_anchors_surface.
-    if p.get("dense_pure_interp", True) and _anchors_are_dense(anchors, int(arr.shape[0]), p):
-        surface = oct_mod.interpolate_anchors_surface(anchors, baseline, p)
-        oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff))
+    _dense = bool(p.get("dense_pure_interp", True) and _anchors_are_dense(anchors, int(arr.shape[0]), p))
+    if _dense:
+        surface = oct_mod.interpolate_anchors_surface(anchors, baseline, {**p, "_refused_chords": _refused})
+        oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff), refuse_gaps=_refused)
+    # FILL CHECK: a refusal stands only where the fill is closer to the image than the chord it replaced; where it
+    # is not (two-point lines everywhere → knots 100+ laterals away), the chord is kept and the surface rebuilt.
+    _dropped: list = []
+    if _refused:
+        _kept, _dropped = oct_mod.chord_fill_check(arr, anchors, _refused, surface, p_eff)
+        if _dropped:
+            _refused = _kept
+            if _dense:
+                surface = oct_mod.interpolate_anchors_surface(anchors, baseline, {**p, "_refused_chords": _refused})
+            else:
+                surface = oct_mod.redetect_surface(arr, anchors, p_eff, baseline=baseline)
+            oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p_eff.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p_eff), refuse_gaps=_refused)
+    _rec = _chord_witness_record(case_id, anchors, p_eff, _refused, "dense" if _dense else "redetect", _dropped)
     cp = _redetect_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     # tmp MUST end in .npz — np.savez_compressed appends '.npz' to any path that doesn't, which would make
     # os.replace move a nonexistent file. Write tmp then atomically replace so a crash can't leave a partial.
     tmp = cp.with_name("redetect.tmp.npz")
+    import json as _json
     np.savez_compressed(tmp, surface=surface.astype(np.float32),
                         anchors_sig=_border_anchors_sig(anchors),
                         raw_mtime=float(os.path.getmtime(raw)),
-                        params_sig=_detect_params_sig(p_eff))
+                        params_sig=_detect_params_sig(p_eff),
+                        chord_witness=_json.dumps(_rec))
     os.replace(tmp, cp)
     return surface
 
@@ -5238,17 +5320,28 @@ def _compute_generalize_cache(case_id: str, m: dict, anchors: dict):
     arr = _load_border_vol(raw)                              # (lateral, depth, frames)
     p = {**oct_mod.DEFAULT_PARAMS, **(m.get("oct_params") or {})}
     baseline = _baseline_surface(case_id, arr, p)           # cached auto surface
+    _refused = oct_mod.chord_witness_refusals(arr, anchors, p)          # chord witness (see _compute_redetect_cache)
     surface = oct_mod.generalize_surface(arr, anchors, p, baseline=baseline)
     # PIN drawn frames exact: the residual field is interpolated across the volume, so at the drawn frames it
     # should reproduce the drawn line exactly, not a smoothed approximation of it.
-    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p))
+    oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p), refuse_gaps=_refused)
+    _dropped: list = []
+    if _refused:
+        _kept, _dropped = oct_mod.chord_fill_check(arr, anchors, _refused, surface, p)
+        if _dropped:
+            _refused = _kept
+            surface = oct_mod.generalize_surface(arr, anchors, p, baseline=baseline)
+            oct_mod.pin_anchors(surface, anchors, int(arr.shape[1]), float(p.get("crop_max_pad", 120)), guarded_slices=oct_mod.folded_laterals(p), refuse_gaps=_refused)
+    _rec = _chord_witness_record(case_id, anchors, p, _refused, "generalize", _dropped)
     cp = _generalize_cache_path(case_id)
     cp.parent.mkdir(parents=True, exist_ok=True)
     tmp = cp.with_name("generalize.tmp.npz")
+    import json as _json
     np.savez_compressed(tmp, surface=surface.astype(np.float32),
                         anchors_sig=_border_anchors_sig(anchors),
                         raw_mtime=float(os.path.getmtime(raw)),
-                        params_sig=_detect_params_sig(p))
+                        params_sig=_detect_params_sig(p),
+                        chord_witness=_json.dumps(_rec))
     os.replace(tmp, cp)
     return surface
 
@@ -5469,8 +5562,19 @@ def oct_border_redetect(case_id: str, req: OctPreprocessRequest) -> dict:
         if anchors:
             _compute_redetect_cache(case_id, {**m, "oct_params": op}, anchors)
             n_anchors = sum(len(v) for v in anchors.values() if isinstance(v, dict))
+            _rec = _read_chord_witness(case_id, anchors)
+            try:
+                orch.write_manifest_value(case_id, {"border_chord_witness": _rec})
+            except Exception:  # noqa: BLE001 — provenance only
+                pass
+            return {"ok": True, "n_anchors": int(n_anchors), "chord_refused": (_rec or {}).get("refused") or []}
         else:
             _redetect_cache_path(case_id).unlink(missing_ok=True)   # cleared → auto on scrub + run
+            _chord_witness_path(case_id).unlink(missing_ok=True)
+            try:
+                orch.write_manifest_value(case_id, {"border_chord_witness": None})
+            except Exception:  # noqa: BLE001
+                pass
             n_anchors = 0
         return {"ok": True, "n_anchors": int(n_anchors)}
     except HTTPException:
@@ -5495,9 +5599,46 @@ _AXIAL_SURF_CACHE: dict = {}   # case_id -> (work_mtime, params_sig, surf(latera
 _AXIAL_SURF_CACHE_MAX = 8      # bounded (2026-09-08): one entry per case opened, never evicted, grew all session
 
 
+def _run_applied_move(mv_path: Path, work: Path, shape):
+    """(move (L, F) float64, canvas_pad, stage names) from a RUN-written border_cache/applied_move.npz
+    (oct_preprocess.write_applied_move_cache, source="run") that belongs to the corrected volume `work`: the
+    stamp recorded at write time (st_mtime_ns + st_size of the delivered NIfTI) must equal work.stat() now.
+    None for anything else — absent, a measured cache, a stale run move (older corrected volume), a wrong shape,
+    a malformed file — and the caller measures as before."""
+    if not mv_path.exists():
+        return None
+    try:
+        z = np.load(mv_path, allow_pickle=False)
+        if "source" not in z.files or str(z["source"]) != "run":
+            return None
+        st = work.stat()
+        if int(z["stamp_mtime_ns"]) != int(st.st_mtime_ns) or int(z["stamp_size"]) != int(st.st_size):
+            return None
+        mv = np.asarray(z["move"], dtype=np.float64)
+        if mv.shape != tuple(int(v) for v in shape) or not np.isfinite(mv).all():
+            return None
+        try:
+            stages = [str(s.get("stage")) for s in json.loads(str(z["stages"])) if isinstance(s, dict)] \
+                if "stages" in z.files else []
+        except Exception:  # noqa: BLE001
+            stages = []
+        return mv, int(z["canvas_pad"]) if "canvas_pad" in z.files else 0, stages
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape, which: str = "anterior"):
     """The reviewer's CORRECTION CURVE, carried into CORRECTED depth space. Returns (prior(lateral,frames), meta)
     or (None, reason).
+
+    2026-09-09 — option (b) is now the primary path: a corrections run persists the EXACT per-(lateral, frame)
+    move it applied (oct_preprocess.write_applied_move_cache → border_cache/applied_move.npz, source="run",
+    stamped with the delivered NIfTI's mtime+size). When that file belongs to the volume being served it is used
+    as-is (meta.source="run", nothing measured, the file is never overwritten); otherwise — a scan preprocessed
+    before this change, a stale stamp, an incomplete composition — the measurement below runs unchanged
+    (meta.source="measured") and its cache replaces the stale file. On case_p1_od_v1_3 the measurement
+    extrapolated 40 of 101 frames (blink dips + a 53-frame surface-crop band + a 330 px pad) and the pane line ran
+    30-160 px off the tissue there; the run move has no such failure mode.
 
     "The curve that was used for correction of the original edge" is border_cache/provided_edges.npz — the exact
     surface the corrections warp flattened to, written at api_server.py:2727 from whichever served surface the
@@ -5551,6 +5692,15 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape, which
         return None, f"provided_edges unreadable: {exc}"
     if surf0.shape != (L, F):
         return None, f"provided_edges shape {surf0.shape} != corrected {(L, F)}"
+    mv_path = bc / "applied_move.npz"
+    # RUN-PERSISTED MOVE first (option (b)). Its canvas_pad is the run's own TOP pad (a bottom pad shifts no row),
+    # so the pad is taken from the file, not from D - raw_depth as the measured branch below has to.
+    _run = _run_applied_move(mv_path, work, (L, F))
+    if _run is not None:
+        _mv_run, _pad_run, _stages_run = _run
+        meta = {"source": "run", "cached": True, "n_extrapolated": 0, "canvas_pad": int(_pad_run),
+                "stages": _stages_run}
+        return oct_mod.carry_correction_curve(surf0 + float(_pad_run), _mv_run, D), meta
     # CANVAS PAD (bug found 2026-09-04 on cs048_od_v1_3). provided_edges.npz is in RAW-canvas rows, but when the
     # pipeline extends the canvas for an above-window apex it pads the volume at the TOP and shifts the provided
     # edges by the same amount (preprocess_oct_to_nifti: `provided_edges = _pe + float(_ext_pad)`). The move below
@@ -5569,15 +5719,16 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape, which
     if _canvas_pad > 0:
         surf0 = surf0 + float(_canvas_pad)
     key = f"{raw.stat().st_mtime_ns}:{work.stat().st_mtime_ns}:{p.get('corrected_prior_max_lag')}:{p.get('corrected_prior_min_cols')}"
-    mv_path = bc / "applied_move.npz"
     move = None
     meta: dict = {}
     if mv_path.exists():
         try:
             z = np.load(mv_path, allow_pickle=False)
+            # a run-written file never carries this key (its key ends ":run:<version>"), so a stale run move
+            # can only fall through to the measurement — it is never mistaken for a measured cache
             if str(z["key"]) == key and z["move"].shape == (L, F):
                 move = np.asarray(z["move"], dtype=np.float64)
-                meta = {"n_extrapolated": int(z["n_extrapolated"]), "cached": True}
+                meta = {"source": "measured", "n_extrapolated": int(z["n_extrapolated"]), "cached": True}
         except Exception:  # noqa: BLE001
             move = None
     if move is None:
@@ -5616,13 +5767,15 @@ def _corrected_prior_surface(case_id: str, work: Path, p: dict, vol_shape, which
         except Exception as exc:  # noqa: BLE001
             return None, f"applied-move measurement failed: {exc}"
         move = np.asarray(r["move"], dtype=np.float64)
-        meta = {"n_extrapolated": len(r["extrapolated_frames"]), "cached": False,
+        meta = {"source": "measured", "n_extrapolated": len(r["extrapolated_frames"]), "cached": False,
                 "extrapolated_frames": r["extrapolated_frames"]}
         try:                                                 # best-effort cache; a read-only store just re-measures
+            # only reached when no VALID run move exists (see _run_applied_move above), so a valid run move is
+            # never overwritten by this measured cache; a stale one is.
             bc.mkdir(parents=True, exist_ok=True)
             tmp = mv_path.with_name("applied_move.tmp.npz")
             np.savez_compressed(tmp, key=np.array(key), move=move.astype(np.float32),
-                                n_extrapolated=np.array(meta["n_extrapolated"]))
+                                n_extrapolated=np.array(meta["n_extrapolated"]), source=np.array("measured"))
             os.replace(tmp, mv_path)
         except Exception:  # noqa: BLE001
             pass
