@@ -3,14 +3,16 @@ import { Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogT
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useCaseStore, type DefectMark } from "../../store/caseStore";
 import { api } from "../../api/client";
-import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, type LifecycleStep } from "../../api/lifecycle";
+import { LIFECYCLE_STEPS, scanStep, stepReached, stepApplicable, octProposals, awaitingCorneaDetection, type LifecycleStep } from "../../api/lifecycle";
 import { useReviewQueueStore, nextAfter } from "../../store/reviewQueueStore";
 import { usePendingEditStore } from "../../store/pendingEditStore";
+import { SubgroupAlignDialog } from "../panels/GroupAlignPanel";
 
 /* Per-scan lifecycle TIMELINE — the active scan's progress through the colour-coded steps, surfacing ONLY
-   the next action(s). Order: Raw → Preprocessed[auto] → Vetted → SAM2(cornea) → Cornea✓ → Classified(scar/
-   control) → Subgroup → Scar → Aligned → Normalized → Corrected → Scheduled. Classification comes AFTER
-   cornea-vetting (it gates only the scar branch, not SAM2), so a control can schedule straight after Cornea✓.
+   the next action(s). Order: Raw → Preprocessed[auto] → Vetted → Aligned(group curvature) → SAM2(cornea) →
+   Cornea✓ → Classified(scar/control) → Subgroup → Scar → Scar-aligned → Normalized → Corrected → Scheduled.
+   Classification comes AFTER cornea-vetting (it gates only the scar branch, not SAM2), so a control can schedule
+   straight after Cornea✓.
    Click any REACHED earlier step to roll back to it (clears the later steps). */
 export function TimelineBar() {
   const segBusy = useWorkflowStore((s) => s.segBusy);
@@ -158,6 +160,11 @@ export function TimelineBar() {
   const scheduleTraining = useCaseStore((s) => s.scheduleTraining);
   const resetStep = useCaseStore((s) => s.resetStep);
   const confirmSubgroup = useCaseStore((s) => s.confirmSubgroup);
+  // Step 3 → 4: group-wise 3D alignment of this patient+eye's replicate scans, per SUBGROUP (reviewer spec 2026-09-11):
+  // "⧉ Align group" first asks about subgroups (SubgroupAlignDialog), the job stamps group_aligned when it completes.
+  const resolveGroupId = useCaseStore((s) => s.resolveGroupId);
+  const refreshCaseInfo = useCaseStore((s) => s.refreshCaseInfo);
+  const approveAligned = useCaseStore((s) => s.approveAligned);
   const skipScar = useCaseStore((s) => s.skipScar);
   const scheduled = Boolean(manifest?.training_scheduled);
   const isConsensus = Boolean(manifest?.consensus_cases);
@@ -168,7 +175,7 @@ export function TimelineBar() {
 
   const busy = segBusy || scarBusy || caseBusy;
   const step: LifecycleStep = scanStep(manifest);
-  const maxStep = LIFECYCLE_STEPS.length - 1;   // 10
+  const maxStep = LIFECYCLE_STEPS.length - 1;   // 13
   // Which step is being VIEWED, and whether that's an inspect (earlier, read-only) vs the live step.
   const viewStep = (selectedStep ?? step) as LifecycleStep;
   const inspecting = selectedStep != null && selectedStep < step;
@@ -190,6 +197,22 @@ export function TimelineBar() {
   // OWN button shows a spinner — these all flip the shared segBusy/scarBusy/caseBusy, so we name the
   // specific one here and clear it when the work settles.
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  // "⧉ Align group" outcome (the stub's reason + the group's members) shown beside the button; per scan.
+  const [alignNote, setAlignNote] = useState<string | null>(null);
+  useEffect(() => { setAlignNote(null); }, [caseInfo?.case_id]);
+  // The "⧉ Alignment (pairs)…" dialog was RETIRED (reviewer 2026-09-12 #1): the step-4 pane in the main area (AlignTabs)
+  // carries the same content, so the button was redundant. GroupAlignPanel.tsx keeps the dialog component (unused).
+  // "Subgroups for <group>" — the question "⧉ Align group" asks first (reviewer spec #1); per eye (base group id).
+  const [subOpen, setSubOpen] = useState(false);
+  const [subGid, setSubGid] = useState<string | null>(null);
+  useEffect(() => { setSubOpen(false); setSubGid(null); }, [caseInfo?.case_id]);
+  const openSubgroups = () => {
+    setAlignNote(null);
+    void resolveGroupId().then((gid) => {
+      if (!gid) { setAlignNote("This scan's patient/eye is unknown — set the group's eye in the sidebar first."); return; }
+      setSubGid(gid); setSubOpen(true);
+    });
+  };
   // REVIEW LOOP — approve/reject then jump to the next scan awaiting approval, so a pass through the backlog
   // is one click per scan instead of click-approve, hunt for the next row, click it.
   const reviewQueue = useReviewQueueStore((s) => s.queue);
@@ -276,8 +299,8 @@ export function TimelineBar() {
   // ── the step strip: click a REACHED step to VIEW it (earlier = inspect read-only; current = back to live) ──
   const strip = (
     <div className="flex items-center gap-1">
-      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as LifecycleStep[]).map((i) => {
-        const applicable = stepApplicable(manifest, i);   // control: scar steps 7-11 are N/A
+      {([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] as LifecycleStep[]).map((i) => {
+        const applicable = stepApplicable(manifest, i);   // control: scar steps 8-12 are N/A
         const reached = applicable && stepReached(manifest, i);   // per-flag, so a SKIPPED step doesn't falsely colour
         const current = step === i;
         const viewing = viewStep === i;
@@ -325,7 +348,7 @@ export function TimelineBar() {
     </>
   );
 
-  // #11 — STEP 5 cornea/background vet: paint cornea/background (scar pen hidden), then confirm → unlocks Scar.
+  // #11 — STEP 6 cornea/background vet: paint cornea/background (scar pen hidden), then confirm → unlocks Scar.
   const CorneaVet = !correcting ? (
     <>
       <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Vet the cornea/background segmentation, then:</span>
@@ -350,7 +373,7 @@ export function TimelineBar() {
       {scheduled ? "Scheduled ✓ (unschedule)" : "Schedule for training"}
     </Button>
   );
-  // #6 — Auto subgroup assignment lives WITH the subgroup controls (steps 7/8), not in the global top-right.
+  // #6 — Auto subgroup assignment lives WITH the subgroup controls (steps 8/9), not in the global top-right.
   const AutoSubgroupBtn = !isConsensus ? (
     <Button size="small" variant="outlined" color="secondary" disabled={busy || subgroupBusy || correcting}
       onClick={() => { setShowSubgroup(true); autoSubgroups(); }}
@@ -373,7 +396,7 @@ export function TimelineBar() {
     <Button size="small" variant="contained" color="info" disabled={busy || correcting} onClick={() => { setBusyAction("align"); alignReplicates(); }}
       startIcon={busyAction === "align" ? <CircularProgress size={13} color="inherit" /> : undefined}
       title="Register + vote this eye's repeat scans (same subgroup) into one consensus, using the scar as-is. Normalization against controls is the next step.">
-      {busyAction === "align" ? "Aligning…" : "⌖ Align replicates"}
+      {busyAction === "align" ? "Aligning…" : "⌖ Align scar replicates"}
     </Button>
   );
   const NormalizeBtn = (
@@ -390,7 +413,7 @@ export function TimelineBar() {
       {busyAction === "skipnorm" ? "Skipping…" : "⏭ Skip normalization"}
     </Button>
   );
-  // STEP 9 scar-source decision: which scar boundary becomes each replicate's TRAINING label.
+  // STEP 10 scar-source decision: which scar boundary becomes each replicate's TRAINING label.
   const scarSource = (manifest?.consensus_scar_source as string | undefined) ?? null;
   const ScarSource = (
     <span className="flex items-center gap-1.5">
@@ -409,7 +432,7 @@ export function TimelineBar() {
       </Button>
     </span>
   );
-  // STEP 6: confirm this scan's subgroup (which lesion set it belongs to → which repeats align together).
+  // STEP 7: confirm this scan's subgroup (which lesion set it belongs to → which repeats align together).
   const SubgroupConfirm = (
     <span className="flex items-center gap-1 text-xs" style={{ color: "var(--c-text-dim)" }}>
       subgroup
@@ -441,8 +464,8 @@ export function TimelineBar() {
     </>
   );
 
-  // INITIAL scar DETECTION (step 6 "Scar"): pick a strategy + run a detector → produces the scar. The scar
-  // CORRECTION tools (guide-hints, Correct ✎) live in step 7 once an initial scar exists. Non-control only.
+  // INITIAL scar DETECTION (offered at step 8 "Subgroup"): pick a strategy + run a detector → produces the scar.
+  // The scar CORRECTION tools (guide-hints, Correct ✎) live in step 9 once an initial scar exists. Non-control only.
   const ScarDetect = classification !== "control" ? (
     <>
       {ScarMethod}
@@ -464,7 +487,7 @@ export function TimelineBar() {
     </>
   ) : null;
 
-  // Scar REFINEMENT (correction): click-hint touch-up of an EXISTING scar. Lives in step 7. Non-control only.
+  // Scar REFINEMENT (correction): click-hint touch-up of an EXISTING scar. Lives in step 9. Non-control only.
   const ScarRefine = classification !== "control" ? (
     <>
       <Button size="small" variant={hintMode ? "contained" : "outlined"} color="warning" disabled={busy || !segLoaded}
@@ -486,7 +509,7 @@ export function TimelineBar() {
     </>
   ) : null;
 
-  // Full scar controls = detect + refine, shown together in the Scar-correction step (7) so you can iterate.
+  // Full scar controls = detect + refine, shown together in the Scar-correction step (9) so you can iterate.
   const ScarReRun = classification !== "control" ? <>{ScarDetect}{ScarRefine}</> : null;
 
   // Move to the next scan awaiting approval. Called AFTER the approve/reject write has landed, so the scan
@@ -1091,14 +1114,19 @@ export function TimelineBar() {
               </>
     );
   } else if (step === 3) {
-    // vetted (pink) → segment the CORNEA (SAM2). Classification (scar/control) is a LATER step now — it comes
-    // after cornea-vetting and gates only the scar branch, so SAM2 runs without it.
+    // vetted (pink) → ALIGN the patient+eye GROUP: register this eye's replicate scans in 3D and regularise their
+    // sagittal curvature (the engine is a separate workflow — until it lands the backend stub only reports the
+    // group's members, and nothing is written). SAM2 comes NEXT, at Aligned (4).
     actions = (
       <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
-        <Button size="small" variant="contained" color="primary" disabled={busy || !!sam2RunningCaseId} onClick={() => runSam2()}
-          title="Run SAM2 cornea-vs-background segmentation. Scar/control classification and scar segmentation come in later steps.">
-          ▶ Run SAM2 (cornea)
+        <Button size="small" variant="contained" color="primary" disabled={busy} onClick={openSubgroups} data-testid="align-group-btn"
+          title="First confirm whether all scans of this eye are one subgroup (or specify subgroups per scan), then each subgroup is aligned as its own group (every scan vs the reference; a few minutes per pair). When the job finishes its scans advance to 4. Aligned.">
+          ⧉ Align group
         </Button>
+        {alignNote && (
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)", maxWidth: 420, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+            title={alignNote}>{alignNote}</span>
+        )}
         {sep}
         {/* #10 — save the preprocessing correction as an MP4 grid (planes × passes, before↔after). */}
         <Button size="small" variant="outlined" disabled={busy || mp4Busy} onClick={() => exportCorrectionMp4()}
@@ -1109,14 +1137,72 @@ export function TimelineBar() {
         {correctionMp4Url && !mp4Busy && (
           <a href={correctionMp4Url} download style={{ color: "var(--c-accent)", fontSize: 12 }} title={correctionMp4Info}>⤓ Download MP4</a>
         )}
-              </div>
+      </div>
     );
   } else if (step === 4) {
+    // group-aligned (pink-red). Reviewer spec 2026-09-11 #4 / 2026-09-12 #2: "✓ Approve axial changes" = the reviewer
+    // approves that the axial changes applied to each replicate meet the consensus (recorded on every scan of the
+    // subgroup). Approving MOVES the subgroup's scans to 5. Cornea, where the cornea-detection button lives (its own
+    // action bar below). "Rectify" is a placeholder (function not yet specified). The pane in the main area shows the
+    // alignment (consensus + pairs / 3-D view / scrub); the separate pairs dialog was retired (redundant with the pane).
+    const RectifyBtn = (
+      <span title="Rectify — not yet specified (placeholder for correcting an alignment that does not meet the consensus)." data-testid="aligned-rectify-wrap">
+        <Button size="small" variant="outlined" color="warning" disabled sx={ACT_SX} data-testid="aligned-rectify">Rectify</Button>
+      </span>
+    );
+    actions = (
+      <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
+        <span>Review the consensus + pairs, 3-D view and scrub (pane →), then:</span>
+        <Button size="small" variant="contained" color="success" disabled={busy || !manifest?.group_aligned} sx={ACT_SX} data-testid="aligned-approve"
+          startIcon={busyAction === "alignapprove" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          onClick={() => { setBusyAction("alignapprove"); void approveAligned(true).then(() => setBusyAction((b) => (b === "alignapprove" ? null : b))); }}
+          title="Approve that the axial changes applied to each replicate of this subgroup meet the consensus. Recorded on EVERY scan of the subgroup (manifest aligned_approved); moves them to 5. Cornea (cornea detection).">
+          {busyAction === "alignapprove" ? "Approving…" : "✓ Approve axial changes"}
+        </Button>
+        {RectifyBtn}
+        {sep}
+        {/* #10 — save the preprocessing correction as an MP4 grid (planes × passes, before↔after). */}
+        <Button size="small" variant="outlined" disabled={busy || mp4Busy} onClick={() => exportCorrectionMp4()}
+          startIcon={mp4Busy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          title="Render this scan's correction as an MP4: rows = axial/coronal/sagittal, columns = after (final) → passes → before (raw), scrubbing every slice.">
+          {mp4Busy ? "Rendering MP4…" : "🎞 Save correction MP4"}
+        </Button>
+        {correctionMp4Url && !mp4Busy && (
+          <a href={correctionMp4Url} download style={{ color: "var(--c-accent)", fontSize: 12 }} title={correctionMp4Info}>⤓ Download MP4</a>
+        )}
+      </div>
+    );
+  } else if (step === 5 && awaitingCorneaDetection(manifest)) {
+    // 5. Cornea, NOT yet segmented (fuchsia): the axial-changes approval brought the subgroup here (reviewer 2026-09-12
+    // #2) — the pending action is cornea detection (SAM2 today; SAM3 is a later model upgrade — the segmentation itself is
+    // unchanged). "undo approval" returns the whole subgroup to 4. Aligned. The alignment pane stays visible (read-only).
+    const approved = (manifest?.aligned_approved ?? null) as Record<string, unknown> | null;
+    actions = (
+      <div className="flex items-center gap-2 text-xs" style={{ color: "var(--c-text-dim)" }}>
+        <Button size="small" variant="contained" color="primary" disabled={busy || !!sam2RunningCaseId} sx={ACT_SX} onClick={() => runSam2()} data-testid="cornea-detect-sam"
+          title="Run the cornea-vs-background segmentation (SAM2 today; SAM3 is a later model upgrade). Scar/control classification and scar segmentation come in later steps.">
+          ▶ Cornea detection (SAM)
+        </Button>
+        <span className="text-[11px]" style={{ color: "var(--c-text-dim)", whiteSpace: "nowrap" }} data-testid="cornea-detect-caption">runs on the consensus volume: pending</span>
+        {sep}
+        <span style={{ color: "#4ade80", whiteSpace: "nowrap" }} data-testid="aligned-approved"
+          title={`Axial changes approved${approved?.ts ? ` at ${approved.ts}` : ""}${approved?.group ? ` (group ${approved.group})` : ""}${approved?.note ? ` — ${approved.note}` : ""}`}>
+          ✓ axial changes approved
+        </span>
+        <Button size="small" variant="text" color="inherit" disabled={busy} sx={ACT_SX} data-testid="aligned-unapprove"
+          startIcon={busyAction === "alignapprove" && caseBusy ? <CircularProgress size={13} color="inherit" /> : undefined}
+          onClick={() => { setBusyAction("alignapprove"); void approveAligned(false).then(() => setBusyAction((b) => (b === "alignapprove" ? null : b))); }}
+          title="Withdraw the approval for every scan of the subgroup — returns them to 4. Aligned.">
+          {busyAction === "alignapprove" ? "Undoing…" : "undo approval"}
+        </Button>
+      </div>
+    );
+  } else if (step === 5) {
     // cornea segmented (fuchsia) → VET the cornea/background (paint, scar pen hidden), then confirm → unlocks
     // classification. Scar detection is NOT shown here until cornea/background is confirmed AND the scan is classified.
     // Auto-populated scans also get a non-destructive "Approve preprocessing" here (their Vetted step was skipped).
     actions = <>{ApprovePreproc && <>{ApprovePreproc}{sep}</>}{CorneaVet}</>;
-  } else if (step === 5) {
+  } else if (step === 6) {
     // cornea/background vetted (purple) → CLASSIFY scar/control. Moved here from before SAM2 (it only gates the
     // scar branch): a control schedules next; a scar scan proceeds to subgroup.
     actions = (
@@ -1132,14 +1218,14 @@ export function TimelineBar() {
         </span>
               </div>
     );
-  } else if (step === 6) {
+  } else if (step === 7) {
     // classified (violet) → SUBGROUP step (assigned BEFORE scar so the strategy comparison at the Scar step is
     // per-subgroup). Scar scan: assign which lesion set it belongs to. Control: no lesion subgroup is needed
     // (the control baseline is eye-wide, control_cases() ignores subgroup) → skip straight to "no scar".
     actions = classification === "control" ? (
       <>
         {/* A control (no scar) is READY once its cornea is vetted — the scar/subgroup/align/normalize/correct
-            steps (7-11) don't apply (greyed in the strip). Its cornea-only label is the training label + the
+            steps (8-12) don't apply (greyed in the strip). Its cornea-only label is the training label + the
             normal baseline, so the next action is Schedule. Correct stays available to touch up the cornea. */}
         <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Control (no scar) — cornea vetted; no scar/align/normalize needed.</span>
         {ScheduleBtn}{sep}{Correct}
@@ -1150,7 +1236,7 @@ export function TimelineBar() {
         {SubgroupConfirm}{sep}{AutoSubgroupBtn}
       </>
     );
-  } else if (step === 7) {
+  } else if (step === 8) {
     // subgroup assigned (purple) → SCAR DETECTION. Subgroup is confirmed, so "⚖ Compare strategies" (right
     // bar) is now PER-SUBGROUP. A control normally skips this step; a fallback skip is shown just in case.
     actions = classification === "control" ? (
@@ -1165,7 +1251,7 @@ export function TimelineBar() {
         {ScarDetect}
       </>
     );
-  } else if (step === 8) {
+  } else if (step === 9) {
     // scar segmented (rose) → refine/correct the scar, then align this subgroup's replicates.
     actions = (
       <>
@@ -1175,19 +1261,19 @@ export function TimelineBar() {
         )}
       </>
     );
-  } else if (step === 9) {
+  } else if (step === 10) {
     // aligned (teal) → choose the TRAINING scar (each replicate's own vs the voted consensus), then normalize
     // against controls or SKIP normalization (use the consensus as-is); Correct to touch up. Schedule/Export
     // are NOT here — they live at the later (corrected/scheduled) steps.
     actions = <>{ScarSource}{sep}{NormalizeBtn}{sep}{SkipNormBtn}{sep}{Correct}</>;
-  } else if (step === 10) {
-    // normalized (cyan) → correct only; scheduling/export live at the corrected/scheduled steps (11/12).
-    actions = <>{Correct}</>;
   } else if (step === 11) {
+    // normalized (cyan) → correct only; scheduling/export live at the corrected/scheduled steps (12/13).
+    actions = <>{Correct}</>;
+  } else if (step === 12) {
     // manually corrected (dark blue)
     actions = <>{ScheduleBtn}{sep}{Correct}{ExportBtn}</>;
   } else {
-    // step 12 — scheduled (green)
+    // step 13 — scheduled (green)
     actions = (
       <>
         <span className="text-xs" style={{ color: "#4ade80" }}>✓ Scheduled for training.</span>
@@ -1209,17 +1295,17 @@ export function TimelineBar() {
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">{caseInfo ? actions : <span className="text-xs" style={{ color: "var(--c-text-dim)" }}>Open or preprocess a scan to begin.</span>}</div>
         <div className="flex-1" style={{ minWidth: 12 }} />
         {/* PUBLICATION: compare scar-detection strategies' reproducibility across the eye's replicates. Lives
-            ONLY in the Scar-detection step (7) — where you pick a detector, AFTER subgroup is assigned, so the
+            ONLY in the Scar-detection step (8) — where you pick a detector, AFTER subgroup is assigned, so the
             comparison is PER-SUBGROUP. Needs ≥2 cornea-segmented replicates of the eye+subgroup; a control has
-            no scar so it's hidden. (Not shown on the aligned consensus / step 9.) */}
-        {caseInfo && step === 7 && classification !== "control" && (
+            no scar so it's hidden. (Not shown on the scar-aligned consensus / step 10.) */}
+        {caseInfo && step === 8 && classification !== "control" && (
           <Button size="small" variant="outlined" color="info" disabled={busy || correcting}
             onClick={() => { setShowCompare(true); compareStrategies(); }}
             title="Run every scar strategy on this eye's replicates and tabulate test–retest reproducibility (pairwise Dice, HD95, volume CV%) — for strategy comparison in the paper. Read-only; doesn't change the scan.">
             ⚖ Compare strategies
           </Button>
         )}
-        {/* #6 — "⊞ Auto subgroups" lives in the Subgroup steps (7/8) actions, not here. */}
+        {/* #6 — "⊞ Auto subgroups" lives in the Subgroup steps (8/9) actions, not here. */}
         {/* Live progress text (SAM2 per-plane %, scar phase, …) next to the spinner — not just an icon. */}
         {(busy || !!sam2RunningCaseId) && status.kind === "working" && (
           <span className="text-xs" style={{ color: "var(--c-text-dim)", maxWidth: 360, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
@@ -1227,6 +1313,11 @@ export function TimelineBar() {
         )}
         {(busy || !!sam2RunningCaseId) && <CircularProgress size={16} />}
       </div>
+
+      {/* "⧉ Align group" → subgroups first; when the per-subgroup jobs finish their scans carry group_aligned → re-read
+          the open scan's manifest so the timeline advances to 4. Aligned without a reload. */}
+      <SubgroupAlignDialog open={subOpen} gid={subGid} onClose={() => setSubOpen(false)}
+        onAligned={() => { void refreshCaseInfo(); const wf = useWorkflowStore.getState(); wf.set("casesVersion", wf.casesVersion + 1); }} />
 
       {/* PUBLICATION: scar-strategy reproducibility table. */}
       <Dialog open={showCompare} onClose={() => setShowCompare(false)} maxWidth="md" fullWidth>

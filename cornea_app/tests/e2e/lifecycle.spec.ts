@@ -29,12 +29,32 @@ test.describe("lifecycle", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 4 (classified): offers SAM2 cornea segmentation", async ({ page, consoleErrors }) => {
+  test("step 3 (vetted): offers the group alignment, not SAM2 yet", async ({ page, consoleErrors }) => {
+    await gotoApp(page);
+    await openCase(page, FIX.vetted);
+    const btns = await mainButtons(page);
+    expect(btns).toEqual(expect.arrayContaining(["Align group"]));
+    expect(btns).not.toContain("Run SAM2 (cornea)");
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test("step 4 (aligned): approve the axial changes, then the cornea detection (SAM) surfaces", async ({ page, consoleErrors }) => {
+    // Reviewer spec 2026-09-11 #4: step 4 offers "✓ Approve axial changes" + a disabled "Rectify" placeholder; the
+    // cornea-detection button is HIDDEN until the approval, then surfaces as "Cornea detection (SAM)".
     await gotoApp(page);
     await openCase(page, FIX.classified);
-    expect(await mainButtons(page)).toEqual(
-      expect.arrayContaining(["Run SAM2 (cornea)"]),
-    );
+    const btns = await mainButtons(page);
+    expect(btns).toEqual(expect.arrayContaining(["✓ Approve axial changes", "Rectify"]));
+    expect(btns).not.toContain("Cornea detection (SAM)");
+    expect(btns).not.toContain("Run SAM2 (cornea)");
+    expect(btns).not.toContain("Align group");
+    await expect(page.getByTestId("aligned-rectify")).toBeDisabled();
+    await page.getByTestId("aligned-approve").click();
+    await expect(page.getByTestId("aligned-approved")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("cornea-detect-sam")).toBeVisible();
+    // withdraw again so the seeded fixture is left as it was for the other tests
+    await page.getByTestId("aligned-unapprove").click();
+    await expect(page.getByTestId("aligned-approve")).toBeVisible({ timeout: 15_000 });
     expect(consoleErrors).toEqual([]);
   });
 
@@ -47,7 +67,7 @@ test.describe("lifecycle", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 6 (corneavet): confirm/auto subgroup", async ({ page, consoleErrors }) => {
+  test("step 7 (corneavet → classified): confirm/auto subgroup", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.corneavet);
     expect(await mainButtons(page)).toEqual(
@@ -56,7 +76,7 @@ test.describe("lifecycle", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 7 (subgroup): scar detection methods", async ({ page, consoleErrors }) => {
+  test("step 8 (subgroup): scar detection methods", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.subgroup);
     expect(await mainButtons(page)).toEqual(
@@ -65,7 +85,7 @@ test.describe("lifecycle", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 8 (scar): scar detect/correct/align", async ({ page, consoleErrors }) => {
+  test("step 9 (scar): scar detect/correct/align", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.scar);
     expect(await mainButtons(page)).toEqual(
@@ -73,13 +93,13 @@ test.describe("lifecycle", () => {
         "Detect scar (threshold)",
         "Scar via SAM2",
         "Correct ✎",
-        "Align replicates",
+        "Align scar replicates",
       ]),
     );
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 11 (corrected): schedule + correct + export metrics", async ({ page, consoleErrors }) => {
+  test("step 12 (corrected): schedule + correct + export metrics", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.corrected);
     expect(await mainButtons(page)).toEqual(
@@ -88,7 +108,7 @@ test.describe("lifecycle", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 9 (consensus): consensus choices + grid modes", async ({ page, consoleErrors }) => {
+  test("step 10 (consensus, scar-aligned): consensus choices + grid modes", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.consensus);
     expect(await mainButtons(page)).toEqual(
@@ -107,7 +127,7 @@ test.describe("lifecycle", () => {
     expect(consoleErrors).toEqual([]);
   });
 
-  test("step 6 control (no scar): offers Schedule + marks scar steps 7-11 N/A", async ({ page, consoleErrors }) => {
+  test("step 7 control (no scar): offers Schedule + marks scar steps 8-12 N/A", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.control);
     const btns = await mainButtons(page);
@@ -115,9 +135,11 @@ test.describe("lifecycle", () => {
     expect(btns).toEqual(expect.arrayContaining(["Schedule for training"]));
     expect(btns).not.toContain("Confirm subgroup");
     expect(btns).not.toContain("Detect scar (threshold)");
-    // Steps 7-11 (Subgroup/Scar/Aligned/Normalized/Corrected) render struck-through (not applicable).
+    // Steps 8-12 (Subgroup/Scar/Scar-aligned/Normalized/Corrected) render struck-through (not applicable);
+    // the group alignment (step 4 "Aligned") applies to a control too, so it is NOT struck.
     const struck = (await page.locator('main span[style*="line-through"]').allInnerTexts()).join(" ");
-    for (const s of ["Subgroup", "Scar", "Aligned", "Normalized", "Corrected"]) expect(struck).toContain(s);
+    for (const s of ["Subgroup", "Scar", "Scar-aligned", "Normalized", "Corrected"]) expect(struck).toContain(s);
+    expect(struck).not.toContain("Aligned");   // case-sensitive: "Scar-aligned" does not match
     expect(consoleErrors).toEqual([]);
   });
 });

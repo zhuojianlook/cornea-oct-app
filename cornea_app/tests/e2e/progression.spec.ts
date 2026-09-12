@@ -4,7 +4,7 @@ import { test, expect, gotoApp, openCase, mainButtons, mainBtn, canvasCount, FIX
  * so it never perturbs the read-only specs that share the seeded backend. Every other spec must
  * avoid clicking backend-mutating buttons; here we drive two real lifecycle transitions. */
 test.describe.serial("progression (mutating)", () => {
-  test("A: Approve preprocessing advances step 2 -> classify (step 3/4)", async ({ page, consoleErrors }) => {
+  test("A: Approve preprocessing advances step 2 -> Vetted (step 3: Align group)", async ({ page, consoleErrors }) => {
     await gotoApp(page);
     await openCase(page, FIX.vet);
 
@@ -14,16 +14,16 @@ test.describe.serial("progression (mutating)", () => {
     // a segmented/preprocessed viewer is rendered.
     expect(await canvasCount(page)).toBeGreaterThanOrEqual(1);
 
-    // MUTATE: approve the preprocessing -> unlocks classification.
+    // MUTATE: approve the preprocessing -> Vetted (step 3) — the next action is the group-wise 3D alignment
+    // ("⧉ Align group"); SAM2 follows at Aligned (4) and classification only after the cornea vet.
     await mainBtn(page, /Approve preprocessing/).click();
 
-    // step 3 (classify): the action bar now exposes the Scar / No-scar(control) classify buttons.
-    await expect(mainBtn(page, /No scar \(control\)/)).toBeVisible({ timeout: 15_000 });
-    await expect(mainBtn(page, /^Scar$/)).toBeVisible();
-    await expect(page.locator("main").getByText("Classify:")).toBeVisible();
+    // step 3 (vetted): the action bar now offers the group alignment (read-only here: never click it).
+    await expect(mainBtn(page, /Align group/)).toBeVisible({ timeout: 15_000 });
 
     const after = await mainButtons(page);
-    expect(after).toEqual(expect.arrayContaining(["Scar", "No scar (control)"]));
+    expect(after).toEqual(expect.arrayContaining(["Align group"]));
+    expect(after).not.toContain("Run SAM2 (cornea)");
     // the step-2 Approve button is gone now that we've moved past it.
     expect(after).not.toEqual(expect.arrayContaining([expect.stringContaining("Approve preprocessing")]));
 

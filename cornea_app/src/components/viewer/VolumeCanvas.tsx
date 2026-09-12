@@ -16,7 +16,7 @@ function hasCrop(m: Record<string, unknown> | null): boolean {
   return (Array.isArray(cr?.frames) && cr!.frames!.length > 0) || (Array.isArray(cl) && cl.length > 0);
 }
 import type { DefectMark } from "../../store/caseStore";
-import { scanStep, hasSegmentation, octProposals } from "../../api/lifecycle";
+import { scanStep, hasSegmentation, octProposals, awaitingCorneaDetection } from "../../api/lifecycle";
 import { PaintToolbar } from "./PaintToolbar";
 import { SliceGallery } from "./SliceGallery";
 import { AxialGallery } from "./AxialGallery";
@@ -25,6 +25,8 @@ import { GtCompareViewer } from "./GtCompareViewer";
 import { BeforeAfterViewer } from "./BeforeAfterViewer";
 import { StepsViewer } from "./StepsViewer";
 import { MotionPanel } from "./MotionPanel";
+import { AlignTabs } from "../panels/AlignTabs";
+import { SubgroupAlignDialog } from "../panels/GroupAlignPanel";
 
 // One size for every toolbar toggle, so the view group and the Slices/Segmentation group line up instead of
 // sitting at two different heights.
@@ -45,8 +47,9 @@ export function VolumeCanvas() {
   const gtViewerClass = useWorkflowStore((s) => s.gtViewerClass);
   const wfSet = useWorkflowStore((s) => s.set);
   // #2/#3: the timeline step being viewed drives which viewer tools are available. The preprocessing tools
-  // (Before/after, Fix-columns, Steps) belong to the Auto→Vetted steps (2–3); from Cornea/SAM2 (4) on, the
-  // viewer is Slices/Segmentation. Inspecting an earlier step is read-only (no border edits until rollback).
+  // (Before/after, Fix-columns, Steps) belong to the Auto→Vetted steps (2–3); Aligned (4) is view-only (a
+  // group-aligned volume takes no border edits); from Cornea/SAM2 (5) on, the viewer is Slices/Segmentation.
+  // Inspecting an earlier step is read-only (no border edits until rollback).
   const selectedStep = useWorkflowStore((s) => s.selectedStep);
   const manifest = (caseInfo?.manifest ?? null) as Record<string, unknown> | null;
   // Crop-approval: an auto de-tilt / off-cornea crop / clipped-apex surface-crop was DETECTED but left
@@ -57,6 +60,29 @@ export function VolumeCanvas() {
   const effStep = selectedStep ?? manifestStep;
   const inspecting = selectedStep != null && selectedStep < manifestStep;
   const preprocStep = effStep >= 1 && effStep <= 3;   // Raw/Auto/Vetted → preprocessing tools belong here
+  // Step 4 "Aligned" (reviewer spec 2026-09-11 #3): the main area shows the alignment of this scan's subgroup
+  // (consensus + pairs / 3-D view / scrub) as an overlay over the still-mounted niivue canvas; "⧉ Aligned" in the
+  // toolbar toggles it off to see the plain slices. The group id is <patient>_<eye>_s<subgroup> (caseStore).
+  // It STAYS visible at 5. Cornea while cornea detection is pending (the approval moved the subgroup there; reviewer
+  // 2026-09-12) — a read-only view of the approved alignment — until a segmentation exists.
+  const alignedStep = effStep === 4 || (effStep === 5 && awaitingCorneaDetection(manifest));
+  const [alignPane, setAlignPane] = useState(true);
+  const [alignGid, setAlignGid] = useState<string | null>(null);
+  // Reviewer 2026-09-12: "⧉ Align group" must serve up the subgroup specifier AGAIN even after the group was aligned —
+  // so the pane's button opens SubgroupAlignDialog (with "re-run an existing result" pre-checked) instead of re-running
+  // straight away. When its jobs finish, re-read the manifest and remount AlignTabs so the new result is shown.
+  const [alignAskOpen, setAlignAskOpen] = useState(false);
+  const [alignReloadNonce, setAlignReloadNonce] = useState(0);
+  const resolveAlignGroupId = useCaseStore((s) => s.resolveAlignGroupId);
+  const alignSub = manifest?.scar_subgroup;
+  useEffect(() => {
+    let cancelled = false;
+    if (!alignedStep || !caseInfo?.case_id) { setAlignGid(null); return; }
+    void resolveAlignGroupId().then((g) => { if (!cancelled) setAlignGid(g); });
+    setAlignAskOpen(false);
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alignedStep, caseInfo?.case_id, alignSub]);
   // The Segmentation toggle should enable as soon as the scan HAS a segmentation (per the manifest), not
   // only after the overlay finishes (re)loading — otherwise it greys on open then ungreys "after a while".
   const hasSeg = hasSegmentation(manifest);
@@ -150,7 +176,8 @@ export function VolumeCanvas() {
   const viewerFilter = `contrast(${contrast}%) brightness(${brightness}%)` + (blur > 0 && !fixColsView ? ` blur(${blur}px)` : "");
   // The 2-D overlays (before/after, fix-columns) are driven by the SAME top toolbar — no nested sub-UI.
   // They're 2-D, so Multi/3D don't apply; fix-columns marks along depth, so it's coronal/sagittal only.
-  const overlay2d = compareView || fixColsView || fixAxialView;
+  const alignPaneOn = alignedStep && alignPane && !!alignGid;
+  const overlay2d = compareView || fixColsView || fixAxialView || alignPaneOn;
   // #9 — Fix-columns "Crop region" mode is SAGITTAL-ONLY (the crop is defined in sagittal terms: frame
   // columns over a lateral-slice range), so force sagittal + disable the coronal option while it's active.
   const cropRegionMode = useWorkflowStore((s) => s.cropRegionMode);
@@ -272,7 +299,8 @@ export function VolumeCanvas() {
     return () => { cancelled = true; };
   }, [caseInfo?.case_id, volumeUrl]);
 
-  // #2/#3: when the VIEWED step is no longer a preprocessing step (e.g. after SAM2 advances it to 4, or
+  // #2/#3: when the VIEWED step is no longer a preprocessing step (e.g. after the group alignment advances it to
+  // 4 / SAM2 to 5, or
   // the user inspects Cornea+), close the preprocessing overlays so the niivue Slices/Segmentation
   // view shows. (Fixes "after SAM2 the user is still in Fix-columns and can't see the segmentation".)
   useEffect(() => {
@@ -283,7 +311,7 @@ export function VolumeCanvas() {
   // Segmentation toggle DEFAULTS to Segmentation for a scan that already HAS a segmentation (#16 — opening a
   // segmented scan should land on its segmentation, not raw Slices); otherwise Slices (greyed until SAM2).
   useEffect(() => {
-    setCompareView(false); setFixColsView(false); setFixAxialView(false); setStepsView(false);
+    setCompareView(false); setFixColsView(false); setFixAxialView(false); setStepsView(false); setAlignPane(true);
     autoCropOpenedRef.current = null;   // clear the once-per-case guard so the surface-crop auto-open can fire
     autoFixOpenedRef.current = null;    // ...and the border-editor auto-open below
     wfSet("showSegmentation", hasSegmentation(manifest));
@@ -519,7 +547,9 @@ export function VolumeCanvas() {
         className="flex items-center gap-2 px-3 border-b overflow-x-auto [&>*]:shrink-0"
         style={{ minHeight: 36, borderColor: "var(--c-border)" }}
       >
-        <ToggleButtonGroup size="small" exclusive value={showSeg ? "seg" : "slices"}
+        {/* Reviewer 2026-09-12: at "4. Aligned" the pane covers the canvas, so the slice/plane/tool controls are
+            hidden — only the "⧉ Aligned" toggle (which brings the plain slices back) stays on this row. */}
+        {!alignPaneOn && <ToggleButtonGroup size="small" exclusive value={showSeg ? "seg" : "slices"}
           onChange={(_, v) => { if (!v) return; wfSet("showSegmentation", v === "seg");
             // If enabling Segmentation before the overlay has finished loading (toggle now enabled from the
             // manifest, not the load), kick off a load so it appears without waiting for the open effect.
@@ -527,7 +557,8 @@ export function VolumeCanvas() {
           title={(segLoaded || hasSeg) ? "" : "Run SAM2 first to view the segmentation overlay"}>
           <ToggleButton value="slices" sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Slices</ToggleButton>
           <ToggleButton value="seg" disabled={!segLoaded && !hasSeg} sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}>Segmentation</ToggleButton>
-        </ToggleButtonGroup>
+        </ToggleButtonGroup>}
+        {!alignPaneOn && (<>
         <span style={{ width: 1, height: 22, background: "var(--c-border)" }} />
         <ToggleButtonGroup size="small" exclusive value={overlay2d ? orient2d : view} onChange={onView}>
           {/* sized to match the Slices/Segmentation group beside them — they had no sx, so they rendered at
@@ -619,6 +650,20 @@ export function VolumeCanvas() {
             title="Every step of the last preprocessing run, including your inputs, as a tree — plus the detector filmstrip"
           >
             ⚙ Steps
+          </ToggleButton>
+        )}
+        </>)}
+        {alignedStep && (
+          <ToggleButton
+            size="small"
+            value="aligned"
+            selected={alignPane}
+            onChange={() => setAlignPane((v) => !v)}
+            sx={{ py: 0.25, px: 1, fontSize: 12, textTransform: "none" }}
+            data-testid="aligned-pane-toggle"
+            title="The group alignment of this scan's subgroup — consensus + pairs, 3-D view, scrub (toggle off to see the plain slices)"
+          >
+            ⧉ Aligned
           </ToggleButton>
         )}
         {/* ⚑ Mark columns MOVED into the border editor's mode group (SliceGallery: "⚑ Mark"). It could not
@@ -773,6 +818,22 @@ export function VolumeCanvas() {
         {stepsView && volumeUrl && (
           <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }}>
             <StepsViewer onClose={() => setStepsView(false)} />
+          </div>
+        )}
+        {/* STEP 4 "Aligned" pane: the alignment content (AlignTabs — the same component the pairs dialog wraps) over the
+            still-mounted niivue canvas; the group id is this scan's alignment subgroup. */}
+        {alignPaneOn && (
+          <div className="absolute inset-0 z-20 flex flex-col" style={{ backgroundColor: "var(--c-bg)" }} data-testid="aligned-pane">
+            <AlignTabs key={`${alignGid!}#${alignReloadNonce}`} gid={alignGid}
+              onReAlign={() => setAlignAskOpen(true)}
+              title={<span style={{ fontSize: 13 }}><b style={{ color: "#ec4899" }}>4. Aligned</b>{effStep === 5 ? <span style={{ color: "#4ade80" }}> · axial changes approved</span> : null} — subgroup group <b>{alignGid}</b></span>} />
+            {/* "⧉ Align group" on an already-aligned group: ask for the subgroups again, then re-run (reviewer 2026-09-12). */}
+            <SubgroupAlignDialog open={alignAskOpen} gid={alignGid} defaultForce onClose={() => setAlignAskOpen(false)}
+              onAligned={() => {
+                void useCaseStore.getState().refreshCaseInfo();
+                const wf = useWorkflowStore.getState(); wf.set("casesVersion", wf.casesVersion + 1);
+                setAlignReloadNonce((n) => n + 1);
+              }} />
           </div>
         )}
         {stage === 4 && (

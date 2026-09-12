@@ -93,7 +93,7 @@ interface CaseState {
   // #4: scar / not-scar (control) decision, made AFTER preprocessing. Persists to the case manifest
   // without re-running the correction; null = undecided.
   setClassification: (cls: "scar" | "control" | null) => Promise<void>;
-  // Timeline step 3 (orange): mark preprocessing manually vetted. Step 7 (green): schedule for training.
+  // Timeline step 3 (pink): mark preprocessing manually vetted. Step 13 (green): schedule for training.
   vetPreprocessing: (corpusEligible?: boolean) => Promise<void>;
   // Approve the preprocessing AS-IS: mark it vetted WITHOUT applying any auto-detected proposals (the user is
   // accepting the current output and declining the de-tilt/crop/surface-crop). Non-destructive — identical to
@@ -179,10 +179,29 @@ interface CaseState {
   // Step regression: roll the scan back to `step`, clearing every later step's manifest flag so the
   // user can redo from there (flag-only on the backend; files remain and are overwritten on re-run).
   resetStep: (step: number) => Promise<void>;
-  // Step 6: set this scan's scar-subgroup AND confirm it (gates align so the right repeats group together).
+  // Step 7 (Classified): set this scan's scar-subgroup AND confirm it (gates align so the right repeats group together).
   confirmSubgroup: (sub: string) => Promise<void>;
-  // Step 6 for a control (no-scar) scan: mark the scar step done without running a detector.
+  // Step 7 (Classified) for a control (no-scar) scan: mark the scar step done without running a detector.
   skipScar: () => Promise<void>;
+  // Step 3 → 4 "Aligned": group-wise 3D alignment of this scan's patient+eye replicate group (regularises their
+  // sagittal curvature). POST /api/group/{gid}/align, gid = patient_eye as the sidebar groups scans. The engine is
+  // a separate workflow: until it lands the backend STUB answers ok:false + reason + the group's members and writes
+  // nothing, so nothing is set optimistically here — the caller shows the answer. null = no case / request failed.
+  /** The patient+eye group id ("CS001_OS") of the open scan — the sidebar's grouping rule; null when unknown. */
+  resolveGroupId: () => Promise<string | null>;
+  /** Start (or report) the minimal pair-registration job for the open scan's group (POST /api/group/{gid}/align). */
+  alignGroup: (force?: boolean) => Promise<{ ok: boolean; started?: boolean; already_running?: boolean; cached?: boolean; running?: boolean; reason?: string; members?: string[]; group?: string } | null>;
+  // Manifest-only: set / clear manifest.group_aligned (the step-4 flag) — for tests and for the engine later.
+  setGroupAligned: (aligned: boolean, note?: string) => Promise<void>;
+  /** This scan's ALIGNMENT group id "<patient>_<eye>_s<k>" (k = manifest.scar_subgroup, default 1; reviewer spec
+   *  2026-09-11: each subgroup aligns as its own group). null when the patient/eye is unknown. */
+  resolveAlignGroupId: () => Promise<string | null>;
+  /** Re-read the open scan's case info (manifest / flags) WITHOUT reloading the volume — after a job elsewhere (the
+   *  align job stamping group_aligned) changed its manifest, so the timeline advances in place. */
+  refreshCaseInfo: () => Promise<void>;
+  /** Step 4 "✓ Approve axial changes": approve (or withdraw) for EVERY scan of this scan's alignment subgroup (the
+   *  approval is of the group's applied axial changes as a whole). POST /api/case/{id}/aligned-approve per member. */
+  approveAligned: (approve: boolean, note?: string) => Promise<{ ok: boolean; cases: string[] } | null>;
 }
 
 function volumeUrlFor(caseId: string): string {
@@ -694,6 +713,129 @@ export const useCaseStore = create<CaseState>()(
         await api.json(`/api/case/${id}/scar/skip`, "POST", "{}");
       } catch (e) {
         set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    resolveGroupId: async () => {
+      const id = get().caseId;
+      if (!id) return null;
+      const man = (get().caseInfo?.manifest ?? {}) as Record<string, unknown>;
+      let patient = String(man.patient_id ?? "").trim();
+      let eye = String(man.eye ?? "").trim();
+      try {
+        if (!patient || !eye) {
+          // Same rule as the sidebar (OctLoader.ingest): cases/list resolves patient/eye from the manifest, else
+          // from the source filename — so the group aligned here is the group the reviewer sees.
+          const r = await api.json<{ cases: Array<{ case_id?: string; patient?: string | null; eye?: string | null }> }>("/api/cases/list");
+          const row = (r.cases || []).find((c) => c.case_id === id);
+          patient = patient || String(row?.patient ?? "").trim();
+          eye = eye || String(row?.eye ?? "").trim();
+        }
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+        return null;
+      }
+      if (!patient || !eye || eye === "?") return null;
+      return `${patient}_${eye}`;
+    },
+
+    alignGroup: async (force = false) => {
+      const id = get().caseId;
+      if (!id) return null;
+      set((s) => { s.busy = true; s.apiError = null; });
+      try {
+        const gid = await get().resolveGroupId();
+        if (!gid) {
+          set((s) => { s.apiError = "Cannot align the group: this scan's patient/eye is unknown — set the group's eye in the sidebar first."; });
+          return null;
+        }
+        return await api.json<{ ok: boolean; started?: boolean; already_running?: boolean; cached?: boolean; running?: boolean; reason?: string; members?: string[]; group?: string }>(
+          `/api/group/${encodeURIComponent(gid)}/align`, "POST", JSON.stringify({ force }));
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+        return null;
+      } finally {
+        set((s) => { s.busy = false; });
+      }
+    },
+
+    setGroupAligned: async (aligned, note) => {
+      const id = get().caseId;
+      if (!id) return;
+      const prev = (get().caseInfo?.manifest as Record<string, unknown> | undefined)?.group_aligned ?? null;
+      // Optimistic (mirrors vetPreprocessing) so the timeline moves at once; replaced by the persisted value.
+      set((s) => {
+        if (s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).group_aligned =
+          aligned ? { ts: new Date().toISOString(), note: note ?? null, source: "manual" } : null;
+      });
+      try {
+        const r = await api.json<{ ok: boolean; group_aligned: Record<string, unknown> | null }>(
+          `/api/case/${id}/group-aligned`, "POST", JSON.stringify({ aligned, note: note ?? null }));
+        set((s) => { if (s.caseId === id && s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).group_aligned = r.group_aligned; });
+      } catch (e) {
+        set((s) => {
+          if (s.caseId === id && s.caseInfo) (s.caseInfo.manifest as Record<string, unknown>).group_aligned = prev;
+          s.apiError = e instanceof Error ? e.message : String(e);
+        });
+      }
+    },
+
+    resolveAlignGroupId: async () => {
+      const base = await get().resolveGroupId();
+      if (!base) return null;
+      const man = (get().caseInfo?.manifest ?? {}) as Record<string, unknown>;
+      const sub = (String(man.scar_subgroup ?? "1").trim() || "1").toLowerCase();
+      return `${base}_s${sub}`;
+    },
+
+    refreshCaseInfo: async () => {
+      const id = get().caseId;
+      if (!id) return;
+      try {
+        const info = await api.json<CaseInfo>("/api/case", "POST", JSON.stringify({ case_id: id }));
+        set((s) => { if (s.caseId === id) s.caseInfo = info; });   // volumeUrl untouched: no reload, no flicker
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+      }
+    },
+
+    approveAligned: async (approve, note) => {
+      const id = get().caseId;
+      if (!id) return null;
+      set((s) => { s.busy = true; s.apiError = null; });
+      try {
+        // every scan of THIS scan's alignment subgroup (the job's member list; falls back to the open scan alone)
+        let members: string[] = [id];
+        const gid = await get().resolveAlignGroupId();
+        if (gid) {
+          try {
+            const st = await api.json<{ members?: string[] }>(`/api/group/${encodeURIComponent(gid)}/align/status`);
+            if (st.members?.length) members = st.members;
+          } catch { /* status unavailable → the open scan only */ }
+        }
+        if (!members.includes(id)) members = [...members, id];
+        const done: string[] = [];
+        let changed = false;
+        for (const cid of members) {
+          const r = await api.json<{ ok: boolean; aligned_approved: Record<string, unknown> | null; aligned_approved_at: string | null }>(
+            `/api/case/${encodeURIComponent(cid)}/aligned-approve`, "POST", JSON.stringify({ approve, note: note ?? null }));
+          done.push(cid); changed = true;
+          if (cid === id) set((s) => {
+            if (s.caseId === id && s.caseInfo) {
+              const mm = s.caseInfo.manifest as Record<string, unknown>;
+              mm.aligned_approved = r.aligned_approved; mm.aligned_approved_at = r.aligned_approved_at;
+            }
+          });
+        }
+        // The approval moved EVERY member of the subgroup (4. Aligned ↔ 5. Cornea): the open scan's row recolours from
+        // the live manifest, the other members' rows only from cases/list → ask the sidebar to re-read it now.
+        if (changed) { const wf = useWorkflowStore.getState(); wf.set("casesVersion", wf.casesVersion + 1); }
+        return { ok: true, cases: done };
+      } catch (e) {
+        set((s) => { s.apiError = e instanceof Error ? e.message : String(e); });
+        return null;
+      } finally {
+        set((s) => { s.busy = false; });
       }
     },
 

@@ -12,7 +12,7 @@ import { useCaseStore } from "../../store/caseStore";
 import { useWorkflowStore } from "../../store/workflowStore";
 import { useReviewQueueStore } from "../../store/reviewQueueStore";
 import type { ConsensusReport } from "../../api/types";
-import { scanStep, LIFECYCLE_STEPS } from "../../api/lifecycle";
+import { scanStep, alignOutcome, LIFECYCLE_STEPS } from "../../api/lifecycle";
 import { REVIEW_FLAGS, reviewFlagMeta, reviewFlagsOf } from "../../api/reviewFlags";
 
 type Status = "queued" | "uploading" | "ready" | "preprocessing" | "done" | "error";
@@ -347,6 +347,8 @@ export function OctLoader() {
   const setStage = useWorkflowStore((s) => s.setStage);
   const initTabs = useWorkflowStore((s) => s.initTabs);
   const segSig = useWorkflowStore((s) => s.segVersion); // bumps on a re-preprocess (incl. Fix-columns)
+  const casesSig = useWorkflowStore((s) => s.casesVersion); // bumps when other scans' lifecycle flags changed (subgroup approval)
+  const listSig = segSig + casesSig;   // either → re-read cases/list so every row's chip follows its CURRENT step
 
   // Background pre-warm bookkeeping (so clicking a scan to scrub is instant).
   const busyRef = useRef(false);
@@ -646,7 +648,7 @@ export function OctLoader() {
   // changes a scan's pass count. Refresh passes from cases/list when segVersion bumps, so the
   // "Download pass" selector never offers passes that no longer exist. Merge by caseId only.
   useEffect(() => {
-    if (segSig === 0) return;
+    if (listSig === 0) return;
     let stop = false;
     (async () => {
       try {
@@ -668,7 +670,7 @@ export function OctLoader() {
     })();
     return () => { stop = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segSig]);
+  }, [listSig]);
 
   // Keep only .OCT (+ companion .txt) from a file/dir selection.
   const pickFiles = (fs: File[]) => fs.filter((f) => /\.(oct|txt)$/i.test(f.name));
@@ -1330,13 +1332,16 @@ export function OctLoader() {
                     // for manual correction; still-preprocessing/queued scans stay locked (no half-written volume).
                     const clickable = !!s.caseId && s.status !== "error" && (!busy || s.status === "done") && !caseBusy;
                     const done = s.status === "done";
-                    // Per-scan lifecycle colour (red→orange→yellow→light blue→dark blue→green) from the
+                    // Per-scan lifecycle colour (the LIFECYCLE_STEPS ramp: red → pink → … → green) from the
                     // timeline step; only from step 2 (preprocessed-auto) onward. The actively-viewed scan
                     // keeps ITS lifecycle colour but a DARKER/stronger shade of it (not a blue accent) so the
                     // open scan stands out without losing its step colour; a colourless (raw) scan falls back
                     // to the accent tint so the selection is still visible.
                     const lifeStep = s.life ? scanStep(s.life) : 0;
-                    const lifeColor = lifeStep >= 2 ? LIFECYCLE_STEPS[lifeStep].color : null;
+                    // Step 4 reads "Aligned" or "Cannot align" per scan (reviewer 2026-09-12).
+                    const outcome = s.life ? alignOutcome(s.life) : null;
+                    const cannotAlign = outcome === "cannot" && lifeStep <= 4;
+                    const lifeColor = cannotAlign ? "#f59e0b" : lifeStep >= 2 ? LIFECYCLE_STEPS[lifeStep].color : null;
                     const rowBg = active
                       ? (lifeColor ? `${lifeColor}66` : "rgba(90,127,168,0.32)")
                       : lifeColor ? `${lifeColor}22` : "transparent";
@@ -1353,7 +1358,7 @@ export function OctLoader() {
                             {s.filename.replace(/\.OCT$/i, "")}
                           </span>
                           <span style={{ color: s.status === "error" ? "var(--c-red)" : lifeColor ?? (done ? "var(--c-green)" : "var(--c-text-dim)") }}>
-                            {s.status === "error" ? "failed" : lifeColor ? LIFECYCLE_STEPS[lifeStep].short : s.status}
+                            {s.status === "error" ? "failed" : cannotAlign ? "Cannot align" : lifeColor ? LIFECYCLE_STEPS[lifeStep].short : s.status}
                           </span>
                           {/* Surface-crop badge: AUTO-detected (blue ⬚) or human-confirmed (⬚✓). A manual "not
                               surface-crop" override (surface_crop_manual === false) hides it. Lets the user find +

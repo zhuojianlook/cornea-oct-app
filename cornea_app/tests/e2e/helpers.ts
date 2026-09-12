@@ -4,17 +4,18 @@ import { test as base, expect, type Page, type Locator } from "@playwright/test"
 export const FIX = {
   raw: "case_zz_raw",                 // step 1
   auto: "case_zz_auto",               // step 2 (preprocessed, unvetted)
-  classified: "case_zz_classified",   // step 4
+  vetted: "case_zz_vetted",           // step 3 (vetted, awaiting the group alignment → "Align group")
+  classified: "case_zz_classified",   // step 4 (group-aligned + classified; awaiting SAM2 → "Run SAM2")
   cornea: "case_zz_cornea",           // step 5 (cornea segmented, awaiting vet)
   corneavet: "case_zz_corneavet",     // step 6 (cornea vetted, awaiting subgroup)
-  control: "case_zz_control",         // step 6 control (no scar) — steps 7-11 N/A
-  subgroup: "case_zz_subgroup",       // step 7 (subgroup assigned)
-  scar: "case_zz_scar",               // step 8 (scar segmented)
+  control: "case_zz_control",         // step 7 control (no scar) — steps 8-12 N/A
+  subgroup: "case_zz_subgroup",       // step 8 (subgroup assigned)
+  scar: "case_zz_scar",               // step 9 (scar segmented)
   vet: "case_zz_vet",                 // step 2 (MUTABLE — Approve preprocessing -> classify)
   stale: "case_zz_stale",             // step 2, run UNSTAMPED with a pipeline_version → auto re-run on open
-  corrected: "case_zz_corrected",     // step 11 (MUTABLE — Schedule / Unschedule)
+  corrected: "case_zz_corrected",     // step 12 (MUTABLE — Schedule / Unschedule)
   members: ["case_zz_od_v1", "case_zz_od_v2", "case_zz_od_v3"],
-  consensus: "case_zzod_od_consensus", // step 9 (replicates aligned)
+  consensus: "case_zzod_od_consensus", // step 10 (scar replicates aligned)
 } as const;
 
 /** A console error we tolerate everywhere (the app serves no favicon). */

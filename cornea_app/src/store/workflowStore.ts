@@ -83,6 +83,7 @@ interface WorkflowState {
   // segmentation overlay
   segLoaded: boolean;
   segVersion: number; // bumps whenever previews re-render → gallery re-fetches
+  casesVersion: number; // bumps when OTHER scans' lifecycle flags changed (e.g. a subgroup-wide approval) → the sidebar re-reads cases/list
   segOpacity: number;
   showSegmentation: boolean;
   segQa: Record<string, unknown> | null;
@@ -188,7 +189,7 @@ interface WorkflowState {
   corneaOnlyPaint: boolean;
   corneaVetBusy: boolean;   // #1 — loading the cornea/background paint layer (spinner on the Paint button)
   correctBusy: boolean;     // loading the Correct paint layer / restoring on Cancel (spinner on Correct & Cancel)
-  consensusScarMode: "consensus" | "own" | null;   // which step-9 scar-source choice is being applied (spinner)
+  consensusScarMode: "consensus" | "own" | null;   // which step-10 scar-source choice is being applied (spinner)
   smartFillBusy: boolean;   // #4 — GrowCut smart-fill running (spinner + disable, avoids the "hung" look)
   smartFillPct: number;     // smart-fill progress 0..100 (drives the progress bar)
   startCorneaVetPaint: () => Promise<void>;
@@ -224,6 +225,7 @@ export const useWorkflowStore = create<WorkflowState>()(
 
     segLoaded: false,
     segVersion: 0,
+    casesVersion: 0,
     segOpacity: 0.5,
     showSegmentation: true,
     segQa: null,
@@ -836,7 +838,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
-        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        // Scar is its own step now — advance the timeline 8(Subgroup)→9(Scar) optimistically (backend set scar_done).
         useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -903,7 +905,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;   // case switched mid-run — don't write onto the new case
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
-        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        // Scar is its own step now — advance the timeline 8(Subgroup)→9(Scar) optimistically (backend set scar_done).
         useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -953,7 +955,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         if (useCaseStore.getState().caseId !== caseId) return;
         await nv.loadSegmentation(overlayUrl(caseId), get().showSegmentation ? get().segOpacity : 0);
         if (useCaseStore.getState().caseId !== caseId) return;
-        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        // Scar is its own step now — advance the timeline 8(Subgroup)→9(Scar) optimistically (backend set scar_done).
         useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;
@@ -993,7 +995,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           /* no WebGL — gallery updates from segVersion below */
         }
         if (useCaseStore.getState().caseId !== caseId) return;
-        // Scar is its own step now — advance the timeline 5(Cornea)→6(Scar) optimistically (backend set scar_done).
+        // Scar is its own step now — advance the timeline 8(Subgroup)→9(Scar) optimistically (backend set scar_done).
         useCaseStore.setState((cs) => { if (cs.caseInfo) (cs.caseInfo.manifest as Record<string, unknown>).scar_done = true; });
         set((s) => {
           s.scarMetrics = res.metrics;

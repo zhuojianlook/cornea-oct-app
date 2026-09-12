@@ -10,12 +10,13 @@ Run by tests/e2e/global-setup.ts before the suite. NEVER point CORNEA_DATA_DIR a
 Cases produced (id -> lifecycle step asserted by the suite):
   case_zz_raw         1  Raw (input only)
   case_zz_auto        2  Preprocessed/auto (before-after + fix-columns surfaces)
-  case_zz_classified  4  Classified (scar) -> Run SAM2 button
+  case_zz_vetted      3  Vetted (awaiting the group alignment) -> Align group button
+  case_zz_classified  4  Group-aligned (+ classified) -> Run SAM2 button
   case_zz_cornea      5  Cornea segmented (awaiting vet) -> paint/vet
-  case_zz_subgroup    7  Subgroup assigned -> scar detect
-  case_zz_scar        8  Scar segmented -> align/correct
-  case_zz_od_v1/v2/v3 8  consensus members (scar, subgroup 1)
-  case_zz_od_consensus 9 Replicates aligned (the step-9 consensus surface)
+  case_zz_subgroup    8  Subgroup assigned -> scar detect
+  case_zz_scar        9  Scar segmented -> align/correct
+  case_zz_od_v1/v2/v3 9  consensus members (scar, subgroup 1)
+  case_zz_od_consensus 10 Scar replicates aligned (the step-10 consensus surface)
 """
 import os
 import shutil
@@ -130,8 +131,11 @@ def main():
     make("case_zz_raw", {"oct_preprocessed": None}, vol=_vol(scar=False))
     # 2) Preprocessed (auto, unvetted) — before/after + fix-columns need context previews + a pass count
     make("case_zz_auto", {"oct_preprocessed": True, "oct_iter": _run()}, vol=_vol(scar=False), ctx=True)
-    # 4) Classified (scar)
+    # 3) Vetted — awaiting the group-wise 3D alignment (step 4): the action bar offers "⧉ Align group"
+    make("case_zz_vetted", {"oct_preprocessed": True, "preproc_vetted": True}, ctx=True)
+    # 4) Group-aligned (+ a scar tag) — awaiting SAM2: the action bar offers "▶ Run SAM2 (cornea)"
     make("case_zz_classified", {"oct_preprocessed": True, "preproc_vetted": True,
+                                "group_aligned": {"ts": "2026-09-10T00:00:00", "group": "zz_os", "source": "seed"},
                                 "scar_classification": "scar"}, ctx=True)
     # 5) Cornea segmented (awaiting vet) — cornea-only labelmap + seg previews
     make("case_zz_cornea", {"oct_preprocessed": True, "preproc_vetted": True, "scar_classification": "scar",
@@ -148,13 +152,13 @@ def main():
                           "sam2_meta": {"ok": True}, "cornea_vetted": True, "subgroup_confirmed": True,
                           "scar_subgroup": "1", "scar_done": True}, lab=_label(scar=True), seg=True, ctx=True)
 
-    # 6c) CONTROL (no scar), cornea vetted — steps 7-11 are N/A; it goes Cornea✓ (6) -> Scheduled (12).
+    # 7c) CONTROL (no scar), cornea vetted — steps 8-12 are N/A; it goes Classified (7) -> Scheduled (13).
     make("case_zz_control", {"oct_preprocessed": True, "preproc_vetted": True, "scar_classification": "control",
                              "sam2_meta": {"ok": True}, "cornea_vetted": True}, lab=_label(scar=False), seg=True, ctx=True)
 
     # Dedicated MUTABLE cases for the progression spec (so mutation tests don't couple to read-only ones):
     #   case_zz_vet       step 2 — Approve preprocessing -> classify
-    #   case_zz_corrected step 11 — Schedule / Unschedule
+    #   case_zz_corrected step 12 — Schedule / Unschedule
     make("case_zz_vet", {"oct_preprocessed": True, "oct_iter": _run()}, vol=_vol(scar=False), ctx=True)
     # STALE step-2 case: preprocessed + unapproved, but its run record carries NO pipeline_version → the
     # sidecar reports pipeline_current:false and the app auto re-runs it on open (pipeline-stale.spec.ts).
@@ -164,7 +168,7 @@ def main():
                                "scar_subgroup": "1", "scar_done": True, "corrected_labelmap": True},
          lab=_label(scar=True), seg=True, ctx=True)
 
-    # 9) Consensus from 3 replicate members (scar, subgroup 1), via the real build (no SAM2)
+    # 10) Consensus from 3 replicate members (scar, subgroup 1), via the real build (no SAM2)
     members = []
     for i, sh in enumerate((0, 2, -2), start=1):
         cid = f"case_zz_od_v{i}"

@@ -65,6 +65,7 @@ import detector_tune
 import oct_motion as oct_motion_mod
 import cohort as cohort_mod
 import debug_align
+import group_job as group_job_mod
 
 app = FastAPI(title="Cornea OCT Segmentation Sidecar")
 
@@ -785,6 +786,242 @@ def get_preview_file(case_id: str, group: str, name: str) -> FileResponse:
     if not p.exists():
         raise HTTPException(404, "Preview not found.")
     return FileResponse(str(p), media_type="image/png")
+
+
+# ── Sagittal thumbnail (subgroup dialog, reviewer 2026-09-12: "show the middle sagittal slice for each scan — this will aid
+# the user in determining if the scans belong to the same subgroup") ──────────────────────────────────────────────────────
+_SAG_THUMB_W = 512
+
+
+def _viewer_volume_path(case_id: str) -> Path:
+    """The NIfTI the VIEWER shows at step 3 — exactly what /api/case/{id}/volume.nii.gz serves (the dim-crop display
+    volume when present + current, else the working / preprocessed volume)."""
+    base = _working_volume(case_id)
+    disp = orch.case_root(case_id) / "previews" / "volume_display.nii.gz"
+    return disp if (disp.exists() and disp.stat().st_mtime >= base.stat().st_mtime) else base
+
+
+_SAG_STACK_KEEP = 16          # LRU: how many per-case sagittal stacks to keep across the store
+_SAG_STACK_DEPTH_STRIDE = 2   # the thumb is ~254 px tall — every 2nd depth row is plenty
+
+
+def _sag_stack_paths(case_id: str) -> tuple[Path, Path]:
+    prev = orch.case_root(case_id) / "previews"
+    return prev / "sagittal_stack.npy", prev / "sagittal_stack.json"
+
+
+def _sag_stack_prune(keep: int = _SAG_STACK_KEEP) -> None:
+    """Keep only the `keep` most recently used sagittal stacks store-wide (each is ~17 MB)."""
+    try:
+        found = sorted(Path(orch.CASES_ROOT if hasattr(orch, "CASES_ROOT") else settings.CASES_ROOT).glob("*/previews/sagittal_stack.npy"),
+                       key=lambda q: q.stat().st_mtime, reverse=True)
+    except Exception:  # noqa: BLE001
+        return
+    for old in found[keep:]:
+        for q in (old, old.with_suffix(".json")):
+            try:
+                q.unlink()
+            except OSError:
+                pass
+
+
+def _sag_stack(case_id: str, vol_path: Path) -> tuple[np.ndarray, dict]:
+    """A uint8 (L, D/stride, F) memmap of the viewer volume under previews/, built once per case so SCRUBBING the
+    sagittal thumbnails (reviewer 2026-09-12) costs ~5 ms per slice instead of ~0.6 s (gunzip of the whole volume).
+    One GLOBAL window (1-99 % over a subsample) so the brightness does not flicker from slice to slice."""
+    import nibabel as nib
+    npy, meta_p = _sag_stack_paths(case_id)
+    src_mtime = vol_path.stat().st_mtime
+    try:
+        meta = json.loads(meta_p.read_text())
+        if npy.exists() and float(meta.get("src_mtime", -1)) >= src_mtime and meta.get("stride") == _SAG_STACK_DEPTH_STRIDE:
+            os.utime(npy, None)                                    # LRU touch
+            return np.load(str(npy), mmap_mode="r"), meta
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    img = nib.load(str(vol_path))
+    L, D, F = (int(v) for v in img.shape[:3])
+    raw = np.asanyarray(img.dataobj)[:, ::_SAG_STACK_DEPTH_STRIDE, :]
+    sub = raw[::4, ::4, ::2].astype(np.float32)
+    fin = sub[np.isfinite(sub)]
+    lo, hi = (float(v) for v in np.percentile(fin, (1, 99))) if fin.size else (0.0, 1.0)
+    if not (hi > lo):
+        hi = lo + 1.0
+    u8 = np.clip((np.nan_to_num(raw.astype(np.float32)) - lo) / (hi - lo) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    try:
+        zooms = [float(v) for v in img.header.get_zooms()[:3]]
+    except Exception:  # noqa: BLE001
+        zooms = [1.0, 1.0, 1.0]
+    meta = {"shape": [L, int(u8.shape[1]), F], "full_depth": D, "stride": _SAG_STACK_DEPTH_STRIDE,
+            "zooms": zooms, "lo": lo, "hi": hi, "src_mtime": src_mtime, "src": str(vol_path)}
+    npy.parent.mkdir(parents=True, exist_ok=True)
+    tmp = npy.with_name(npy.name + f".{os.getpid()}.tmp.npy")
+    np.save(str(tmp), u8); os.replace(tmp, npy)
+    meta_p.write_text(json.dumps(meta))
+    _sag_stack_prune()
+    return np.load(str(npy), mmap_mode="r"), meta
+
+
+def _thumb_from_stack(case_id: str, vol_path: Path, lateral: int | None, label: str) -> tuple[bytes, int, int]:
+    """The same picture as _render_sagittal_thumb, sliced out of the per-case uint8 stack (fast path for scrubbing)."""
+    from PIL import Image, ImageDraw, ImageFont
+    stack, meta = _sag_stack(case_id, vol_path)
+    L, _Ds, F = (int(v) for v in meta["shape"])
+    lat = L // 2 if lateral is None else int(lateral)
+    if not (0 <= lat < L):
+        raise HTTPException(400, f"lateral must be 0..{L - 1}, not {lateral}")
+    u8 = np.ascontiguousarray(np.asarray(stack[lat])[:, ::-1])     # (depth/stride, frame); high frames on the left
+    pil = Image.fromarray(u8, "L")
+    zl, zd, zf = (meta.get("zooms") or [1.0, 1.0, 1.0])[:3]
+    zd = zd if zd > 0 else 1.0
+    zf = zf if zf > 0 else 1.0
+    th = max(1, int(round(_SAG_THUMB_W * (int(meta["full_depth"]) * zd) / (F * zf))))
+    pil = pil.resize((_SAG_THUMB_W, th), Image.LANCZOS).convert("RGB")
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.load_default(size=13)
+    except TypeError:
+        font = ImageFont.load_default()
+    text = f"{label}  ·  lateral {lat}/{L - 1}"
+    x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+    draw.rectangle((2, 2, x1 - x0 + 10, y1 - y0 + 8), fill=(0, 0, 0))
+    draw.text((6, 4), text, fill=(255, 220, 90), font=font)
+    import io
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue(), lat, L
+
+
+def _render_sagittal_thumb(vol_path: Path, lateral: int | None, label: str) -> tuple[bytes, int, int]:
+    """PNG bytes of one sagittal slice of `vol_path` in the app's orientation (x = frames, HIGH frames on the LEFT;
+    y = depth, row 0 at the top), windowed to the slice's 1-99 percentiles, downscaled to ~_SAG_THUMB_W px wide (aspect
+    kept) with a thin label burned in at the top-left. Returns (png, lateral, L)."""
+    import nibabel as nib
+    from PIL import Image, ImageDraw, ImageFont
+    img = nib.load(str(vol_path))
+    L = int(img.shape[0])
+    lat = L // 2 if lateral is None else int(lateral)
+    if not (0 <= lat < L):
+        raise HTTPException(400, f"lateral must be 0..{L - 1}, not {lateral}")
+    sl = np.asarray(img.dataobj[lat, :, :], np.float32)          # (depth, frame), same (L, D, F) layout as group_align
+    sl = sl[:, ::-1]                                              # high frames on the left, as in the app
+    fin = sl[np.isfinite(sl)]
+    if fin.size:
+        lo, hi = (float(v) for v in np.percentile(fin, (1, 99)))
+    else:
+        lo, hi = 0.0, 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+    u8 = np.clip((np.nan_to_num(sl) - lo) / (hi - lo) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    pil = Image.fromarray(u8, "L")
+    D, F = u8.shape
+    # Keep the PHYSICAL aspect the viewer shows (voxel spacing from the header: frames ~0.04 mm vs depth ~0.003 mm),
+    # not the voxel aspect — a 101-frame × 640-row slice is ~4 mm wide × 2 mm deep on screen.
+    try:
+        zl, zd, zf = (float(v) for v in img.header.get_zooms()[:3])
+    except Exception:  # noqa: BLE001
+        zd = zf = 1.0
+    if not (zd > 0 and zf > 0):
+        zd = zf = 1.0
+    th = max(1, int(round(_SAG_THUMB_W * (D * zd) / (F * zf))))
+    pil = pil.resize((_SAG_THUMB_W, th), Image.LANCZOS)
+    pil = pil.convert("RGB")
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.load_default(size=13)
+    except TypeError:                                             # older Pillow: bitmap default only
+        font = ImageFont.load_default()
+    text = f"{label}  ·  lateral {lat}/{L - 1}"
+    x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+    draw.rectangle((2, 2, x1 - x0 + 10, y1 - y0 + 8), fill=(0, 0, 0))
+    draw.text((6, 4), text, fill=(255, 220, 90), font=font)
+    import io
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue(), lat, L
+
+
+@app.get("/api/case/{case_id}/sagittal-thumb/meta")
+def get_sagittal_thumb_meta(case_id: str) -> dict:
+    """How many sagittal slices this scan has, so the subgroup dialog can SCRUB its thumbnail (reviewer 2026-09-12).
+    Header-only (no voxel read); `ready` says whether the fast per-case stack is already built."""
+    cid = _require_case(case_id)
+    try:
+        src = _viewer_volume_path(cid)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(404, f"No volume for {case_id}: {exc}")
+    if not src.exists():
+        raise HTTPException(404, f"No volume for {case_id}.")
+    import nibabel as nib
+    L, D, F = (int(v) for v in nib.load(str(src)).shape[:3])
+    npy, meta_p = _sag_stack_paths(cid)
+    ready = False
+    try:
+        ready = npy.exists() and float(json.loads(meta_p.read_text()).get("src_mtime", -1)) >= src.stat().st_mtime
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return {"ok": True, "case_id": cid, "laterals": L, "mid": L // 2, "depth": D, "frames": F, "ready": bool(ready)}
+
+
+@app.get("/api/case/{case_id}/sagittal-thumb")
+def get_sagittal_thumb(case_id: str, lateral: str = "mid"):
+    """One sagittal slice of the corrected (viewer) volume as a small PNG — the SubgroupAlignDialog shows the middle one
+    per scan so the reviewer can compare the imaged region across an eye's scans. `lateral` = "mid" (default: L // 2)
+    or an explicit index. App orientation (high frames on the left), 1-99 % window, ~512 px wide, label burned in.
+    Cached at <case>/previews/sagittal_thumb_<lateral>.png and regenerated when older than the volume it was rendered
+    from. GET ⇒ token-exempt, like the other preview images."""
+    cid = _require_case(case_id)
+    lat: int | None = None
+    if str(lateral).strip().lower() not in ("", "mid", "middle"):
+        try:
+            lat = int(lateral)
+        except ValueError:
+            raise HTTPException(400, f"lateral must be 'mid' or an integer, not {lateral!r}")
+    try:
+        src = _viewer_volume_path(cid)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(404, f"No volume for {case_id}: {exc}")
+    if not src.exists():
+        raise HTTPException(404, f"No volume for {case_id}.")
+    src_mtime = src.stat().st_mtime
+    headers = {"Cache-Control": "private, max-age=300"}
+    prev = orch.case_root(cid) / "previews"
+    if lat is not None:
+        cached = prev / f"sagittal_thumb_{lat}.png"
+        if cached.exists() and cached.stat().st_mtime >= src_mtime:
+            return FileResponse(str(cached), media_type="image/png", headers=headers)
+    else:
+        # "mid" resolves to L // 2 only once the header is read; the cache file carries the resolved index, so look for
+        # any sagittal_thumb_*.png marked as the middle one via its sidecar .mid marker.
+        marker = prev / "sagittal_thumb_mid.txt"
+        try:
+            mid_idx = int(marker.read_text().strip())
+            cached = prev / f"sagittal_thumb_{mid_idx}.png"
+            if cached.exists() and cached.stat().st_mtime >= src_mtime and marker.stat().st_mtime >= src_mtime:
+                return FileResponse(str(cached), media_type="image/png", headers=headers)
+        except (OSError, ValueError):
+            pass
+    label = cid[5:] if cid.startswith("case_") else cid
+    try:                                                          # fast path: the per-case uint8 stack (scrubbing)
+        png, lat_used, _L = _thumb_from_stack(cid, src, lat, label)
+    except HTTPException:
+        raise
+    except Exception:                                             # noqa: BLE001 — fall back to the per-slice reader
+        png, lat_used, _L = _render_sagittal_thumb(src, lat, label)
+    cached = prev / f"sagittal_thumb_{lat_used}.png"
+    try:
+        prev.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_name(cached.name + f".{os.getpid()}.tmp")
+        tmp.write_bytes(png); os.replace(tmp, cached)
+        if lat is None:
+            (prev / "sagittal_thumb_mid.txt").write_text(str(lat_used))
+    except OSError:
+        pass
+    return Response(content=png, media_type="image/png", headers=headers)
 
 
 @app.post("/api/case/{case_id}/context-previews")
@@ -3117,6 +3354,8 @@ def _oct_preprocess_case_impl(case_id: str, req: OctPreprocessRequest) -> dict:
              # to the Subgroup step (subgroup is now before scar), skipping the cornea/background vet step.
              "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None,
              "cornea_vetted": None, "subgroup_confirmed": None,
+             # The group alignment (step 4, group_aligned) was measured on the PREVIOUS volume → stale; re-align.
+             "group_aligned": None, "aligned_approved": None, "aligned_approved_at": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if cls:
         extra["scar_classification"] = cls
@@ -3221,8 +3460,10 @@ def keep_raw_case(case_id: str) -> dict:
              # else. preproc_vetted is explicitly cleared rather than left alone, so a previously-vetted scan
              # does not keep an approval that referred to the discarded correction.
              "preproc_vetted": False, "training_scheduled": False,
-             # seg files were deleted above → clear their flags so the timeline drops to Vetted (not SAM2).
+             # seg files were deleted above → clear their flags so the timeline drops to Preprocessed (not SAM2).
              "sam2_meta": None, "corrected_labelmap": None, "consensus_case": None, "scar_done": None, "cornea_vetted": None,
+             # The group alignment (step 4) was measured on the discarded correction → stale; re-align.
+             "group_aligned": None, "aligned_approved": None, "aligned_approved_at": None,
              "qa_json": None, "segmentation_preview_dir": None}
     if m.get("scar_classification"):
         extra["scar_classification"] = m.get("scar_classification")
@@ -4141,23 +4382,31 @@ def schedule_training(case_id: str, req: TrainingScheduleRequest) -> dict:
 # Per-step manifest flags, in lifecycle order (mirrors api/lifecycle.ts scanStep). Resetting TO step N
 # clears the flags of every step AFTER N, so the scan drops back to N and the user can redo from there.
 # Files on disk are left intact (re-running a step overwrites its artifact) — this is flag-only + reversible.
+# Step numbers == LIFECYCLE_STEPS indices: 1 Raw, 2 Auto, 3 Vetted, 4 Aligned (group-wise 3D alignment of the
+# eye's replicates), 5 Cornea (SAM2), 6 Cornea✓, 7 Classified, 8 Subgroup, 9 Scar, 10 Scar-aligned (consensus),
+# 11 Normalized, 12 Corrected, 13 Scheduled. Classification sits AFTER the cornea vet (it gates only the scar
+# branch), exactly as scanStep orders it, so rolling back to Cornea/Cornea✓ clears it too.
 _STEP_RESET_FLAGS: dict[int, list[str]] = {
     2: ["oct_preprocessed", "oct_iter"],          # Preprocessed (auto)
     3: ["preproc_vetted"],                          # Vetted
-    4: ["scar_classification", "scar_range"],       # Classified (scar/control)
+    # Aligned: the group alignment stamp, the reviewer's approval of the applied axial changes and the subgroup
+    # confirmation the alignment was started under — all step-4 state, all cleared when group_aligned is.
+    4: ["group_aligned", "aligned_approved", "aligned_approved_at", "align_subgroup_confirmed"],
     5: ["sam2_meta", "qa_json", "segmentation_preview_dir"],  # Cornea (SAM2)
     6: ["cornea_vetted"],                           # Cornea/background paint-vetted
-    7: ["subgroup_confirmed"],                      # Subgroup assigned (now BEFORE scar)
-    8: ["scar_done", "scar_metrics"],               # Scar segmented (now AFTER subgroup)
-    9: ["consensus_case", "consensus_scar_source"],            # Aligned (link + the scar-source choice)
-    10: ["normalized", "normalization_skipped"],               # Normalised against controls (or skipped)
-    11: ["corrected_labelmap"],                     # Manually corrected
-    12: ["training_scheduled"],                     # Scheduled for training
+    7: ["scar_classification", "scar_range"],       # Classified (scar/control) — AFTER cornea vet
+    8: ["subgroup_confirmed"],                      # Subgroup assigned (BEFORE scar)
+    9: ["scar_done", "scar_metrics"],               # Scar segmented (AFTER subgroup)
+    10: ["consensus_case", "consensus_scar_source"],           # Scar-aligned (consensus link + the scar-source choice)
+    11: ["normalized", "normalization_skipped"],               # Normalised against controls (or skipped)
+    12: ["corrected_labelmap"],                     # Manually corrected
+    13: ["training_scheduled"],                     # Scheduled for training
 }
+_MAX_STEP = max(_STEP_RESET_FLAGS)   # 13
 
 
 class ResetStepRequest(BaseModel):
-    step: int   # target step to return to (1-12); everything AFTER it is cleared
+    step: int   # target step to return to (1-13); everything AFTER it is cleared
 
 
 @app.post("/api/case/{case_id}/reset-step")
@@ -4171,8 +4420,8 @@ def reset_step(case_id: str, req: ResetStepRequest) -> dict:
     if orch.read_manifest(cid).get("consensus_cases"):
         raise HTTPException(400, "This is a built consensus case — rebuild it rather than resetting a step.")
     target = int(req.step)
-    if target < 1 or target > 12:
-        raise HTTPException(400, "step must be 1-12.")
+    if target < 1 or target > _MAX_STEP:
+        raise HTTPException(400, f"step must be 1-{_MAX_STEP}.")
     updates: dict = {}
     cleared: list[str] = []
     for s, keys in _STEP_RESET_FLAGS.items():
@@ -4197,6 +4446,790 @@ def reset_step(case_id: str, req: ResetStepRequest) -> dict:
         orch.write_manifest_value(cid, updates)
     return {"ok": True, "step": target, "cleared": cleared,
             "case_info": orch.current_case_info(cid)}
+
+
+# ── STEP 4 "Aligned": group-wise 3D alignment of a patient+eye group's replicate scans ─────────────────────
+def _group_id_norm(gid: str) -> str:
+    """Normalise a patient+eye group id ("CS001_OD", "cs001|od", "CS001 OD") to lowercase "patient_eye"."""
+    return re.sub(r"[\s|/:,+]+", "_", str(gid or "").strip()).strip("_").lower()
+
+
+# ALIGNMENT SUBGROUPS (reviewer spec 2026-09-11 #1/#2): "⧉ Align group" first asks whether all scans of the eye belong to
+# the same subgroup; each subgroup then aligns as its own group. THE subgroup is manifest.scar_subgroup — one concept
+# ("which replicates belong together"), shared with the scar stage (its consensus / strategy comparison already group by
+# it, and the sidebar's per-scan subgroup inputs edit it). The CONFIRMATION is a separate flag, align_subgroup_confirmed:
+# subgroup_confirmed is the step-8 flag (lifecycle.ts colours Cornea✓ and Subgroup as reached on it, and a SAM2 run
+# clears it), so stamping it here at step 4 would paint later steps done before SAM2 ran.
+# Group id = <patient>_<eye>[_s<k>]: the plain form is the whole eye (legacy: every subgroup), the _s<k> form is one
+# subgroup; its job dir is groups/<patient>_<eye>_s<k>/align_min.
+_SUBGROUP_SUFFIX = re.compile(r"^(?P<base>.+)_s(?P<sub>[^_]+)$")
+
+
+def _sub_norm(v) -> str:
+    """A subgroup label as stored (scar_subgroup): stripped, '1' when empty; lowercased so it is a safe gid part."""
+    return (str(v if v is not None else "1").strip() or "1").lower()
+
+
+def _case_subgroup(m: dict | None) -> str:
+    return _sub_norm((m or {}).get("scar_subgroup"))
+
+
+def _align_base_and_sub(group_id: str) -> tuple[str, str | None]:
+    """('cs001_os', '1') for 'CS001_OS_s1'; ('cs001_os', None) for the plain eye id."""
+    gid = _group_id_norm(group_id)
+    mo = _SUBGROUP_SUFFIX.match(gid)
+    if mo:
+        return mo.group("base"), mo.group("sub")
+    return gid, None
+
+
+def _group_members(group_id: str) -> tuple[list[str], dict]:
+    """Case ids of the OCT scans in the patient+eye group `group_id` — the SAME grouping rule /api/cases/list
+    feeds the sidebar (manifest patient_id/eye first, else the source filename; consensus + non-OCT cases
+    skipped; an unknown eye never joins a group), so the group the reviewer sees is the group that gets
+    aligned. A `<patient>_<eye>_s<k>` id keeps only the scans whose subgroup (scar_subgroup, default 1) is k.
+    Sorted by case id; read-only. key = {patient, eye, subgroup (None for the plain eye id)}."""
+    want, sub_want = _align_base_and_sub(group_id)
+    members: list[str] = []
+    key: dict = {"patient": None, "eye": None, "subgroup": sub_want}
+    root = settings.CASES_ROOT
+    if not want or not root.exists():
+        return members, key
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.endswith("_consensus"):
+            continue
+        cid = child.name
+        try:
+            m = orch.read_manifest(cid)
+        except Exception:  # noqa: BLE001
+            continue
+        if not m or m.get("consensus_cases"):
+            continue
+        src = m.get("oct_source") or m.get("companion_txt")
+        if not src:
+            continue
+        meta: dict = {}
+        try:
+            meta = metrics_export.parse_case_meta(src)
+        except Exception:  # noqa: BLE001
+            pass
+        pid = str(m.get("patient_id") or meta.get("patient_id") or "").strip()
+        eye = str(m.get("eye") or meta.get("eye") or "").strip()
+        if not pid or not eye or eye == "?":
+            continue
+        if _group_id_norm(f"{pid}_{eye}") != want:
+            continue
+        if sub_want is not None and _case_subgroup(m) != sub_want:
+            continue
+        members.append(cid)
+        key = {"patient": pid, "eye": eye.upper(), "subgroup": sub_want}
+    return members, key
+
+
+# ── the MINIMAL "Align group" job (group_job.py, reviewer ask 2026-09-11) ─────────────────────────────────
+# POST /api/group/{gid}/align starts (or reports) a SUBPROCESS that runs group_align.register_group on the group's
+# members and writes <WORKSPACE_ROOT>/groups/<gid>/align_min/{progress.json, result.json, overlay_<cid>.png, job.log}.
+# READ-ONLY on the cases (load_member write_cache=False; no manifest is touched — manifest.group_aligned stays the
+# consensus step's job). One job at a time on the machine (the engine is heavy: 3 BLAS threads, minutes per pair).
+_ALIGN_LOCK = threading.RLock()   # re-entrant: _align_status is called under it
+_ALIGN_PROCS: dict = {}          # gid → subprocess.Popen of the running / last job started by THIS sidecar
+
+
+class GroupAlignRequest(BaseModel):
+    force: bool = False            # re-run even when a result.json exists
+    transitivity: bool = False     # also run register_group's transitivity triples (slow)
+    reference: str | None = None   # pin the reference member (default: the engine's pose rule)
+    sensitivity: bool = True       # run the reference-sensitivity stage (extra pairs; ~2/3 of a big group's runtime)
+    # INTERNAL: the sidecar-resolved member list (subgroup-aware) handed to group_job --members; whatever a client
+    # sends here is overwritten by _group_members before the spawn.
+    members: list[str] | None = None
+
+
+def _groups_root() -> Path:
+    return Path(settings.WORKSPACE_ROOT) / "groups"
+
+
+def _align_gid(group_id: str) -> str:
+    """The normalised group id as a SAFE path segment (a-z 0-9 _ . -; never '.', '..' or empty)."""
+    gid = _group_id_norm(group_id)
+    if not gid or gid in (".", "..") or not re.fullmatch(r"[a-z0-9_.\-]+", gid):
+        raise HTTPException(404, f"No such patient+eye group: {group_id}")
+    return gid
+
+
+def _align_dir(gid: str) -> Path:
+    return _groups_root() / gid / "align_min"
+
+
+def _align_pid_alive(pid) -> bool:
+    """A group_job.py process with this pid is alive (guards a stale progress.json after a sidecar restart)."""
+    try:
+        pid = int(pid)
+        os.kill(pid, 0)
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        return b"group_job.py" in cmd
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _align_max_jobs() -> int:
+    """How many align jobs may run at once (CORNEA_ALIGN_JOBS, default 1). Each uses 3 BLAS threads; a bulk run over
+    the whole store sets it to 3-4 so the machine is used without starving the app."""
+    try:
+        return max(1, int(os.environ.get("CORNEA_ALIGN_JOBS", "1")))
+    except ValueError:
+        return 1
+
+
+def _align_running_gids(exclude: str | None = None) -> list[str]:
+    with _ALIGN_LOCK:
+        return [g for g, proc in list(_ALIGN_PROCS.items()) if g != exclude and proc.poll() is None]
+
+
+def _align_running_elsewhere(gid: str) -> str | None:
+    """The gid of another group's running job when the machine is FULL (see _align_max_jobs), else None."""
+    others = _align_running_gids(exclude=gid)
+    return others[0] if len(others) >= _align_max_jobs() else None
+
+
+def _align_status(gid: str, members: list, key: dict) -> dict:
+    d = _align_dir(gid)
+    prog = group_job_mod.read_json(d / group_job_mod.PROGRESS_NAME)
+    with _ALIGN_LOCK:
+        proc = _ALIGN_PROCS.get(gid)
+    running = False; exit_code = None
+    if proc is not None:
+        exit_code = proc.poll(); running = exit_code is None
+    elif prog and prog.get("running"):
+        running = _align_pid_alive(prog.get("pid"))
+    res_path = d / group_job_mod.RESULT_NAME
+    res = group_job_mod.read_json(res_path) if res_path.exists() else None
+    error = (prog or {}).get("error")
+    if not running and not error:
+        if proc is not None and exit_code not in (None, 0):
+            error = f"job exited with code {exit_code}"
+        elif prog and prog.get("running") and not (res and res.get("timestamp")):
+            error = "job is no longer running (killed or the sidecar restarted mid-run)"
+    seconds = None
+    if prog and running and prog.get("started"):
+        seconds = time.time() - float(prog["started"])
+    elif res:
+        seconds = res.get("seconds")
+    stale = bool(res) and res.get("engine_md5") != group_job_mod.engine_md5()
+    if res and not running:
+        try:
+            _align_stamp_if_due(gid)     # a job started via /subgroups: stamp group_aligned once per result
+        except Exception as e:  # noqa: BLE001
+            print(f"[align] stamp {gid}: {type(e).__name__}: {e}", flush=True)
+    return {"group": gid, "patient": key.get("patient"), "eye": key.get("eye"), "subgroup": key.get("subgroup"),
+            "members": list(members), "stamp": _align_stamp_state(gid),
+            "running": running, "done": bool(res) and not running, "error": error, "progress": prog,
+            "result_exists": bool(res), "result_timestamp": (res or {}).get("timestamp"), "reference": (res or {}).get("reference"),
+            "engine_md5_now": group_job_mod.engine_md5(), "engine_md5_result": (res or {}).get("engine_md5"), "engine_stale": stale,
+            "seconds": seconds, "dir": str(d), "running_elsewhere": _align_running_elsewhere(gid)}
+
+
+def _align_spawn(gid: str, d: Path, req: "GroupAlignRequest") -> "subprocess.Popen":
+    """Start the job subprocess (tests monkeypatch this). 3 BLAS threads, its own session (a kill reaps its pools)."""
+    d.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        env[k] = "3"
+    cmd = [sys.executable, str(Path(group_job_mod.__file__).resolve()), "--group", gid,
+           "--cases-root", str(settings.CASES_ROOT), "--out-dir", str(d), "--workers", "3"]
+    if req.transitivity:
+        cmd.append("--transitivity")
+    if not req.sensitivity:
+        cmd.append("--no-sensitivity")
+    if req.reference:
+        cmd += ["--reference", orch.safe_case_id(req.reference)]
+    if req.members:
+        cmd += ["--members", ",".join(orch.safe_case_id(c) for c in req.members)]
+    out = open(d / "job.stdout", "ab")
+    try:
+        return subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                                cwd=str(Path(__file__).resolve().parent), start_new_session=True)
+    finally:
+        out.close()
+
+
+# ── job completion: stamp manifest.group_aligned (reviewer spec 2026-09-11 #2: "the app progresses the respective scans,
+#    under their subgroups, to the 4. Aligned tab"). A job started through /subgroups leaves align_min/stamp_request.json;
+#    when its result lands (watcher thread, or lazily on the next status call after a sidecar restart) every member of the
+#    result is stamped ONCE per result timestamp, and an approval of an OLDER result is voided. A plain /align job of a
+#    group that was never set up through /subgroups stamps nothing (unchanged behaviour). ─────────────────────────────
+_STAMP_NAME = "stamp_request.json"
+_STAMP_LOCK = threading.Lock()
+_ALIGN_QUEUE: list[dict] = []     # subgroup jobs waiting for the machine (one job at a time): {gid, members, key, req}
+
+
+def _align_stamp_state(gid: str) -> dict | None:
+    st = group_job_mod.read_json(_align_dir(gid) / _STAMP_NAME)
+    if not st:
+        return None
+    return {"requested": st.get("requested"), "members": st.get("members"), "stamped_timestamp": st.get("stamped_timestamp"),
+            "stamped": st.get("stamped"), "stamped_at": st.get("stamped_at")}
+
+
+def _align_stamp_request(gid: str, members: list[str]) -> None:
+    d = _align_dir(gid)
+    d.mkdir(parents=True, exist_ok=True)
+    with _STAMP_LOCK:
+        cur = group_job_mod.read_json(d / _STAMP_NAME) or {}
+        cur.update({"group": gid, "members": list(members), "requested": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        group_job_mod._write_json(d / _STAMP_NAME, cur)
+
+
+def _align_stamp_if_due(gid: str) -> dict | None:
+    """Stamp group_aligned on every member of the group's CURRENT result when a stamp was requested for the group and
+    this result timestamp has not been stamped yet. Returns what was written (or None when nothing was due)."""
+    d = _align_dir(gid)
+    with _STAMP_LOCK:
+        sreq = group_job_mod.read_json(d / _STAMP_NAME)
+        if not sreq:
+            return None
+        res = group_job_mod.read_json(d / group_job_mod.RESULT_NAME)
+        ts = (res or {}).get("timestamp")
+        if not res or not ts or sreq.get("stamped_timestamp") == ts:
+            return None
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        members = [orch.safe_case_id(c) for c in (res.get("member_ids") or sreq.get("members") or [])]
+        stamped: list[str] = []; unapproved: list[str] = []
+        for cid in members:
+            if not orch.case_root(cid).exists():
+                continue
+            m = orch.read_manifest(cid)
+            # Was this scan actually PLACED on the group's canvas? (roster role reference / contributing / via.)
+            # A refused scan stays in the group (its pane explains why) but reads "cannot align" in the sidebar.
+            rost = {str(r.get("cid")): r for r in (res.get("roster") or [])}
+            entry = rost.get(cid) or {}
+            placed = bool(entry.get("placed", True)) if entry else (cid not in (res.get("non_contributing") or {}))
+            why = None if placed else (entry.get("role") or (res.get("non_contributing") or {}).get(cid) or "not placed")
+            upd: dict = {"group_aligned": {"ts": now, "group": gid, "note": None, "source": "align_job",
+                                           "result_timestamp": ts, "subgroup": _case_subgroup(m),
+                                           "placed": placed, "why_not": why, "role": entry.get("role"),
+                                           "via": entry.get("via")},
+                         "align_not_possible": None}
+            prev = m.get("aligned_approved")
+            if prev and not (isinstance(prev, dict) and prev.get("result_timestamp") == ts):
+                upd["aligned_approved"] = None; upd["aligned_approved_at"] = None   # approved an OLDER result
+                unapproved.append(cid)
+            orch.write_manifest_value(cid, upd)
+            stamped.append(cid)
+        sreq.update({"stamped_timestamp": ts, "stamped": stamped, "stamped_at": now, "unapproved": unapproved})
+        group_job_mod._write_json(d / _STAMP_NAME, sreq)
+        print(f"[align] {gid}: group_aligned stamped on {stamped} (result {ts}); approval cleared on {unapproved}", flush=True)
+        return {"stamped": stamped, "unapproved": unapproved, "result_timestamp": ts}
+
+
+def _align_queue_next() -> None:
+    """Start the next queued subgroup job when nothing runs (called by the watcher when a job ends)."""
+    with _ALIGN_LOCK:
+        busy = sum(1 for proc in _ALIGN_PROCS.values() if proc.poll() is None)
+        if busy >= _align_max_jobs() or not _ALIGN_QUEUE:
+            return
+        nxt = _ALIGN_QUEUE.pop(0)
+    try:
+        _align_start(nxt["gid"], nxt["members"], nxt["key"], nxt["req"], stamp=nxt.get("stamp", False), allow_queue=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[align] queued job {nxt['gid']} could not start: {type(e).__name__}: {e}", flush=True)
+    if _ALIGN_QUEUE:
+        _align_queue_next()          # fill the remaining slots
+
+
+def _align_watch(gid: str, proc) -> None:
+    """Daemon thread per spawned job: when it exits, stamp (if due) and start the next queued job."""
+    try:
+        while proc.poll() is None:
+            time.sleep(2.0)
+        if proc.poll() == 0:
+            _align_stamp_if_due(gid)
+    except Exception as e:  # noqa: BLE001
+        print(f"[align] watcher {gid}: {type(e).__name__}: {e}", flush=True)
+    finally:
+        _align_queue_next()
+
+
+def _align_start(gid: str, members: list[str], key: dict, req: "GroupAlignRequest", *, stamp: bool = False,
+                 allow_queue: bool = False) -> dict:
+    """Start (or report) the align job of ONE group id. stamp=True records a stamp request so the job's completion
+    marks every member group_aligned (a cached result stamps at once). allow_queue=True queues the job behind another
+    group's running one instead of refusing (the per-subgroup fan-out)."""
+    d = _align_dir(gid)
+    req.members = list(members)
+    with _ALIGN_LOCK:
+        proc = _ALIGN_PROCS.get(gid)
+        if proc is not None and proc.poll() is None:
+            return {"ok": True, "started": False, "already_running": True, **_align_status(gid, members, key)}
+    if stamp:
+        _align_stamp_request(gid, members)
+    st = _align_status(gid, members, key)
+    if st["running"]:
+        return {"ok": True, "started": False, "already_running": True, **st}
+    if st["result_exists"] and not req.force:
+        return {"ok": True, "started": False, "cached": True, **_align_status(gid, members, key)}
+    if len(members) < 2:
+        raise HTTPException(400, f"Group {gid} has a single scan ({members[0]}); nothing to align.")
+    other = _align_running_elsewhere(gid)
+    if other:
+        if not allow_queue:
+            raise HTTPException(409, f"Another group's alignment is still running ({other}); wait for it to finish.")
+        with _ALIGN_LOCK:
+            if not any(q["gid"] == gid for q in _ALIGN_QUEUE):
+                _ALIGN_QUEUE.append({"gid": gid, "members": list(members), "key": dict(key), "req": req, "stamp": stamp})
+        return {"ok": True, "started": False, "queued": True, "queued_behind": other, **st}
+    with _ALIGN_LOCK:
+        d.mkdir(parents=True, exist_ok=True)
+        # keep the previous result readable until the new one lands: result.json → result.prev.json
+        rp = d / group_job_mod.RESULT_NAME
+        if rp.exists():
+            try:
+                os.replace(rp, d / "result.prev.json")
+            except OSError:
+                pass
+        try:
+            (d / group_job_mod.PROGRESS_NAME).write_text(json.dumps(
+                {"group": gid, "members": members, "phase": "starting", "members_done": 0, "members_total": len(members),
+                 "pairs_done": 0, "pairs_total": len(members) - 1, "overlays_done": 0, "started": time.time(),
+                 "updated": time.time(), "pid": None, "running": True, "done": False, "error": None}), encoding="utf-8")
+        except OSError:
+            pass
+        proc = _align_spawn(gid, d, req)
+        _ALIGN_PROCS[gid] = proc
+    threading.Thread(target=_align_watch, args=(gid, proc), name=f"align-watch-{gid}", daemon=True).start()
+    return {"ok": True, "started": True, **_align_status(gid, members, key)}
+
+
+@app.post("/api/group/{group_id}/align")
+def group_align(group_id: str, req: GroupAlignRequest | None = None) -> dict:
+    """Timeline steps 3/4 ("⧉ Align group" / the panel's re-run): start the pair-registration job for a patient+eye group
+    or one of its subgroups (`<patient>_<eye>_s<k>`; 404 when no OCT case resolves to it) or report the running / cached
+    one. Body {force, transitivity, reference}. Writes ONLY under <workspace>/groups/<gid>/align_min/; manifests are
+    touched only when the group was set up through /subgroups (then completion stamps group_aligned, see
+    _align_stamp_if_due) — a plain group never stamps."""
+    req = req or GroupAlignRequest()
+    members, key = _group_members(group_id)
+    if not members:
+        raise HTTPException(404, f"No such patient+eye group: {group_id}")
+    gid = _align_gid(group_id)
+    return _align_start(gid, members, key, req, stamp=False, allow_queue=False)
+
+
+# ── the SUBGROUP step of "⧉ Align group" (reviewer spec 2026-09-11 #1/#2) ─────────────────────────────────────────────
+class SubgroupsRequest(BaseModel):
+    assignments: dict[str, str | int] = {}   # case_id → subgroup label (1, 2, … or a name); omitted scans keep theirs
+    confirm: bool = True                     # stamp align_subgroup_confirmed on the assigned scans
+    force: bool = False                      # re-run a subgroup that already has a result
+    transitivity: bool = False
+    sensitivity: bool = True       # run the reference-sensitivity stage (off for a bulk run over the store)
+
+
+def _subgroup_scan_row(cid: str, base: str) -> dict:
+    m = orch.read_manifest(cid)
+    sub = _case_subgroup(m)
+    return {"case_id": cid, "subgroup": sub, "align_group": f"{base}_s{sub}",
+            "align_subgroup_confirmed": bool(m.get("align_subgroup_confirmed")),
+            "align_not_possible": m.get("align_not_possible"),
+            "subgroup_confirmed": bool(m.get("subgroup_confirmed")),
+            "group_aligned": (m.get("group_aligned") or None), "aligned_approved": (m.get("aligned_approved") or None),
+            "preproc_vetted": bool(m.get("preproc_vetted")), "sam2_meta": bool(m.get("sam2_meta"))}
+
+
+@app.get("/api/group/{group_id}/subgroups")
+def group_subgroups(group_id: str) -> dict:
+    """The eye's scans with their current subgroup + step-4 flags, and the align status per subgroup id."""
+    base, _sub = _align_base_and_sub(group_id)
+    members, key = _group_members(base)
+    if not members:
+        raise HTTPException(404, f"No such patient+eye group: {group_id}")
+    scans = [_subgroup_scan_row(cid, base) for cid in members]
+    by_sub: dict[str, list[str]] = {}
+    for row in scans:
+        by_sub.setdefault(row["subgroup"], []).append(row["case_id"])
+    jobs: dict = {}
+    for sub, mem in by_sub.items():
+        sgid = f"{base}_s{sub}"
+        try:
+            sgid = _align_gid(sgid)
+        except HTTPException:
+            jobs[sub] = {"group": sgid, "members": mem, "error": "subgroup label is not a safe group id"}
+            continue
+        st = _align_status(sgid, mem, {**key, "subgroup": sub}) if _align_dir(sgid).exists() else None
+        jobs[sub] = {"group": sgid, "members": mem, "status": st, "alignable": len(mem) >= 2}
+    return {"ok": True, "group": base, "patient": key.get("patient"), "eye": key.get("eye"), "scans": scans,
+            "subgroups": jobs, "queued": [q["gid"] for q in _ALIGN_QUEUE]}
+
+
+@app.post("/api/group/{group_id}/subgroups")
+def group_subgroups_confirm(group_id: str, req: SubgroupsRequest | None = None) -> dict:
+    """Confirm the eye's subgroups and align each one: writes scar_subgroup (+ align_subgroup_confirmed) on the assigned
+    scans (only scans OF this eye; anything else in `assignments` is rejected), then starts one align job per distinct
+    subgroup with ≥ 2 scans (queued one behind the other — the machine runs one job at a time); a subgroup with a single
+    scan is reported in `skipped`. Each started job stamps group_aligned on its members when it completes (its scans
+    advance to step 4 "Aligned"); a subgroup whose result is already cached (and not `force`d) stamps at once."""
+    req = req or SubgroupsRequest()
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+    base, _sub = _align_base_and_sub(group_id)
+    members, key = _group_members(base)
+    if not members:
+        raise HTTPException(404, f"No such patient+eye group: {group_id}")
+    allowed = set(members)
+    written: dict = {}; rejected: list[str] = []
+    for cid, lab in (req.assignments or {}).items():
+        try:
+            c = orch.safe_case_id(cid)
+        except HTTPException:
+            rejected.append(cid); continue
+        if c not in allowed:
+            rejected.append(cid); continue
+        sub = _sub_norm(lab)
+        upd: dict = {"scar_subgroup": sub}
+        if req.confirm:
+            upd["align_subgroup_confirmed"] = True
+        orch.write_manifest_value(c, upd)
+        written[c] = sub
+    scans = [_subgroup_scan_row(cid, base) for cid in members]
+    by_sub: dict[str, list[str]] = {}
+    for row in scans:
+        by_sub.setdefault(row["subgroup"], []).append(row["case_id"])
+    jobs: list[dict] = []; skipped: list[dict] = []
+
+    def _cannot_align(mem: list[str], sgid: str, sub: str, reason: str) -> None:
+        """Mark these scans "cannot align" (reviewer 2026-09-12: every scan ends at aligned or cannot-align)."""
+        for c in mem:
+            try:
+                orch.write_manifest_value(c, {"align_not_possible": {"ts": now_iso, "group": sgid, "subgroup": sub,
+                                                                     "reason": reason}})
+            except Exception as exc:  # noqa: BLE001
+                print(f"[align] cannot-align mark failed for {c}: {exc}", flush=True)
+
+    for sub in sorted(by_sub):
+        mem = by_sub[sub]
+        sgid = f"{base}_s{sub}"
+        try:
+            sgid = _align_gid(sgid)
+        except HTTPException:
+            reason = "subgroup label is not a safe group id (use a number or a-z 0-9 . -)"
+            _cannot_align(mem, sgid, sub, reason)
+            skipped.append({"subgroup": sub, "group": sgid, "members": mem, "reason": reason})
+            continue
+        if len(mem) < 2:
+            reason = f"subgroup {sub} has a single scan ({mem[0]}) — nothing to align; it stays at Vetted"
+            _cannot_align(mem, sgid, sub, reason)
+            skipped.append({"subgroup": sub, "group": sgid, "members": mem, "reason": reason})
+            continue
+        areq = GroupAlignRequest(force=req.force, transitivity=req.transitivity, members=mem, sensitivity=req.sensitivity)
+        try:
+            st = _align_start(sgid, mem, {**key, "subgroup": sub}, areq, stamp=True, allow_queue=True)
+        except HTTPException as e:
+            _cannot_align(mem, sgid, sub, str(e.detail))
+            skipped.append({"subgroup": sub, "group": sgid, "members": mem, "reason": str(e.detail)})
+            continue
+        jobs.append({"subgroup": sub, **st})
+    return {"ok": True, "group": base, "patient": key.get("patient"), "eye": key.get("eye"), "written": written,
+            "rejected": rejected, "confirmed": bool(req.confirm), "subgroups": {r["case_id"]: r["subgroup"] for r in scans},
+            "scans": scans, "jobs": jobs, "skipped": skipped}
+
+
+@app.get("/api/group/{group_id}/align/status")
+def group_align_status(group_id: str) -> dict:
+    members, key = _group_members(group_id)
+    if not members:
+        raise HTTPException(404, f"No such patient+eye group: {group_id}")
+    return _align_status(_align_gid(group_id), members, key)
+
+
+@app.get("/api/group/{group_id}/align/result")
+def group_align_result(group_id: str) -> dict:
+    members, key = _group_members(group_id)
+    if not members:
+        raise HTTPException(404, f"No such patient+eye group: {group_id}")
+    gid = _align_gid(group_id)
+    res = group_job_mod.read_json(_align_dir(gid) / group_job_mod.RESULT_NAME)
+    if not res:
+        raise HTTPException(404, f"No alignment result for group {gid} yet.")
+    res["overlay_url_base"] = f"/api/group/{gid}/align/overlay/"
+    res["consensus_url"] = f"/api/group/{gid}/align/consensus"
+    res["volume_url"] = f"/api/group/{gid}/align/volume"                    # the FINAL placement (post-transform)
+    res["volume_pairs_url"] = f"/api/group/{gid}/align/volume?stage=pairs"  # the pair engine's placement
+    res["aligned_url"] = f"/api/group/{gid}/align/aligned"
+    res["transforms_url"] = f"/api/group/{gid}/align/transforms.json"
+    res["scrub_url"] = f"/api/group/{gid}/align/sagittal"                 # ?lateral=<int>&stage=both|before|after → PNG
+    res["scrub_meta_url"] = f"/api/group/{gid}/align/sagittal/meta"
+    res["status"] = _align_status(gid, members, key)
+    # step-4 flags per member, read live from the manifests (the job never writes them)
+    approval: dict = {}
+    for rec in (res.get("members") or []):
+        try:
+            m = orch.read_manifest(orch.safe_case_id(str(rec.get("cid"))))
+        except Exception:  # noqa: BLE001
+            m = {}
+        rec["group_aligned"] = (m.get("group_aligned") or None)
+        rec["aligned_approved"] = (m.get("aligned_approved") or None)
+        rec["subgroup"] = _case_subgroup(m)
+        approval[str(rec.get("cid"))] = bool(m.get("aligned_approved"))
+    res["approval"] = {"members": approval, "all": bool(approval) and all(approval.values()), "any": any(approval.values())}
+    return res
+
+
+@app.get("/api/group/{group_id}/align/overlay/{member}")
+def group_align_overlay(group_id: str, member: str):
+    gid = _align_gid(group_id)
+    cid = orch.safe_case_id(member)
+    p = _align_dir(gid) / group_job_mod.overlay_name(cid)
+    if not p.exists():
+        raise HTTPException(404, f"No overlay for {cid} in group {gid}.")
+    return FileResponse(str(p), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/group/{group_id}/align/consensus")
+def group_align_consensus(group_id: str):
+    """consensus.png of the group's last align job (the PROVISIONAL consensus montage). GET ⇒ token-exempt, like the
+    overlays."""
+    gid = _align_gid(group_id)
+    p = _align_dir(gid) / group_job_mod.CONSENSUS_PNG
+    if not p.exists():
+        raise HTTPException(404, f"No consensus image for group {gid}.")
+    return FileResponse(str(p), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/group/{group_id}/align/consensus.json")
+def group_align_consensus_json(group_id: str) -> dict:
+    gid = _align_gid(group_id)
+    res = group_job_mod.read_json(_align_dir(gid) / group_job_mod.CONSENSUS_JSON)
+    if not res:
+        raise HTTPException(404, f"No consensus for group {gid}.")
+    return res
+
+
+@app.get("/api/group/{group_id}/align/aligned")
+def group_align_aligned(group_id: str):
+    """aligned.png — the post-transform fused montage (every member moved by its FINAL rigid transform, final lines
+    dashed, consensus thick white; group_job.apply_transforms). GET ⇒ token-exempt, like the overlays."""
+    gid = _align_gid(group_id)
+    p = _align_dir(gid) / group_job_mod.ALIGNED_PNG
+    if not p.exists():
+        raise HTTPException(404, f"No applied-alignment image for group {gid}.")
+    return FileResponse(str(p), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/group/{group_id}/align/transforms.json")
+def group_align_transforms_json(group_id: str) -> dict:
+    """transforms.json — per member the FINAL per-frame rigid transform (df, dx, a_final, b_final, δa, δb, residual
+    RMS per frame, profile_beyond_tilt flags, sizes)."""
+    gid = _align_gid(group_id)
+    res = group_job_mod.read_json(_align_dir(gid) / group_job_mod.TRANSFORMS_JSON)
+    if not res:
+        raise HTTPException(404, f"No transforms for group {gid}.")
+    return res
+
+
+@app.get("/api/group/{group_id}/align/volume")
+def group_align_volume(group_id: str, stage: str = "final"):
+    """aligned_rgb.nii.gz — the placed members as one RGB(A) volume for the panel's 3-D view: the FINAL placement
+    (with the axial changes applied; default) or `?stage=pairs` for the pair engine's placement
+    (aligned_rgb_pairs.nii.gz). Served as application/gzip with NO Content-Encoding (niivue gunzips by the .nii.gz
+    name itself; see debug_align_view). The URL is token-exempt (GET) so niivue's own fetch loads it directly."""
+    gid = _align_gid(group_id)
+    if stage not in ("final", "pairs", "applied"):
+        raise HTTPException(400, f"stage must be 'final' (default) or 'pairs', not {stage!r}")
+    name = group_job_mod.VOLUME_PAIRS_NAME if stage == "pairs" else group_job_mod.VOLUME_NAME
+    p = _align_dir(gid) / name
+    if not p.exists() and stage == "pairs":          # an older result: the single volume IS the pair placement
+        p = _align_dir(gid) / group_job_mod.VOLUME_NAME
+    if not p.exists():
+        raise HTTPException(404, f"No aligned volume for group {gid}.")
+    return FileResponse(str(p), media_type="application/gzip", filename=name,
+                        headers={"Cache-Control": "no-cache"})
+
+
+# ── the SCRUB endpoints (reviewer ask 2026-09-11 #4: "allow the user to scrub through the sagittal views (before and
+#    after) of the replicates after axial changes are applied") ─────────────────────────────────────────────────
+# group_job.apply_transforms leaves, per member, BOTH placements on the union canvas as uint8 memmaps under
+# align_min/scrub/ (before = the pair engine's placement, after = the axial changes applied) plus meta.json (per-lateral
+# line RMS to the consensus per stage). One canvas lateral = one contiguous (Dc, Fc) block, so a composite is a
+# memory-mapped read + a PIL render (~0.1 s); the PNG is cached on disk (scrub/<stage>_<lateral>.png) and the memmaps /
+# lines of the last _SCRUB_LRU groups stay open in-process (keyed by meta.json's mtime: a re-run reloads).
+_SCRUB_CACHE: dict = {}          # gid → group_job.load_scrub(...) result (insertion order = LRU order)
+_SCRUB_LOCK = threading.Lock()
+_SCRUB_LRU = 2
+_SCRUB_PNG_CAP = 300             # on-disk composites kept per group (~1.4 MB each at a central lateral → ≤ ~0.4 GB)
+
+
+def _scrub_png_prune(scrub_dir: Path) -> None:
+    """Keep the newest _SCRUB_PNG_CAP composites (a full 560-lateral sweep would otherwise leave ~0.8 GB)."""
+    try:
+        pngs = sorted(scrub_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        for p in pngs[:max(0, len(pngs) - _SCRUB_PNG_CAP)]:
+            p.unlink()
+    except OSError:
+        pass
+
+
+def _scrub_data(gid: str) -> dict:
+    d = _align_dir(gid)
+    meta_p = d / group_job_mod.SCRUB_DIR / group_job_mod.SCRUB_META
+    if not meta_p.exists():
+        raise HTTPException(404, f"No scrub data for group {gid} — re-run the alignment (this result predates the scrub view or is still running).")
+    try:
+        mtime = meta_p.stat().st_mtime
+    except OSError:
+        raise HTTPException(404, f"No scrub data for group {gid}.")
+    with _SCRUB_LOCK:
+        ent = _SCRUB_CACHE.get(gid)
+        if ent is not None and ent.get("mtime") == mtime:
+            _SCRUB_CACHE.pop(gid); _SCRUB_CACHE[gid] = ent          # most recently used last
+            return ent
+    data = group_job_mod.load_scrub(d)
+    if data is None:
+        raise HTTPException(404, f"Scrub data for group {gid} is incomplete — re-run the alignment.")
+    with _SCRUB_LOCK:
+        _SCRUB_CACHE.pop(gid, None); _SCRUB_CACHE[gid] = data
+        while len(_SCRUB_CACHE) > _SCRUB_LRU:
+            _SCRUB_CACHE.pop(next(iter(_SCRUB_CACHE)))
+    return data
+
+
+@app.get("/api/group/{group_id}/align/sagittal/meta")
+def group_align_sagittal_meta(group_id: str) -> dict:
+    """scrub/meta.json + the PNG url base: {laterals, depth, frames, covered_range, default_lateral, members, reference,
+    colours, channels, rms: {cid: {before: [Lc], after: [Lc]}} (line RMS to the consensus per lateral, null where
+    undefined), rms_summary, stage_labels, canvas, window, bytes, timestamp}."""
+    gid = _align_gid(group_id)
+    data = _scrub_data(gid)
+    if not all(k in data["meta"] for k in group_job_mod.TISSUE_KEYS):
+        data = _scrub_tissue_lazy(gid, data)
+    meta = dict(data["meta"])
+    meta["rms"] = {cid: {s: [None if not np.isfinite(v) else float(v) for v in np.asarray(arr, float)] for s, arr in st.items()}
+                   for cid, st in meta["rms"].items()}
+    meta["png_url"] = f"/api/group/{gid}/align/sagittal"
+    meta["columns"] = group_job_mod.scrub_columns(meta)      # click → which scan's panel (reviewer 2026-09-12)
+    return meta
+
+
+_SCRUB_TISSUE_LOCK = threading.Lock()
+
+
+def _scrub_tissue_lazy(gid: str, data: dict) -> dict:
+    """A meta.json written before the tissue-edge metrics existed: compute them once from the memmaps (~2 s for
+    3 members × 2 stages on CS001) and rewrite meta.json under a lock. If meta.json changed underneath (a re-run
+    finished meanwhile) the new one is served and nothing is written; a failure is reported in tissue_error only."""
+    d = _align_dir(gid)
+    meta_p = d / group_job_mod.SCRUB_DIR / group_job_mod.SCRUB_META
+    with _SCRUB_TISSUE_LOCK:
+        try:
+            if meta_p.stat().st_mtime != data.get("mtime"):
+                return _scrub_data(gid)                  # someone else (a re-run or a parallel request) rewrote it
+        except OSError:
+            raise HTTPException(404, f"No scrub data for group {gid}.")
+        cur = group_job_mod.read_json(meta_p) or {}
+        if all(k in cur for k in group_job_mod.TISSUE_KEYS):
+            return _scrub_data(gid)
+        try:
+            add = group_job_mod.tissue_edge_metrics(meta_p.parent, d / group_job_mod.ALIGNED_LINES, cur)
+        except Exception as e:
+            data["meta"]["tissue_error"] = f"{type(e).__name__}: {e}"
+            return data
+        cur.update(add)
+        try:
+            group_job_mod._write_json(meta_p, cur)
+        except OSError as e:
+            data["meta"].update(add); data["meta"]["tissue_error"] = f"not saved: {e}"
+            return data
+    return _scrub_data(gid)
+
+
+@app.get("/api/group/{group_id}/align/sagittal")
+def group_align_sagittal(group_id: str, lateral: int, stage: str = "both", member: str | None = None, scale: int = 1):
+    """One PNG composite for a canvas lateral: rows = BEFORE (pair placement) / AFTER (axial changes applied), columns =
+    every member in grey + 'all' blended by the 3-D channels; x = frames (high on the left, as in the app), y = depth
+    (cropped around the lines); the member's line thin in its colour, the consensus thick white, the line RMS to the
+    consensus in each title. `stage` = both (default) | before | after. Cached under align_min/scrub/. GET ⇒
+    token-exempt; the panel adds ?t=<result timestamp> so the browser may cache it."""
+    gid = _align_gid(group_id)
+    if stage not in ("both", *group_job_mod.SCRUB_STAGES):
+        raise HTTPException(400, f"stage must be 'both', 'before' or 'after', not {stage!r}")
+    data = _scrub_data(gid)
+    Lc = int(data["meta"]["canvas"]["shape"][0])
+    if not (0 <= int(lateral) < Lc):
+        raise HTTPException(400, f"lateral must be 0..{Lc - 1}, not {lateral}")
+    headers = {"Cache-Control": "private, max-age=3600"}
+    # ?member=<cid|all> renders THAT panel alone and large — the click-to-zoom of one scan (reviewer 2026-09-12);
+    # it is not cached on disk (one file per scan × lateral would swamp the cache) and renders in ~60 ms.
+    if member:
+        pw = int(max(340, min(1600, 1100 * max(1, int(scale)))))
+        try:
+            png = group_job_mod.render_scrub_png(data, int(lateral), stage, panel_w=pw, only=str(member))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return Response(content=png, media_type="image/png", headers=headers)
+    p = _align_dir(gid) / group_job_mod.SCRUB_DIR / group_job_mod.scrub_png_name(stage, int(lateral))
+    if p.exists():
+        return FileResponse(str(p), media_type="image/png", headers=headers)
+    try:
+        png = group_job_mod.render_scrub_png(data, int(lateral), stage)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    try:
+        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+        tmp.write_bytes(png); os.replace(tmp, p)
+        _scrub_png_prune(p.parent)
+    except OSError:
+        pass
+    return Response(content=png, media_type="image/png", headers=headers)
+
+
+class GroupAlignedRequest(BaseModel):
+    aligned: bool = True
+    note: str | None = None
+
+
+@app.post("/api/case/{case_id}/group-aligned")
+def set_group_aligned(case_id: str, req: GroupAlignedRequest) -> dict:
+    """Manifest-only: set (aligned=true) or clear (false) manifest.group_aligned — the step-4 "Aligned" flag
+    read by api/lifecycle.ts scanStep. For tests and for the alignment engine to stamp its result (the stub
+    /api/group/{gid}/align never calls it). Stored as {ts, group, note, source} so the engine can add its own
+    fields (percent_match, …) later without changing the shape; null when cleared."""
+    cid = _require_case(case_id)
+    if req.aligned:
+        pid, eye, _sub = _case_identity(cid)
+        val: dict | None = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "group": (f"{pid}_{eye}" if pid and eye else None),
+                            "note": (req.note or None), "source": "manual"}
+        m = orch.write_manifest_value(cid, {"group_aligned": val})
+        return {"ok": True, "group_aligned": m.get("group_aligned")}
+    # clearing the alignment voids the approval of its axial changes (step-4 state, see _STEP_RESET_FLAGS)
+    m = orch.write_manifest_value(cid, {"group_aligned": None, "aligned_approved": None, "aligned_approved_at": None})
+    return {"ok": True, "group_aligned": m.get("group_aligned")}
+
+
+class AlignedApproveRequest(BaseModel):
+    approve: bool = True
+    note: str | None = None
+
+
+@app.post("/api/case/{case_id}/aligned-approve")
+def set_aligned_approved(case_id: str, req: AlignedApproveRequest) -> dict:
+    """Step 4 "✓ Approve axial changes" (reviewer spec 2026-09-11 #4): the reviewer approves that the axial changes
+    applied to each replicate meet the consensus. Manifest-only: aligned_approved = {ts, note, group, result_timestamp,
+    source} (+ aligned_approved_at), null when withdrawn. Requires the scan to be group-aligned (400 otherwise); the
+    approval records the result timestamp it was given for, so a later re-run of the alignment voids it.
+    Approving SURFACES the cornea-detection controls in the app (next step)."""
+    cid = _require_case(case_id)
+    m = orch.read_manifest(cid)
+    if req.approve:
+        ga = m.get("group_aligned")
+        if not ga:
+            raise HTTPException(400, "This scan is not group-aligned yet — run \"⧉ Align group\" first.")
+        ga = ga if isinstance(ga, dict) else {}
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        upd: dict = {"aligned_approved": {"ts": now, "note": (req.note or None), "group": ga.get("group"),
+                                          "result_timestamp": ga.get("result_timestamp"), "source": "manual"},
+                     "aligned_approved_at": now}
+    else:
+        upd = {"aligned_approved": None, "aligned_approved_at": None}
+    m = orch.write_manifest_value(cid, upd)
+    return {"ok": True, "aligned_approved": m.get("aligned_approved"), "aligned_approved_at": m.get("aligned_approved_at")}
 
 
 class ObserverAnalysisRequest(BaseModel):
@@ -7822,13 +8855,17 @@ def cases_list() -> dict:
                 "input_volume": bool(m.get("input_volume") or m.get("corrected_volume")),
                 "oct_preprocessed": bool(m.get("oct_preprocessed")),
                 "preproc_vetted": bool(m.get("preproc_vetted")),
+                "group_aligned": bool(m.get("group_aligned")),   # step 4 (Aligned): group curvature alignment done
+                "aligned_approved": bool(m.get("aligned_approved")),           # step 4: axial changes approved
+                "align_subgroup_confirmed": bool(m.get("align_subgroup_confirmed")),   # step 4: subgroup confirmed
+                "align_not_possible": m.get("align_not_possible"),                     # step 4: nothing to align against
                 "scar_classification": m.get("scar_classification") or None,
                 "scar_range": (list(m.get("scar_range")) if m.get("scar_range") else None),
                 "scar_subgroup": (str(m.get("scar_subgroup")).strip() if m.get("scar_subgroup") else None),
                 "sam2_meta": bool(m.get("sam2_meta")),
                 "scar_done": bool(m.get("scar_done")),
                 "subgroup_confirmed": bool(m.get("subgroup_confirmed")),
-                "consensus_case": bool(m.get("consensus_case")),   # so an ALIGNED member colours as step 7
+                "consensus_case": bool(m.get("consensus_case")),   # so a SCAR-ALIGNED member colours as step 10
                 "normalized": bool(m.get("normalized")),
                 "corrected_labelmap": bool(m.get("corrected_labelmap")),
                 "training_scheduled": bool(m.get("training_scheduled")),

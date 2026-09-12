@@ -52,7 +52,7 @@ export function SubgroupGrid() {
   const [data, setData] = useState<Record<string, ScanPreviews>>({});
   const [loading, setLoading] = useState(false);
   // The VOTED CONSENSUS result's own segmentation previews (density-coloured) — so the consensus itself is
-  // visible at step 9, not only the per-scan grid. Fetched from the consensus case's "segmentation" group.
+  // visible at step 10 (Scar-aligned), not only the per-scan grid. Fetched from the consensus case's "segmentation" group.
   const [consImgs, setConsImgs] = useState<PreviewImage[]>([]);
   useEffect(() => {
     if (!consensusId) return;
